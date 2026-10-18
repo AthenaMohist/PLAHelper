@@ -14,3 +14,11 @@ pla-bridge = { path = "../pla-bridge" }
 tokio = { workspace = true }
 egui = "0.29"
 eframe = { version = "0.29", default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
+
+# Win32: 吸附 Plasticity 主窗口(窗口枚举/矩形/进程映像名/进程创建时间)。
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Threading",
+] }

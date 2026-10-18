@@ -1,42 +1,110 @@
-//! [PLA-000] PLA 助手 UI — eframe/egui 三栏主界面。
-//! 左: 快照墙(P0-1) | 中: 实体树+选择集(P0-2) | 右: 尺寸驱动(P1-1)
-//! 顶部工具条按钮可绑定快捷键(设置面板内), 冲突即时红字告警。
+//! [PLA-000] PLA Toolbar — Plasticity 风格置顶工具栏。
+//!
+//! 形态: 无边框横向工具栏, 自动吸附到 Plasticity 主窗口标题栏空白区
+//! (文档名右侧、右上角控件左侧), AlwaysOnTop。多实例一对一绑定多个
+//! Plasticity 窗口(见 window_finder 模块注释)。
+//!
+//! Bug 修复: bridge 常驻后台线程 + mpsc 通道(不再 UI 线程短连接阻塞);
+//! 工具栏按钮每功能只构建一次(clicked / secondary_clicked 分流)。
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use std::time::{Duration, Instant};
+
+use pla_ui::bridge_thread::{BridgeCmd, BridgeEvent, BridgeHandle};
 use pla_ui::hotkey::{Action, Hotkey, HotkeyMap};
-use serde_json::Value;
+use pla_ui::window_finder;
+
+// ---------------- Plasticity 风格色板 ----------------
+const COL_PANEL: egui::Color32 = egui::Color32::from_rgb(0x26, 0x26, 0x26);
+const COL_BTN: egui::Color32 = egui::Color32::from_rgb(0x33, 0x33, 0x33);
+const COL_BTN_HOVER: egui::Color32 = egui::Color32::from_rgb(0x3d, 0x3d, 0x3d);
+/// Plasticity 图标方块绿(强调色)。
+const COL_ACCENT: egui::Color32 = egui::Color32::from_rgb(0x3e, 0xa3, 0x4d);
+const COL_TEXT: egui::Color32 = egui::Color32::from_rgb(0xcc, 0xcc, 0xcc);
+const COL_MUTED: egui::Color32 = egui::Color32::from_rgb(0x8a, 0x8a, 0x8a);
+const COL_YELLOW: egui::Color32 = egui::Color32::from_rgb(0xd9, 0xa8, 0x2c);
+const COL_RED: egui::Color32 = egui::Color32::from_rgb(0xd0, 0x50, 0x45);
+const COL_GRAY_DOT: egui::Color32 = egui::Color32::from_rgb(0x77, 0x77, 0x77);
+
+// ---------------- 工具栏形态/吸附参数(可调) ----------------
+/// 工具栏逻辑尺寸(横向一行按钮)。
+const TOOLBAR_SIZE: [f32; 2] = [208.0, 30.0];
+/// 方形图标按钮边长。
+const BTN_SIZE: f32 = 24.0;
+/// 吸附: 工具栏右缘距目标窗口右缘的退让(避开右上角 min/max/close 控件区)。
+const SNAP_RIGHT_INSET: f32 = 150.0;
+/// 吸附: 相对目标窗口顶边的下移(物理像素)。
+const SNAP_TOP_GAP: i32 = 2;
+/// 吸附/绑定轮询间隔。
+const SNAP_POLL_MS: u64 = 300;
+/// 位置漂移小于该值(物理像素)不重发定位命令, 避免抖动。
+const SNAP_EPS: f32 = 2.0;
+
+/// 工具栏按钮列(横向排列, 顺序即产品顺序)。
+const TOOLBAR_ACTIONS: [Action; 6] = [
+    Action::EntitiesRefresh,
+    Action::SnapshotManual,
+    Action::ToggleSnapshots,
+    Action::ToggleEntities,
+    Action::ToggleDim,
+    Action::ToggleSettings,
+];
 
 fn main() -> eframe::Result<()> {
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1180.0, 720.0])
-            .with_title("PLA 助手 — Plasticity Snapshot & Selection"),
+            .with_inner_size(TOOLBAR_SIZE)
+            .with_title("PLA Toolbar")
+            .with_resizable(false)
+            .with_decorations(false)
+            .with_window_level(egui::WindowLevel::AlwaysOnTop),
         ..Default::default()
     };
-    eframe::run_native("pla-ui", opts, Box::new(|cc| Ok::<Box<dyn eframe::App>, _>(Box::new(PlaApp::new(cc)))))
+    eframe::run_native(
+        "pla-ui",
+        opts,
+        Box::new(|cc| Ok::<Box<dyn eframe::App>, _>(Box::new(PlaApp::new(cc)))),
+    )
 }
 
-#[derive(Default)]
 struct PlaApp {
-    entities: Vec<Value>,
+    /// 常驻 bridge 线程句柄(mpsc 收发)。
+    bridge: BridgeHandle,
     bridge_status: String,
+    /// 吸附目标(未绑定 = None)。
+    snap_target: Option<window_finder::TargetWindow>,
+    /// 上次吸附定位使用的目标锚点 (right, top), 用于漂移检测。
+    last_snap_anchor: Option<(i32, i32)>,
+    last_snap_poll: Instant,
+    entities: Vec<serde_json::Value>,
     snapshots: Vec<String>,
+    show_snapshots: bool,
+    show_entities: bool,
+    show_dim: bool,
+    show_settings: bool,
     sel_name: String,
     sel_members: Vec<String>,
     dim_value: f64,
     hotkeys: HotkeyMap,
-    /// 正在录制快捷键的动作 (None = 未在录制)
+    /// 正在录制快捷键的动作名 (None = 未在录制)。
     recording: Option<String>,
-    conflict_msg: Option<String>,
+    /// 面板内提示: (是否错误, 文本)。诚实提示原则: 未接线必须弹明确文字。
+    notice: Option<(bool, String)>,
     doc_key: String,
 }
 
-/// 中文矢量字体: 运行时优先 C:\Windows\Fonts\msyh.ttc(微软雅黑),
-/// 失败回退嵌入的 simhei.ttf(9.7MB, 保证离线可用)。egui 默认字体无 CJK → 方块。
+impl Drop for PlaApp {
+    fn drop(&mut self) {
+        self.bridge.send(BridgeCmd::Shutdown);
+    }
+}
+
+/// 中文矢量字体: 运行时优先 C:\Windows\Fonts\simhei.ttf → Deng.ttf → msyh.ttf,
+/// 失败回退嵌入的 simhei.ttf 兜底。注意: 禁用任何 .ttc —
+/// TTC(TrueType Collection) ab_glyph 不支持, 会 panic 崩溃(实锤 10-20)。
 fn install_cjk_fonts(ctx: &egui::Context) {
     use egui::{FontData, FontDefinitions};
     let mut fonts = FontDefinitions::default();
-    // 注意: 不用 msyh.ttc — TTC(TrueType Collection) ab_glyph 不支持, 会 panic 崩溃(实锤 10-20)。
     let candidates = [
         ("C:\\Windows\\Fonts\\simhei.ttf", "simhei"),
         ("C:\\Windows\\Fonts\\Deng.ttf", "deng"),
@@ -45,7 +113,9 @@ fn install_cjk_fonts(ctx: &egui::Context) {
     let mut installed = false;
     for (path, name) in candidates {
         if let Ok(data) = std::fs::read(path) {
-            fonts.font_data.insert(name.to_string(), FontData::from_owned(data).into());
+            fonts
+                .font_data
+                .insert(name.to_string(), FontData::from_owned(data).into());
             fonts
                 .families
                 .entry(egui::FontFamily::Proportional)
@@ -56,16 +126,17 @@ fn install_cjk_fonts(ctx: &egui::Context) {
         }
     }
     if !installed {
-        // 兜底: 嵌入的思源黑体副本
         const SIMHEI: &[u8] = include_bytes!("../assets/simhei.ttf");
-        fonts.font_data.insert("simhei".into(), FontData::from_owned(SIMHEI.to_vec()).into());
+        fonts
+            .font_data
+            .insert("simhei".into(), FontData::from_owned(SIMHEI.to_vec()).into());
         fonts
             .families
             .entry(egui::FontFamily::Proportional)
             .or_default()
             .insert(0, "simhei".to_string());
     }
-    // 等宽族也补 CJK(快捷键/日志区)
+    // 等宽族也补 CJK(快捷键/日志区)。
     fonts
         .families
         .entry(egui::FontFamily::Monospace)
@@ -74,256 +145,534 @@ fn install_cjk_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
+/// Plasticity 风格样式: 深灰面板/按钮、绿色强调、小圆角、弱阴影、小字号。
+fn apply_plasticity_style(ctx: &egui::Context) {
+    const SW: f32 = 1.0; // stroke 宽度
+    let mut style = (*ctx.style()).clone();
+    let v = &mut style.visuals;
+    v.dark_mode = true;
+    v.panel_fill = COL_PANEL;
+    v.window_fill = COL_PANEL;
+    v.extreme_bg_color = egui::Color32::from_rgb(0x1e, 0x1e, 0x1e);
+    v.faint_bg_color = egui::Color32::from_rgb(0x2e, 0x2e, 0x2e);
+    v.widgets.noninteractive.bg_fill = COL_PANEL;
+    v.widgets.noninteractive.fg_stroke = egui::Stroke::new(SW, COL_TEXT);
+    v.widgets.inactive.bg_fill = COL_BTN;
+    v.widgets.inactive.weak_bg_fill = COL_BTN;
+    v.widgets.inactive.fg_stroke = egui::Stroke::new(SW, COL_TEXT);
+    v.widgets.hovered.bg_fill = COL_BTN_HOVER;
+    v.widgets.hovered.weak_bg_fill = COL_BTN_HOVER;
+    v.widgets.hovered.fg_stroke = egui::Stroke::new(SW, egui::Color32::WHITE);
+    v.widgets.active.bg_fill = COL_ACCENT;
+    v.widgets.active.weak_bg_fill = COL_ACCENT;
+    v.widgets.active.fg_stroke = egui::Stroke::new(SW, egui::Color32::WHITE);
+    v.widgets.open.bg_fill = COL_BTN_HOVER;
+    v.widgets.open.weak_bg_fill = COL_BTN_HOVER;
+    v.selection.bg_fill = COL_ACCENT;
+    v.selection.stroke = egui::Stroke::new(SW, COL_TEXT);
+    // 小圆角 3.0: Visuals 无全局 rounding 字段, 逐 widget 类设置。
+    for w in [
+        &mut v.widgets.noninteractive,
+        &mut v.widgets.inactive,
+        &mut v.widgets.hovered,
+        &mut v.widgets.active,
+        &mut v.widgets.open,
+    ] {
+        w.rounding = egui::Rounding::same(3.0);
+    }
+    v.window_stroke = egui::Stroke::new(SW, egui::Color32::from_rgb(0x44, 0x44, 0x44));    v.window_shadow = egui::epaint::Shadow::NONE;
+    v.popup_shadow = egui::epaint::Shadow::NONE;
+    v.button_frame = true;
+    // 小字号(12-13)。
+    style.text_styles = [
+        (egui::TextStyle::Heading, egui::FontId::proportional(14.0)),
+        (egui::TextStyle::Body, egui::FontId::proportional(12.5)),
+        (egui::TextStyle::Button, egui::FontId::proportional(12.0)),
+        (egui::TextStyle::Small, egui::FontId::proportional(10.0)),
+        (egui::TextStyle::Monospace, egui::FontId::monospace(12.0)),
+    ]
+    .into();
+    style.spacing.item_spacing = egui::vec2(6.0, 4.0);
+    ctx.set_style(style);
+}
+
+/// bridge 状态文本 → 圆点颜色。
+fn status_color(status: &str) -> egui::Color32 {
+    if status.starts_with("已连接") {
+        COL_ACCENT
+    } else if status.starts_with("连接中") {
+        COL_YELLOW
+    } else {
+        COL_RED
+    }
+}
+
+/// 节标题: 全大写浅灰小字(文本由调用方保证大写)。
+fn section_header(ui: &mut egui::Ui, text: &str) {
+    ui.label(
+        egui::RichText::new(text)
+            .small()
+            .strong()
+            .color(COL_MUTED),
+    );
+}
+
 impl PlaApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         install_cjk_fonts(&cc.egui_ctx);
+        apply_plasticity_style(&cc.egui_ctx);
         Self {
-            bridge_status: "未连接".into(),
+            bridge: BridgeHandle::spawn(),
+            bridge_status: "连接中…".into(),
+            snap_target: None,
+            last_snap_anchor: None,
+            last_snap_poll: Instant::now() - Duration::from_millis(SNAP_POLL_MS),
+            entities: Vec::new(),
+            snapshots: pla_ui::snapshot::list_snapshots(),
+            show_snapshots: false,
+            show_entities: false,
+            show_dim: false,
+            show_settings: false,
+            sel_name: String::new(),
+            sel_members: Vec::new(),
+            dim_value: 0.0,
+            hotkeys: HotkeyMap::default(),
+            recording: None,
+            notice: None,
             doc_key: "model1".into(),
-            ..Default::default()
+        }
+    }
+
+    /// 非阻塞收取 bridge 线程事件(每帧调用)。
+    fn poll_bridge(&mut self) {
+        while let Some(ev) = self.bridge.poll() {
+            match ev {
+                BridgeEvent::Status(s) => self.bridge_status = s,
+                BridgeEvent::Entities(list) => self.entities = list,
+                BridgeEvent::Error(e) => self.notice = Some((true, e)),
+            }
         }
     }
 
     /// 集中动作分发: 每个按钮都有真实行为; 未实现的功能弹明确提示, 不做假按钮。
     fn run_action(&mut self, a: Action) {
         match a {
-            Action::EntitiesRefresh => self.refresh_entities(),
-            Action::SnapshotManual => {
-                match pla_ui::snapshot::take_manual_snapshot(&self.doc_key) {
-                    Ok(name) => self.snapshots.insert(0, name),
-                    Err(e) => self.conflict_msg = Some(format!("快照失败: {e}")),
+            Action::EntitiesRefresh => self.bridge.send(BridgeCmd::RefreshEntities),
+            Action::SnapshotManual => match pla_ui::snapshot::take_manual_snapshot(&self.doc_key) {
+                Ok(name) => {
+                    self.snapshots.insert(0, name);
+                    self.notice = Some((false, "快照已保存到 snapshots/ 目录".into()));
                 }
-            }
+                Err(e) => self.notice = Some((true, e)),
+            },
             Action::SnapshotRestore => {
-                self.conflict_msg = Some("切换快照: 先在快照墙选一个快照".into());
+                self.notice = Some((true, "切换快照未接线: 恢复写入需要 PLA-004 G4 闭环".into()));
             }
             Action::SelSave => {
-                self.conflict_msg = Some(format!(
-                    "选择集「{}」: {} 个成员 — 保存逻辑接线中(需要 bridge 组创建)",
-                    self.sel_name, self.sel_members.len()
-                ));
+                let doc = self.doc_key.clone();
+                let name = self.sel_name.clone();
+                let members = self.sel_members.clone();
+                match pla_ui::selection::save_selection(&doc, &name, &members) {
+                    Ok(path) => self.notice = Some((false, format!("选择集已保存: {path}"))),
+                    Err(e) => self.notice = Some((true, e)),
+                }
             }
             Action::SelApply => {
-                self.conflict_msg = Some("应用选择集: 需要 PUT_SOME 组创建语义(PLA-004 G4)".into());
+                self.notice = Some((true, "应用选择集需要 PUT_SOME 组创建语义(PLA-004 G4), 未接线".into()));
             }
             Action::DimApply => {
-                self.conflict_msg = Some("尺寸驱动: 需要 facet 读写闭环(PLA-004 G4 后)".into());
+                self.notice = Some((true, "尺寸驱动需要 facet 读写闭环(PLA-004 G4 后), 未接线".into()));
             }
+            Action::ToggleSnapshots => self.show_snapshots = !self.show_snapshots,
+            Action::ToggleEntities => self.show_entities = !self.show_entities,
+            Action::ToggleDim => self.show_dim = !self.show_dim,
+            Action::ToggleSettings => self.show_settings = !self.show_settings,
         }
     }
 
-    fn refresh_entities(&mut self) {
-        self.bridge_status = "连接中…".into();
-        match pla_ui::bridge_thread::fetch_entities_blocking(&self.doc_key) {
-            Ok(list) => {
-                self.entities = list;
-                self.bridge_status = "已连接".into();
-            }
-            Err(e) => {
-                self.bridge_status = format!("失败: {e}");
-            }
+    /// 吸附定位: 轮询目标窗口, 需要时发 OuterPosition(egui points)。
+    fn update_snap(&mut self, ctx: &egui::Context) {
+        if self.last_snap_poll.elapsed() < Duration::from_millis(SNAP_POLL_MS) {
+            return;
         }
+        self.last_snap_poll = Instant::now();
+        let new_target = window_finder::acquire_target();
+        // 目标锚点(物理像素): (右缘, 顶缘)。
+        let new_anchor = new_target.as_ref().map(|t| (t.right, t.top));
+        self.snap_target = new_target;
+        let Some(target) = self.snap_target.as_ref() else {
+            // 未绑定: 清锚点, 等 Plasticity 出现。
+            self.last_snap_anchor = None;
+            return;
+        };
+        let anchor_changed = match (new_anchor, self.last_snap_anchor) {
+            (Some((nr, nt)), Some((or, ot))) => {
+                (nr - or).abs() as f32 > SNAP_EPS || (nt - ot).abs() as f32 > SNAP_EPS
+            }
+            _ => true,
+        };
+        if !anchor_changed {
+            return;
+        }
+        self.last_snap_anchor = new_anchor;
+        // 物理 → egui points: OuterPosition 用 points(见 egui 0.29 ViewportInfo)。
+        let ppp = ctx.pixels_per_point();
+        let w_phys = TOOLBAR_SIZE[0] * ppp;
+        let x_phys = target.right as f32 - SNAP_RIGHT_INSET - w_phys;
+        let y_phys = target.top as f32 + SNAP_TOP_GAP as f32;
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
+            x_phys / ppp,
+            y_phys / ppp,
+        )));
+    }
+
+    /// 面板/提示窗的基准位置: 吸附时贴工具栏下方, 否则屏幕右侧。
+    fn panel_pos(ctx: &egui::Context) -> Option<egui::Pos2> {
+        ctx.input(|i| {
+            i.viewport()
+                .outer_rect
+                .map(|r| egui::pos2(r.left() + 2.0, r.bottom() + 6.0))
+        })
+    }
+
+    /// 构建一个跟随工具栏位置的 egui::Window(独立函数以明确生命周期)。
+    fn make_win<'a>(
+        title: &'static str,
+        open: &'a mut bool,
+        base: Option<egui::Pos2>,
+    ) -> egui::Window<'a> {
+        let mut w = egui::Window::new(egui::RichText::new(title).size(13.0))
+            .open(open)
+            .resizable(true)
+            .collapsible(false)
+            .default_width(280.0);
+        w = match base {
+            Some(p) => w.current_pos(p),
+            // current_pos 跟随不可行时退回屏幕锚定。
+            None => w.anchor(egui::Align2::RIGHT_TOP, [-8.0, 36.0]),
+        };
+        w
     }
 }
 
 impl eframe::App for PlaApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_bridge();
+        self.update_snap(ctx);
+
         // ---- 快捷键触发(全局): 解本帧按键事件, 纯逻辑匹配 ----
-        let ev: Vec<(bool, bool, bool, String)> = ctx.input(|i| {
-            let m = i.modifiers;
-            i.events.iter().filter_map(|e| match e {
-                egui::Event::Key { key, pressed: true, repeat: false, .. } => {
-                    Some((m.ctrl, m.alt, m.shift, format!("{key:?}")))
-                }
-                _ => None,
-            }).collect()
-        });
-        for (ctrl, alt, shift, kname) in &ev {
-            for a in Action::ALL {
-                if self.hotkeys.matches_raw(&format!("{a:?}"), *ctrl, *alt, *shift, kname) {
-                    match a {
-                        Action::EntitiesRefresh => self.refresh_entities(),
-                        Action::SnapshotManual => self.snapshots.insert(0, format!("snap-{}", chrono_now())),
-                        _ => {}
+        if self.recording.is_none() {
+            let keys: Vec<(bool, bool, bool, String)> = ctx.input(|i| {
+                let m = i.modifiers;
+                i.events
+                    .iter()
+                    .filter_map(|e| match e {
+                        egui::Event::Key { key, pressed: true, repeat: false, .. } => {
+                            Some((m.ctrl, m.alt, m.shift, format!("{key:?}")))
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            });
+            for (ctrl, alt, shift, kname) in keys {
+                for a in Action::ALL {
+                    if self.hotkeys.matches_raw(&format!("{a:?}"), ctrl, alt, shift, &kname) {
+                        self.run_action(a);
                     }
                 }
             }
         }
 
-        egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading("PLA 助手");
-                ui.separator();
-                for a in Action::ALL {
-                    let hk = self
-                        .hotkeys
-                        .binds
-                        .get(&format!("{a:?}"))
-                        .map(|h| h.display());
-                    let label = match hk {
-                        Some(k) => format!("{} ({k})", a.label()),
-                        None => a.label().to_string(),
+        // ---- 横向工具栏本体(单按钮单构建 — Bug 2 修复) ----
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::none()
+                    .fill(COL_PANEL)
+                    .inner_margin(egui::Margin::same(3.0)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    // 状态圆点区: 未绑定=灰; 已绑定显示 bridge 状态色。
+                    let (dot_rect, dot_resp) =
+                        ui.allocate_exact_size(egui::vec2(12.0, BTN_SIZE), egui::Sense::hover());
+                    let dot_color = if self.snap_target.is_none() {
+                        COL_GRAY_DOT
+                    } else {
+                        status_color(&self.bridge_status)
                     };
-                    if ui.button(&label).clicked() {
-                        match a {
-                            Action::EntitiesRefresh => self.refresh_entities(),
-                            Action::SnapshotManual => self.snapshots.insert(0, format!("snap-{}", chrono_now())),
-                            _ => {}
-                        }
-                    }
-                    // 右键 = 进入该按钮的快捷键录制
-                    if ui.button(&label).secondary_clicked() {
-                        self.recording = Some(format!("{a:?}"));
-                        self.conflict_msg = None;
-                    }
-                }
-                ui.separator();
-                ui.colored_label(egui::Color32::GRAY, format!("bridge: {}", self.bridge_status));
-            });
-        });
-
-        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                if let Some(rec) = &self.recording {
-                    ui.colored_label(egui::Color32::YELLOW, format!("按任意键组合为「{}」绑定快捷键 (Esc 取消)", rec));
-                    if ui.button("取消").clicked() { self.recording = None; }
-                }
-                if let Some(msg) = &self.conflict_msg {
-                    ui.colored_label(egui::Color32::RED, format!("⚠ 冲突: {msg}"));
-                }
-            });
-        });
-
-        egui::SidePanel::left("snapshots").show(ctx, |ui| {
-            ui.heading("快照墙");
-            ui.separator();
-            ui.horizontal(|ui| {
-                // 打开快照文件夹 — 只显示图标, 悬停出文字(需求 2)
-                if ui.button("📂").on_hover_text("打开快照文件夹").clicked() {
-                    if let Err(e) = pla_ui::snapshot::open_snapshot_dir() {
-                        self.conflict_msg = Some(e);
-                    }
-                }
-                if ui.button("📷").on_hover_text("手动快照 (保存当前文档副本)").clicked() {
-                    self.run_action(Action::SnapshotManual);
-                }
-            });
-            ui.separator();
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                for s in &self.snapshots {
-                    ui.horizontal(|ui| {
-                        ui.label("📷");
-                        ui.label(s);
-                        if ui.small_button("切换").clicked() { /* P0-1 切换 */ }
-                    });
-                }
-            });
-        });
-
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                // 中: 实体树 + 选择集
-                egui::SidePanel::left("inner-entities").show_inside(ui, |ui| {
-                    ui.heading(format!("实体树 — {}", self.doc_key));
+                    ui.painter().circle_filled(dot_rect.center(), 4.0, dot_color);
+                    let bind_tip = match &self.snap_target {
+                        Some(t) => format!("已绑定: {}\nbridge: {}/{}", t.title, self.bridge_status, self.bridge.url),
+                        None => "未绑定 — 等待 Plasticity 窗口…\n(找到后自动吸附到其标题栏)".to_string(),
+                    };
+                    dot_resp.on_hover_text(bind_tip);
                     ui.separator();
-                    let mut toggle: Option<String> = None;
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        for e in &self.entities {
-                            let name = e.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-                            let kind = e.get("kind").and_then(|v| v.as_str()).unwrap_or("?");
-                            let id = e.get("id").and_then(|v| v.as_str()).unwrap_or("?").to_string();
-                            ui.horizontal(|ui| {
-                                let mut checked = self.sel_members.iter().any(|m| m == &id);
-                                if ui.checkbox(&mut checked, "").changed() {
-                                    toggle = Some(id.clone());
-                                }
-                                ui.label(format!("{name} ({kind})"));
-                            });
+
+                    for a in TOOLBAR_ACTIONS {
+                        let active = match a {
+                            Action::ToggleSnapshots => self.show_snapshots,
+                            Action::ToggleEntities => self.show_entities,
+                            Action::ToggleDim => self.show_dim,
+                            Action::ToggleSettings => self.show_settings,
+                            _ => false,
+                        };
+                        let hk = self
+                            .hotkeys
+                            .binds
+                            .get(&format!("{a:?}"))
+                            .map(|h| h.display())
+                            .unwrap_or_else(|| "未绑定".into());
+                        let hint = format!(
+                            "{}\n左键: 执行 | 右键: 录制快捷键\n快捷键: {hk}",
+                            a.label()
+                        );
+                        // 关键: 每个功能只构建一次按钮。
+                        // (旧代码 clicked / secondary_clicked 各 add 一个 → 屏幕上渲染两份)
+                        let btn = egui::Button::new(egui::RichText::new(a.icon()).size(13.0))
+                            .min_size(egui::vec2(BTN_SIZE, BTN_SIZE))
+                            .fill(if active { COL_ACCENT } else { COL_BTN });
+                        let resp = ui.add(btn).on_hover_text(hint);
+                        if resp.clicked() {
+                            self.run_action(a);
                         }
-                    });
-                    if let Some(id) = toggle {
-                        if let Some(pos) = self.sel_members.iter().position(|m| m == &id) {
-                            self.sel_members.remove(pos);
-                        } else {
-                            self.sel_members.push(id);
+                        // 右键 = 进入该按钮的快捷键录制。
+                        if resp.secondary_clicked() {
+                            self.recording = Some(format!("{a:?}"));
+                            self.notice = None;
                         }
                     }
                 });
-                // 右: 选择集 + 尺寸驱动 + 快捷键设置
-                egui::SidePanel::right("inner-tools").show_inside(ui, |ui| {
-                    ui.heading("选择集");
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        ui.label("名称:");
-                        ui.text_edit_singleline(&mut self.sel_name);
-                        if ui.button("保存").clicked() { /* P0-2 */ }
-                        if ui.button("应用").clicked() { /* P0-2 PUT_SOME */ }
-                    });
-                    ui.separator();
-                    ui.heading("尺寸驱动 (P1)");
-                    ui.horizontal(|ui| {
-                        ui.add(egui::DragValue::new(&mut self.dim_value).speed(0.1));
-                        if ui.button("应用平移").clicked() { /* P1-1 */ }
-                    });
-                    ui.separator();
-                    ui.heading("快捷键设置");
-                    ui.separator();
-                    for a in Action::ALL {
-                        let key = format!("{a:?}");
+            });
+
+        // ---- 侧面板(egui::Window, 跟随工具栏位置) ----
+        let base = Self::panel_pos(ctx);
+
+        if self.show_snapshots {
+            let mut opened = self.show_snapshots;
+            Self::make_win("快照墙", &mut opened, base).show(ctx, |ui| {
+                section_header(ui, "SNAPSHOTS");
+                ui.horizontal(|ui| {
+                    if ui.button("📂 打开文件夹").clicked() {
+                        if let Err(e) = pla_ui::snapshot::open_snapshot_dir() {
+                            self.notice = Some((true, e));
+                        }
+                    }
+                    if ui.button("📷 手动快照").clicked() {
+                        self.run_action(Action::SnapshotManual);
+                    }
+                });
+                ui.separator();
+                egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                    if self.snapshots.is_empty() {
+                        ui.label(egui::RichText::new("(暂无快照)").color(COL_MUTED));
+                    }
+                    for s in &self.snapshots {
                         ui.horizontal(|ui| {
-                            ui.label(a.label());
-                            let cur = self.hotkeys.binds.get(&key).map(|h| h.display()).unwrap_or_else(|| "-".into());
-                            ui.monospace(cur);
-                            if ui.small_button("绑定").clicked() {
-                                self.recording = Some(key.clone());
-                                self.conflict_msg = None;
-                            }
-                            if self.hotkeys.binds.contains_key(&key) && ui.small_button("清除").clicked() {
-                                self.hotkeys.binds.remove(&key);
-                            }
+                            ui.label("📷");
+                            ui.label(s);
                         });
                     }
-                    ui.separator();
-                    let conflicts = self.hotkeys.conflicts();
-                    if !conflicts.is_empty() {
-                        ui.colored_label(egui::Color32::RED, "⚠ 快捷键冲突:");
-                        for (k, acts) in &conflicts {
-                            ui.colored_label(egui::Color32::RED, format!("  {k} → {acts:?}"));
+                });
+            });
+            self.show_snapshots = opened;
+        }
+
+        if self.show_entities {
+            let mut opened = self.show_entities;
+            let mut toggle: Option<String> = None;
+            Self::make_win("实体树 / 选择集", &mut opened, base).show(ctx, |ui| {
+                section_header(ui, "ENTITIES");
+                ui.label(
+                    egui::RichText::new(format!("doc: {} — 勾选进选择集", self.doc_key))
+                        .small()
+                        .color(COL_MUTED),
+                );
+                ui.separator();
+                egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+                    if self.entities.is_empty() {
+                        ui.label(
+                            egui::RichText::new("(空 — 点工具栏 🔄 刷新实体)").color(COL_MUTED),
+                        );
+                    }
+                    for e in &self.entities {
+                        let name =
+                            e.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                        let kind =
+                            e.get("kind").and_then(|v| v.as_str()).unwrap_or("?");
+                        let id = match e.get("id") {
+                            Some(serde_json::Value::String(s)) => s.clone(),
+                            Some(serde_json::Value::Number(n)) => n.to_string(),
+                            _ => "?".into(),
+                        };
+                        let mut checked = self.sel_members.iter().any(|m| m == &id);
+                        // 单 widget: checkbox 带文本(不要 label+checkbox 两个 widget)。
+                        if ui.checkbox(&mut checked, format!("{name} ({kind})")).changed() {
+                            toggle = Some(id);
                         }
                     }
                 });
+                ui.separator();
+                section_header(ui, "SELECTION");
+                ui.horizontal(|ui| {
+                    ui.label("名称:");
+                    ui.text_edit_singleline(&mut self.sel_name);
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("保存(本地 JSON)").clicked() {
+                        self.run_action(Action::SelSave);
+                    }
+                    if ui.button("应用").clicked() {
+                        self.run_action(Action::SelApply);
+                    }
+                });
+                ui.label(
+                    egui::RichText::new(format!("已勾选 {} 个成员", self.sel_members.len()))
+                        .small()
+                        .color(COL_MUTED),
+                );
             });
-        });
+            self.show_entities = opened;
+            if let Some(id) = toggle {
+                if let Some(pos) = self.sel_members.iter().position(|m| m == &id) {
+                    self.sel_members.remove(pos);
+                } else {
+                    self.sel_members.push(id);
+                }
+            }
+        }
 
-        // ---- 录制捕获 ----
+        if self.show_dim {
+            let mut opened = self.show_dim;
+            Self::make_win("尺寸驱动", &mut opened, base).show(ctx, |ui| {
+                section_header(ui, "DIMENSION");
+                ui.horizontal(|ui| {
+                    ui.label("数值:");
+                    ui.add(egui::DragValue::new(&mut self.dim_value).speed(0.1));
+                    if ui.button("应用平移").clicked() {
+                        self.run_action(Action::DimApply);
+                    }
+                });
+                ui.label(
+                    egui::RichText::new("⚠ 需 facet 读写闭环(PLA-004 G4 后), 当前未接线")
+                        .small()
+                        .color(COL_MUTED),
+                );
+            });
+            self.show_dim = opened;
+        }
+
+        if self.show_settings {
+            let mut opened = self.show_settings;
+            Self::make_win("设置", &mut opened, base).show(ctx, |ui| {
+                section_header(ui, "BRIDGE");
+                ui.monospace(&self.bridge.url);
+                let bind_text = match &self.snap_target {
+                    Some(t) => format!("绑定窗口: {}", t.title),
+                    None => "绑定窗口: 未绑定(等待 Plasticity…)".into(),
+                };
+                ui.label(egui::RichText::new(bind_text).small().color(COL_MUTED));
+                ui.label(egui::RichText::new(format!("状态: {}", self.bridge_status)).small());
+                ui.separator();
+                section_header(ui, "HOTKEYS");
+                ui.label(
+                    egui::RichText::new("提示: 右键工具栏按钮可直接开始录制").small().color(COL_MUTED),
+                );
+                for a in Action::ALL {
+                    let key = format!("{a:?}");
+                    ui.horizontal(|ui| {
+                        ui.label(a.icon());
+                        ui.label(a.label());
+                        let cur = self
+                            .hotkeys
+                            .binds
+                            .get(&key)
+                            .map(|h| h.display())
+                            .unwrap_or_else(|| "-".into());
+                        ui.monospace(cur);
+                        if ui.small_button("绑定").clicked() {
+                            self.recording = Some(key.clone());
+                            self.notice = None;
+                        }
+                        if self.hotkeys.binds.contains_key(&key)
+                            && ui.small_button("清除").clicked()
+                        {
+                            self.hotkeys.binds.remove(&key);
+                        }
+                    });
+                }
+                ui.separator();
+                let conflicts = self.hotkeys.conflicts();
+                if !conflicts.is_empty() {
+                    for (k, acts) in &conflicts {
+                        ui.colored_label(COL_RED, format!("⚠ 冲突: {k} → {acts:?}"));
+                    }
+                }
+            });
+            self.show_settings = opened;
+        }
+
+        // ---- 提示/错误浮窗(诚实提示: 未接线必须弹明确文字) ----
+        if let Some((is_err, msg)) = self.notice.clone() {
+            let mut open = true;
+            let mut w = egui::Window::new(
+                egui::RichText::new(if is_err { "⚠ 提示" } else { "✔ 完成" }).size(13.0),
+            )
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(false);
+            w = match base.map(|p| p + egui::vec2(0.0, 40.0)) {
+                Some(p) => w.current_pos(p),
+                None => w.anchor(egui::Align2::RIGHT_BOTTOM, [-8.0, -8.0]),
+            };
+            w.show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new(&msg).color(if is_err { COL_RED } else { COL_ACCENT }),
+                );
+            });
+            if !open {
+                self.notice = None;
+            }
+        }
+
+        // ---- 录制捕获(沿用 hotkey.rs 逻辑) ----
         if self.recording.is_some() {
             if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
                 self.recording = None;
             } else {
-                let (mods, key) = ctx.input(|i| (i.modifiers, i.events.iter().find_map(|e|
-                    matches!(e, egui::Event::Key { pressed: true, repeat: false, .. })
-                        .then(|| match e { egui::Event::Key { key, .. } => *key, _ => unreachable!() })
-                )));
+                let (mods, key) = ctx.input(|i| {
+                    (
+                        i.modifiers,
+                        i.events.iter().find_map(|e| match e {
+                            egui::Event::Key { key, pressed: true, repeat: false, .. } => Some(*key),
+                            _ => None,
+                        }),
+                    )
+                });
                 if let Some(key) = key {
                     let hk = Hotkey {
-                        ctrl: mods.ctrl, alt: mods.alt, shift: mods.shift,
+                        ctrl: mods.ctrl,
+                        alt: mods.alt,
+                        shift: mods.shift,
                         key: format!("{key:?}"),
                     };
                     if let Some(action) = self.recording.clone() {
                         match self.hotkeys.try_bind(&action, hk.clone()) {
-                            Ok(()) => { self.recording = None; self.conflict_msg = None; }
+                            Ok(()) => {
+                                self.recording = None;
+                                self.notice = None;
+                            }
                             Err(others) => {
-                                self.conflict_msg = Some(format!("{} 已被 {:?} 占用", hk.display(), others));
+                                self.notice =
+                                    Some((true, format!("{} 已被 {:?} 占用", hk.display(), others)));
                             }
                         }
                     }
                 }
             }
+            ctx.request_repaint();
         }
-    }
-}
 
-fn chrono_now() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs().to_string()
+        // bridge 事件到达时保持重绘(轮询线程 200ms 一跳)。
+        ctx.request_repaint_after(Duration::from_millis(250));
+    }
 }

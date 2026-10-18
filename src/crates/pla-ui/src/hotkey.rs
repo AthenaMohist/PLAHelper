@@ -30,6 +30,10 @@ pub enum Action {
     SelApply,         // P0-2 应用选择集
     DimApply,         // P1-1 应用尺寸
     EntitiesRefresh,  // 刷新实体树
+    ToggleSnapshots,  // 工具栏: 开/关快照墙面板
+    ToggleEntities,   // 工具栏: 开/关实体树面板
+    ToggleDim,        // 工具栏: 开/关尺寸驱动面板
+    ToggleSettings,   // 工具栏: 开/关设置面板
 }
 
 impl Action {
@@ -41,6 +45,10 @@ impl Action {
             Action::SelApply => "应用选择集",
             Action::DimApply => "应用尺寸",
             Action::EntitiesRefresh => "刷新实体",
+            Action::ToggleSnapshots => "快照墙面板",
+            Action::ToggleEntities => "实体树面板",
+            Action::ToggleDim => "尺寸驱动面板",
+            Action::ToggleSettings => "设置面板",
         }
     }
     /// 图标 (emoji, 随 CJK 字体渲染)。
@@ -52,11 +60,17 @@ impl Action {
             Action::SelApply => "🎯",
             Action::DimApply => "📐",
             Action::EntitiesRefresh => "🔄",
+            Action::ToggleSnapshots => "🖼",
+            Action::ToggleEntities => "🌳",
+            Action::ToggleDim => "📐",
+            Action::ToggleSettings => "⚙",
         }
     }
-    pub const ALL: [Action; 6] = [
+    pub const ALL: [Action; 10] = [
         Action::SnapshotManual, Action::SnapshotRestore, Action::SelSave,
         Action::SelApply, Action::DimApply, Action::EntitiesRefresh,
+        Action::ToggleSnapshots, Action::ToggleEntities, Action::ToggleDim,
+        Action::ToggleSettings,
     ];
 }
 

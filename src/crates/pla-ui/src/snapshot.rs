@@ -1,5 +1,5 @@
 //! [PLA-000 P0-1] 快照文件管家 — 文件级快照(PRD 兜底方案, 唯一实锤可行路径)。
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn snapshot_dir() -> PathBuf {
@@ -17,19 +17,41 @@ fn now_stamp() -> String {
     let days = t / 86400;
     let secs = t % 86400;
     let (h, m, s) = (secs / 3600 + 8, (secs % 3600) / 60, secs % 60);
-    // days since 1970 → y/m/d (简化: 只用日期序号, 文件名可读性够用)
-    format!("snap-d{days}_{h:02}:{m:02}:{s:02}")
+    // 注意: 分隔符必须用 '-', 不能用 ':' — Windows 文件名非法字符(os error 123)。
+    format!("snap-d{days}_{h:02}-{m:02}-{s:02}")
+}
+
+/// Windows 文件名净化: 非法字符 `\/:*?"<>|` → '-', 去首尾空白与结尾点,
+/// 空结果退回 "snapshot"。(QA Bug A: 冒号落盘 os error 123)
+pub fn sanitize_filename(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| {
+            if matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') {
+                '-'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim().trim_end_matches('.').to_string();
+    if trimmed.is_empty() {
+        "snapshot".into()
+    } else {
+        trimmed
+    }
 }
 
 /// 手动快照: 找最近修改的 .plasticity 文档(常见位置), 复制到 snapshots/。
 pub fn take_manual_snapshot(doc_key: &str) -> Result<String, String> {
     let src = find_latest_doc(doc_key)
         .ok_or_else(|| "未找到最近修改的 .plasticity 文档 — 请先在 Plasticity 中 Ctrl+S 保存, 并确认文档在常见位置(文档/桌面/下载)".to_string())?;
-    let name = format!(
+    // 文件名过净化函数: doc 来源 stem + 时间戳均可能含非法字符。
+    let name = sanitize_filename(&format!(
         "{}-{}",
         src.file_stem().and_then(|s| s.to_str()).unwrap_or("doc"),
         now_stamp()
-    );
+    ));
     let dst = snapshot_dir().join(format!("{name}.plasticity"));
     std::fs::copy(&src, &dst).map_err(|e| format!("复制失败: {e}"))?;
     Ok(name)
@@ -43,6 +65,26 @@ pub fn open_snapshot_dir() -> Result<(), String> {
         .spawn()
         .map(|_| ())
         .map_err(|e| format!("打开失败: {e}"))
+}
+
+/// 启动时列出现有快照(原 TODO G2-2): exe 同级 snapshots/*.plasticity, 文件名新→旧。
+pub fn list_snapshots() -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(snapshot_dir())
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| {
+                    e.path()
+                        .extension()
+                        .map(|x| x == "plasticity")
+                        .unwrap_or(false)
+                })
+                .filter_map(|e| e.file_name().into_string().ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names.reverse();
+    names
 }
 
 fn find_latest_doc(doc_key: &str) -> Option<PathBuf> {
@@ -74,4 +116,37 @@ fn find_latest_doc(doc_key: &str) -> Option<PathBuf> {
 
 fn dirs_home() -> PathBuf {
     std::env::var("USERPROFILE").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("C:\\Users"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 净化函数: 非法字符全替换, 边界输入兜底(返工单要求)。
+    #[test]
+    fn sanitize_filename_replaces_illegal_chars() {
+        assert_eq!(sanitize_filename("12:30:45"), "12-30-45");
+        assert_eq!(sanitize_filename("a/b\\c:d*e?f\"g<h>i|j"), "a-b-c-d-e-f-g-h-i-j");
+        assert_eq!(sanitize_filename("普通:名称"), "普通-名称");
+        assert_eq!(sanitize_filename("  "), "snapshot");
+        assert_eq!(sanitize_filename("..."), "snapshot");
+        assert_eq!(sanitize_filename("end."), "end");
+        // 组合名(文档 stem + 时间戳)整体净化后可直接落盘。
+        let name = sanitize_filename(&format!("my{}doc-{}", ":", now_stamp()));
+        let path = std::env::temp_dir().join(format!("{name}.plasticity"));
+        std::fs::write(&path, b"probe").expect("净化后文件名仍无法落盘");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// 回归(QA Bug A): 快照文件名不得含 Windows 非法字符, 且能实际落盘。
+    #[test]
+    fn snapshot_filename_legal_and_writable_on_windows() {
+        let name = format!("test_doc-{}", now_stamp());
+        assert!(!name.contains(':'), "文件名含非法字符 ':' : {name}");
+        assert!(!name.contains(['\\', '/', '*', '?', '"', '<', '>', '|']));
+        let path = std::env::temp_dir().join(format!("{name}.plasticity"));
+        std::fs::write(&path, b"probe").expect("快照文件名无法落盘");
+        assert!(path.exists());
+        std::fs::remove_file(&path).ok();
+    }
 }
