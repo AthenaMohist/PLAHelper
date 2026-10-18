@@ -1,0 +1,33 @@
+[package]
+name = "pla-app"
+version = "0.1.0"
+edition.workspace = true
+
+[[bin]]
+name = "pla-app"
+path = "src/main.rs"
+
+[dependencies]
+pla-bridge = { path = "../pla-bridge" }
+pla-core = { path = "../pla-core" }
+pla-snapshot = { path = "../pla-snapshot" }
+pla-selection = { path = "../pla-selection" }
+pla-dim = { path = "../pla-dim" }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+# tauri 2 依赖过重（编译时间 / 离线环境拉取依赖不可行），M1-a 采用 feature gate：
+# `--features tauri` 才启用 tauri 装配；默认构建为纯 bin 打印装配日志。
+tauri = { version = "2", features = [], optional = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }  # CLI 薄壳 runtime（dim-update/selection-apply 走 bridge）
+
+[features]
+default = []
+tauri = ["dep:tauri"]
+
+[dev-dependencies]
+tokio = { workspace = true }
+futures-util = "0.3"
+tokio-tungstenite = { workspace = true }

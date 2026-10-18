@@ -1,0 +1,20 @@
+1c53aeed3b [FEAT] pla-ui R2: ①bridge 真连接(刷新实体走 list_visible 码22, 5s 超时, PLA_BRIDGE_URL 可覆写) ②run_action 集中分发 — 所有按钮可点, 未接线的弹诚实提示不做假按钮 ③工具栏按钮去重(单构建+右键绑定) ④全按钮图标+文字 ⑤快照墙 +手动快照按钮 → 📂打开快照文件夹(hover 文字)+📷图标按钮 ⑥手动快照真实现: 找最近修改 .plasticity 复制到 exe 同级 snapshots/
+e05420a8a3 [FIX] pla-ui 双击崩溃 — msyh.ttc 是 TrueType Collection, ab_glyph 不支持 ttc 渲染 panic; 候选清单只留单文件 TTF(simhei 优先, 系统必有)
+3cd11fcf4d [FIX] pla-ui 中文方块 — egui 默认字体无 CJK; 启动注入 C:\Windows\Fonts\msyh.ttc(雅黑), 回退 simhei.ttf, 最终兜底嵌入字体副本(9.7MB); 等宽族同步补 CJK
+393aed5e69 [FEAT] PLA-000 M2: pla-ui GUI v1 — eframe/egui 三栏(快照墙|实体树+选择集|尺寸驱动+快捷键设置); 快捷键管理器 HotkeyMap(绑定/冲突检测 try_bind/conflicts/matches_raw) + 3 单测; 顶栏按钮右键或设置面板进入录制绑定, 冲突红字告警; PRD 定稿=pla/PRD-v1.md P0-1/P0-2/P1-1 骨架
+782b3f6cac [FIX] PLA-004 R5: entities 嵌套展开去重 — 容器首子实体同时浮为顶层行导致名字双列, 展开时跳过已出现名(全测绿, 真机 6→5 条)
+432e966703 [FIX] PLA-004 R4: code22 容器记录嵌套实体展开 — wire 实锤全场景打包在单容器 payload(367KB)内, 扫 [tag=6][slen][printable name]+parent=ff 平铺输出(真 dump 5/5 命中 0 误报); 4KB 阈值隔离平铺记录防 mock/LIST_ALL 误报; python 同算法对真 dump 复核 5 实体
+d7950efe32 [FIX] PLA-004 R3: entities 全树化 — fetch 改走 LIST_VISIBLE(code22, wire 实锤回全场景嵌套记录), 失败回退 LIST_ALL; 截断 fail-loud(record 声明 len>帧剩余时报错, 设备 ~368KB 单帧静默截断实锤 — model1 的 Curves 组整段被切)
+9fe180102e [PROBE] wire_probe v2: code=22 响应落盘 wire_dump.bin 全量 368KB(屏幕 hex 只 296B 不够逆向)
+0927862612 [FIX] wire_probe: Windows 无 /tmp — 输出文件改当前目录 wire_probe_out.txt + 起止分隔行防混淆
+416485c06c [PROBE] DPL-218: wire_probe — 裸 tungstenite 遍历握手声明未知码(10/11/16/22/24-30), 响应 hex 落盘 /tmp/wire_probe_out.txt 供记录布局逆向(LIST_ALL 仅回顶层 2 对象, 实体树需子查询码)
+92356ffb7c [FIX] DPL-218 R3: 巡察使终态豁免吞当天超时收口 — [DPL-183/201] 豁免规则把 done/archived 卡的 24h 内超时整条过滤(PLA-004 实锤 6+ 次超时零入账, 台账断档 11 天); ①scan() 取消终态 continue(SQL 本身 24h 窗口, 终态状态仅保留元数据) ②dedupe 从 repeat_retry-only 扩到全部 outcome 按 (task_id,run_id) 幂等, 防终态卡连日重复入账; 实测补入 14 行(dry-run 与真跑一致)
+468c4216c7 [FIX] PLA-004 R2: LIST_ALL 记录布局按真机帧逆向重写 — [flags|kind_raw|type_code|index|0|0|parent|tag6|len|name+pad][变长块], id=index 实锤(两记录+00 同=1 非自增), name=tag6 后置串(Scene/Extruded.002 解码实锤), kind 映射 type_code 5/4=solid 2=sheet 9=fillet(TODO-PROBE), facets 变长块真机语义待探针(mock 约定保留); 4 处 mock 按真机布局重写; workspace 全绿 18/18 suite
+90ba0ce5fe [FIX] PLA-004 OC 直修: 二进制协议重写落地 main(JSON 版被 merge 丢弃的 BLOCKER 收口) — ①CLI connect 包 rt.block_on(no reactor panic) ②protocol 对象记录解析 id/kind/name/facets(f32 顶点)+4B 对齐 padding 实锤 ③list_response_to_value 键 objects→entities 对齐上层消费 ④4 个 E2E mock 重写为二进制协议回放 ⑤全 workspace test 78/78 绿
+5323649caf Merge branch 'wt/t_6a1ab215'
+5765f19e24 Merge branch 'wt/t_4a299c82'
+94d66ea373 Merge branch 'wt/t_be4efd26'
+9a604fcdb3 Merge remote-tracking branch 'origin/main'
+f6d639fae2 [FIX] DPL-218 OC 直修 — gate_reject helper: 拒绝原因结构化透传([gate-reject] JSON 首行+人读正文), 落编号门/来源痕迹门/修补父边门; 剩余门维持原文案(已带人读原因)
+4ffdbdc66d Backup 2026-10-18
+d0bc9db1ff Backup 2026-10-18

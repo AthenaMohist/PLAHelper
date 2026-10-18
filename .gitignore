@@ -1,0 +1,19 @@
+# Rust 构建产物
+target/
+**/*.rs.bk
+
+# 本地探针输出（wire_probe 落盘等）
+wire_dump.bin
+wire_probe_out.txt
+*.pprof
+
+# IDE / 系统
+.vscode/
+.idea/
+Thumbs.db
+
+# 快照产物（运行时生成，不入库）
+snapshots/
+
+# archive 明确不入库（旧版中间文件，仅本地考古）
+archive/
