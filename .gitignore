@@ -17,3 +17,4 @@ snapshots/
 
 # archive 明确不入库（旧版中间文件，仅本地考古）
 archive/
+test/
