@@ -21,7 +21,7 @@ fn rounded_rect_path(rect: Rect, r: f32, seg: usize) -> Vec<Pos2> {
     let r = r.clamp(0.0, rect.width().min(rect.height()) / 2.0);
     let (l, t, ri, b) = (rect.left(), rect.top(), rect.right(), rect.bottom());
     let mut pts = Vec::with_capacity(4 * (seg + 1));
-    let mut arc = |cx: f32, cy: f32, a0: f32, out: &mut Vec<Pos2>| {
+    let arc = |cx: f32, cy: f32, a0: f32, out: &mut Vec<Pos2>| {
         for i in 0..=seg {
             let a = a0 + FRAC_PI_2 * (i as f32) / (seg as f32);
             out.push(Pos2::new(cx + r * a.cos(), cy + r * a.sin()));

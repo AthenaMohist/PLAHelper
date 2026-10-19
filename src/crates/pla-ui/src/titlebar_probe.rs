@@ -17,8 +17,17 @@
 /// 文件名块右缘与工具栏左缘的间隙(物理像素)。
 pub const FILENAME_GAP_PX: f32 = 16.0;
 
+/// 探测命中结果(物理像素): `right` = 文件名块右缘(屏幕坐标系),
+/// `cy` = 文件名块垂直中心(相对窗口顶) — 顶栏内容垂直居中,
+/// 工具栏按它垂直居中可同时适配正常/最大化两种顶栏高度(R6-2i)。
+pub struct ProbeHit {
+    pub right: i32,
+    pub cy: i32,
+}
+
 #[cfg(windows)]
 mod imp {
+    use super::ProbeHit;
     use windows::Win32::Foundation::HWND;
     use windows::Win32::Graphics::Gdi::{
         CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC,
@@ -27,9 +36,9 @@ mod imp {
     use windows::Win32::Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS};
     use windows::Win32::UI::WindowsAndMessaging::PW_RENDERFULLCONTENT;
 
-    /// 探测目标窗口顶栏「文件名文字块」右缘(物理像素, 屏幕坐标系)。
+    /// 探测目标窗口顶栏「文件名文字块」(物理像素)。
     /// `ppp` = egui pixels_per_point, 用于尺度相关阈值。
-    pub fn probe_filename_right_edge(target: &crate::window_finder::TargetWindow, ppp: f32) -> Option<i32> {
+    pub fn probe_filename_right_edge(target: &crate::window_finder::TargetWindow, ppp: f32) -> Option<ProbeHit> {
         let ppp = if ppp.is_finite() && ppp >= 0.5 { ppp } else { 1.0 };
         unsafe { probe_impl(target, ppp) }
     }
@@ -37,13 +46,15 @@ mod imp {
     unsafe fn probe_impl(
         target: &crate::window_finder::TargetWindow,
         ppp: f32,
-    ) -> Option<i32> {
+    ) -> Option<ProbeHit> {
         let width = target.width();
         if width < 200 {
             return None;
         }
-        // 条带高度: 顶栏 ~36 逻辑 px, 随 DPI 缩放; 上限防呆。
-        let strip_h = ((52.0 * ppp).round() as i32).clamp(32, 88);
+        // 条带高度: 正常顶栏 ~36 逻辑 px, 最大化时加高(~56+), 取 88 逻辑 px
+        // 上限一档(160 物理防呆)。条带变深会扫到第二行图标/文字, 但文件名块
+        // 的判据是「左半区最靠右的宽块」— 第二行内容都在文件名左侧, 不影响。
+        let strip_h = ((88.0 * ppp).round() as i32).clamp(48, 160);
         // 只扫描条带中段(避开上边框线和下缘渐变)。
         let y0 = 2;
         let y1 = strip_h - 2;
@@ -97,8 +108,12 @@ mod imp {
                         );
                         eprintln!("[probe] strip dump -> {}", path.display());
                     }
-                    out = scan_filename_edge(&buf, width, strip_h, y0, y1, ppp)
-                        .map(|edge| target.left + edge);
+                    out = scan_filename_edge(&buf, width, strip_h, y0, y1, ppp).map(
+                        |(edge, y_top, y_bot)| ProbeHit {
+                            right: target.left + edge,
+                            cy: (y_top + y_bot + 1) / 2,
+                        },
+                    );
                 }
             }
             SelectObject(mem, old);
@@ -110,7 +125,7 @@ mod imp {
         result
     }
 
-    /// 在 BGRA 条带像素里找文件名块右缘(相对窗口左缘, 物理像素)。
+    /// 在 BGRA 条带像素里找文件名块: 返回 (右缘相对窗口左缘, 块顶 y, 块底 y)。
     fn scan_filename_edge(
         buf: &[u8],
         width: i32,
@@ -118,7 +133,7 @@ mod imp {
         y0: i32,
         y1: i32,
         ppp: f32,
-    ) -> Option<i32> {
+    ) -> Option<(i32, i32, i32)> {
         let w = width as usize;
         let row = w * 4;
         let (ys, ye) = (y0.max(0) as usize, (y1 as usize).min(strip_h as usize));
@@ -191,17 +206,42 @@ mod imp {
         }
         // 文件名块: 起点 < 窗口宽 50%, 宽度 ≥ min_block_w, 取其中最靠右者。
         blocks.retain(|(s, e)| *s < w as i32 / 2 && e - s + 1 >= min_block_w);
-        let (_, right) = blocks.into_iter().max_by_key(|(_, e)| *e)?;
-        Some(right + 1)
+        let (left, right) = blocks.into_iter().max_by_key(|(_, e)| *e)?;
+        // 块的垂直范围: 只统计该块列区间内的文字像素行 — 顶栏内容垂直居中,
+        // 这个中心就是工具栏要吸附的垂直中心(最大化/正常通吃)。
+        let mut y_top: i32 = -1;
+        let mut y_bot: i32 = -1;
+        for y in ys..ye {
+            for x in left.max(0)..=(right.min(w as i32 - 1)) {
+                let o = y * row + x as usize * 4;
+                let lum = (u32::from(buf[o]) + u32::from(buf[o + 1]) + u32::from(buf[o + 2])) / 3;
+                if lum >= lum_min && lum <= lum_max {
+                    if y_top < 0 {
+                        y_top = y as i32;
+                    }
+                    y_bot = y as i32;
+                    break;
+                }
+            }
+        }
+        if y_top < 0 {
+            return None;
+        }
+        Some((right + 1, y_top, y_bot))
     }
 }
 
 #[cfg(not(windows))]
 mod imp {
+    pub struct ProbeHit {
+        pub right: i32,
+        pub cy: i32,
+    }
+
     pub fn probe_filename_right_edge(
         _target: &crate::window_finder::TargetWindow,
         _ppp: f32,
-    ) -> Option<i32> {
+    ) -> Option<ProbeHit> {
         None
     }
 }

@@ -19,7 +19,7 @@ use pla_ui::round_corners;
 use pla_ui::window_finder;
 
 // ---------------- Plasticity 风格色板 ----------------
-const COL_PANEL: egui::Color32 = egui::Color32::from_rgb(0x26, 0x26, 0x26);
+const COL_PANEL: egui::Color32 = egui::Color32::from_rgb(0x1e, 0x1e, 0x1e);
 const COL_BTN: egui::Color32 = egui::Color32::from_rgb(0x33, 0x33, 0x33);
 const COL_BTN_HOVER: egui::Color32 = egui::Color32::from_rgb(0x3d, 0x3d, 0x3d);
 /// Plasticity 图标方块绿(强调色)。
@@ -107,10 +107,10 @@ struct PlaApp {
     snap_target: Option<window_finder::TargetWindow>,
     /// 上次吸附定位使用的目标锚点 (left, top, x_phys), 用于漂移检测。
     /// x_phys 含探测结果 — 文件名长度变化(切换文档)也会触发重定位。
-    last_snap_anchor: Option<(i32, i32, i32)>,
+    last_snap_anchor: Option<(i32, i32, i32, i32)>,
     last_snap_poll: Instant,
     /// 文件名探测缓存: (目标 hwnd, 文件名块右缘物理 x)。None = 未探测到(降级偏移)。
-    probed_edge: Option<(isize, i32)>,
+    probed_edge: Option<(isize, pla_ui::titlebar_probe::ProbeHit)>,
     last_probe_poll: Instant,
     entities: Vec<serde_json::Value>,
     snapshots: Vec<String>,
@@ -275,6 +275,21 @@ fn panel_frame() -> egui::Frame {
         .stroke(egui::Stroke::new(2.0_f32, egui::Color32::from_white_alpha(130)))
 }
 
+/// 面板内侧羽化光晕(所有面板统一: 工具栏 + 悬浮提示 + 功能面板, R6-2i)。
+/// ui.max_rect() = 内容区(定值, 与内容无关), 外扩 6 = 面板可见矩形。
+fn paint_panel_glow(ui: &egui::Ui) {
+    let panel_rect = ui.max_rect().expand(6.0);
+    let mut glow_mesh = egui::Mesh::default();
+    pla_ui::glow::append_inner_glow(
+        &mut glow_mesh,
+        panel_rect,
+        ROUNDING,
+        &[(0.0, 60), (1.5, 22), (3.0, 0)],
+        [255, 246, 228],
+    );
+    ui.painter_at(panel_rect).add(egui::Shape::mesh(glow_mesh));
+}
+
 /// 子视口面板头: 标题 + 右侧 ✕ 关闭钮。
 fn panel_header(ui: &mut egui::Ui, title: &str, open: &mut bool) {
     ui.horizontal(|ui| {
@@ -409,21 +424,29 @@ impl PlaApp {
             self.last_probe_poll = Instant::now();
         }
         // 物理 x: 探测命中 → 文件名右缘+间隙+右移微调; 否则降级固定偏移。
+        // 物理 y: 探测命中 → 按文件名块垂直中心居中(顶栏内容居中, 正常/最大化
+        // 顶栏高度不同也能吸附到正中, R6-2i); 否则降级顶部固定间隙。
         // 两者都按 ppp 缩放: probe/GetWindowRect 在 DPI-aware 进程里是物理像素,
         // 固定常量是逻辑 px, 不缩放在高 DPI 下会缩水遮文件名(R6 实测 4K/3x)。
         let ppp = ctx.pixels_per_point();
-        let x_phys = match self.probed_edge {
-            Some((h, edge)) if h == target.hwnd => {
-                edge as f32 + (SNAP_FILENAME_GAP + SNAP_RIGHT_SHIFT) * ppp
+        let (x_phys, y_phys) = match &self.probed_edge {
+            Some((h, hit)) if *h == target.hwnd => {
+                let x = hit.right as f32 + (SNAP_FILENAME_GAP + SNAP_RIGHT_SHIFT) * ppp;
+                let y = target.top as f32 + hit.cy as f32 - TOOLBAR_SIZE[1] * 0.5 * ppp;
+                (x, y)
             }
-            _ => target.left as f32 + (SNAP_LEFT_OFFSET + SNAP_RIGHT_SHIFT) * ppp,
+            _ => (
+                target.left as f32 + (SNAP_LEFT_OFFSET + SNAP_RIGHT_SHIFT) * ppp,
+                target.top as f32 + SNAP_TOP_GAP as f32,
+            ),
         };
-        let new_anchor = Some((target.left, target.top, x_phys as i32));
+        let new_anchor = Some((target.left, target.top, x_phys as i32, y_phys as i32));
         let anchor_changed = match (new_anchor, self.last_snap_anchor) {
             (Some(n), Some(o)) => {
                 (n.0 - o.0).abs() as f32 > SNAP_EPS
                     || (n.1 - o.1).abs() as f32 > SNAP_EPS
                     || (n.2 - o.2).abs() as f32 > SNAP_EPS
+                    || (n.3 - o.3).abs() as f32 > SNAP_EPS
             }
             _ => true,
         };
@@ -432,7 +455,6 @@ impl PlaApp {
         }
         self.last_snap_anchor = new_anchor;
         // 物理 → egui points: OuterPosition 用 points(见 egui 0.29 ViewportInfo)。
-        let y_phys = target.top as f32 + SNAP_TOP_GAP as f32;
         ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
             x_phys / ppp,
             y_phys / ppp,
@@ -489,6 +511,7 @@ fn show_child_window(
                         .show(ctx, |ui| {
                             panel_header(ui, title, &mut flag);
                             contents(ui);
+                            paint_panel_glow(ui);
                         });
                     // 跟随工具栏: 外框漂移超阈值即重定位。
                     let cur = ctx.input(|i| i.viewport().outer_rect);
@@ -631,20 +654,8 @@ impl eframe::App for PlaApp {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                 });
-                // R6-2g: 光晕减薄 10pt→3pt(用户反馈太厚), 完全收在 6pt 边距内
-                // 不碰按钮; 上版四角别扭是 10pt 内环(高 30-20)圆角归零成直角所致,
-                // 3pt 深度下内环圆角剩 3pt, 自愈。
-                let panel_rect = ui.max_rect().expand(6.0);
-                let mut glow_mesh = egui::Mesh::default();
-                pla_ui::glow::append_inner_glow(
-                    &mut glow_mesh,
-                    panel_rect,
-                    ROUNDING,
-                    &[(0.0, 60), (1.5, 22), (3.0, 0)],
-                    [255, 246, 228],
-                );
-                ui.painter_at(panel_rect)
-                    .add(egui::Shape::mesh(glow_mesh));
+                // R6-2i: 光晕统一走 paint_panel_glow(与所有弹出面板同款)。
+                paint_panel_glow(ui);
             });
         self.hovered_hint = hovered;
 
@@ -692,7 +703,10 @@ impl eframe::App for PlaApp {
                             egui::ViewportClass::Immediate => {
                                 egui::CentralPanel::default()
                                     .frame(panel_frame())
-                                    .show(tctx, |ui| show_ui(ui));
+                                    .show(tctx, |ui| {
+                                        show_ui(ui);
+                                        paint_panel_glow(ui);
+                                    });
                                 let cur = tctx.input(|i| i.viewport().outer_rect);
                                 if let Some(r) = cur {
                                     if (r.left() - desired.x).abs() > SNAP_EPS
