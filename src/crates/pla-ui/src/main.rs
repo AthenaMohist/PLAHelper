@@ -326,19 +326,55 @@ struct SnapItemActions {
     rename_cancel: bool,
 }
 
-/// 快照缩略图(有 png 用真图, 没有占位相机)。点击行为随模式: 浏览=打开, 管理=勾选。
-fn snap_image(ui: &mut egui::Ui, png: Option<&std::sync::Arc<[u8]>>, name: &str, max: egui::Vec2, manage: bool, a: &mut SnapItemActions) {
+/// PNG 尺寸解析(只读 IHDR 头, 不解码): 签名 8B + len 4B + "IHDR" 4B + W 4B + H 4B。
+/// 我们的截图 PNG 由 wincap.rs 生成, 结构确定; 解析失败返回 None 走占位。
+fn png_dims(bytes: &[u8]) -> Option<(f32, f32)> {
+    if bytes.len() < 24 || &bytes[12..16] != b"IHDR" {
+        return None;
+    }
+    let w = u32::from_be_bytes(bytes[16..20].try_into().ok()?) as f32;
+    let h = u32::from_be_bytes(bytes[20..24].try_into().ok()?) as f32;
+    (w > 0.0 && h > 0.0).then_some((w, h))
+}
+
+/// 快照缩略图: 按图片真实宽高比把格宽撑满(fit_to_exact_size, 不变形), 高封顶 max_h。
+/// 点击行为随模式: 浏览=打开, 管理=勾选。
+fn snap_image(
+    ui: &mut egui::Ui,
+    png: Option<&std::sync::Arc<[u8]>>,
+    name: &str,
+    cell_w: f32,
+    max_h: f32,
+    manage: bool,
+    a: &mut SnapItemActions,
+) {
+    // R7-7: max_size 只限制不撑满(宽屏截图缩到限高后宽度远小于格宽) —
+    // 由 IHDR 真实比例反推精确显示尺寸。
+    let (iw, ih) = match png.and_then(|b| png_dims(b)) {
+        Some((w, h)) => {
+            let fh = cell_w * h / w;
+            if fh <= max_h {
+                (cell_w, fh)
+            } else {
+                let s = max_h / fh; // 竖长图封顶: 等比缩, 宽度让位
+                (cell_w * s, max_h)
+            }
+        }
+        None => (cell_w, (cell_w * 0.45).min(max_h)),
+    };
     let resp = if let Some(bytes) = png {
         ui.add(
             egui::Image::from_bytes(format!("bytes://{name}"), bytes.clone())
-                .max_size(max)
+                .fit_to_exact_size(egui::vec2(iw, ih))
                 .sense(egui::Sense::click()),
         )
     } else {
         ui.add_sized(
-            egui::vec2(max.x, max.y.min(80.0)),
-            egui::Label::new(egui::RichText::new("📷").size(if max.x > 100.0 { 30.0 } else { 18.0 }))
-                .sense(egui::Sense::click()),
+            egui::vec2(iw, ih),
+            egui::Label::new(
+                egui::RichText::new("📷").size(if cell_w > 100.0 { 30.0 } else { 16.0 }),
+            )
+            .sense(egui::Sense::click()),
         )
     };
     let clicked = resp.clicked();
@@ -352,12 +388,15 @@ fn snap_image(ui: &mut egui::Ui, png: Option<&std::sync::Arc<[u8]>>, name: &str,
 }
 
 /// 单个快照项: 缩略图 + 名称行(勾选框[管理模式]/名称/收藏星/改名钮)。
-/// 改名中(renaming)时名称行变为编辑框 + ✓/✕。只采集动作, 不执行 — 借用隔离。
+/// 改名中(renaming)时名称行变为编辑框 + √/×。只采集动作, 不执行 — 借用隔离。
+/// cell_w 是项的固定宽度(收藏 3 列均分 / 全部区撑满): 名称 truncate 依赖
+/// 固定宽度子区才生效 — Grid 列宽随内容走, truncate 形同虚设(R7-7)。
 fn snap_item(
     ui: &mut egui::Ui,
     name: &str,
     png: Option<&std::sync::Arc<[u8]>>,
-    img_max: egui::Vec2,
+    cell_w: f32,
+    max_img_h: f32,
     is_fav: bool,
     manage: bool,
     selected: bool,
@@ -366,67 +405,75 @@ fn snap_item(
 ) -> SnapItemActions {
     let mut a = SnapItemActions::default();
     let stem = name.trim_end_matches(".plasticity").to_string();
-    ui.vertical(|ui| {
-        snap_image(ui, png, name, img_max, manage, &mut a);
-        ui.horizontal(|ui| {
-            if renaming {
-                ui.add_sized(
-                    egui::vec2(img_max.x * 0.55, 18.0),
-                    egui::TextEdit::singleline(rename_buf),
-                );
-                if ui.small_button("✓").on_hover_text("确认改名").clicked() {
-                    a.rename_commit = true;
+    ui.allocate_ui_with_layout(
+        egui::vec2(cell_w, 36.0),
+        egui::Layout::top_down(egui::Align::LEFT),
+        |ui| {
+            snap_image(ui, png, name, cell_w, max_img_h, manage, &mut a);
+            ui.horizontal(|ui| {
+                if renaming {
+                    ui.add_sized(
+                        egui::vec2((cell_w - 46.0).max(30.0), 18.0),
+                        egui::TextEdit::singleline(rename_buf),
+                    );
+                    if ui.small_button("√").on_hover_text("确认改名").clicked() {
+                        a.rename_commit = true;
+                    }
+                    if ui.small_button("×").on_hover_text("取消").clicked() {
+                        a.rename_cancel = true;
+                    }
+                    return;
                 }
-                if ui.small_button("✕").on_hover_text("取消").clicked() {
-                    a.rename_cancel = true;
+                if manage {
+                    let mut on = selected;
+                    if ui.checkbox(&mut on, "").changed() {
+                        a.select_toggle = Some(on);
+                    }
                 }
-                return;
-            }
-            if manage {
-                let mut on = selected;
-                if ui.checkbox(&mut on, "").changed() {
-                    a.select_toggle = Some(on);
+                let name_resp = ui
+                    .add(
+                        egui::Label::new(egui::RichText::new(&stem).small().color(COL_TEXT))
+                            .sense(egui::Sense::click())
+                            .truncate(),
+                    )
+                    .on_hover_text(if manage { &stem } else { "点击在新窗口打开快照" });
+                if name_resp.clicked() && !manage {
+                    a.open = true;
                 }
-            }
-            let name_resp = ui
-                .add(
-                    egui::Label::new(egui::RichText::new(&stem).small().color(COL_TEXT))
-                        .sense(egui::Sense::click())
-                        .truncate(),
+                let star = egui::Button::new(
+                    egui::RichText::new(if is_fav { "★" } else { "☆" })
+                        .size(12.0)
+                        .color(if is_fav {
+                            egui::Color32::from_rgb(255, 200, 60)
+                        } else {
+                            COL_MUTED
+                        }),
                 )
-                .on_hover_text(if manage { &stem } else { "点击在新窗口打开快照" });
-            if name_resp.clicked() && !manage {
-                a.open = true;
-            }
-            let star = egui::Button::new(
-                egui::RichText::new(if is_fav { "★" } else { "☆" })
-                    .size(12.0)
-                    .color(if is_fav {
-                        egui::Color32::from_rgb(255, 200, 60)
-                    } else {
-                        COL_MUTED
-                    }),
-            )
-            .frame(false);
-            if ui
-                .add(star)
-                .on_hover_text(if is_fav { "取消收藏" } else { "收藏(置顶小图)" })
-                .clicked()
-            {
-                a.fav_toggle = true;
-            }
-            if ui
-                .add(
-                    egui::Button::new(egui::RichText::new("✎").size(12.0).color(COL_MUTED))
+                .frame(false);
+                if ui
+                    .add(star)
+                    .on_hover_text(if is_fav { "取消收藏" } else { "收藏(置顶小图)" })
+                    .clicked()
+                {
+                    a.fav_toggle = true;
+                }
+                if ui
+                    .add(
+                        // R7-7: ✎(U+270E) 不在 GB2312/SimHei 字形集内 → 渲染成方框;
+                        // 改用文字「改」, 同理 ✓/✕ → √/×(均为 GB2312 成员)。
+                        egui::Button::new(
+                            egui::RichText::new("改").size(11.0).color(COL_MUTED),
+                        )
                         .frame(false),
-                )
-                .on_hover_text("改名")
-                .clicked()
-            {
-                a.rename_start = true;
-            }
-        });
-    });
+                    )
+                    .on_hover_text("改名")
+                    .clicked()
+                {
+                    a.rename_start = true;
+                }
+            });
+        },
+    );
     a
 }
 
@@ -436,14 +483,14 @@ fn panel_header(ui: &mut egui::Ui, title: &str, open: &mut bool, icons: Option<B
         ui.label(egui::RichText::new(title).size(13.0).strong().color(COL_TEXT));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let close = egui::Button::new(
-                egui::RichText::new("✕").size(13.0).color(egui::Color32::WHITE),
+                egui::RichText::new("×").size(13.0).color(egui::Color32::WHITE),
             )
             .frame(false)
             .rounding(egui::Rounding::same(4.0));
             if ui.add(close).clicked() {
                 *open = false;
             }
-            // 图标按钮区: right_to_left 布局下加在 ✕ 之后 → 出现在 ✕ 左侧
+            // 图标按钮区: right_to_left 布局下加在 × 之后 → 出现在 × 左侧
             if let Some(extra) = icons {
                 extra(ui);
             }
@@ -640,7 +687,7 @@ impl PlaApp {
 
 /// 子视口渲染的公共入口: Immediate 模式 = 独立 OS 窗口(圆角深色面板);
 /// Embedded 回退(后端不支持多视口) = 原地 egui::Window, 行为不劣化。
-/// 面板位置每帧跟随工具栏(漂移 >2px 重发 OuterPosition), 关闭走 ✕ 或 OS 关闭。
+/// 面板位置每帧跟随工具栏(漂移 >2px 重发 OuterPosition), 关闭走 × 或 OS 关闭。
 fn show_child_window(
     parent: &egui::Context,
     id: &'static str,
@@ -654,7 +701,7 @@ fn show_child_window(
     header_extra_and_show(parent, id, title, desired, size, open, active, add_contents, None)
 }
 
-/// 同 show_child_window, 但允许在标题右侧、✕ 左侧插入图标按钮区(R7-5 快照墙)。
+/// 同 show_child_window, 但允许在标题右侧、× 左侧插入图标按钮区(R7-5 快照墙)。
 #[allow(clippy::too_many_arguments)]
 fn header_extra_and_show(
     parent: &egui::Context,
@@ -682,7 +729,7 @@ fn header_extra_and_show(
     parent.show_viewport_immediate(
         egui::ViewportId::from_hash_of(id),
         builder,
-        // 非 move: flag 借用进闭包, ✕/OS 关闭的结果能在调用后传回。
+        // 非 move: flag 借用进闭包, ×/OS 关闭的结果能在调用后传回。
         |ctx, class| {
             if ctx.input(|i| i.viewport().close_requested()) {
                 flag = false;
@@ -848,7 +895,7 @@ impl eframe::App for PlaApp {
                     ui.separator();
                     // 关闭按钮: 退出助手工具栏。
                     let close_btn = egui::Button::new(
-                        egui::RichText::new("✕").size(13.0).color(egui::Color32::WHITE),
+                        egui::RichText::new("×").size(13.0).color(egui::Color32::WHITE),
                     )
                     .min_size(egui::vec2(BTN_SIZE, BTN_SIZE))
                     .rounding(egui::Rounding::same(ROUNDING))
@@ -979,7 +1026,7 @@ impl eframe::App for PlaApp {
                             hit.set(true);
                         }
                     };
-                    // right_to_left 布局: 先加的靠右 → 视觉顺序 🗑 📂 📷 ✕(右→左)
+                    // right_to_left 布局: 先加的靠右 → 视觉顺序 🗑 📂 📷 ×(右→左)
                     icon_btn(ui, "🗑", "管理 — 多选删除", &dm);
                     icon_btn(ui, "📂", "打开快照文件夹", &dod);
                     icon_btn(ui, "📷", "手动快照 — 保存文档副本 + 截图当前画面", &ds);
@@ -995,8 +1042,10 @@ impl eframe::App for PlaApp {
                     |ui| {
                         let mut open_err: Option<String> = None;
                         let avail_w = ui.available_width();
-                        let big_img = egui::vec2(avail_w, 190.0); // 大图撑满内容宽(R7-6)
-                        let small_img = egui::vec2((avail_w - 16.0) / 3.0, 46.0);
+                        // R7-7: 收藏 3 列均分窗口宽(列宽=(可用-2*8pt间距)/3), 全部区一行一个撑满。
+                        let fav_gap = 8.0_f32;
+                        let fav_cell_w = ((avail_w - fav_gap * 2.0) / 3.0).max(40.0);
+                        let big_cell_w = avail_w;
 
                         // ---- 管理模式操作条(删除立即执行, 列表随后按新数据渲染) ----
                         if self.snap_manage {
@@ -1065,40 +1114,42 @@ impl eframe::App for PlaApp {
                                 ui.label(
                                     egui::RichText::new("★ 收藏").small().strong().color(COL_MUTED),
                                 );
-                                egui::Grid::new("snap-fav-grid")
-                                    .spacing([8.0, 8.0])
-                                    .show(ui, |ui| {
-                                        for trio in fav_list.chunks(3) {
-                                            for s in trio {
-                                                let act = snap_item(
-                                                    ui,
-                                                    s,
-                                                    self.snap_pngs.get(s),
-                                                    small_img,
-                                                    true,
-                                                    self.snap_manage,
-                                                    self.snap_selected.contains(s),
-                                                    self.rename_edit.as_deref() == Some(s.as_str()),
-                                                    &mut self.rename_buf,
-                                                );
-                                                if act.open {
-                                                    opens.push(s.clone());
-                                                }
-                                                if act.fav_toggle {
-                                                    fav_ops.push((s.clone(), false));
-                                                }
-                                                if let Some(on) = act.select_toggle {
-                                                    sel_toggles.push((s.clone(), on));
-                                                }
-                                                if act.rename_start && !self.snap_manage {
-                                                    rename_start = Some(s.clone());
-                                                }
-                                                rename_commit |= act.rename_commit;
-                                                rename_cancel |= act.rename_cancel;
+                                // R7-7: 弃 Grid(列宽随内容, 图片缩成小点、放不下 3 个) —
+                                // 改手动行布局, 每项固定宽 fav_cell_w(3 列均分窗口宽)。
+                                for trio in fav_list.chunks(3) {
+                                    ui.horizontal(|ui| {
+                                        for s in trio {
+                                            let act = snap_item(
+                                                ui,
+                                                s,
+                                                self.snap_pngs.get(s),
+                                                fav_cell_w,
+                                                64.0,
+                                                true,
+                                                self.snap_manage,
+                                                self.snap_selected.contains(s),
+                                                self.rename_edit.as_deref()
+                                                    == Some(s.as_str()),
+                                                &mut self.rename_buf,
+                                            );
+                                            if act.open {
+                                                opens.push(s.clone());
                                             }
-                                            ui.end_row();
+                                            if act.fav_toggle {
+                                                fav_ops.push((s.clone(), false));
+                                            }
+                                            if let Some(on) = act.select_toggle {
+                                                sel_toggles.push((s.clone(), on));
+                                            }
+                                            if act.rename_start && !self.snap_manage {
+                                                rename_start = Some(s.clone());
+                                            }
+                                            rename_commit |= act.rename_commit;
+                                            rename_cancel |= act.rename_cancel;
                                         }
                                     });
+                                    ui.add_space(4.0);
+                                }
                                 ui.separator();
                                 ui.label(
                                     egui::RichText::new("全部").small().strong().color(COL_MUTED),
@@ -1109,14 +1160,15 @@ impl eframe::App for PlaApp {
                                     ui,
                                     s,
                                     self.snap_pngs.get(s),
-                                    big_img,
+                                    big_cell_w,
+                                    300.0,
                                     self.snap_favs.contains(s),
                                     self.snap_manage,
                                     self.snap_selected.contains(s),
                                     self.rename_edit.as_deref() == Some(s.as_str()),
                                     &mut self.rename_buf,
                                 );
-                                ui.separator();
+                                ui.add_space(4.0);
                                 if act.open {
                                     opens.push(s.clone());
                                 }
@@ -1314,7 +1366,7 @@ impl eframe::App for PlaApp {
                             }
                         });
                         ui.label(
-                            egui::RichText::new("⚠ 需 facet 读写闭环(PLA-004 G4 后), 当前未接线")
+                            egui::RichText::new("! 需 facet 读写闭环(PLA-004 G4 后), 当前未接线")
                                 .small()
                                 .color(COL_MUTED),
                         );
@@ -1381,7 +1433,7 @@ impl eframe::App for PlaApp {
                             let conflicts = self.hotkeys.conflicts();
                             if !conflicts.is_empty() {
                                 for (k, acts) in &conflicts {
-                                    ui.colored_label(COL_RED, format!("⚠ 冲突: {k} → {acts:?}"));
+                                    ui.colored_label(COL_RED, format!("! 冲突: {k} → {acts:?}"));
                                 }
                             }
                         });
@@ -1407,7 +1459,7 @@ impl eframe::App for PlaApp {
                     .with_position(desired)
                     .with_inner_size(size);
                 let mut open_flag = true;
-                // 非 move: open_flag 借用进闭包, ✕ 关闭能传回。
+                // 非 move: open_flag 借用进闭包, × 关闭能传回。
                 ctx.show_viewport_immediate(
                     egui::ViewportId::from_hash_of("notice-popup"),
                     builder,
@@ -1417,7 +1469,7 @@ impl eframe::App for PlaApp {
                             open_flag = false;
                         }
                         let show_ui = |ui: &mut egui::Ui, open: &mut bool| {
-                            panel_header(ui, if is_err { "⚠ 提示" } else { "✔ 完成" }, open, None);
+                            panel_header(ui, if is_err { "! 提示" } else { "√ 完成" }, open, None);
                             ui.label(
                                 egui::RichText::new(&msg)
                                     .color(if is_err { COL_RED } else { COL_ACCENT }),
