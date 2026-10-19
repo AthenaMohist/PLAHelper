@@ -628,20 +628,21 @@ impl eframe::App for PlaApp {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                 });
-                // R6-2e 内侧羽化光晕: glow 后端做不了逐像素透明(R5 圆角教训),
-                // 外侧光晕带以黑为底合成 = 半透明黑框(R6-2d 实测)。改为面板内
-                // 多圈递减 alpha 白描边模拟羽化 — 贴边稍亮、向内渐隐, 暗而柔和。
+                // R6-2f 真羽化: 顶点色 Mesh 沿圆角矩形双环插值, GPU 线性渐变,
+                // 无离散描边的色带(R6-2e「框中框」被否决)。首环贴边微亮,
+                // 10pt 内平滑衰减到 0; 奶白色, 整体压暗(用户要求暗而柔)。
                 // ui.max_rect() = 内容区(定值, 与内容无关), 外扩 6 = 面板可见矩形。
                 let panel_rect = ui.max_rect().expand(6.0);
-                let p = ui.painter_at(panel_rect);
-                for (inset, alpha) in [(0.0_f32, 55_u8), (2.5, 30), (5.0, 14), (8.0, 6)] {
-                    let r = panel_rect.shrink(inset);
-                    p.rect_stroke(
-                        r,
-                        (ROUNDING - inset).max(0.0),
-                        egui::Stroke::new(2.0_f32, egui::Color32::from_white_alpha(alpha)),
-                    );
-                }
+                let mut glow_mesh = egui::Mesh::default();
+                pla_ui::glow::append_inner_glow(
+                    &mut glow_mesh,
+                    panel_rect,
+                    ROUNDING,
+                    &[(0.0, 60), (5.0, 18), (10.0, 0)],
+                    [255, 246, 228],
+                );
+                ui.painter_at(panel_rect)
+                    .add(egui::Shape::mesh(glow_mesh));
             });
         self.hovered_hint = hovered;
 

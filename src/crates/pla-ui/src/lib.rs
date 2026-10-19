@@ -1,4 +1,5 @@
 pub mod bridge_thread;
+pub mod glow;
 pub mod hotkey;
 pub mod round_corners;
 pub mod selection;
