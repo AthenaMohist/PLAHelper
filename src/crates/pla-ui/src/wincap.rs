@@ -54,6 +54,8 @@ fn png_chunk(out: &mut Vec<u8>, ty: &[u8; 4], data: &[u8]) {
     out.extend_from_slice(&(crc ^ 0xFFFF_FFFF).to_be_bytes());
 }
 
+/// 独立 CRC32(一次性整段; 编码器主路径用 crc32_update 链式)。仅测试使用。
+#[cfg(test)]
 fn crc32(data: &[u8]) -> u32 {
     crc32_update(0xFFFF_FFFF, data) ^ 0xFFFF_FFFF
 }

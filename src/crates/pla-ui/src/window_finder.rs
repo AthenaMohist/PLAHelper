@@ -205,9 +205,23 @@ mod imp {
     }
 
     /// 获取本实例应绑定的 Plasticity 窗口(第 N 个); 不足 N 个则 None(未绑定)。
-    pub fn acquire_target() -> Option<TargetWindow> {
+    /// R7-6: 多窗口时代(快照墙会开新 Plasticity 窗口), 裸 HWND 序不稳定 —
+    /// 优先绑标题含「<doc_key>.plasticity」的窗口(带扩展名, 快照窗口的
+    /// "model1-snap-..." 不会误匹配裸 "model1"); 无命中才退回全局第 N 个。
+    pub fn acquire_target(doc_key: &str) -> Option<TargetWindow> {
         let idx = instance_ordinal();
-        find_plasticity_windows().into_iter().nth(idx)
+        let all = find_plasticity_windows();
+        let key = format!("{}.plasticity", doc_key.trim().trim_end_matches(".plasticity"));
+        if doc_key.trim().len() > 3 {
+            let matched: Vec<_> = all
+                .iter()
+                .filter(|w| w.title.to_lowercase().contains(&key.to_lowercase()))
+                .collect();
+            if let Some(w) = matched.into_iter().nth(idx) {
+                return Some(w.clone());
+            }
+        }
+        all.into_iter().nth(idx)
     }
 }
 

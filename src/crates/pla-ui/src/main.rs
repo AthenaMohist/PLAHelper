@@ -81,7 +81,8 @@ const TOOLBAR_ACTIONS: [Action; 5] = [
 ];
 
 /// 面板逻辑尺寸 (宽, 高) — 子视口 OS 窗口大小。
-const PANEL_SNAPSHOTS: [f32; 2] = [280.0, 380.0];
+/// R7-6: 快照墙改窄加高(232x480) — 一行一个快照, 缩略图撑满内容宽。
+const PANEL_SNAPSHOTS: [f32; 2] = [232.0, 480.0];
 const PANEL_ENTITIES: [f32; 2] = [280.0, 410.0];
 const PANEL_DIM: [f32; 2] = [280.0, 170.0];
 const PANEL_SETTINGS: [f32; 2] = [300.0, 470.0];
@@ -138,6 +139,15 @@ struct PlaApp {
     doc_key: String,
     /// 快照 PNG 字节缓存(name → bytes): 快照文件不可变, 读盘一次。
     snap_pngs: std::collections::HashMap<String, std::sync::Arc<[u8]>>,
+    /// 收藏的快照名(含 .plasticity), 与 snapshot/meta.json 同步。
+    snap_favs: std::collections::HashSet<String>,
+    /// 管理模式: 多选删除。
+    snap_manage: bool,
+    /// 管理模式勾选集合。
+    snap_selected: std::collections::HashSet<String>,
+    /// 正在改名的快照名 + 编辑缓冲。
+    rename_edit: Option<String>,
+    rename_buf: String,
     /// Win32 窗口圆角裁剪状态(已套 Rgn 的 HWND + 尺寸)。
     round_state: round_corners::RoundState,
     /// 上次圆角轮询时刻。
@@ -304,7 +314,123 @@ fn paint_panel_glow(ui: &egui::Ui) {
     ui.painter_at(panel_rect).add(egui::Shape::mesh(glow_mesh));
 }
 
-/// 子视口面板头: 标题 + 可选图标按钮区(标题右侧, ✕ 左侧) + 右侧 ✕ 关闭钮。
+/// 快照项交互结果(由 snap_item 采集, 调用方统一执行)。
+#[derive(Default)]
+struct SnapItemActions {
+    open: bool,
+    fav_toggle: bool,
+    /// 管理模式勾选翻转后的新状态。
+    select_toggle: Option<bool>,
+    rename_start: bool,
+    rename_commit: bool,
+    rename_cancel: bool,
+}
+
+/// 快照缩略图(有 png 用真图, 没有占位相机)。点击行为随模式: 浏览=打开, 管理=勾选。
+fn snap_image(ui: &mut egui::Ui, png: Option<&std::sync::Arc<[u8]>>, name: &str, max: egui::Vec2, manage: bool, a: &mut SnapItemActions) {
+    let resp = if let Some(bytes) = png {
+        ui.add(
+            egui::Image::from_bytes(format!("bytes://{name}"), bytes.clone())
+                .max_size(max)
+                .sense(egui::Sense::click()),
+        )
+    } else {
+        ui.add_sized(
+            egui::vec2(max.x, max.y.min(80.0)),
+            egui::Label::new(egui::RichText::new("📷").size(if max.x > 100.0 { 30.0 } else { 18.0 }))
+                .sense(egui::Sense::click()),
+        )
+    };
+    let clicked = resp.clicked();
+    if manage {
+        if clicked {
+            a.select_toggle = Some(!a.select_toggle.unwrap_or(false));
+        }
+    } else if clicked {
+        a.open = true;
+    }
+}
+
+/// 单个快照项: 缩略图 + 名称行(勾选框[管理模式]/名称/收藏星/改名钮)。
+/// 改名中(renaming)时名称行变为编辑框 + ✓/✕。只采集动作, 不执行 — 借用隔离。
+fn snap_item(
+    ui: &mut egui::Ui,
+    name: &str,
+    png: Option<&std::sync::Arc<[u8]>>,
+    img_max: egui::Vec2,
+    is_fav: bool,
+    manage: bool,
+    selected: bool,
+    renaming: bool,
+    rename_buf: &mut String,
+) -> SnapItemActions {
+    let mut a = SnapItemActions::default();
+    let stem = name.trim_end_matches(".plasticity").to_string();
+    ui.vertical(|ui| {
+        snap_image(ui, png, name, img_max, manage, &mut a);
+        ui.horizontal(|ui| {
+            if renaming {
+                ui.add_sized(
+                    egui::vec2(img_max.x * 0.55, 18.0),
+                    egui::TextEdit::singleline(rename_buf),
+                );
+                if ui.small_button("✓").on_hover_text("确认改名").clicked() {
+                    a.rename_commit = true;
+                }
+                if ui.small_button("✕").on_hover_text("取消").clicked() {
+                    a.rename_cancel = true;
+                }
+                return;
+            }
+            if manage {
+                let mut on = selected;
+                if ui.checkbox(&mut on, "").changed() {
+                    a.select_toggle = Some(on);
+                }
+            }
+            let name_resp = ui
+                .add(
+                    egui::Label::new(egui::RichText::new(&stem).small().color(COL_TEXT))
+                        .sense(egui::Sense::click())
+                        .truncate(),
+                )
+                .on_hover_text(if manage { &stem } else { "点击在新窗口打开快照" });
+            if name_resp.clicked() && !manage {
+                a.open = true;
+            }
+            let star = egui::Button::new(
+                egui::RichText::new(if is_fav { "★" } else { "☆" })
+                    .size(12.0)
+                    .color(if is_fav {
+                        egui::Color32::from_rgb(255, 200, 60)
+                    } else {
+                        COL_MUTED
+                    }),
+            )
+            .frame(false);
+            if ui
+                .add(star)
+                .on_hover_text(if is_fav { "取消收藏" } else { "收藏(置顶小图)" })
+                .clicked()
+            {
+                a.fav_toggle = true;
+            }
+            if ui
+                .add(
+                    egui::Button::new(egui::RichText::new("✎").size(12.0).color(COL_MUTED))
+                        .frame(false),
+                )
+                .on_hover_text("改名")
+                .clicked()
+            {
+                a.rename_start = true;
+            }
+        });
+    });
+    a
+}
+
+
 fn panel_header(ui: &mut egui::Ui, title: &str, open: &mut bool, icons: Option<Box<dyn FnOnce(&mut egui::Ui)>>) {
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new(title).size(13.0).strong().color(COL_TEXT));
@@ -357,6 +483,11 @@ impl PlaApp {
             hovered_hint: None,
             doc_key,
             snap_pngs: std::collections::HashMap::new(),
+            snap_favs: std::collections::HashSet::new(),
+            snap_manage: false,
+            snap_selected: std::collections::HashSet::new(),
+            rename_edit: None,
+            rename_buf: String::new(),
             round_state: round_corners::RoundState::new(),
             last_round_poll: Instant::now() - Duration::from_millis(ROUND_POLL_MS),
         }
@@ -418,6 +549,7 @@ impl PlaApp {
                 if self.show_snapshots {
                     // 每次开墙刷新: 快照可能被外部增删(含 Plasticity 侧)
                     self.snapshots = pla_ui::snapshot::list_snapshots(&self.doc_key);
+                    self.snap_favs = pla_ui::snapshot::load_favs(&self.doc_key);
                 }
             }
             Action::ToggleEntities => self.show_entities = !self.show_entities,
@@ -439,7 +571,7 @@ impl PlaApp {
             return;
         }
         self.last_snap_poll = Instant::now();
-        let new_target = window_finder::acquire_target();
+        let new_target = window_finder::acquire_target(&self.doc_key);
         self.snap_target = new_target;
         // 用 owned 克隆避免在 self 上叠加可变借用。
         let Some(target) = self.snap_target.clone() else {
@@ -828,7 +960,9 @@ impl eframe::App for PlaApp {
                 // 不能借用局部变量; Rc<Cell<bool>> 兼顾两者, 面板关闭后统一执行。
                 let do_snapshot = std::rc::Rc::new(std::cell::Cell::new(false));
                 let do_open_dir = std::rc::Rc::new(std::cell::Cell::new(false));
-                let (ds, dod) = (do_snapshot.clone(), do_open_dir.clone());
+                let do_manage = std::rc::Rc::new(std::cell::Cell::new(false));
+                let (ds, dod, dm) =
+                    (do_snapshot.clone(), do_open_dir.clone(), do_manage.clone());
                 let icons: Box<dyn FnOnce(&mut egui::Ui)> = Box::new(move |ui| {
                     let icon_btn = |ui: &mut egui::Ui, glyph: &str, tip: &str, hit: &std::cell::Cell<bool>| {
                         if ui
@@ -845,7 +979,8 @@ impl eframe::App for PlaApp {
                             hit.set(true);
                         }
                     };
-                    // right_to_left 布局: 先加的靠右 → 视觉顺序 📂 📷 ✕(右→左)
+                    // right_to_left 布局: 先加的靠右 → 视觉顺序 🗑 📂 📷 ✕(右→左)
+                    icon_btn(ui, "🗑", "管理 — 多选删除", &dm);
                     icon_btn(ui, "📂", "打开快照文件夹", &dod);
                     icon_btn(ui, "📷", "手动快照 — 保存文档副本 + 截图当前画面", &ds);
                 });
@@ -859,69 +994,205 @@ impl eframe::App for PlaApp {
                     true,
                     |ui| {
                         let mut open_err: Option<String> = None;
-                        let cell_w = 118.0_f32;
-                        let cell_h = 80.0_f32;
+                        let avail_w = ui.available_width();
+                        let big_img = egui::vec2(avail_w, 190.0); // 大图撑满内容宽(R7-6)
+                        let small_img = egui::vec2((avail_w - 16.0) / 3.0, 46.0);
+
+                        // ---- 管理模式操作条(删除立即执行, 列表随后按新数据渲染) ----
+                        if self.snap_manage {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new(format!("已选 {}", self.snap_selected.len()))
+                                        .small()
+                                        .color(COL_MUTED),
+                                );
+                                let del = ui.add(
+                                    egui::Button::new(
+                                        egui::RichText::new("🗑 删除所选")
+                                            .small()
+                                            .color(egui::Color32::WHITE),
+                                    )
+                                    .fill(egui::Color32::from_rgb(150, 45, 45)),
+                                );
+                                let del = del.on_hover_text("删除勾选的快照(含截图), 不可恢复");
+                                if del.clicked() && !self.snap_selected.is_empty() {
+                                    let names: Vec<String> =
+                                        self.snap_selected.iter().cloned().collect();
+                                    match pla_ui::snapshot::delete_snapshots(&self.doc_key, &names)
+                                    {
+                                        Ok(n) => {
+                                            self.snapshots =
+                                                pla_ui::snapshot::list_snapshots(&self.doc_key);
+                                            for n in &names {
+                                                self.snap_pngs.remove(n);
+                                                self.snap_selected.remove(n);
+                                                self.snap_favs.remove(n);
+                                            }
+                                            self.set_notice((false, format!("已删除 {n} 个快照")));
+                                        }
+                                        Err(e) => self.set_notice((true, e)),
+                                    }
+                                }
+                                if ui.small_button("完成").clicked() {
+                                    self.snap_manage = false;
+                                    self.snap_selected.clear();
+                                }
+                            });
+                            ui.separator();
+                        }
+
+                        // 收藏置顶(小图 3 列), 其余一行一个(大图撑满)
+                        let (fav_list, other_list): (Vec<String>, Vec<String>) = self
+                            .snapshots
+                            .iter()
+                            .cloned()
+                            .partition(|s| self.snap_favs.contains(s));
+                        let mut fav_ops: Vec<(String, bool)> = Vec::new();
+                        let mut sel_toggles: Vec<(String, bool)> = Vec::new();
+                        let mut opens: Vec<String> = Vec::new();
+                        let mut rename_start: Option<String> = None;
+                        let mut rename_commit = false;
+                        let mut rename_cancel = false;
+                        let mut refresh = false;
+
                         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                             if self.snapshots.is_empty() {
                                 ui.label(
                                     egui::RichText::new("(暂无快照 — 点右上 📷 拍摄)").color(COL_MUTED),
                                 );
                             }
-                            // 两列网格: 缩略图在上, 文件名在下; 点图或点文件名都打开
-                            egui::Grid::new("snap-grid").spacing([10.0, 10.0]).show(ui, |ui| {
-                                for pair in self.snapshots.chunks(2) {
-                                    for s in pair {
-                                        let stem = s.trim_end_matches(".plasticity").to_string();
-                                        let clicked = ui
-                                            .vertical(|ui| {
-                                                let img_resp = if let Some(bytes) =
-                                                    self.snap_pngs.get(s)
-                                                {
-                                                    ui.add(
-                                                        egui::Image::from_bytes(
-                                                            format!("bytes://{s}"),
-                                                            bytes.clone(),
-                                                        )
-                                                        .max_size(egui::vec2(cell_w, cell_h))
-                                                        .sense(egui::Sense::click()),
-                                                    )
-                                                } else {
-                                                    // 无截图的快照: 占位相机图标(既有旧快照)
-                                                    ui.add_sized(
-                                                        egui::vec2(cell_w, cell_h),
-                                                        egui::Label::new(
-                                                            egui::RichText::new("📷").size(30.0),
-                                                        )
-                                                        .sense(egui::Sense::click()),
-                                                    )
-                                                };
-                                                let name_resp = ui
-                                                    .add(
-                                                        egui::Label::new(
-                                                            egui::RichText::new(&stem)
-                                                                .small()
-                                                                .color(COL_TEXT),
-                                                        )
-                                                        .sense(egui::Sense::click())
-                                                        .truncate(),
-                                                    )
-                                                    .on_hover_text(&stem);
-                                                img_resp.union(name_resp).clicked()
-                                            })
-                                            .inner;
-                                        if clicked {
-                                            if let Err(e) = pla_ui::snapshot::open_in_plasticity(
-                                                s,
-                                                &self.doc_key,
-                                            ) {
-                                                open_err = Some(e);
+                            if !fav_list.is_empty() {
+                                ui.label(
+                                    egui::RichText::new("★ 收藏").small().strong().color(COL_MUTED),
+                                );
+                                egui::Grid::new("snap-fav-grid")
+                                    .spacing([8.0, 8.0])
+                                    .show(ui, |ui| {
+                                        for trio in fav_list.chunks(3) {
+                                            for s in trio {
+                                                let act = snap_item(
+                                                    ui,
+                                                    s,
+                                                    self.snap_pngs.get(s),
+                                                    small_img,
+                                                    true,
+                                                    self.snap_manage,
+                                                    self.snap_selected.contains(s),
+                                                    self.rename_edit.as_deref() == Some(s.as_str()),
+                                                    &mut self.rename_buf,
+                                                );
+                                                if act.open {
+                                                    opens.push(s.clone());
+                                                }
+                                                if act.fav_toggle {
+                                                    fav_ops.push((s.clone(), false));
+                                                }
+                                                if let Some(on) = act.select_toggle {
+                                                    sel_toggles.push((s.clone(), on));
+                                                }
+                                                if act.rename_start && !self.snap_manage {
+                                                    rename_start = Some(s.clone());
+                                                }
+                                                rename_commit |= act.rename_commit;
+                                                rename_cancel |= act.rename_cancel;
                                             }
+                                            ui.end_row();
                                         }
-                                    }
-                                    ui.end_row();
+                                    });
+                                ui.separator();
+                                ui.label(
+                                    egui::RichText::new("全部").small().strong().color(COL_MUTED),
+                                );
+                            }
+                            for s in &other_list {
+                                let act = snap_item(
+                                    ui,
+                                    s,
+                                    self.snap_pngs.get(s),
+                                    big_img,
+                                    self.snap_favs.contains(s),
+                                    self.snap_manage,
+                                    self.snap_selected.contains(s),
+                                    self.rename_edit.as_deref() == Some(s.as_str()),
+                                    &mut self.rename_buf,
+                                );
+                                ui.separator();
+                                if act.open {
+                                    opens.push(s.clone());
                                 }
-                            });
+                                if act.fav_toggle {
+                                    fav_ops.push((s.clone(), true));
+                                }
+                                if let Some(on) = act.select_toggle {
+                                    sel_toggles.push((s.clone(), on));
+                                }
+                                if act.rename_start && !self.snap_manage {
+                                    rename_start = Some(s.clone());
+                                }
+                                rename_commit |= act.rename_commit;
+                                rename_cancel |= act.rename_cancel;
+                            }
                         });
+
+                        // ---- 统一执行采集到的动作(此时列表借用已结束) ----
+                        for (s, v) in fav_ops {
+                            if let Err(e) = pla_ui::snapshot::set_fav(&self.doc_key, &s, v) {
+                                open_err = Some(e);
+                            }
+                            if v {
+                                self.snap_favs.insert(s);
+                            } else {
+                                self.snap_favs.remove(&s);
+                            }
+                        }
+                        for (s, on) in sel_toggles {
+                            if on {
+                                self.snap_selected.insert(s);
+                            } else {
+                                self.snap_selected.remove(&s);
+                            }
+                        }
+                        if rename_cancel {
+                            self.rename_edit = None;
+                        }
+                        if let Some(s) = rename_start {
+                            self.rename_buf = s.trim_end_matches(".plasticity").to_string();
+                            self.rename_edit = Some(s);
+                        }
+                        if rename_commit {
+                            if let Some(old) = self.rename_edit.clone() {
+                                match pla_ui::snapshot::rename_snapshot(
+                                    &self.doc_key,
+                                    &old,
+                                    &self.rename_buf,
+                                ) {
+                                    Ok(new_name) => {
+                                        self.snapshots =
+                                            pla_ui::snapshot::list_snapshots(&self.doc_key);
+                                        self.snap_pngs.remove(&old);
+                                        // 收藏键跟随改名
+                                        if self.snap_favs.remove(&old) {
+                                            self.snap_favs.insert(new_name.clone());
+                                        }
+                                        if self.rename_edit.as_deref() == Some(old.as_str()) {
+                                            self.rename_edit = None;
+                                        }
+                                        self.set_notice((false, format!("已改名: {new_name}")));
+                                    }
+                                    Err(e) => self.set_notice((true, e)),
+                                }
+                                refresh = true;
+                            }
+                            self.rename_edit = None;
+                        }
+                        if refresh {
+                            self.snapshots = pla_ui::snapshot::list_snapshots(&self.doc_key);
+                        }
+                        for o in opens {
+                            if let Err(e) = pla_ui::snapshot::open_in_plasticity(&o, &self.doc_key) {
+                                open_err = Some(e);
+                            }
+                        }
                         if let Some(e) = open_err {
                             self.set_notice((true, e));
                         }
@@ -935,6 +1206,11 @@ impl eframe::App for PlaApp {
                     if let Err(e) = pla_ui::snapshot::open_snapshot_dir(&self.doc_key) {
                         self.set_notice((true, e));
                     }
+                }
+                if do_manage.get() {
+                    self.snap_manage = !self.snap_manage;
+                    self.snap_selected.clear();
+                    self.rename_edit = None;
                 }
                 self.show_snapshots = flag;
             }

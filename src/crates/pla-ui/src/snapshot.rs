@@ -91,6 +91,109 @@ pub fn snapshot_dir_of(doc_key: &str) -> PathBuf {
     snapshot_dir_for(find_latest_doc(doc_key).as_ref())
 }
 
+// ---------------- 收藏/改名/删除(R7-6) ----------------
+/// 收藏状态持久化: 快照目录下 meta.json — {快照文件名(含扩展名): true}。
+/// 轻量边车文件, 不动快照本体; 改名/删除时同步迁移。
+
+fn meta_path(dir: &PathBuf) -> PathBuf {
+    dir.join("meta.json")
+}
+
+fn load_meta(doc_key: &str) -> std::collections::HashMap<String, bool> {
+    let p = meta_path(&snapshot_dir_of(doc_key));
+    std::fs::read(&p)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+fn save_meta(doc_key: &str, meta: &std::collections::HashMap<String, bool>) -> Result<(), String> {
+    let dir = snapshot_dir_of(doc_key);
+    let _ = std::fs::create_dir_all(&dir);
+    let bytes = serde_json::to_vec_pretty(meta).map_err(|e| format!("序列化 meta: {e}"))?;
+    std::fs::write(meta_path(&dir), bytes).map_err(|e| format!("写 meta: {e}"))
+}
+
+/// 收藏的快照名集合。
+pub fn load_favs(doc_key: &str) -> std::collections::HashSet<String> {
+    load_meta(doc_key)
+        .into_iter()
+        .filter(|(_, v)| *v)
+        .map(|(k, _)| k)
+        .collect()
+}
+
+/// 设置/取消收藏。
+pub fn set_fav(doc_key: &str, name: &str, fav: bool) -> Result<(), String> {
+    let mut meta = load_meta(doc_key);
+    meta.insert(name.to_string(), fav);
+    save_meta(doc_key, &meta)
+}
+
+/// 批量删除快照(.plasticity + 同名 .png + meta 条目)。返回实际删除个数。
+pub fn delete_snapshots(doc_key: &str, names: &[String]) -> Result<usize, String> {
+    let dir = snapshot_dir_of(doc_key);
+    let mut removed = 0usize;
+    let mut errs = Vec::new();
+    for n in names {
+        let stem = n.trim_end_matches(".plasticity");
+        let mut ok = true;
+        for f in [format!("{n}"), format!("{stem}.png")] {
+            let p = dir.join(sanitize_filename(&f));
+            match std::fs::remove_file(&p) {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    ok = false;
+                    errs.push(format!("{}: {e}", p.display()));
+                }
+            }
+        }
+        if ok {
+            removed += 1;
+        }
+    }
+    let mut meta = load_meta(doc_key);
+    let before = meta.len();
+    meta.retain(|k, _| !names.iter().any(|n| n == k));
+    if meta.len() != before {
+        save_meta(doc_key, &meta)?;
+    }
+    if !errs.is_empty() {
+        return Err(format!("部分删除失败: {}", errs.join("; ")));
+    }
+    Ok(removed)
+}
+
+/// 快照改名(同步 .plasticity/.png/meta 键)。new_stem 会过文件名净化。
+pub fn rename_snapshot(doc_key: &str, old_name: &str, new_stem: &str) -> Result<String, String> {
+    let old_stem = old_name.trim_end_matches(".plasticity");
+    let new_stem = sanitize_filename(new_stem);
+    if new_stem.is_empty() {
+        return Err("新名称无效".into());
+    }
+    let dir = snapshot_dir_of(doc_key);
+    for (a, b) in [
+        (format!("{old_stem}.plasticity"), format!("{new_stem}.plasticity")),
+        (format!("{old_stem}.png"), format!("{new_stem}.png")),
+    ] {
+        let pa = dir.join(sanitize_filename(&a));
+        let pb = dir.join(sanitize_filename(&b));
+        if pa.exists() {
+            if pb.exists() {
+                return Err(format!("目标已存在: {}", pb.display()));
+            }
+            std::fs::rename(&pa, &pb).map_err(|e| format!("重命名 {} 失败: {e}", pa.display()))?;
+        }
+    }
+    let mut meta = load_meta(doc_key);
+    if let Some(v) = meta.remove(old_name) {
+        meta.insert(format!("{new_stem}.plasticity"), v);
+        save_meta(doc_key, &meta)?;
+    }
+    Ok(format!("{new_stem}.plasticity"))
+}
+
 /// 快照墙点击 → 用 Plasticity 打开快照文件(新进程 → 新窗口)。
 pub fn open_in_plasticity(snapshot_name: &str, doc_key: &str) -> Result<(), String> {
     let dir = snapshot_dir_of(doc_key);
@@ -145,6 +248,15 @@ fn find_latest_doc(doc_key: &str) -> Option<PathBuf> {
     let mut push = |p: PathBuf| {
         if !p.is_file() {
             return; // Recent 里可能有已删除/改名的旧目标, 只收现存文件
+        }
+        // R7-6: 排除我们自己的快照 — 快照墙开进 Plasticity 后会进 Recent,
+        // 文件名又含文档名, 不排除会劫持「当前文档」判定(23:10 实测)。
+        if p.file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.contains("-snap-d"))
+            .unwrap_or(false)
+        {
+            return;
         }
         if let Ok(meta) = p.metadata() {
             let mt = meta.modified().unwrap_or(UNIX_EPOCH);
