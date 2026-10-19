@@ -63,7 +63,7 @@ const NOTICE_TTL: Duration = Duration::from_secs(6);
 const ROUND_POLL_MS: u64 = 500;
 
 /// 全局圆角(工具栏/面板/按钮一致)。
-const ROUNDING: f32 = 6.0;
+const ROUNDING: f32 = 10.0;
 
 /// 工具栏按钮列(横向排列, 顺序即产品顺序)。
 const TOOLBAR_ACTIONS: [Action; 6] = [
@@ -514,7 +514,10 @@ impl eframe::App for PlaApp {
         // 左上角圆), 由 SetWindowRgn 兜底; 子视口懒创建, 定时枚举补套。
         if self.last_round_poll.elapsed() >= Duration::from_millis(ROUND_POLL_MS) {
             self.last_round_poll = Instant::now();
-            round_corners::poll_round_windows(&mut self.round_state);
+            round_corners::poll_round_windows(
+                &mut self.round_state,
+                (ROUNDING * 2.0 * ctx.pixels_per_point()).round() as i32,
+            );
         }
 
         // ---- 快捷键触发(全局): 解本帧按键事件, 纯逻辑匹配 ----

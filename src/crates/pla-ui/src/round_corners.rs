@@ -23,9 +23,6 @@ mod imp {
         EnumWindows, GetWindowRect, GetWindowThreadProcessId, IsWindow, IsWindowVisible,
     };
 
-    /// 圆角半径(物理像素): 12px 椭圆对应 6pt 逻辑圆角(@1x 缩放)。
-    const RADIUS_PX: i32 = 12;
-
     /// 圆角裁剪状态: 已套 Rgn 的 HWND → 套用时窗口 (宽, 高) 物理像素。
     #[derive(Default)]
     pub struct RoundState {
@@ -47,7 +44,9 @@ mod imp {
 
     /// 轮询本进程全部可见顶层窗口, 为新出现或尺寸变化的窗口套圆角 Rgn。
     /// 每帧调用太频(枚举开销), 调用方按 ~500ms 节流(main.rs ROUND_POLL_MS)。
-    pub fn poll_round_windows(state: &mut RoundState) {
+    /// ellipse_px: CreateRoundRectRgn 椭圆直径(物理像素) = egui ROUNDING×2×ppp,
+    /// 由调用方按当前 DPI 换算 — 写死会和 egui 画出的圆角在高 DPI 下错位露黑角。
+    pub fn poll_round_windows(state: &mut RoundState, ellipse_px: i32) {
         let my_pid = std::process::id();
         // 清理已销毁窗口的死条目(QA 返工备注): HWND 会被系统复用, 不清理
         // 则 applied 表随子视口反复开合缓慢膨胀。残余极低危场景 — 复用后
@@ -87,7 +86,7 @@ mod imp {
                     continue;
                 }
                 // CreateRoundRectRgn 返回裸 HRGN(失败返回空句柄)。
-                let rgn: HRGN = CreateRoundRectRgn(0, 0, w + 1, h + 1, RADIUS_PX, RADIUS_PX);
+                let rgn: HRGN = CreateRoundRectRgn(0, 0, w + 1, h + 1, ellipse_px, ellipse_px);
                 if rgn.is_invalid() {
                     continue;
                 }
