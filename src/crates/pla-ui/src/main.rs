@@ -32,11 +32,11 @@ const COL_GRAY_DOT: egui::Color32 = egui::Color32::from_rgb(0x77, 0x77, 0x77);
 
 // ---------------- 工具栏形态/吸附参数(可调) ----------------
 /// 工具栏固定逻辑尺寸(横向一行按钮): 圆点+分隔线+6 按钮+分隔线+关闭键。
-/// 实测推算: 边距 12 + 内容 ~276(264 时 ✕ 被吞 1/3) → 宽 288 留余量;
-/// 高 36 = 边距 12 + 按钮 24(原 30 造成图标底部裁切)。
-/// 注: 曾尝试 min_rect 自适应, 但 CentralPanel 的 min_rect 含整个可用区,
-/// need=窗口+余量 每帧自增, 已回退固定值 — 勿再对 panel ui 做 min_rect 测量。
-const TOOLBAR_SIZE: [f32; 2] = [288.0, 36.0];
+/// 宽 276 = 264(✕ 被吞 1/3 的旧值)+8 溢出+4 余量, 288 被用户反馈略宽;
+/// 高 30: 内容顶对齐(边距 6+按钮 24=30 恰好贴合, 不裁切)。
+/// 注: 勿对 panel ui 用 min_rect 测尺寸做自适应 — CentralPanel 的 min_rect
+/// 含整个可用区, need=窗口+余量 每帧自增(R6-2b 已回退, 教训留档)。
+const TOOLBAR_SIZE: [f32; 2] = [276.0, 30.0];
 /// 方形图标按钮边长。
 const BTN_SIZE: f32 = 24.0;
 /// 吸附定位(物理像素): 优先像素探测 Plasticity 顶栏「文件名文字块」右缘
@@ -265,6 +265,10 @@ fn panel_frame() -> egui::Frame {
         .fill(COL_PANEL)
         .rounding(egui::Rounding::same(ROUNDING))
         .inner_margin(egui::Margin::same(6.0))
+        // R6-2b: 轮廓描边(绿色取自 Plasticity 图标方块), 与主程序视觉区隔。
+        // 窗口=面板本体, 外侧光晕会被窗口边缘裁掉, 故用描边不用 shadow;
+        // 画 2px, 贴窗口边被裁一半后实际可见约 1px。
+        .stroke(egui::Stroke::new(2.0_f32, COL_ACCENT))
 }
 
 /// 子视口面板头: 标题 + 右侧 ✕ 关闭钮。
