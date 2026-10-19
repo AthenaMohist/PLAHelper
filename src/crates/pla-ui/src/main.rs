@@ -31,12 +31,12 @@ const COL_RED: egui::Color32 = egui::Color32::from_rgb(0xd0, 0x50, 0x45);
 const COL_GRAY_DOT: egui::Color32 = egui::Color32::from_rgb(0x77, 0x77, 0x77);
 
 // ---------------- 工具栏形态/吸附参数(可调) ----------------
-/// 工具栏固定逻辑尺寸(横向一行按钮): 圆点+分隔线+6 按钮+分隔线+关闭键。
-/// 宽 276 = 264(✕ 被吞 1/3 的旧值)+8 溢出+4 余量, 288 被用户反馈略宽;
+/// 工具栏固定逻辑尺寸(横向一行按钮): 圆点+分隔线+5 按钮+分隔线+关闭键。
+/// 宽 246 = 276(6 按钮旧值) - 30(手动快照按钮 24 + 间距 6 移入快照墙, R7-5);
 /// 高 30: 垂直边距 3+3 + 按钮 24 = 30, 按钮行恰在窗口中心(吸附按中心对齐)。
 /// 窗口 = 面板本体, 不留外侧光晕带 — glow 后端透明窗口不可靠(R5 圆角教训),
 /// 光晕带以黑为底合成会变成「半透明黑框」(R6-2d 实测), 光晕改画面板内侧。
-const TOOLBAR_SIZE: [f32; 2] = [276.0, 30.0];
+const TOOLBAR_SIZE: [f32; 2] = [246.0, 30.0];
 /// 面板整体右移微调(逻辑 px, 按 ppp 缩放; R6-2e 用户要求再偏右 10)。
 const SNAP_RIGHT_SHIFT: f32 = 10.0;
 /// 吸附垂直微调(逻辑 pt, 按 ppp 缩放; 仅作用于探测命中分支)。
@@ -70,9 +70,10 @@ const ROUND_POLL_MS: u64 = 500;
 const ROUNDING: f32 = 10.0;
 
 /// 工具栏按钮列(横向排列, 顺序即产品顺序)。
-const TOOLBAR_ACTIONS: [Action; 6] = [
+/// R7-5: 手动快照移入快照墙头部(图标钮), 一级工具栏不再放 —
+/// 宽度 = 276 - (按钮24 + 间距6) = 246。
+const TOOLBAR_ACTIONS: [Action; 5] = [
     Action::EntitiesRefresh,
-    Action::SnapshotManual,
     Action::ToggleSnapshots,
     Action::ToggleEntities,
     Action::ToggleDim,
@@ -135,6 +136,8 @@ struct PlaApp {
     /// 本帧悬停按钮的提示 (第一行, 第二行); None = 无悬停。
     hovered_hint: Option<(String, String)>,
     doc_key: String,
+    /// 快照 PNG 字节缓存(name → bytes): 快照文件不可变, 读盘一次。
+    snap_pngs: std::collections::HashMap<String, std::sync::Arc<[u8]>>,
     /// Win32 窗口圆角裁剪状态(已套 Rgn 的 HWND + 尺寸)。
     round_state: round_corners::RoundState,
     /// 上次圆角轮询时刻。
@@ -301,16 +304,22 @@ fn paint_panel_glow(ui: &egui::Ui) {
     ui.painter_at(panel_rect).add(egui::Shape::mesh(glow_mesh));
 }
 
-/// 子视口面板头: 标题 + 右侧 ✕ 关闭钮。
-fn panel_header(ui: &mut egui::Ui, title: &str, open: &mut bool) {
+/// 子视口面板头: 标题 + 可选图标按钮区(标题右侧, ✕ 左侧) + 右侧 ✕ 关闭钮。
+fn panel_header(ui: &mut egui::Ui, title: &str, open: &mut bool, icons: Option<Box<dyn FnOnce(&mut egui::Ui)>>) {
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new(title).size(13.0).strong().color(COL_TEXT));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let close = egui::Button::new(egui::RichText::new("✕").color(egui::Color32::WHITE))
-                .frame(false)
-                .rounding(egui::Rounding::same(4.0));
+            let close = egui::Button::new(
+                egui::RichText::new("✕").size(13.0).color(egui::Color32::WHITE),
+            )
+            .frame(false)
+            .rounding(egui::Rounding::same(4.0));
             if ui.add(close).clicked() {
                 *open = false;
+            }
+            // 图标按钮区: right_to_left 布局下加在 ✕ 之后 → 出现在 ✕ 左侧
+            if let Some(extra) = icons {
+                extra(ui);
             }
         });
     });
@@ -321,6 +330,8 @@ impl PlaApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         install_cjk_fonts(&cc.egui_ctx);
         apply_plasticity_style(&cc.egui_ctx);
+        // 快照墙缩略图: Image::from_bytes 需要 extras 加载器解码 PNG(子视口共享同一 ctx)
+        egui_extras::install_image_loaders(&cc.egui_ctx);
         let doc_key = "model1".to_string();
         Self {
             bridge: BridgeHandle::spawn(),
@@ -345,6 +356,7 @@ impl PlaApp {
             notice_at: Instant::now(),
             hovered_hint: None,
             doc_key,
+            snap_pngs: std::collections::HashMap::new(),
             round_state: round_corners::RoundState::new(),
             last_round_poll: Instant::now() - Duration::from_millis(ROUND_POLL_MS),
         }
@@ -372,13 +384,17 @@ impl PlaApp {
     fn run_action(&mut self, a: Action) {
         match a {
             Action::EntitiesRefresh => self.bridge.send(BridgeCmd::RefreshEntities),
-            Action::SnapshotManual => match pla_ui::snapshot::take_manual_snapshot(&self.doc_key) {
-                Ok(name) => {
-                    self.snapshots.insert(0, name);
-                    self.notice = Some((false, "快照已保存到 snapshots/ 目录".into()));
+            Action::SnapshotManual => {
+                let hwnd = self.snap_target.as_ref().map(|t| t.hwnd);
+                match pla_ui::snapshot::take_manual_snapshot(&self.doc_key, hwnd) {
+                    Ok(name) => {
+                        self.snapshots = pla_ui::snapshot::list_snapshots(&self.doc_key);
+                        self.snap_pngs.clear(); // 新快照可能有新 PNG, 下次进面板重读
+                        self.notice = Some((false, format!("快照已保存: {name}")));
+                    }
+                    Err(e) => self.notice = Some((true, e)),
                 }
-                Err(e) => self.notice = Some((true, e)),
-            },
+            }
             Action::SnapshotRestore => {
                 self.notice = Some((true, "切换快照未接线: 恢复写入需要 PLA-004 G4 闭环".into()));
             }
@@ -397,7 +413,13 @@ impl PlaApp {
             Action::DimApply => {
                 self.notice = Some((true, "尺寸驱动需要 facet 读写闭环(PLA-004 G4 后), 未接线".into()));
             }
-            Action::ToggleSnapshots => self.show_snapshots = !self.show_snapshots,
+            Action::ToggleSnapshots => {
+                self.show_snapshots = !self.show_snapshots;
+                if self.show_snapshots {
+                    // 每次开墙刷新: 快照可能被外部增删(含 Plasticity 侧)
+                    self.snapshots = pla_ui::snapshot::list_snapshots(&self.doc_key);
+                }
+            }
             Action::ToggleEntities => self.show_entities = !self.show_entities,
             Action::ToggleDim => self.show_dim = !self.show_dim,
             Action::ToggleSettings => self.show_settings = !self.show_settings,
@@ -497,8 +519,25 @@ fn show_child_window(
     active: bool,
     add_contents: impl FnOnce(&mut egui::Ui),
 ) {
+    header_extra_and_show(parent, id, title, desired, size, open, active, add_contents, None)
+}
+
+/// 同 show_child_window, 但允许在标题右侧、✕ 左侧插入图标按钮区(R7-5 快照墙)。
+#[allow(clippy::too_many_arguments)]
+fn header_extra_and_show(
+    parent: &egui::Context,
+    id: &'static str,
+    title: &'static str,
+    desired: egui::Pos2,
+    size: egui::Vec2,
+    open: &mut bool,
+    active: bool,
+    add_contents: impl FnOnce(&mut egui::Ui),
+    header_icons: Option<Box<dyn FnOnce(&mut egui::Ui)>>,
+) {
     let mut flag = *open;
     let mut contents = Some(add_contents);
+    let mut icons = header_icons;
     let builder = egui::ViewportBuilder::default()
         .with_title(title)
         .with_decorations(false)
@@ -531,7 +570,7 @@ fn show_child_window(
                     egui::CentralPanel::default()
                         .frame(panel_frame())
                         .show(ctx, |ui| {
-                            panel_header(ui, title, &mut flag);
+                            panel_header(ui, title, &mut flag, icons.take());
                             contents(ui);
                             paint_panel_glow(ui);
                         });
@@ -775,7 +814,42 @@ impl eframe::App for PlaApp {
             let desired = next_pos(&mut stack_y, PANEL_SNAPSHOTS[1]);
             if let Some(desired) = desired {
                 let mut flag = self.show_snapshots;
-                show_child_window(
+                // PNG 缓存填充(快照文件不可变, 每个只读盘一次)
+                let snap_dir = pla_ui::snapshot::snapshot_dir_of(&self.doc_key);
+                for s in &self.snapshots {
+                    if !self.snap_pngs.contains_key(s) {
+                        let stem = s.trim_end_matches(".plasticity");
+                        if let Ok(b) = std::fs::read(snap_dir.join(format!("{stem}.png"))) {
+                            self.snap_pngs.insert(s.clone(), std::sync::Arc::from(b));
+                        }
+                    }
+                }
+                // 头部图标钮的点击结果经 Cell 传出 — icons 闭包要求 'static,
+                // 不能借用局部变量; Rc<Cell<bool>> 兼顾两者, 面板关闭后统一执行。
+                let do_snapshot = std::rc::Rc::new(std::cell::Cell::new(false));
+                let do_open_dir = std::rc::Rc::new(std::cell::Cell::new(false));
+                let (ds, dod) = (do_snapshot.clone(), do_open_dir.clone());
+                let icons: Box<dyn FnOnce(&mut egui::Ui)> = Box::new(move |ui| {
+                    let icon_btn = |ui: &mut egui::Ui, glyph: &str, tip: &str, hit: &std::cell::Cell<bool>| {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new(glyph).size(13.0).color(egui::Color32::WHITE),
+                                )
+                                .frame(false)
+                                .rounding(egui::Rounding::same(4.0)),
+                            )
+                            .on_hover_text(tip)
+                            .clicked()
+                        {
+                            hit.set(true);
+                        }
+                    };
+                    // right_to_left 布局: 先加的靠右 → 视觉顺序 📂 📷 ✕(右→左)
+                    icon_btn(ui, "📂", "打开快照文件夹", &dod);
+                    icon_btn(ui, "📷", "手动快照 — 保存文档副本 + 截图当前画面", &ds);
+                });
+                header_extra_and_show(
                     ctx,
                     "panel-snapshots",
                     "快照墙",
@@ -784,31 +858,84 @@ impl eframe::App for PlaApp {
                     &mut flag,
                     true,
                     |ui| {
-                        section_header(ui, "SNAPSHOTS");
-                        ui.horizontal(|ui| {
-                            if ui.button("📂 打开文件夹").clicked() {
-                                if let Err(e) = pla_ui::snapshot::open_snapshot_dir(&self.doc_key) {
-                                    self.set_notice((true, e));
-                                }
-                            }
-                            if ui.button("📷 手动快照").clicked() {
-                                self.run_action(Action::SnapshotManual);
-                            }
-                        });
-                        ui.separator();
-                        egui::ScrollArea::vertical().max_height(250.0).show(ui, |ui| {
+                        let mut open_err: Option<String> = None;
+                        let cell_w = 118.0_f32;
+                        let cell_h = 80.0_f32;
+                        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                             if self.snapshots.is_empty() {
-                                ui.label(egui::RichText::new("(暂无快照)").color(COL_MUTED));
+                                ui.label(
+                                    egui::RichText::new("(暂无快照 — 点右上 📷 拍摄)").color(COL_MUTED),
+                                );
                             }
-                            for s in &self.snapshots {
-                                ui.horizontal(|ui| {
-                                    ui.label("📷");
-                                    ui.label(s);
-                                });
-                            }
+                            // 两列网格: 缩略图在上, 文件名在下; 点图或点文件名都打开
+                            egui::Grid::new("snap-grid").spacing([10.0, 10.0]).show(ui, |ui| {
+                                for pair in self.snapshots.chunks(2) {
+                                    for s in pair {
+                                        let stem = s.trim_end_matches(".plasticity").to_string();
+                                        let clicked = ui
+                                            .vertical(|ui| {
+                                                let img_resp = if let Some(bytes) =
+                                                    self.snap_pngs.get(s)
+                                                {
+                                                    ui.add(
+                                                        egui::Image::from_bytes(
+                                                            format!("bytes://{s}"),
+                                                            bytes.clone(),
+                                                        )
+                                                        .max_size(egui::vec2(cell_w, cell_h))
+                                                        .sense(egui::Sense::click()),
+                                                    )
+                                                } else {
+                                                    // 无截图的快照: 占位相机图标(既有旧快照)
+                                                    ui.add_sized(
+                                                        egui::vec2(cell_w, cell_h),
+                                                        egui::Label::new(
+                                                            egui::RichText::new("📷").size(30.0),
+                                                        )
+                                                        .sense(egui::Sense::click()),
+                                                    )
+                                                };
+                                                let name_resp = ui
+                                                    .add(
+                                                        egui::Label::new(
+                                                            egui::RichText::new(&stem)
+                                                                .small()
+                                                                .color(COL_TEXT),
+                                                        )
+                                                        .sense(egui::Sense::click())
+                                                        .truncate(),
+                                                    )
+                                                    .on_hover_text(&stem);
+                                                img_resp.union(name_resp).clicked()
+                                            })
+                                            .inner;
+                                        if clicked {
+                                            if let Err(e) = pla_ui::snapshot::open_in_plasticity(
+                                                s,
+                                                &self.doc_key,
+                                            ) {
+                                                open_err = Some(e);
+                                            }
+                                        }
+                                    }
+                                    ui.end_row();
+                                }
+                            });
                         });
+                        if let Some(e) = open_err {
+                            self.set_notice((true, e));
+                        }
                     },
+                    Some(icons),
                 );
+                if do_snapshot.get() {
+                    self.run_action(Action::SnapshotManual);
+                }
+                if do_open_dir.get() {
+                    if let Err(e) = pla_ui::snapshot::open_snapshot_dir(&self.doc_key) {
+                        self.set_notice((true, e));
+                    }
+                }
                 self.show_snapshots = flag;
             }
         }
@@ -1014,7 +1141,7 @@ impl eframe::App for PlaApp {
                             open_flag = false;
                         }
                         let show_ui = |ui: &mut egui::Ui, open: &mut bool| {
-                            panel_header(ui, if is_err { "⚠ 提示" } else { "✔ 完成" }, open);
+                            panel_header(ui, if is_err { "⚠ 提示" } else { "✔ 完成" }, open, None);
                             ui.label(
                                 egui::RichText::new(&msg)
                                     .color(if is_err { COL_RED } else { COL_ACCENT }),

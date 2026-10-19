@@ -52,13 +52,14 @@ pub fn sanitize_filename(name: &str) -> String {
     }
 }
 
-/// 手动快照: 定位当前文档(最近修改的 .plasticity), 复制到文档同级 snapshot/ 文件夹。
+/// 手动快照: 定位当前文档(最近修改的 .plasticity), 复制到文档同级 snapshot/ 文件夹,
+/// 并截取 Plasticity 主窗口画面存为同名 .png(快照墙缩略图, 尽力而为, 失败不阻断)。
 /// 文档定位三路(R7-3, 本机实测 D 盘项目目录的文档只有 Recent 能覆盖):
 ///   1. Windows Recent *.plasticity.lnk 解析(IShellLink COM) — 覆盖任意保存位置, 最可靠;
 ///   2. 已知文件夹(SHGetKnownFolderPath, 处理下载重定向到 D:\下载 之类)递归扫深度 2;
 ///   3. USERPROFILE 下的 Documents/Desktop/Downloads 兜底。
 /// doc_key 是软过滤: 命中则取命中集合里最新的, 全体为空时回退全局最新(不再因硬过滤报"找不到")。
-pub fn take_manual_snapshot(doc_key: &str) -> Result<String, String> {
+pub fn take_manual_snapshot(doc_key: &str, plasticity_hwnd: Option<isize>) -> Result<String, String> {
     let src = find_latest_doc(doc_key).ok_or_else(|| {
         format!(
             "未找到最近修改的 .plasticity 文档 — 已扫 Windows Recent 记录 + 已知文件夹(文档/桌面/下载), \
@@ -75,7 +76,35 @@ pub fn take_manual_snapshot(doc_key: &str) -> Result<String, String> {
     let _ = std::fs::create_dir_all(&dir);
     let dst = dir.join(format!("{name}.plasticity"));
     std::fs::copy(&src, &dst).map_err(|e| format!("复制失败: {e}"))?;
+    // 缩略图: PrintWindow 抓 Plasticity 主窗口 → 同名 .png
+    if let Some(hwnd) = plasticity_hwnd {
+        let png = dir.join(format!("{name}.png"));
+        if let Err(e) = crate::wincap::capture_window_png(hwnd, &png) {
+            eprintln!("[snapshot] 窗口截图失败(不阻断快照): {e}");
+        }
+    }
     Ok(name)
+}
+
+/// 当前文档对应的快照目录(不创建)。
+pub fn snapshot_dir_of(doc_key: &str) -> PathBuf {
+    snapshot_dir_for(find_latest_doc(doc_key).as_ref())
+}
+
+/// 快照墙点击 → 用 Plasticity 打开快照文件(新进程 → 新窗口)。
+pub fn open_in_plasticity(snapshot_name: &str, doc_key: &str) -> Result<(), String> {
+    let dir = snapshot_dir_of(doc_key);
+    let path = dir.join(sanitize_filename(snapshot_name));
+    if !path.is_file() {
+        return Err(format!("快照文件不存在: {}", path.display()));
+    }
+    let exe = crate::window_finder::plasticity_exe_path()
+        .ok_or_else(|| "未找到 Plasticity 进程 — 请先打开 Plasticity".to_string())?;
+    std::process::Command::new(&exe)
+        .arg(&path)
+        .spawn()
+        .map_err(|e| format!("启动 Plasticity 失败: {e}"))?;
+    Ok(())
 }
 
 /// 打开当前文档的快照文件夹(explorer); 目录不存在则先创建。
@@ -380,7 +409,7 @@ mod tests {
             Some(p) => println!("doc_key=model1 → {p:?}"),
             None => println!("doc_key=model1 → 无候选"),
         }
-        let result = take_manual_snapshot("model1");
+        let result = take_manual_snapshot("model1", None);
         println!("take_manual_snapshot(model1) = {result:?}");
         assert!(result.is_ok(), "手动快照失败: {result:?}");
         // R7-4: 快照必须落在文档同级 snapshot/ 目录
@@ -393,7 +422,7 @@ mod tests {
             assert!(!list.is_empty(), "文档同级 snapshot/ 中列不到快照");
         }
         // doc_key 无命中时软过滤回退全局最新, 也应成功
-        let fallback = take_manual_snapshot("no-such-key-xyz");
+        let fallback = take_manual_snapshot("no-such-key-xyz", None);
         println!("take_manual_snapshot(无命中key) = {fallback:?}");
         assert!(fallback.is_ok(), "软过滤回退失败: {fallback:?}");
     }

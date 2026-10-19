@@ -12,7 +12,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 pla-bridge = { path = "../pla-bridge" }
 tokio = { workspace = true }
+# egui_extras(image): 快照墙缩略图 — Image::from_bytes 需要安装 extras 的
+# 图片加载器才能解码 PNG(egui 0.29 本体无 png feature, R7-5)。
 egui = "0.29"
+egui_extras = { version = "0.29", features = ["image"] }
 eframe = { version = "0.29", default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
 
 # Win32: 吸附 Plasticity 主窗口(窗口枚举/矩形/进程映像名/进程创建时间);

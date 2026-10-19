@@ -106,6 +106,15 @@ mod imp {
         }
     }
 
+    /// Plasticity 主程序完整路径(取任意一个 Plasticity 主窗口所属进程)。
+    /// 用于「快照墙点缩略图 → 新 Plasticity 窗口打开快照」(R7-5)。
+    pub fn plasticity_exe_path() -> Option<std::path::PathBuf> {
+        find_plasticity_windows()
+            .first()
+            .and_then(|w| unsafe { process_image_name(HWND(w.hwnd)) })
+            .map(std::path::PathBuf::from)
+    }
+
     /// 全部可见的 Plasticity 主窗口, 按 HWND 升序。
     pub fn find_plasticity_windows() -> Vec<TargetWindow> {
         let mut out = Vec::new();
