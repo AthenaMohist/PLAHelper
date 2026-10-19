@@ -39,6 +39,11 @@ const COL_GRAY_DOT: egui::Color32 = egui::Color32::from_rgb(0x77, 0x77, 0x77);
 const TOOLBAR_SIZE: [f32; 2] = [276.0, 30.0];
 /// 面板整体右移微调(逻辑 px, 按 ppp 缩放; R6-2e 用户要求再偏右 10)。
 const SNAP_RIGHT_SHIFT: f32 = 10.0;
+/// 吸附垂直微调(逻辑 pt, 按 ppp 缩放; 仅作用于探测命中分支)。
+/// R6-2l 实测校准: PrintWindow 渲染原点与 GetWindowRect 窗口原点存在
+/// 不可见边框级的系统性偏移, 3pt 结构偏差修复后仍残留 ~1.8pt 偏低,
+/// 以 -2pt 校准(用户 250%DPI 实测; 若换 DPI 后再有偏差, 调此常量)。
+const SNAP_Y_NUDGE_PT: f32 = -2.0;
 /// 注: 勿对 panel ui 用 min_rect 测尺寸做自适应 — CentralPanel 的 min_rect
 /// 含整个可用区, need=窗口+余量 每帧自增(R6-2b 已回退, 教训留档)。
 /// 方形图标按钮边长。
@@ -439,7 +444,9 @@ impl PlaApp {
         let (x_phys, y_phys) = match &self.probed_edge {
             Some((h, hit)) if *h == target.hwnd => {
                 let x = hit.right as f32 + (SNAP_FILENAME_GAP + SNAP_RIGHT_SHIFT) * ppp;
-                let y = target.top as f32 + hit.cy as f32 - TOOLBAR_SIZE[1] * 0.5 * ppp;
+                let y = target.top as f32
+                    + (hit.cy as f32 + SNAP_Y_NUDGE_PT * ppp)
+                    - TOOLBAR_SIZE[1] * 0.5 * ppp;
                 (x, y)
             }
             _ => (
