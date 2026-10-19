@@ -49,8 +49,10 @@ async fn mock_server(listener: TcpListener, put_some_count: Arc<AtomicUsize>) {
             ].to_vec();
             fn obj_record(id: u32, kind: u32, name: &str) -> Vec<u8> {
                 // [真机布局 DPL-218 逆向]: flags|kind_raw|type_code|index|0|0|parent|tag6|len|name+pad
-                let kind_raw = 4u32;                                   // 实体 kind_raw=4(Extruded 实锤)
-                let type_code = match kind { 2 => 2u32, _ => 5 };      // 5=solid, 2=sheet
+                // R7-18 修正映射: tag-20 槽 = T(type_code): 0=solid, 1=sheet
+                // (旧 DPL-218 kind_raw=4 是计数器误判)。
+                let kind_raw = 4u32;
+                let type_code = match kind { 2 => 1u32, _ => 0u32 };   // 0=solid, 1=sheet
                 let mut v = Vec::new();
                 v.extend_from_slice(&1u32.to_le_bytes());
                 v.extend_from_slice(&kind_raw.to_le_bytes());

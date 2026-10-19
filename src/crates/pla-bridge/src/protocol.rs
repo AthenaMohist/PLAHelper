@@ -377,6 +377,8 @@ pub struct EntityBlock {
     /// 父节点 idx(Scene=0), 0xffffffff 视为根。
     pub b: u32,
     pub name: String,
+    /// 网格顶点(真机 mesh verts / mock facet verts) — dim 平移用。
+    pub facets: Vec<Vec<[f32; 3]>>,
 }
 
 /// 在记录体内扫描实体名块。带 T/idx/a/b 合法性校验 + 体记录 mesh 区段
@@ -418,27 +420,78 @@ fn scan_entity_blocks(rec: &[u8]) -> Vec<EntityBlock> {
             pos += 4;
             continue;
         }
-        out.push(EntityBlock {
-            tcode, idx, a, b, name: String::from_utf8_lossy(nm).to_string(),
-        });
         let mut next = pos + 8 + slen;
         next += (4 - (next % 4)) % 4;
-        // 体记录: 精确跳过 mesh 前五段(数值全部做过上限校验, 异常即放弃跳步)
+        // payload 双格式解析(R7-18): 体记录名后是真 mesh
+        // [nv][verts nv*12B][ntri][tris ntri*12B][nn(==nv)][normals nn*12B][尾部未解],
+        // mock 是 legacy facets [fcount≤64][每 facet: vcount][verts vcount*12B]。
+        // 真格式优先(verts 即 dim 所需顶点), 校验失败退 legacy, 再失败小步扫描。
+        let mut facets: Vec<Vec<[f32; 3]>> = Vec::new();
+        // payload 解析仅对体记录(T=0/1): T=5 组的 payload 是内联子记录,
+        // 不能当 facet/numeric 头解析(否则 fcount 误读会吞掉后续记录)。
         if (tcode == 0 || tcode == 1) && next + 4 <= rec.len() {
-            let nv = u32::from_le_bytes(rec[next..next+4].try_into().unwrap()) as usize;
-            let mut p = next + 4 + nv.saturating_mul(24);
-            if nv <= 10_000_000 && p + 4 <= rec.len() {
-                let ntri = u32::from_le_bytes(rec[p..p+4].try_into().unwrap()) as usize;
-                p += 4 + ntri.saturating_mul(12);
-                if ntri <= 10_000_000 && p + 4 <= rec.len() {
-                    let nn = u32::from_le_bytes(rec[p..p+4].try_into().unwrap()) as usize;
-                    p += 4 + nn.saturating_mul(12);
-                    if nn <= 10_000_000 && p <= rec.len() {
-                        next = p; // 尾部块结构未解, 从这里继续小步扫描
+            let n0 = u32::from_le_bytes(rec[next..next+4].try_into().unwrap()) as usize;
+            let mut ok = false;
+            if (1..=10_000_000).contains(&n0) {
+                let mut p = next + 4 + n0 * 12;
+                if p + 4 <= rec.len() {
+                    let ntri = u32::from_le_bytes(rec[p..p+4].try_into().unwrap()) as usize;
+                    p += 4 + ntri.saturating_mul(12);
+                    if (0..=10_000_000).contains(&ntri) && p + 4 <= rec.len() {
+                        let nn = u32::from_le_bytes(rec[p..p+4].try_into().unwrap()) as usize;
+                        p += 4 + nn.saturating_mul(12);
+                        if nn == n0 && p <= rec.len() {
+                            ok = true;
+                            let mut verts = Vec::with_capacity(n0);
+                            for i in 0..n0 {
+                                let o = next + 4 + i * 12;
+                                let x = f32::from_le_bytes(rec[o..o+4].try_into().unwrap());
+                                let y = f32::from_le_bytes(rec[o+4..o+8].try_into().unwrap());
+                                let z = f32::from_le_bytes(rec[o+8..o+12].try_into().unwrap());
+                                verts.push([x, y, z]);
+                            }
+                            facets.push(verts);
+                            next = p;
+                        }
+                    }
+                }
+            }
+            if !ok {
+                let mut p = next;
+                let mut ok2 = true;
+                let mut f: Vec<Vec<[f32; 3]>> = Vec::new();
+                if p + 4 <= rec.len() {
+                    let fcount = u32::from_le_bytes(rec[p..p+4].try_into().unwrap()) as usize;
+                    p += 4;
+                    if (1..=64).contains(&fcount) {
+                        for _ in 0..fcount {
+                            if p + 4 > rec.len() { ok2 = false; break }
+                            let vc = u32::from_le_bytes(rec[p..p+4].try_into().unwrap()) as usize;
+                            p += 4;
+                            if vc > 65536 || p + vc * 12 > rec.len() { ok2 = false; break }
+                            let mut verts = Vec::with_capacity(vc);
+                            for i in 0..vc {
+                                let o = p + i * 12;
+                                let x = f32::from_le_bytes(rec[o..o+4].try_into().unwrap());
+                                let y = f32::from_le_bytes(rec[o+4..o+8].try_into().unwrap());
+                                let z = f32::from_le_bytes(rec[o+8..o+12].try_into().unwrap());
+                                verts.push([x, y, z]);
+                            }
+                            p += vc * 12;
+                            f.push(verts);
+                        }
+                        if ok2 {
+                            facets = f;
+                            next = p;
+                        }
                     }
                 }
             }
         }
+        out.push(EntityBlock {
+            tcode, idx, a, b, name: String::from_utf8_lossy(nm).to_string(),
+            facets,
+        });
         pos = next;
     }
     out
@@ -459,6 +512,9 @@ fn kind_name(tcode: u32) -> String {
         0 => "solid".to_string(),
         1 => "sheet".to_string(),
         5 => "group".to_string(),
+        // TODO-PROBE: 真机 fillet 的 T 码未实锤(R7-18); 9 沿用 mock 约定,
+        // 维持 pla-dim 拓扑硬拒(TOPOLOGY_KINDS)的测试路径。真机码探明后更新。
+        9 => "fillet".to_string(),
         other => format!("type{other}"),
     }
 }
@@ -469,6 +525,15 @@ pub fn list_response_to_value(frame: &Frame) -> Result<serde_json::Value, Bridge
             let mut objs: Vec<serde_json::Value> = Vec::new();
             for body in objects {
                 for blk in scan_entity_blocks(body) {
+                    let fj: Vec<serde_json::Value> = blk
+                        .facets
+                        .iter()
+                        .map(|verts| {
+                            serde_json::json!({ "vertices": verts.iter()
+                                .map(|v| serde_json::json!([v[0], v[1], v[2]]))
+                                .collect::<Vec<_>>() })
+                        })
+                        .collect();
                     objs.push(serde_json::json!({
                         // idx = 树内编号, 全帧唯一(实测 0..24 无重复) — 对外 id。
                         // (a 是分类型计数器, group 与 solid 间会撞号, 不能作 id)
@@ -477,6 +542,7 @@ pub fn list_response_to_value(frame: &Frame) -> Result<serde_json::Value, Bridge
                         "parent_idx": blk.b,
                         "kind": kind_name(blk.tcode),
                         "name": blk.name,
+                        "facets": fj,
                         "raw_len": body.len(),
                     }));
                 }
