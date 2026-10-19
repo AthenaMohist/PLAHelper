@@ -686,6 +686,8 @@ pub fn latest_doc_path(doc_key: &str) -> Option<PathBuf> {
 /// 顺序: 先删超龄, 再按旧→新删到 max_count 以内。附带同名 png/meta 同步删除。
 pub fn cleanup_snapshots(doc_key: &str, max_count: usize, max_age_days: u64) -> Result<usize, String> {
     let dir = snapshot_dir_of(doc_key);
+    // 收藏快照永不清理(R7-16): favs 来自 meta.json(快照墙 ★)。
+    let favs = load_favs(doc_key);
     let mut entries: Vec<(String, std::time::SystemTime)> = std::fs::read_dir(&dir)
         .map(|rd| {
             rd.flatten()
@@ -697,6 +699,9 @@ pub fn cleanup_snapshots(doc_key: &str, max_count: usize, max_age_days: u64) -> 
                 })
                 .filter_map(|e| {
                     let name = e.file_name().to_str()?.to_string();
+                    if favs.contains(&name) {
+                        return None; // 收藏项不参与清理
+                    }
                     let mt = e.metadata().and_then(|m| m.modified()).ok()?;
                     Some((name, mt))
                 })

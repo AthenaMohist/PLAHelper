@@ -24,6 +24,8 @@ pub enum CdpCmd {
     ApplyIds(Vec<u32>),
     /// 立即拉一次实体树。
     RefreshTree,
+    /// 通用 evaluate(R7-16): 尺寸驱动命令派发等自动化尝试。
+    Eval(String),
     Shutdown,
 }
 
@@ -36,6 +38,8 @@ pub enum CdpEvent {
     Selection(SelectionSnapshot),
     /// 实体树（OutlinerSection 平铺, 含 curves/instances）。
     Tree(Vec<TreeNode>),
+    /// Eval 回包。
+    EvalResult(String),
 }
 
 /// 一个选中条目。
@@ -252,6 +256,16 @@ async fn session_loop(
         // --- UI 命令(非阻塞) ---
         match cmd_rx.try_recv() {
             Ok(CdpCmd::Shutdown) => return Err(anyhow::anyhow!("shutdown")),
+            Ok(CdpCmd::Eval(expr)) => {
+                match eval_roundtrip(ws, &mut mid, &expr).await {
+                    Ok(r) => {
+                        let _ = ev_tx.send(CdpEvent::EvalResult(r));
+                    }
+                    Err(e) => {
+                        let _ = ev_tx.send(CdpEvent::EvalResult(format!("ERR: {e}")));
+                    }
+                }
+            }
             Ok(CdpCmd::RefreshTree) => {
                 let tree_raw = eval_roundtrip(ws, &mut mid, TREE_JS).await?;
                 if tree_raw != last_tree {

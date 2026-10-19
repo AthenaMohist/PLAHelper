@@ -148,6 +148,11 @@ struct PlaApp {
     /// CDP 侧 undo 栈深度(步数计数源)。
     cdp_undo: i64,
     dim_value: f64,
+    /// 尺寸驱动(R7-16): 关联选择集 + 方向 + 数值(PRD P1-1 定义)。
+    dim_sets: Vec<String>,
+    dim_set_sel: usize,
+    dim_axis: usize,
+    dim_loaded: bool,
     hotkeys: HotkeyMap,
     /// 正在录制快捷键的动作名 (None = 未在录制)。
     recording: Option<String>,
@@ -635,6 +640,10 @@ impl PlaApp {
             last_auto_mtime: None,
             cdp_undo: -1,
             dim_value: 0.0,
+            dim_sets: Vec::new(),
+            dim_set_sel: 0,
+            dim_axis: 0,
+            dim_loaded: false,
             hotkeys: pla_ui::hotkey::load_binds().unwrap_or_default(),
             recording: None,
             notice: None,
@@ -684,6 +693,9 @@ impl PlaApp {
                     } else {
                         self.live_sel.clear();
                     }
+                }
+                pla_bridge::cdp::CdpEvent::EvalResult(s) => {
+                    self.set_notice((false, format!("CDP: {}", s)));
                 }
                 pla_bridge::cdp::CdpEvent::Tree(nodes) => {
                     self.cdp_tree = nodes
@@ -1739,17 +1751,103 @@ impl eframe::App for PlaApp {
                     true,
                     |ui| {
                         section_header(ui, "DIMENSION");
+                        // R7-16: 尺寸关联 = 选择集 + 方向 + 数值(PRD P1-1)。
+                        if !self.dim_loaded {
+                            self.dim_sets =
+                                pla_ui::selection::list_cdp_selections(&self.doc_key);
+                            self.dim_loaded = true;
+                        }
                         ui.horizontal(|ui| {
-                            ui.label("数值:");
+                            ui.label("关联选择集:");
+                            let cur = self
+                                .dim_sets
+                                .get(self.dim_set_sel)
+                                .map(|s| s.as_str())
+                                .unwrap_or("(无)");
+                            egui::ComboBox::from_id_salt("dim-set")
+                                .selected_text(cur)
+                                .show_ui(ui, |ui| {
+                                    for (i, s) in self.dim_sets.iter().enumerate() {
+                                        ui.selectable_value(&mut self.dim_set_sel, i, s);
+                                    }
+                                });
+                            if ui.small_button("刷新").clicked() {
+                                self.dim_sets =
+                                    pla_ui::selection::list_cdp_selections(&self.doc_key);
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("方向:");
+                            for (i, ax) in ["X", "Y", "Z"].iter().enumerate() {
+                                ui.selectable_value(&mut self.dim_axis, i, *ax);
+                            }
+                            ui.label("数值(毫米):");
                             ui.add(egui::DragValue::new(&mut self.dim_value).speed(0.1));
-                            if ui.button("应用平移").clicked() {
-                                self.run_action(Action::DimApply);
+                        });
+                        ui.horizontal(|ui| {
+                            if ui.button("① 选中关联实体").clicked() {
+                                let Some(name) = self.dim_sets.get(self.dim_set_sel).cloned() else {
+                                    self.set_notice((true, "没有已保存的选择集 — 先在选择集窗口保存".into()));
+                                    return;
+                                };
+                                match pla_ui::selection::load_cdp_selection(&self.doc_key, &name) {
+                                    Some(members) => {
+                                        let ids: Vec<u32> = members
+                                            .iter()
+                                            .filter_map(|m| m.id.parse::<u32>().ok())
+                                            .collect();
+                                        if ids.is_empty() {
+                                            self.set_notice((true, "选择集无可用的数值 id".into()));
+                                        } else {
+                                            let n = ids.len();
+                                            self.cdp
+                                                .send(pla_bridge::cdp::CdpCmd::ApplyIds(ids));
+                                            self.set_notice((
+                                                false,
+                                                format!("已选中 {n} 项 ({name})"),
+                                            ));
+                                        }
+                                    }
+                                    None => {
+                                        self.set_notice((true, format!("选择集 {name} 读取失败")))
+                                    }
+                                }
+                            }
+                            if ui.button("💾 保存关联").clicked() {
+                                let Some(name) = self.dim_sets.get(self.dim_set_sel).cloned() else {
+                                    self.set_notice((true, "没有关联的选择集".into()));
+                                    return;
+                                };
+                                let axis = ["X", "Y", "Z"][self.dim_axis.min(2)];
+                                let exe = std::env::current_exe()
+                                    .ok()
+                                    .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+                                    .unwrap_or_else(|| std::path::PathBuf::from("."));
+                                let dir = exe
+                                    .join("selections-cdp")
+                                    .join(&self.doc_key);
+                                let _ = std::fs::create_dir_all(&dir);
+                                let json = serde_json::json!({
+                                    "set": name, "axis": axis, "value": self.dim_value,
+                                });
+                                match std::fs::write(
+                                    dir.join(format!("dim-{}.json", name)),
+                                    serde_json::to_vec_pretty(&json).unwrap_or_default(),
+                                ) {
+                                    Ok(_) => self.set_notice((
+                                        false,
+                                        format!("尺寸关联已保存: {name} {axis}={}", self.dim_value),
+                                    )),
+                                    Err(e) => self.set_notice((true, format!("保存失败: {e}"))),
+                                }
                             }
                         });
                         ui.label(
-                            egui::RichText::new("! 需 facet 读写闭环(PLA-004 G4 后), 当前未接线")
-                                .small()
-                                .color(COL_MUTED),
+                            egui::RichText::new(
+                                "② 应用平移: 命令参数化(move-item 交互状态机)待活体逆向 — ① 已可用",
+                            )
+                            .small()
+                            .color(COL_MUTED),
                         );
                     },
                 );

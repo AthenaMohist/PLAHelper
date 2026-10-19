@@ -122,3 +122,51 @@ pub fn save_cdp_selection(
         .map_err(|e| format!("写文件失败: {e}"))?;
     Ok(path.display().to_string())
 }
+
+/// 列出已保存的 CDP 选择集(R7-16)。
+pub fn list_cdp_selections(doc_key: &str) -> Vec<String> {
+    let exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let dir = exe.join("selections-cdp").join(sanitize(doc_key));
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for e in rd.flatten() {
+            if e.path().extension().map(|x| x == "json").unwrap_or(false) {
+                if let Some(n) = e.file_name().to_str() {
+                    out.push(n.trim_end_matches(".json").to_string());
+                }
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// 读取 CDP 选择集成员。
+pub fn load_cdp_selection(doc_key: &str, name: &str) -> Option<Vec<CdpMember>> {
+    let exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let path = exe
+        .join("selections-cdp")
+        .join(sanitize(doc_key))
+        .join(format!("{}.json", sanitize(name)));
+    let data = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&data).ok().map(|v: serde_json::Value| {
+        v["members"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .map(|m| CdpMember {
+                        kind: m["kind"].as_str().unwrap_or("").to_string(),
+                        id: m["id"].as_str().unwrap_or("").to_string(),
+                        name: m["name"].as_str().unwrap_or("").to_string(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+}
