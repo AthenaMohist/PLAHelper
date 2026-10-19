@@ -387,6 +387,27 @@ fn snap_image(
     }
 }
 
+/// 14×14 矢量铅笔钮(feather edit-2 缩绘): ✎(U+270E) 字形在 SimHei(GB2312)与
+/// NotoEmoji 中都没有 → 只能画出来(R7-8)。
+fn pencil_button(ui: &mut egui::Ui) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::click());
+    let col = if resp.hovered() { COL_TEXT } else { COL_MUTED };
+    let s = 14.0 / 24.0;
+    let pt = |x: f32, y: f32| egui::pos2(rect.left() + x * s, rect.top() + y * s);
+    ui.painter().add(egui::Shape::convex_polygon(
+        vec![
+            pt(2.0, 22.0),
+            pt(7.5, 20.5),
+            pt(21.0, 7.0),
+            pt(17.0, 3.0),
+            pt(3.5, 16.5),
+        ],
+        col,
+        egui::Stroke::NONE,
+    ));
+    resp
+}
+
 /// 单个快照项: 缩略图 + 名称行(勾选框[管理模式]/名称/收藏星/改名钮)。
 /// 改名中(renaming)时名称行变为编辑框 + √/×。只采集动作, 不执行 — 借用隔离。
 /// cell_w 是项的固定宽度(收藏 3 列均分 / 全部区撑满): 名称 truncate 依赖
@@ -430,45 +451,54 @@ fn snap_item(
                         a.select_toggle = Some(on);
                     }
                 }
-                let name_resp = ui
-                    .add(
-                        egui::Label::new(egui::RichText::new(&stem).small().color(COL_TEXT))
-                            .sense(egui::Sense::click())
-                            .truncate(),
-                    )
-                    .on_hover_text(if manage { &stem } else { "点击在新窗口打开快照" });
+                let name_resp = {
+                    // R7-8: 名称行各元素全部定宽 — 之前 Button 自带 padding 使
+                    // 单元格内容最小宽 > cell_w, 收藏第 3 列被挤出面板右缘。
+                    let sp = ui.spacing().item_spacing.x;
+                    let reserve = if manage { 16.0 + sp } else { 0.0 };
+                    let rem = (cell_w - (14.0 + sp) * 2.0 - reserve).max(24.0);
+                    let nr = ui
+                        .allocate_ui_with_layout(
+                            egui::vec2(rem, 14.0),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(&stem).small().color(COL_TEXT),
+                                    )
+                                    .sense(egui::Sense::click())
+                                    .truncate(),
+                                )
+                            },
+                        )
+                        .inner;
+                    nr.on_hover_text(if manage { &stem } else { "点击在新窗口打开快照" })
+                };
                 if name_resp.clicked() && !manage {
                     a.open = true;
                 }
-                let star = egui::Button::new(
-                    egui::RichText::new(if is_fav { "★" } else { "☆" })
-                        .size(12.0)
-                        .color(if is_fav {
-                            egui::Color32::from_rgb(255, 200, 60)
-                        } else {
-                            COL_MUTED
-                        }),
-                )
-                .frame(false);
-                if ui
-                    .add(star)
+                // 收藏星: 定宽 14, painter 画字(Button 自带 padding 撑宽单元格)
+                let star_col = if is_fav {
+                    egui::Color32::from_rgb(255, 200, 60)
+                } else {
+                    COL_MUTED
+                };
+                let (srect, sresp) =
+                    ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::click());
+                ui.painter().text(
+                    srect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    if is_fav { "★" } else { "☆" },
+                    egui::FontId::proportional(13.0),
+                    star_col,
+                );
+                if sresp
                     .on_hover_text(if is_fav { "取消收藏" } else { "收藏(置顶小图)" })
                     .clicked()
                 {
                     a.fav_toggle = true;
                 }
-                if ui
-                    .add(
-                        // R7-7: ✎(U+270E) 不在 GB2312/SimHei 字形集内 → 渲染成方框;
-                        // 改用文字「改」, 同理 ✓/✕ → √/×(均为 GB2312 成员)。
-                        egui::Button::new(
-                            egui::RichText::new("改").size(11.0).color(COL_MUTED),
-                        )
-                        .frame(false),
-                    )
-                    .on_hover_text("改名")
-                    .clicked()
-                {
+                if pencil_button(ui).on_hover_text("改名").clicked() {
                     a.rename_start = true;
                 }
             });
@@ -914,19 +944,27 @@ impl eframe::App for PlaApp {
             });
         self.hovered_hint = hovered;
 
-        // ---- 工具栏外框基准位置(子视口都锚在它正下方) ----
-        let toolbar_bottom_left = ctx.input(|i| {
-            i.viewport()
-                .outer_rect
-                .map(|r| egui::pos2(r.left() + 2.0, r.bottom() + 6.0))
-        });
+        // ---- 工具栏外框基准位置(功能面板锚正下方, HUD 锚右侧) ----
+        let toolbar_rect = ctx
+            .input(|i| i.viewport().outer_rect);
+        let toolbar_bottom_left =
+            toolbar_rect.map(|r| egui::pos2(r.left() + 2.0, r.bottom() + 6.0));
 
-        // ---- 悬停提示: 子视口弹出在工具栏正下方(不遮按钮) ----
-        if let Some((line1, line2)) = self.hovered_hint.clone() {
-            if let Some(base) = toolbar_bottom_left {
-                let size = egui::vec2(260.0, 54.0);
-                let desired = egui::pos2(base.x, base.y);
-                let mut contents = Some(());
+        // ---- HUD 视口: 悬停提示 + 操作通知, 弹在工具栏右侧 —
+        // R7-8: 两者原先都堆在工具栏正下方, 互相重叠还盖住快照墙; 二级按钮
+        // (快照墙头部图标)的 egui 原生 tooltip 在窄视口右上角直接被裁掉看不见,
+        // 其 hover 统一改走 hovered_hint 通道(见快照墙 icons 闭包)。
+        if self.hovered_hint.is_some() || self.notice.is_some() {
+            if let Some(tr) = toolbar_rect {
+                let hint = self.hovered_hint.clone();
+                let notice = self.notice.clone();
+                let size = egui::vec2(
+                    260.0,
+                    if hint.is_some() && notice.is_some() { 104.0 } else { 56.0 },
+                );
+                let desired = egui::pos2(tr.right() + 8.0, tr.top() + 2.0);
+                let mut hud = Some((hint, notice));
+                let mut open_flag = true; // notice 的 × 关闭经它传出
                 let builder = egui::ViewportBuilder::default()
                     .with_decorations(false)
                     .with_resizable(false)
@@ -936,38 +974,85 @@ impl eframe::App for PlaApp {
                     .with_position(desired)
                     .with_inner_size(size);
                 ctx.show_viewport_immediate(
-                    egui::ViewportId::from_hash_of("hover-tooltip"),
+                    egui::ViewportId::from_hash_of("hud-popup"),
                     builder,
-                    move |tctx, class| {
-                        let Some(()) = contents.take() else { return };
-                        let show_ui = |ui: &mut egui::Ui| {
-                            ui.label(egui::RichText::new(&line1).size(12.5).strong().color(egui::Color32::WHITE));
-                            ui.label(
-                                egui::RichText::new(&line2)
-                                    .size(11.5)
-                                    .color(egui::Color32::from_rgb(0x9a, 0x9a, 0x9a)),
-                            );
+                    |hctx, class| {
+                        let Some((hint, notice)) = hud.take() else { return };
+                        if hctx.input(|i| i.viewport().close_requested()) {
+                            open_flag = false;
+                        }
+                        let show_ui = |ui: &mut egui::Ui, open: &mut bool| {
+                            if let Some((l1, l2)) = &hint {
+                                ui.label(
+                                    egui::RichText::new(l1)
+                                        .size(12.5)
+                                        .strong()
+                                        .color(egui::Color32::WHITE),
+                                );
+                                ui.label(
+                                    egui::RichText::new(l2)
+                                        .size(11.5)
+                                        .color(egui::Color32::from_rgb(0x9a, 0x9a, 0x9a)),
+                                );
+                            }
+                            if let Some((is_err, msg)) = &notice {
+                                if hint.is_some() {
+                                    ui.separator();
+                                }
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(if *is_err { "! 提示" } else { "√ 完成" })
+                                            .size(12.5)
+                                            .strong()
+                                            .color(if *is_err { COL_RED } else { COL_ACCENT }),
+                                    );
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if ui
+                                                .add(
+                                                    egui::Button::new(
+                                                        egui::RichText::new("×")
+                                                            .size(12.0)
+                                                            .color(egui::Color32::WHITE),
+                                                    )
+                                                    .frame(false),
+                                                )
+                                                .clicked()
+                                            {
+                                                *open = false;
+                                            }
+                                        },
+                                    );
+                                });
+                                ui.label(
+                                    egui::RichText::new(msg)
+                                        .color(if *is_err { COL_RED } else { COL_ACCENT }),
+                                );
+                            }
                         };
                         match class {
-                            egui::ViewportClass::Embedded | egui::ViewportClass::Root | egui::ViewportClass::Deferred => {
+                            egui::ViewportClass::Embedded
+                            | egui::ViewportClass::Root
+                            | egui::ViewportClass::Deferred => {
                                 egui::Window::new("提示")
                                     .resizable(false)
                                     .collapsible(false)
-                                    .show(tctx, |ui| show_ui(ui));
+                                    .show(hctx, |ui| show_ui(ui, &mut open_flag));
                             }
                             egui::ViewportClass::Immediate => {
                                 egui::CentralPanel::default()
                                     .frame(panel_frame())
-                                    .show(tctx, |ui| {
-                                        show_ui(ui);
+                                    .show(hctx, |ui| {
+                                        show_ui(ui, &mut open_flag);
                                         paint_panel_glow(ui);
                                     });
-                                let cur = tctx.input(|i| i.viewport().outer_rect);
+                                let cur = hctx.input(|i| i.viewport().outer_rect);
                                 if let Some(r) = cur {
                                     if (r.left() - desired.x).abs() > SNAP_EPS
                                         || (r.top() - desired.y).abs() > SNAP_EPS
                                     {
-                                        tctx.send_viewport_cmd(
+                                        hctx.send_viewport_cmd(
                                             egui::ViewportCommand::OuterPosition(desired),
                                         );
                                     }
@@ -976,6 +1061,9 @@ impl eframe::App for PlaApp {
                         }
                     },
                 );
+                if !open_flag {
+                    self.notice = None;
+                }
             }
         }
 
@@ -1008,28 +1096,42 @@ impl eframe::App for PlaApp {
                 let do_snapshot = std::rc::Rc::new(std::cell::Cell::new(false));
                 let do_open_dir = std::rc::Rc::new(std::cell::Cell::new(false));
                 let do_manage = std::rc::Rc::new(std::cell::Cell::new(false));
-                let (ds, dod, dm) =
-                    (do_snapshot.clone(), do_open_dir.clone(), do_manage.clone());
+                // hover 提示槽: egui 原生 tooltip 在窄视口右上角被裁(R7-8 问题3),
+                // 改写入槽位 → 回到主视口并入 hovered_hint → HUD 弹工具栏右侧。
+                let tip_slot =
+                    std::rc::Rc::new(std::cell::RefCell::new(None::<(String, String)>));
+                let (ds, dod, dm, ts) = (
+                    do_snapshot.clone(),
+                    do_open_dir.clone(),
+                    do_manage.clone(),
+                    tip_slot.clone(),
+                );
                 let icons: Box<dyn FnOnce(&mut egui::Ui)> = Box::new(move |ui| {
-                    let icon_btn = |ui: &mut egui::Ui, glyph: &str, tip: &str, hit: &std::cell::Cell<bool>| {
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    egui::RichText::new(glyph).size(13.0).color(egui::Color32::WHITE),
-                                )
-                                .frame(false)
-                                .rounding(egui::Rounding::same(4.0)),
+                    let icon_btn = |ui: &mut egui::Ui,
+                                    glyph: &str,
+                                    tip: &str,
+                                    hit: &std::cell::Cell<bool>,
+                                    ts: &std::cell::RefCell<Option<(String, String)>>| {
+                        let resp = ui.add(
+                            egui::Button::new(
+                                egui::RichText::new(glyph)
+                                    .size(13.0)
+                                    .color(egui::Color32::WHITE),
                             )
-                            .on_hover_text(tip)
-                            .clicked()
-                        {
+                            .frame(false)
+                            .rounding(egui::Rounding::same(4.0)),
+                        );
+                        if resp.hovered() {
+                            *ts.borrow_mut() = Some((format!("{glyph} {tip}"), String::new()));
+                        }
+                        if resp.clicked() {
                             hit.set(true);
                         }
                     };
                     // right_to_left 布局: 先加的靠右 → 视觉顺序 🗑 📂 📷 ×(右→左)
-                    icon_btn(ui, "🗑", "管理 — 多选删除", &dm);
-                    icon_btn(ui, "📂", "打开快照文件夹", &dod);
-                    icon_btn(ui, "📷", "手动快照 — 保存文档副本 + 截图当前画面", &ds);
+                    icon_btn(ui, "🗑", "管理 — 多选删除", &dm, &ts);
+                    icon_btn(ui, "📂", "打开快照文件夹", &dod, &ts);
+                    icon_btn(ui, "📷", "手动快照 — 保存文档副本 + 截图当前画面", &ds, &ts);
                 });
                 header_extra_and_show(
                     ctx,
@@ -1042,9 +1144,10 @@ impl eframe::App for PlaApp {
                     |ui| {
                         let mut open_err: Option<String> = None;
                         let avail_w = ui.available_width();
-                        // R7-7: 收藏 3 列均分窗口宽(列宽=(可用-2*8pt间距)/3), 全部区一行一个撑满。
-                        let fav_gap = 8.0_f32;
-                        let fav_cell_w = ((avail_w - fav_gap * 2.0) / 3.0).max(40.0);
+                        // R7-8: 用真实 item_spacing 推列宽(写死 8pt 与样式不符时
+                        // 3 列总宽 > 可用宽, 第 3 列被挤出面板右缘)。
+                        let sp = ui.spacing().item_spacing.x;
+                        let fav_cell_w = ((avail_w - sp * 2.0) / 3.0).max(40.0);
                         let big_cell_w = avail_w;
 
                         // ---- 管理模式操作条(删除立即执行, 列表随后按新数据渲染) ----
@@ -1251,6 +1354,10 @@ impl eframe::App for PlaApp {
                     },
                     Some(icons),
                 );
+                // 图标 hover → HUD(工具栏右侧), 覆盖工具栏自身的 hint
+                if let Some(t) = tip_slot.borrow_mut().take() {
+                    self.hovered_hint = Some(t);
+                }
                 if do_snapshot.get() {
                     self.run_action(Action::SnapshotManual);
                 }
@@ -1443,68 +1550,7 @@ impl eframe::App for PlaApp {
             }
         }
 
-        // ---- 提示/错误浮窗(诚实提示): 子视口, 自动 6s 关闭 ----
-        if let Some((is_err, msg)) = self.notice.clone() {
-            if let Some(base) = toolbar_bottom_left {
-                let desired = egui::pos2(base.x, base.y);
-                let size = egui::vec2(300.0, 80.0);
-                let mut contents = Some((is_err, msg));
-                let builder = egui::ViewportBuilder::default()
-                    .with_title("提示")
-                    .with_decorations(false)
-                    .with_resizable(false)
-                    .with_transparent(true)
-                    .with_window_level(egui::WindowLevel::AlwaysOnTop)
-                    .with_active(false)
-                    .with_position(desired)
-                    .with_inner_size(size);
-                let mut open_flag = true;
-                // 非 move: open_flag 借用进闭包, × 关闭能传回。
-                ctx.show_viewport_immediate(
-                    egui::ViewportId::from_hash_of("notice-popup"),
-                    builder,
-                    |nctx, class| {
-                        let Some((is_err, msg)) = contents.take() else { return };
-                        if nctx.input(|i| i.viewport().close_requested()) {
-                            open_flag = false;
-                        }
-                        let show_ui = |ui: &mut egui::Ui, open: &mut bool| {
-                            panel_header(ui, if is_err { "! 提示" } else { "√ 完成" }, open, None);
-                            ui.label(
-                                egui::RichText::new(&msg)
-                                    .color(if is_err { COL_RED } else { COL_ACCENT }),
-                            );
-                        };
-                        match class {
-                            egui::ViewportClass::Embedded | egui::ViewportClass::Root | egui::ViewportClass::Deferred => {
-                                egui::Window::new("提示")
-                                    .resizable(false)
-                                    .collapsible(false)
-                                    .show(nctx, |ui| show_ui(ui, &mut open_flag));
-                            }
-                            egui::ViewportClass::Immediate => {
-                                egui::CentralPanel::default()
-                                    .frame(panel_frame())
-                                    .show(nctx, |ui| show_ui(ui, &mut open_flag));
-                                let cur = nctx.input(|i| i.viewport().outer_rect);
-                                if let Some(r) = cur {
-                                    if (r.left() - desired.x).abs() > SNAP_EPS
-                                        || (r.top() - desired.y).abs() > SNAP_EPS
-                                    {
-                                        nctx.send_viewport_cmd(
-                                            egui::ViewportCommand::OuterPosition(desired),
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    },
-                );
-                if !open_flag {
-                    self.notice = None;
-                }
-            }
-        }
+        // ---- 提示/错误浮窗已并入上方 HUD 视口(R7-8), 不再单独弹出 ----
 
         // ---- 录制捕获(沿用 hotkey.rs 逻辑) ----
         if self.recording.is_some() {
