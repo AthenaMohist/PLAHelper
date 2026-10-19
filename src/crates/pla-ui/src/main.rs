@@ -19,7 +19,7 @@ use pla_ui::round_corners;
 use pla_ui::window_finder;
 
 // ---------------- Plasticity 风格色板 ----------------
-const COL_PANEL: egui::Color32 = egui::Color32::from_rgb(0x1e, 0x1e, 0x1e);
+const COL_PANEL: egui::Color32 = egui::Color32::from_rgb(0x18, 0x18, 0x18);
 const COL_BTN: egui::Color32 = egui::Color32::from_rgb(0x33, 0x33, 0x33);
 const COL_BTN_HOVER: egui::Color32 = egui::Color32::from_rgb(0x3d, 0x3d, 0x3d);
 /// Plasticity 图标方块绿(强调色)。

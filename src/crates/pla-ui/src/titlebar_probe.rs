@@ -207,19 +207,35 @@ mod imp {
         // 文件名块: 起点 < 窗口宽 50%, 宽度 ≥ min_block_w, 取其中最靠右者。
         blocks.retain(|(s, e)| *s < w as i32 / 2 && e - s + 1 >= min_block_w);
         let (left, right) = blocks.into_iter().max_by_key(|(_, e)| *e)?;
-        // 块的垂直范围: 只统计该块列区间内的文字像素行 — 顶栏内容垂直居中,
-        // 这个中心就是工具栏要吸附的垂直中心(最大化/正常通吃)。
+        // 块的垂直范围: 只统计该块列区间内的文字像素行, 且只取**第一条连续
+        // 文字行带**。条带加深(88px)后, 块列区间可能垂直覆盖到第二行内容
+        // (视口按钮与文件名横向重叠), 全范围统计会把块底拉到第二行、中心
+        // 偏低(R6-2j 截图实测)。顶栏文字行内部没有 ≥3px 的整行空白, 以
+        // 3 连空行作为行带结束判据; 行内 <2 像素的杂点不算文字行(抗噪)。
         let mut y_top: i32 = -1;
         let mut y_bot: i32 = -1;
+        let mut empty_run = 0i32;
         for y in ys..ye {
+            let mut px = 0u32;
             for x in left.max(0)..=(right.min(w as i32 - 1)) {
                 let o = y * row + x as usize * 4;
                 let lum = (u32::from(buf[o]) + u32::from(buf[o + 1]) + u32::from(buf[o + 2])) / 3;
                 if lum >= lum_min && lum <= lum_max {
-                    if y_top < 0 {
-                        y_top = y as i32;
+                    px += 1;
+                    if px >= 2 {
+                        break;
                     }
-                    y_bot = y as i32;
+                }
+            }
+            if px >= 2 {
+                if y_top < 0 {
+                    y_top = y as i32;
+                }
+                y_bot = y as i32;
+                empty_run = 0;
+            } else if y_top >= 0 {
+                empty_run += 1;
+                if empty_run >= 3 {
                     break;
                 }
             }
