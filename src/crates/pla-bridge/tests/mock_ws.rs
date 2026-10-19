@@ -49,6 +49,24 @@ const REAL_PUTSOME_RESP: &[u8] = &[
 /// records. The real capture is 368040B; replaying it verbatim requires
 /// committing the blob to the repo, so tests synthesize the frame from the
 /// probe-confirmed field values. Header semantics are identical.
+/// R7-12 实锤布局的一个实体名块: [T=5][idx][a][b=父idx][parent=ffffffff]
+/// [tag=6][slen][name+pad]。(T=5 组块无 mesh 跳步, 最小可控)
+fn entity_block(idx: u32, a: u32, name: &[u8]) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(&5u32.to_le_bytes());
+    b.extend_from_slice(&idx.to_le_bytes());
+    b.extend_from_slice(&a.to_le_bytes());
+    b.extend_from_slice(&0u32.to_le_bytes()); // b = 父 idx
+    b.extend_from_slice(&0xffff_ffffu32.to_le_bytes());
+    b.extend_from_slice(&6u32.to_le_bytes()); // tag
+    b.extend_from_slice(&(name.len() as u32).to_le_bytes());
+    b.extend_from_slice(name);
+    while b.len() % 4 != 0 {
+        b.push(0);
+    }
+    b
+}
+
 fn list_all_response(mid: u32, n_objects: u32) -> Vec<u8> {
     let mut b = Vec::new();
     b.extend_from_slice(&20u32.to_le_bytes()); // LIST_ALL_1
@@ -61,11 +79,13 @@ fn list_all_response(mid: u32, n_objects: u32) -> Vec<u8> {
         b.push(0);
     }
     b.extend_from_slice(&0u32.to_le_bytes()); // version
-    b.extend_from_slice(&n_objects.to_le_bytes());
-    for _ in 0..n_objects {
-        b.extend_from_slice(&44u32.to_le_bytes()); // record len
-        b.extend_from_slice(&[0u8; 44]);
+    b.extend_from_slice(&1u32.to_le_bytes()); // 单记录装 n 个名块(R7-12 布局)
+    let mut body = Vec::new();
+    for i in 0..n_objects {
+        body.extend_from_slice(&entity_block(i, 100 + i, format!("e{i}").as_bytes()));
     }
+    b.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    b.extend_from_slice(&body);
     b
 }
 
@@ -239,11 +259,13 @@ async fn large_list_all_decodes() {
         big.push(0);
     }
     big.extend_from_slice(&0u32.to_le_bytes());
-    big.extend_from_slice(&2u32.to_le_bytes());
-    for _ in 0..2 {
-        big.extend_from_slice(&183_984u32.to_le_bytes());
-        big.extend_from_slice(&vec![0xabu8; 183_984]);
-    }
+    big.extend_from_slice(&1u32.to_le_bytes());
+    // 一条 ~368KB 级记录, 内部装 2 个有效名块(R7-12 布局) — raw_len 断言对齐记录长
+    let mut body = entity_block(0, 100, b"Scene");
+    body.extend_from_slice(&entity_block(1, 101, b"Box.001"));
+    body.resize(183_984, 0);
+    big.extend_from_slice(&183_984u32.to_le_bytes());
+    big.extend_from_slice(&body);
     let url = spawn_replay(vec![big]).await;
     let client = BridgeClient::connect_with_config(&url, test_cfg()).unwrap();
     client.wait_alive(Duration::from_secs(2)).await.unwrap();
@@ -251,7 +273,8 @@ async fn large_list_all_decodes() {
     let v = client.list_all("model1.plasticity").await.unwrap();
     let objs = v["entities"].as_array().unwrap();
     assert_eq!(objs.len(), 2);
-    assert_eq!(objs[0]["raw_len"], 183_984);
+    assert_eq!(objs[0]["name"], "Scene");
+    assert_eq!(objs[1]["kind"], "group");
 
     client.shutdown();
 }

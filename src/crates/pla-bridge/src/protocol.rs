@@ -353,146 +353,132 @@ pub fn response_code(frame: &Frame) -> Option<u32> {
 ///   +1c tag=6 | +20 strlen | name utf8 + 4B 对齐 pad | 之后 [blk_len][blk] 变长块(bbox 72B 等)
 /// facets: 真机变长块语义未实锤 → 返回空, dim 顶点平移待后续探针。
 
-/// [PLA-004 R3] Nested-name-block scan for LIST_VISIBLE (code 22) payloads.
+/// 单个实体名块(R7-12 逆向实锤, 双帧 17/17 记录验证)。
 ///
-/// Wire layout (model1 dump, 2026-10-20): a code-22 response carries a
-/// top-level Scene record plus ONE container record whose payload packs all
-/// scene objects back-to-back. Each nested block ends with
-/// `[parent=0xffffffff][tag=6][slen][name utf8 + pad]`, preceded by an
-/// 8-field header. We flatten by scanning for `[tag=6][slen 1..64]
-/// [printable name]` preceded by `parent=0xffffffff` — verified against the
-/// real dump: 5/5 blocks found, 0 false positives.
-fn scan_nested_names(rec: &[u8]) -> Vec<(String, u32)> {
+/// 码 20/22 响应的记录体内是背靠背的名块流:
+///   `[T][idx][a][b][parent=0xffffffff][tag=6][slen][name utf8+pad]`
+///   * T=type_code: **0=实体(solid) 1=片体(sheet) 5=组/容器(Scene/Group)**
+///     (旧 DPL-218 的 kind_raw=4=Extruded 系把运行计数器误当类型 — 4/14/232
+///     等值随文档变化, 已证伪);
+///   * idx=树内编号, a=全局实体号(文档内唯一, 作对外 id), b=父节点 idx
+///     (Scene=0; 实测 '111' b=0 / '111222' b=1 / 部分体 b=1、b=2 与
+///     Scene→'111'→'111222' 三层嵌套完全吻合);
+///   * parent 槽恒 0xffffffff(根标记), 真层级在 b。
+/// 体记录(T=0/1)名后紧跟 mesh: [nverts][verts nv*24B][ntri][tris ntri*12B]
+/// [nn(=nv)][normals nn*12B][尾部块(96B 级, 结构未解)] — 前五段可精确跳过。
+#[derive(Debug, Clone)]
+pub struct EntityBlock {
+    /// type_code: 0=solid, 1=sheet, 5=group/scene。
+    pub tcode: u32,
+    /// 树内编号(父引用 b 指向它)。
+    pub idx: u32,
+    /// 全局实体号(文档内唯一) — 对外 id。
+    pub a: u32,
+    /// 父节点 idx(Scene=0), 0xffffffff 视为根。
+    pub b: u32,
+    pub name: String,
+}
+
+/// 在记录体内扫描实体名块。带 T/idx/a/b 合法性校验 + 体记录 mesh 区段
+/// 精确跳过(verts/normals 浮点海是误报重灾区, 跳过即归零)。
+fn scan_entity_blocks(rec: &[u8]) -> Vec<EntityBlock> {
     let mut out = Vec::new();
-    if rec.len() < 12 { return out; }
+    if rec.len() < 28 { return out; }
     let mut pos = 0usize;
-    while pos + 12 <= rec.len() {
-        let tag = u32::from_le_bytes(rec[pos..pos + 4].try_into().unwrap());
-        if tag == 6 {
-            let slen = u32::from_le_bytes(rec[pos + 4..pos + 8].try_into().unwrap()) as usize;
-            if (1..=64).contains(&slen) && pos + 8 + slen <= rec.len() {
-                let nm = &rec[pos + 8..pos + 8 + slen];
-                if nm.iter().all(|&c| (0x20..0x7f).contains(&c)) {
-                    // parent u32 sits right before tag
-                    let parent = if pos >= 4 {
-                        u32::from_le_bytes(rec[pos - 4..pos].try_into().unwrap())
-                    } else { 0 };
-                    let name = String::from_utf8_lossy(nm).into_owned();
-                    // dedupe: skip if identical name at same offset already pushed
-                    if !out.iter().any(|(n, _): &(String, u32)| *n == name) {
-                        out.push((name, parent));
+    // 循环条件只保证 tag+slen 在界内(名块可贴记录尾); header 回看由 pos>=20 保证
+    while pos + 8 <= rec.len() {
+        // 名块锚: [tag=6][slen 1..48][printable name]
+        if u32::from_le_bytes(rec[pos..pos+4].try_into().unwrap()) != 6 {
+            pos += 4;
+            continue;
+        }
+        let slen = u32::from_le_bytes(rec[pos+4..pos+8].try_into().unwrap()) as usize;
+        if !(1..=48).contains(&slen) || pos + 8 + slen > rec.len() {
+            pos += 4;
+            continue;
+        }
+        let nm = &rec[pos+8..pos+8+slen];
+        if !nm.iter().all(|c| (32..127).contains(c)) {
+            pos += 4;
+            continue;
+        }
+        // 5 字段头在 tag 前 20B
+        if pos < 20 {
+            pos += 4;
+            continue;
+        }
+        let h = struct_u5(rec, pos - 20);
+        let (tcode, idx, a, b, parent) = h;
+        let hdr_ok = parent == 0xffff_ffff
+            && tcode <= 64
+            && idx < 1_000_000
+            && a < 1_000_000
+            && b < 1_000_000;
+        if !hdr_ok {
+            pos += 4;
+            continue;
+        }
+        out.push(EntityBlock {
+            tcode, idx, a, b, name: String::from_utf8_lossy(nm).to_string(),
+        });
+        let mut next = pos + 8 + slen;
+        next += (4 - (next % 4)) % 4;
+        // 体记录: 精确跳过 mesh 前五段(数值全部做过上限校验, 异常即放弃跳步)
+        if (tcode == 0 || tcode == 1) && next + 4 <= rec.len() {
+            let nv = u32::from_le_bytes(rec[next..next+4].try_into().unwrap()) as usize;
+            let mut p = next + 4 + nv.saturating_mul(24);
+            if nv <= 10_000_000 && p + 4 <= rec.len() {
+                let ntri = u32::from_le_bytes(rec[p..p+4].try_into().unwrap()) as usize;
+                p += 4 + ntri.saturating_mul(12);
+                if ntri <= 10_000_000 && p + 4 <= rec.len() {
+                    let nn = u32::from_le_bytes(rec[p..p+4].try_into().unwrap()) as usize;
+                    p += 4 + nn.saturating_mul(12);
+                    if nn <= 10_000_000 && p <= rec.len() {
+                        next = p; // 尾部块结构未解, 从这里继续小步扫描
                     }
-                    pos += 8 + slen;
-                    // skip 4-byte alignment pad
-                    let used = slen % 4;
-                    if used != 0 { pos += 4 - used; }
-                    continue;
                 }
             }
         }
-        pos += 4;
+        pos = next;
     }
     out
 }
 
-fn parse_object_record(rec: &[u8]) -> Option<(u32, String, String, Vec<Vec<[f64; 3]>>)> {
-    if rec.len() < 32 { return None; }
-    let kind_raw = u32::from_le_bytes(rec[4..8].try_into().ok()?);
-    let type_code = u32::from_le_bytes(rec[8..12].try_into().ok()?);
-    let index = u32::from_le_bytes(rec[12..16].try_into().ok()?);
-    let mut pos = 28usize;
-    let mut name = String::new();
-    let mut facets: Vec<Vec<[f64; 3]>> = Vec::new();
-    while pos + 8 <= rec.len() {
-        let tag = u32::from_le_bytes(rec[pos..pos+4].try_into().ok()?);
-        let nlen = u32::from_le_bytes(rec[pos+4..pos+8].try_into().ok()?) as usize;
-        if tag == 6 && pos + 8 + nlen <= rec.len() {
-            name = String::from_utf8_lossy(&rec[pos+8..pos+8+nlen]).to_string();
-            pos += 8 + nlen;
-            pos += (4 - (pos % 4)) % 4;
-            break;
-        } else if tag == 6 {
-            return None;
-        }
-        pos += 4; // 未知 tag 4B 步进防死循环
+fn struct_u5(rec: &[u8], at: usize) -> (u32, u32, u32, u32, u32) {
+    (
+        u32::from_le_bytes(rec[at..at+4].try_into().unwrap()),
+        u32::from_le_bytes(rec[at+4..at+8].try_into().unwrap()),
+        u32::from_le_bytes(rec[at+8..at+12].try_into().unwrap()),
+        u32::from_le_bytes(rec[at+12..at+16].try_into().unwrap()),
+        u32::from_le_bytes(rec[at+16..at+20].try_into().unwrap()),
+    )
+}
+
+fn kind_name(tcode: u32) -> String {
+    match tcode {
+        0 => "solid".to_string(),
+        1 => "sheet".to_string(),
+        5 => "group".to_string(),
+        other => format!("type{other}"),
     }
-    // name 之后若剩 ≥8B, 按 mock 约定 [fcount u32][每 facet: vcount u32 + vcount×3×f32] 解析 facets;
-    // 真机该区域是变长块(bbox 等), fcount 会是 bbox 字节头(如 0x48)而非小整数 → 用上限(≤64)过滤防误读。
-    if rec.len() >= pos + 8 {
-        let fcount = u32::from_le_bytes(rec[pos..pos+4].try_into().unwrap()) as usize;
-        if fcount > 0 && fcount <= 64 {
-            let mut p2 = pos + 4;
-            for _ in 0..fcount {
-                if rec.len() < p2 + 4 { break; }
-                let vcount = u32::from_le_bytes(rec[p2..p2+4].try_into().unwrap()) as usize;
-                p2 += 4;
-                let mut verts = Vec::with_capacity(vcount.min(65536));
-                for _ in 0..vcount.min(65536) {
-                    if rec.len() < p2 + 12 { break; }
-                    let x = f32::from_le_bytes(rec[p2..p2+4].try_into().unwrap()) as f64;
-                    let y = f32::from_le_bytes(rec[p2+4..p2+8].try_into().unwrap()) as f64;
-                    let z = f32::from_le_bytes(rec[p2+8..p2+12].try_into().unwrap()) as f64;
-                    verts.push([x, y, z]);
-                    p2 += 12;
-                }
-                facets.push(verts);
-            }
-        }
-    }
-    let kind = match (kind_raw, type_code) {
-        (1, _) => "scene".to_string(),
-        (_, 5) | (_, 4) => "solid".to_string(),
-        (_, 2) => "sheet".to_string(),
-        // TODO-PROBE: fillet 真机 type_code 未实锤, mock 约定 9(DPL-218 逆向占位)
-        (_, 9) => "fillet".to_string(),
-        _ => "other".to_string(),
-    };
-    Some((index, kind, name, facets))
 }
 
 pub fn list_response_to_value(frame: &Frame) -> Result<serde_json::Value, BridgeError> {
     match &frame.payload {
         FramePayload::ListResponse { code, filename, version, objects } => {
             let mut objs: Vec<serde_json::Value> = Vec::new();
-            for o in objects {
-                match parse_object_record(o) {
-                    Some((id, kind, name, facets)) => {
-                        let fj: Vec<serde_json::Value> = facets.iter().map(|verts| {
-                            serde_json::json!({ "vertices": verts.iter().map(|v| serde_json::json!([v[0], v[1], v[2]])).collect::<Vec<_>>() })
-                        }).collect();
-                        objs.push(serde_json::json!({
-                            "id": id.to_string(),
-                            "kind": kind,
-                            "name": name,
-                            "facets": fj,
-                            "raw_len": o.len(),
-                        }));
-                    }
-                    None => objs.push(serde_json::json!({ "raw_len": o.len() })),
-                }
-                // [PLA-004 R3] code-22 container records pack all scene objects
-                // in one payload — flatten nested name blocks into the list.
-                // Threshold 4KB: real container 367KB, ordinary flat row ~44B —
-                // flat records (LIST_ALL, small mocks) never produce false hits.
-                if o.len() >= 4096 {
-                    // Skip names already emitted as top-level rows (the container's
-                    // first child can also surface as its own header row).
-                    let seen: Vec<String> = objs
-                        .iter()
-                        .filter_map(|v| v.get("name").and_then(|n| n.as_str()).map(String::from))
-                        .collect();
-                    for (i, (nm, _parent)) in scan_nested_names(o).into_iter().enumerate() {
-                        if seen.iter().any(|n| n == &nm) {
-                            continue;
-                        }
-                        objs.push(serde_json::json!({
-                            "id": format!("n{i}"),
-                            "kind": "nested",
-                            "name": nm,
-                            "facets": [],
-                            "raw_len": 0,
-                        }));
-                    }
+            for body in objects {
+                for blk in scan_entity_blocks(body) {
+                    objs.push(serde_json::json!({
+                        // idx = 树内编号, 全帧唯一(实测 0..24 无重复) — 对外 id。
+                        // (a 是分类型计数器, group 与 solid 间会撞号, 不能作 id)
+                        "id": blk.idx.to_string(),
+                        "order": blk.a,
+                        "parent_idx": blk.b,
+                        "kind": kind_name(blk.tcode),
+                        "name": blk.name,
+                        "raw_len": body.len(),
+                    }));
                 }
             }
             Ok(serde_json::json!({
@@ -708,4 +694,51 @@ fn oc_decode_mock_listall() {
         other => panic!("wrong payload: {other:?}"),
     }
 }
+}
+
+#[cfg(test)]
+mod r712_tests {
+    use super::*;
+
+    fn block(idx: u32, a: u32, name: &[u8]) -> Vec<u8> {
+        let mut b = Vec::new();
+        for v in [5u32, idx, a, 0, 0xffff_ffff] {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        b.extend_from_slice(&6u32.to_le_bytes());
+        b.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        b.extend_from_slice(name);
+        while b.len() % 4 != 0 { b.push(0); }
+        b
+    }
+
+    #[test]
+    fn scan_finds_two_adjacent_group_blocks() {
+        let mut body = block(0, 100, b"e0");
+        body.extend_from_slice(&block(1, 101, b"e1"));
+        let blks = scan_entity_blocks(&body);
+        assert_eq!(blks.len(), 2, "got: {blks:?}");
+        assert_eq!(blks[0].name, "e0");
+        assert_eq!(blks[1].name, "e1");
+        assert_eq!(blks[1].a, 101);
+    }
+
+    #[test]
+    fn scan_mesh_body_skips_floats() {
+        // T=0 体块 + nverts=2 + verts/normals 浮点 + ntri=1 + 3 索引 + 尾巴
+        let mut body = block(0, 1, b"Solid.001");
+        let mut mesh = Vec::new();
+        mesh.extend_from_slice(&2u32.to_le_bytes()); // nverts
+        mesh.extend_from_slice(&[0u8; 48]);          // verts 2*24
+        mesh.extend_from_slice(&1u32.to_le_bytes()); // ntri
+        mesh.extend_from_slice(&[0u8; 12]);          // tris
+        mesh.extend_from_slice(&2u32.to_le_bytes()); // nn
+        mesh.extend_from_slice(&[0u8; 48]);          // normals
+        mesh.extend_from_slice(&[0x06, 0, 0, 0, 3, 0, 0, 0]); // 尾部伪装名块(应被 T 校验拦下? T=3 合法… 此处只验不 panic)
+        body.extend_from_slice(&mesh);
+        body.extend_from_slice(&block(1, 2, b"Next"));
+        let blks = scan_entity_blocks(&body);
+        assert_eq!(blks.len(), 2, "got: {blks:?}");
+        assert_eq!(blks[1].name, "Next");
+    }
 }
