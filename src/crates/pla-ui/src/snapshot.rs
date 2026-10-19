@@ -675,3 +675,67 @@ mod tests {
         assert!(fallback.is_ok(), "软过滤回退失败: {fallback:?}");
     }
 }
+
+
+/// 当前文档路径(R7-15 自动快照用: mtime 判断"是否有新保存内容")。
+pub fn latest_doc_path(doc_key: &str) -> Option<PathBuf> {
+    find_latest_doc(doc_key)
+}
+
+/// 清理策略(R7-15): 按数量上限 + 按时间。返回删除个数。
+/// 顺序: 先删超龄, 再按旧→新删到 max_count 以内。附带同名 png/meta 同步删除。
+pub fn cleanup_snapshots(doc_key: &str, max_count: usize, max_age_days: u64) -> Result<usize, String> {
+    let dir = snapshot_dir_of(doc_key);
+    let mut entries: Vec<(String, std::time::SystemTime)> = std::fs::read_dir(&dir)
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| {
+                    e.path()
+                        .extension()
+                        .map(|x| x == "plasticity")
+                        .unwrap_or(false)
+                })
+                .filter_map(|e| {
+                    let name = e.file_name().to_str()?.to_string();
+                    let mt = e.metadata().and_then(|m| m.modified()).ok()?;
+                    Some((name, mt))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if entries.is_empty() {
+        return Ok(0);
+    }
+    entries.sort_by(|a, b| a.1.cmp(&b.1)); // 旧→新
+    let now = std::time::SystemTime::now();
+    let mut to_delete: Vec<String> = Vec::new();
+    if max_age_days > 0 {
+        let ttl = std::time::Duration::from_secs(max_age_days * 86400);
+        for (name, mt) in &entries {
+            if now.duration_since(*mt).map(|d| d > ttl).unwrap_or(false) {
+                to_delete.push(name.clone());
+            }
+        }
+    }
+    if max_count > 0 {
+        let aged = to_delete.len();
+        let alive = entries.len() - aged;
+        if alive > max_count {
+            let mut need = alive - max_count;
+            for (name, _) in &entries {
+                if need == 0 {
+                    break;
+                }
+                if to_delete.contains(name) {
+                    continue;
+                }
+                to_delete.push(name.clone());
+                need -= 1;
+            }
+        }
+    }
+    if to_delete.is_empty() {
+        return Ok(0);
+    }
+    delete_snapshots(doc_key, &to_delete)
+}

@@ -53,6 +53,10 @@ pub struct SelectionSnapshot {
     pub state: String,
     pub size: i64,
     pub items: Vec<SelItem>,
+    /// undo 栈深度 = 已执行操作步数(自动快照"定步数"计数源)。
+    pub undo_len: i64,
+    /// 几何数据库版本号(编辑即增)。
+    pub geo_ver: i64,
 }
 
 /// 实体树节点（平铺, indent 表层级）。
@@ -113,7 +117,11 @@ const SEL_SNAPSHOT_JS: &str = r#"(function(){
       name: String(x.name||''),
       parent: (x.parent&&x.parent.constructor)? x.parent.constructor.name : ''
   }) }) } catch(e){}
+  var undo=-1, geoVer=-1;
+  try{ undo = ed.history._undoStack.length }catch(e){}
+  try{ geoVer = ed.geo._version }catch(e){}
   return JSON.stringify({ st:'ok', size: (typeof s.size==='number')? s.size : -1,
+    undo: undo, geoVer: geoVer,
     ids: idset('ids'),
     solidIds: idset('solidIds'), sheetIds: idset('sheetIds'),
     faceIds: idset('faceIds'), edgeIds: idset('edgeIds'),
@@ -322,6 +330,8 @@ async fn session_loop(
                         state: "ok".into(),
                         size: v["size"].as_i64().unwrap_or(-1),
                         items,
+                        undo_len: v["undo"].as_i64().unwrap_or(-1),
+                        geo_ver: v["geoVer"].as_i64().unwrap_or(-1),
                     }));
                 } else {
                     let _ = ev_tx.send(CdpEvent::Selection(SelectionSnapshot {
@@ -329,6 +339,8 @@ async fn session_loop(
                         state: v["st"].as_str().unwrap_or("unknown").to_string(),
                         size: -1,
                         items: Vec::new(),
+                        undo_len: -1,
+                        geo_ver: -1,
                     }));
                 }
             }

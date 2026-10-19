@@ -159,3 +159,30 @@ mod tests {
         assert_eq!(h.display(), "Ctrl+Alt+Shift+F5");
     }
 }
+
+/// 持久化路径: exe 同级 hotkeys.json(R7-15, 工程债 #13)。
+fn config_path() -> PathBuf {
+    let exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."));
+    exe.join("hotkeys.json")
+}
+
+use std::path::PathBuf;
+
+/// 保存快捷键绑定到 hotkeys.json(尽力而为, 失败静默)。
+pub fn save_binds(binds: &HotkeyMap) {
+    let path = config_path();
+    if let Ok(json) = serde_json::to_string_pretty(&binds.binds) {
+        let _ = std::fs::write(&path, json);
+    }
+}
+
+/// 启动时加载 hotkeys.json; 文件不存在/损坏时返回 None(用默认绑定)。
+pub fn load_binds() -> Option<HotkeyMap> {
+    let path = config_path();
+    let data = std::fs::read_to_string(&path).ok()?;
+    let binds: std::collections::BTreeMap<String, Hotkey> = serde_json::from_str(&data).ok()?;
+    Some(HotkeyMap { binds })
+}

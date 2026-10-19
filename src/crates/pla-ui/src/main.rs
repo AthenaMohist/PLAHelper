@@ -85,7 +85,7 @@ const TOOLBAR_ACTIONS: [Action; 4] = [
 const PANEL_SNAPSHOTS: [f32; 2] = [232.0, 480.0];
 const PANEL_ENTITIES: [f32; 2] = [280.0, 410.0];
 const PANEL_DIM: [f32; 2] = [280.0, 170.0];
-const PANEL_SETTINGS: [f32; 2] = [300.0, 470.0];
+const PANEL_SETTINGS: [f32; 2] = [300.0, 560.0];
 
 fn main() -> eframe::Result<()> {
     let opts = eframe::NativeOptions {
@@ -135,6 +135,18 @@ struct PlaApp {
     cdp_tree: Vec<(String, String, i64, bool)>,
     /// CDP 选择集勾选成员 (kind, id, name)。
     sel_cdp_members: Vec<(String, String, String)>,
+    /// 自动快照(R7-15, PRD P0-1): 定时(分钟, 0=关) + 定步数(undo 增量, 0=关)。
+    auto_snap_enabled: bool,
+    auto_interval_min: i32,
+    auto_steps: i32,
+    /// 清理策略: 数量上限(0=不限) / 保留天数(0=不限)。
+    snap_max_count: i32,
+    snap_max_age_days: i32,
+    last_auto_time: Instant,
+    last_auto_step: i64,
+    last_auto_mtime: Option<std::time::SystemTime>,
+    /// CDP 侧 undo 栈深度(步数计数源)。
+    cdp_undo: i64,
     dim_value: f64,
     hotkeys: HotkeyMap,
     /// 正在录制快捷键的动作名 (None = 未在录制)。
@@ -613,8 +625,17 @@ impl PlaApp {
             live_sel: Vec::new(),
             cdp_tree: Vec::new(),
             sel_cdp_members: Vec::new(),
+            auto_snap_enabled: true,
+            auto_interval_min: 10,
+            auto_steps: 20,
+            snap_max_count: 50,
+            snap_max_age_days: 7,
+            last_auto_time: Instant::now(),
+            last_auto_step: -1,
+            last_auto_mtime: None,
+            cdp_undo: -1,
             dim_value: 0.0,
-            hotkeys: HotkeyMap::default(),
+            hotkeys: pla_ui::hotkey::load_binds().unwrap_or_default(),
             recording: None,
             notice: None,
             notice_at: Instant::now(),
@@ -649,6 +670,9 @@ impl PlaApp {
             match ev {
                 pla_bridge::cdp::CdpEvent::Status(s) => self.cdp_status = s,
                 pla_bridge::cdp::CdpEvent::Selection(snap) => {
+                    if snap.undo_len >= 0 {
+                        self.cdp_undo = snap.undo_len;
+                    }
                     if snap.ok {
                         self.live_sel = snap
                             .items
@@ -672,6 +696,71 @@ impl PlaApp {
         // 提示浮窗自动关闭。
         if self.notice.is_some() && self.notice_at.elapsed() > NOTICE_TTL {
             self.notice = None;
+        }
+        self.auto_snapshot_tick();
+    }
+
+    /// 自动快照(R7-15, PRD P0-1): 定时 + 定步数 + mtime 防重 + 清理策略。
+    fn auto_snapshot_tick(&mut self) {
+        if !self.auto_snap_enabled || !self.cdp_status.contains("已连接") {
+            return;
+        }
+        // 定时
+        if self.auto_interval_min > 0
+            && self.last_auto_time.elapsed()
+                >= Duration::from_secs(self.auto_interval_min as u64 * 60)
+        {
+            self.try_auto_snapshot("定时");
+            return;
+        }
+        // 定步数: undo 栈深度增量(首次见到计数器只记录基线)
+        if self.auto_steps > 0 && self.cdp_undo >= 0 {
+            if self.last_auto_step < 0 {
+                self.last_auto_step = self.cdp_undo;
+            } else if self.cdp_undo - self.last_auto_step >= self.auto_steps as i64 {
+                self.try_auto_snapshot("定步数");
+            }
+        }
+    }
+
+    /// 尝试一次自动快照: 文档 mtime 未变(无新保存)则跳过; 成功后跑清理策略。
+    fn try_auto_snapshot(&mut self, reason: &str) {
+        self.last_auto_time = Instant::now();
+        if self.cdp_undo >= 0 {
+            self.last_auto_step = self.cdp_undo;
+        }
+        let mtime = pla_ui::snapshot::latest_doc_path(&self.doc_key)
+            .and_then(|p| p.metadata().ok())
+            .and_then(|m| m.modified().ok());
+        // mtime 防重: 上次自动快照后没有新的 Ctrl+S → 无新内容可拍
+        if let (Some(a), Some(b)) = (mtime, self.last_auto_mtime) {
+            if a == b {
+                return;
+            }
+        }
+        let hwnd = self.snap_target.as_ref().map(|t| t.hwnd);
+        match pla_ui::snapshot::take_manual_snapshot(&self.doc_key, hwnd) {
+            Ok(name) => {
+                self.last_auto_mtime = mtime;
+                self.snapshots = pla_ui::snapshot::list_snapshots(&self.doc_key);
+                self.snap_pngs.clear();
+                self.snap_infos = pla_ui::snapshot::load_meta_infos(&self.doc_key);
+                // 清理策略
+                let removed = pla_ui::snapshot::cleanup_snapshots(
+                    &self.doc_key,
+                    self.snap_max_count.max(0) as usize,
+                    self.snap_max_age_days.max(0) as u64,
+                )
+                .unwrap_or(0);
+                self.snapshots = pla_ui::snapshot::list_snapshots(&self.doc_key);
+                if removed > 0 {
+                    self.set_notice((
+                        false,
+                        format!("自动快照({reason}): {name}；清理 {} 个旧快照", removed),
+                    ));
+                }
+            }
+            Err(_) => {} // 自动快照失败不打扰(如未保存过), 下次再试
         }
     }
 
@@ -1692,6 +1781,32 @@ impl eframe::App for PlaApp {
                             egui::RichText::new(format!("状态: {}", self.bridge_status)).small(),
                         );
                         ui.separator();
+                        section_header(ui, "AUTO SNAPSHOT");
+                        ui.checkbox(&mut self.auto_snap_enabled, "启用自动快照(需 CDP 已连接)");
+                        ui.horizontal(|ui| {
+                            ui.label("定时(分钟):");
+                            ui.add(
+                                egui::DragValue::new(&mut self.auto_interval_min)
+                                    .range(0..=1440),
+                            );
+                            ui.label("定步数:");
+                            ui.add(egui::DragValue::new(&mut self.auto_steps).range(0..=1000));
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("上限(个):");
+                            ui.add(egui::DragValue::new(&mut self.snap_max_count).range(0..=500));
+                            ui.label("保留(天):");
+                            ui.add(egui::DragValue::new(&mut self.snap_max_age_days).range(0..=365));
+                        });
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "当前步数: {} — 快照按文档保存副本, 未保存新内容时自动跳过",
+                                if self.cdp_undo >= 0 { self.cdp_undo.to_string() } else { "-".into() }
+                            ))
+                            .small()
+                            .color(COL_MUTED),
+                        );
+                        ui.separator();
                         section_header(ui, "HOTKEYS");
                         ui.label(
                             egui::RichText::new("提示: 右键工具栏按钮可直接开始录制")
@@ -1719,6 +1834,7 @@ impl eframe::App for PlaApp {
                                         && ui.small_button("清除").clicked()
                                     {
                                         self.hotkeys.binds.remove(&key);
+                                        pla_ui::hotkey::save_binds(&self.hotkeys);
                                     }
                                 });
                             }
@@ -1877,6 +1993,7 @@ impl eframe::App for PlaApp {
                             Ok(()) => {
                                 self.recording = None;
                                 self.notice = None;
+                                pla_ui::hotkey::save_binds(&self.hotkeys);
                             }
                             Err(others) => {
                                 self.set_notice((
