@@ -42,10 +42,19 @@ pub fn sanitize_filename(name: &str) -> String {
     }
 }
 
-/// 手动快照: 找最近修改的 .plasticity 文档(常见位置), 复制到 snapshots/。
+/// 手动快照: 找最近修改的 .plasticity 文档, 复制到 snapshots/。
+/// 文档定位三路(R7-3, 本机实测 D 盘项目目录的文档只有 Recent 能覆盖):
+///   1. Windows Recent *.plasticity.lnk 解析(IShellLink COM) — 覆盖任意保存位置, 最可靠;
+///   2. 已知文件夹(SHGetKnownFolderPath, 处理下载重定向到 D:\下载 之类)递归扫深度 2;
+///   3. USERPROFILE 下的 Documents/Desktop/Downloads 兜底。
+/// doc_key 是软过滤: 命中则取命中集合里最新的, 全体为空时回退全局最新(不再因硬过滤报"找不到")。
 pub fn take_manual_snapshot(doc_key: &str) -> Result<String, String> {
-    let src = find_latest_doc(doc_key)
-        .ok_or_else(|| "未找到最近修改的 .plasticity 文档 — 请先在 Plasticity 中 Ctrl+S 保存, 并确认文档在常见位置(文档/桌面/下载)".to_string())?;
+    let src = find_latest_doc(doc_key).ok_or_else(|| {
+        format!(
+            "未找到最近修改的 .plasticity 文档 — 已扫 Windows Recent 记录 + 已知文件夹(文档/桌面/下载), \
+             关键字 '{doc_key}' 无命中且无任何 .plasticity 候选。请先在 Plasticity 中 Ctrl+S 保存一次。"
+        )
+    })?;
     // 文件名过净化函数: doc 来源 stem + 时间戳均可能含非法字符。
     let name = sanitize_filename(&format!(
         "{}-{}",
@@ -87,31 +96,223 @@ pub fn list_snapshots() -> Vec<String> {
     names
 }
 
+/// 全量候选收集 → doc_key 软过滤 → 取最新。
 fn find_latest_doc(doc_key: &str) -> Option<PathBuf> {
-    let mut best: Option<(SystemTime, PathBuf)> = None;
-    let roots = [
-        dirs_home().join("Documents"),
-        dirs_home().join("Desktop"),
-        dirs_home().join("Downloads"),
-        dirs_home(),
-    ];
-    for root in roots {
-        let Ok(rd) = std::fs::read_dir(&root) else { continue };
-        for entry in rd.flatten() {
-            let p = entry.path();
+    let mut cands: Vec<(SystemTime, PathBuf)> = Vec::new();
+    let mut push = |p: PathBuf| {
+        if !p.is_file() {
+            return; // Recent 里可能有已删除/改名的旧目标, 只收现存文件
+        }
+        if let Ok(meta) = p.metadata() {
+            let mt = meta.modified().unwrap_or(UNIX_EPOCH);
+            cands.push((mt, p));
+        }
+    };
+
+    // 1) Recent .lnk 解析 — 本机实锤唯一能覆盖 D:\...\PLAhelper\test\model1.plasticity 的通道。
+    for p in recent_plasticity_targets() {
+        push(p);
+    }
+    // 2) 已知文件夹(SHGetKnownFolderPath, 跟随系统重定向) 递归深度 2。
+    for root in known_roots() {
+        scan_dir_recursive(&root, 2, &mut push);
+    }
+
+    if cands.is_empty() {
+        return None;
+    }
+    cands.sort_by(|a, b| b.0.cmp(&a.0)); // 新→旧
+    let key = doc_key.trim().trim_end_matches(".plasticity");
+    if key.is_empty() {
+        return cands.first().map(|(_, p)| p.clone());
+    }
+    // 软过滤: 命中集合非空才用, 否则回退全局最新(全局都空时上面已返回 None)。
+    cands.iter()
+        .find(|(_, p)| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.contains(key))
+                .unwrap_or(false)
+        })
+        .or_else(|| cands.first())
+        .map(|(_, p)| p.clone())
+}
+
+/// 已知文件夹扫描根: SHGetKnownFolderPath(跟随重定向) + USERPROFILE 兜底, 去重。
+fn known_roots() -> Vec<PathBuf> {
+    use known_folder::folder_id;
+    let mut roots = Vec::new();
+    for fid in [
+        folder_id::DOCUMENTS,
+        folder_id::DESKTOP,
+        folder_id::DOWNLOADS,
+    ] {
+        if let Some(p) = known_folder::path(fid) {
+            roots.push(p);
+        }
+    }
+    let home = dirs_home();
+    roots.push(home.join("Documents"));
+    roots.push(home.join("Desktop"));
+    roots.push(home.join("Downloads"));
+    roots.push(home.clone());
+    let mut seen = std::collections::HashSet::new();
+    roots.retain(|p| seen.insert(p.canonicalize().unwrap_or_else(|_| p.clone())));
+    roots
+}
+
+/// 深度受限递归扫描 .plasticity 文件(深度 0 = 只扫本层)。
+fn scan_dir_recursive(dir: &PathBuf, depth: u8, push: &mut impl FnMut(PathBuf)) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for entry in rd.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            // 跳过明显的系统/缓存目录, 避免扫 home 全树时踩进 AppData
             let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            let matches = name.ends_with(".plasticity")
-                && (doc_key.is_empty() || name.contains(doc_key.trim_end_matches(".plasticity")));
-            if !matches { continue; }
-            if let Ok(meta) = p.metadata() {
-                let mt = meta.modified().unwrap_or(UNIX_EPOCH);
-                if best.as_ref().map(|(t, _)| mt > *t).unwrap_or(true) {
-                    best = Some((mt, p));
+            if name.starts_with('.') || name == "AppData" {
+                continue;
+            }
+            if depth > 0 {
+                scan_dir_recursive(&p, depth - 1, push);
+            }
+        } else if p
+            .extension()
+            .map(|x| x == "plasticity")
+            .unwrap_or(false)
+        {
+            push(p);
+        }
+    }
+}
+
+/// Known Folder API 封装(windows crate, 仅 cfg(windows) 生效, 其它平台空实现)。
+mod known_folder {
+    #[cfg(windows)]
+    pub mod folder_id {
+        pub use windows::Win32::UI::Shell::{
+            FOLDERID_Desktop as DESKTOP, FOLDERID_Documents as DOCUMENTS,
+            FOLDERID_Downloads as DOWNLOADS,
+        };
+    }
+
+    /// SHGetKnownFolderPath → PWSTR(调用方持有, 用完 CoTaskMemFree)。
+    #[cfg(windows)]
+    pub fn path(fid: windows::core::GUID) -> Option<std::path::PathBuf> {
+        use windows::Win32::System::Com::CoTaskMemFree;
+        use windows::Win32::UI::Shell::{KNOWN_FOLDER_FLAG, SHGetKnownFolderPath};
+        unsafe {
+            match SHGetKnownFolderPath(&fid, KNOWN_FOLDER_FLAG(0), None) {
+                Ok(pw) => {
+                    let s = pw.to_string().ok();
+                    CoTaskMemFree(Some(pw.as_ptr() as *const _));
+                    s.map(std::path::PathBuf::from)
                 }
+                Err(_) => None,
             }
         }
     }
-    best.map(|(_, p)| p)
+
+    #[cfg(not(windows))]
+    pub mod folder_id {
+        pub const DOCUMENTS: u32 = 0;
+        pub const DESKTOP: u32 = 0;
+        pub const DOWNLOADS: u32 = 0;
+    }
+    #[cfg(not(windows))]
+    pub fn path(_fid: u32) -> Option<std::path::PathBuf> {
+        None
+    }
+}
+
+/// 解析 Windows Recent 中所有 *.plasticity.lnk 的目标完整路径。
+/// COM: CoInitializeEx → CoCreateInstance(ShellLink) → IPersistFile::Load → IShellLinkW::GetPath。
+/// 注: windows-0.52 未生成 CLSID_ShellLink 常量, 手写 GUID(00021401-0000-0000-C000-000000000046)。
+#[cfg(windows)]
+fn recent_plasticity_targets() -> Vec<PathBuf> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::{ComInterface, GUID, PCWSTR};
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, IPersistFile, CLSCTX_INPROC_SERVER,
+        COINIT_APARTMENTTHREADED, STGM_READ,
+    };
+    use windows::Win32::UI::Shell::{IShellLinkW, SHGetKnownFolderPath, FOLDERID_Recent, KNOWN_FOLDER_FLAG};
+
+    // CLSID_ShellLink 的稳定值(自 Windows 95 起未变)
+    const CLSID_SHELL_LINK: GUID = GUID::from_u128(0x00021401_0000_0000_c000_000000000046);
+
+    let mut out = Vec::new();
+    unsafe {
+        // 可能已被宿主初始化为其它模式, RPC_E_CHANGED_MODE 时 apartment 仍就绪, 照常继续
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+
+        let recent_dir = match SHGetKnownFolderPath(&FOLDERID_Recent, KNOWN_FOLDER_FLAG(0), None) {
+            Ok(pw) => {
+                let s = pw.to_string().ok().map(PathBuf::from);
+                windows::Win32::System::Com::CoTaskMemFree(Some(pw.as_ptr() as *const _));
+                s
+            }
+            Err(_) => None,
+        };
+        let Some(recent_dir) = recent_dir else { return out };
+
+        let Ok(rd) = std::fs::read_dir(&recent_dir) else { return out };
+        let mut lnks: Vec<std::path::PathBuf> = rd
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.to_lowercase().ends_with(".plasticity.lnk"))
+                    .unwrap_or(false)
+            })
+            .collect();
+        lnks.sort_by_key(|p| {
+            std::fs::metadata(p)
+                .and_then(|m| m.modified())
+                .unwrap_or(UNIX_EPOCH)
+        });
+        lnks.reverse(); // 新→旧
+
+        let shell_link: IShellLinkW =
+            match CoCreateInstance(&CLSID_SHELL_LINK, None, CLSCTX_INPROC_SERVER) {
+                Ok(sl) => sl,
+                Err(_) => return out,
+            };
+        let persist: IPersistFile = match shell_link.cast() {
+            Ok(p) => p,
+            Err(_) => return out,
+        };
+
+        for lnk in lnks {
+            let wide: Vec<u16> = std::ffi::OsStr::new(&lnk)
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+            if persist.Load(PCWSTR(wide.as_ptr()), STGM_READ).is_err() {
+                continue;
+            }
+            let mut buf = [0u16; 1024];
+            // GetPath(pszfile, pfd: *mut WIN32_FIND_DATAW, fflags) — 不需要 find data, 传 null
+            if shell_link.GetPath(&mut buf, std::ptr::null_mut(), 0).is_err() {
+                continue;
+            }
+            let len = buf.iter().position(|&c| c == 0).unwrap_or(0);
+            if len == 0 {
+                continue;
+            }
+            let target = String::from_utf16_lossy(&buf[..len]);
+            let target = target.trim_end_matches('\0').trim();
+            if target.to_lowercase().ends_with(".plasticity") {
+                out.push(PathBuf::from(target));
+            }
+        }
+    }
+    out
+}
+
+#[cfg(not(windows))]
+fn recent_plasticity_targets() -> Vec<PathBuf> {
+    Vec::new()
 }
 
 fn dirs_home() -> PathBuf {
@@ -148,5 +349,29 @@ mod tests {
         std::fs::write(&path, b"probe").expect("快照文件名无法落盘");
         assert!(path.exists());
         std::fs::remove_file(&path).ok();
+    }
+
+    /// 冒烟(本机手动跑: cargo test -p pla-ui --release -- --ignored --nocapture):
+    /// 验证 Recent .lnk 解析能定位到真实文档(用户实际文档在 D 盘项目目录,
+    /// 旧版只扫 USERPROFILE 必然报"未找到" — R7-3 根因回归)。
+    #[test]
+    #[ignore]
+    fn recent_lnk_resolves_real_doc_and_snapshot_succeeds() {
+        let targets = recent_plasticity_targets();
+        println!("Recent 解析到 {} 个 .plasticity 目标:", targets.len());
+        for t in &targets {
+            println!("  {t:?} (exists={})", t.is_file());
+        }
+        match find_latest_doc("model1") {
+            Some(p) => println!("doc_key=model1 → {p:?}"),
+            None => println!("doc_key=model1 → 无候选"),
+        }
+        let result = take_manual_snapshot("model1");
+        println!("take_manual_snapshot(model1) = {result:?}");
+        assert!(result.is_ok(), "手动快照失败: {result:?}");
+        // doc_key 无命中时软过滤回退全局最新, 也应成功
+        let fallback = take_manual_snapshot("no-such-key-xyz");
+        println!("take_manual_snapshot(无命中key) = {fallback:?}");
+        assert!(fallback.is_ok(), "软过滤回退失败: {fallback:?}");
     }
 }
