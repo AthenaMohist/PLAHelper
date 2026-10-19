@@ -2,13 +2,23 @@
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub fn snapshot_dir() -> PathBuf {
+/// 快照目录策略(R7-4): 跟随文档 — 文档同级的 snapshot/ 文件夹, 每个文档的快照各归其位。
+/// doc 为 None(尚未定位到文档)时退回 exe 同级 snapshots/(旧行为兜底)。
+pub fn snapshot_dir_for(doc: Option<&PathBuf>) -> PathBuf {
+    match doc {
+        Some(d) => d
+            .parent()
+            .map(|p| p.join("snapshot"))
+            .unwrap_or_else(fallback_dir),
+        None => fallback_dir(),
+    }
+}
+
+fn fallback_dir() -> PathBuf {
     let exe = std::env::current_exe().ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
         .unwrap_or_else(|| PathBuf::from("."));
-    let dir = exe.join("snapshots");
-    let _ = std::fs::create_dir_all(&dir);
-    dir
+    exe.join("snapshots")
 }
 
 fn now_stamp() -> String {
@@ -42,7 +52,7 @@ pub fn sanitize_filename(name: &str) -> String {
     }
 }
 
-/// 手动快照: 找最近修改的 .plasticity 文档, 复制到 snapshots/。
+/// 手动快照: 定位当前文档(最近修改的 .plasticity), 复制到文档同级 snapshot/ 文件夹。
 /// 文档定位三路(R7-3, 本机实测 D 盘项目目录的文档只有 Recent 能覆盖):
 ///   1. Windows Recent *.plasticity.lnk 解析(IShellLink COM) — 覆盖任意保存位置, 最可靠;
 ///   2. 已知文件夹(SHGetKnownFolderPath, 处理下载重定向到 D:\下载 之类)递归扫深度 2;
@@ -61,14 +71,17 @@ pub fn take_manual_snapshot(doc_key: &str) -> Result<String, String> {
         src.file_stem().and_then(|s| s.to_str()).unwrap_or("doc"),
         now_stamp()
     ));
-    let dst = snapshot_dir().join(format!("{name}.plasticity"));
+    let dir = snapshot_dir_for(Some(&src));
+    let _ = std::fs::create_dir_all(&dir);
+    let dst = dir.join(format!("{name}.plasticity"));
     std::fs::copy(&src, &dst).map_err(|e| format!("复制失败: {e}"))?;
     Ok(name)
 }
 
-/// 打开快照文件夹(explorer)。
-pub fn open_snapshot_dir() -> Result<(), String> {
-    let dir = snapshot_dir();
+/// 打开当前文档的快照文件夹(explorer); 目录不存在则先创建。
+pub fn open_snapshot_dir(doc_key: &str) -> Result<(), String> {
+    let dir = snapshot_dir_for(find_latest_doc(doc_key).as_ref());
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建快照目录失败: {e}"))?;
     std::process::Command::new("explorer")
         .arg(dir.as_os_str())
         .spawn()
@@ -76,9 +89,10 @@ pub fn open_snapshot_dir() -> Result<(), String> {
         .map_err(|e| format!("打开失败: {e}"))
 }
 
-/// 启动时列出现有快照(原 TODO G2-2): exe 同级 snapshots/*.plasticity, 文件名新→旧。
-pub fn list_snapshots() -> Vec<String> {
-    let mut names: Vec<String> = std::fs::read_dir(snapshot_dir())
+/// 列出当前文档的现有快照(原 TODO G2-2): 文档同级 snapshot/*.plasticity, 文件名新→旧。
+pub fn list_snapshots(doc_key: &str) -> Vec<String> {
+    let dir = snapshot_dir_for(find_latest_doc(doc_key).as_ref());
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
         .map(|rd| {
             rd.flatten()
                 .filter(|e| {
@@ -369,6 +383,15 @@ mod tests {
         let result = take_manual_snapshot("model1");
         println!("take_manual_snapshot(model1) = {result:?}");
         assert!(result.is_ok(), "手动快照失败: {result:?}");
+        // R7-4: 快照必须落在文档同级 snapshot/ 目录
+        if let Some(doc) = find_latest_doc("model1") {
+            let expect = snapshot_dir_for(Some(&doc));
+            println!("期望快照目录: {expect:?} (exists={})", expect.is_dir());
+            assert!(expect.is_dir(), "文档同级 snapshot/ 目录未创建");
+            let list = list_snapshots("model1");
+            println!("list_snapshots(model1) = {list:?}");
+            assert!(!list.is_empty(), "文档同级 snapshot/ 中列不到快照");
+        }
         // doc_key 无命中时软过滤回退全局最新, 也应成功
         let fallback = take_manual_snapshot("no-such-key-xyz");
         println!("take_manual_snapshot(无命中key) = {fallback:?}");

@@ -321,6 +321,7 @@ impl PlaApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         install_cjk_fonts(&cc.egui_ctx);
         apply_plasticity_style(&cc.egui_ctx);
+        let doc_key = "model1".to_string();
         Self {
             bridge: BridgeHandle::spawn(),
             bridge_status: "连接中…".into(),
@@ -330,7 +331,7 @@ impl PlaApp {
             probed_edge: None,
             last_probe_poll: Instant::now() - Duration::from_millis(PROBE_POLL_MS),
             entities: Vec::new(),
-            snapshots: pla_ui::snapshot::list_snapshots(),
+            snapshots: pla_ui::snapshot::list_snapshots(&doc_key),
             show_snapshots: false,
             show_entities: false,
             show_dim: false,
@@ -343,7 +344,7 @@ impl PlaApp {
             notice: None,
             notice_at: Instant::now(),
             hovered_hint: None,
-            doc_key: "model1".into(),
+            doc_key,
             round_state: round_corners::RoundState::new(),
             last_round_poll: Instant::now() - Duration::from_millis(ROUND_POLL_MS),
         }
@@ -786,7 +787,7 @@ impl eframe::App for PlaApp {
                         section_header(ui, "SNAPSHOTS");
                         ui.horizontal(|ui| {
                             if ui.button("📂 打开文件夹").clicked() {
-                                if let Err(e) = pla_ui::snapshot::open_snapshot_dir() {
+                                if let Err(e) = pla_ui::snapshot::open_snapshot_dir(&self.doc_key) {
                                     self.set_notice((true, e));
                                 }
                             }
