@@ -96,9 +96,16 @@ fn bridge_thread_main(
     };
     // doc_key 与旧实现保持一致(暂固定)。
     let doc_key = "model1";
+    // 请求级超时 40s 必须 > UI 侧 RefreshEntities 外层超时(30s):
+    // 大模型码22 全树序列化+传输可达数十秒(R5 实测), 让外层先触发,
+    // 才能把友好的「刷新超时(30s)」文案带给用户而非笼统 request timeout。
+    let cfg = pla_bridge::BridgeConfig {
+        request_timeout: Duration::from_secs(40),
+        backoff: Default::default(),
+    };
     rt.block_on(async move {
         // connect() 内部 spawn supervisor(重连退避内建), 首连也在 supervisor 内完成。
-        let client = match pla_bridge::BridgeClient::connect(&url) {
+        let client = match pla_bridge::BridgeClient::connect_with_config(&url, cfg) {
             Ok(c) => c,
             Err(e) => {
                 let _ = ev_tx.send(BridgeEvent::Status(format!("断线:连接失败({e})")));
@@ -126,8 +133,10 @@ fn bridge_thread_main(
                 }
                 Ok(BridgeCmd::RefreshEntities) => {
                     if client.is_alive() {
+                        // 30s: 大模型码22 全树序列化+传输是主要耗时源
+                        // (367KB 小文档瞬间完成, 30s 足够宽裕 — R5 实测)。
                         match tokio::time::timeout(
-                            Duration::from_secs(5),
+                            Duration::from_secs(30),
                             client.list_visible(doc_key),
                         )
                         .await
@@ -144,7 +153,9 @@ fn bridge_thread_main(
                                 let _ = ev_tx.send(BridgeEvent::Error(format!("拉取实体失败: {e}")));
                             }
                             Err(_) => {
-                                let _ = ev_tx.send(BridgeEvent::Error("拉取实体超时(5s)".into()));
+                                let _ = ev_tx.send(
+                                    BridgeEvent::Error("刷新超时(30s) — 文档过大?".into()),
+                                );
                             }
                         }
                     } else {

@@ -1,0 +1,6 @@
+=== SUBSCRIBE PROBE mode=after22 ===
+HANDSHAKE resp (68B)
+PRE-22 resp: 1091464B code=22
+SENT code=23 mid=60, collecting 8s (cap 8MB)
+DEADLINE reached
+TOTAL: 0 frames, 0B

@@ -455,6 +455,16 @@ fn handle_binary(shared: &Arc<Shared>, bytes: &[u8]) -> bool {
         Ok(f) => f,
         Err(e) => {
             tracing::debug!(error = ?e, "undecodable bridge frame");
+            // [R5 返工] fail-loud 传播: 截断响应帧的 8 字节头(code+mid)仍
+            // 完好 — 按帧头 mid 把 pending 等待方以 Codec 错误立即完成,
+            // 否则 oneshot 永不解析, 用户只会看到笼统的 30s 超时而不是
+            // 「声明/实收」截断详情(安全网失效)。mid 无主时 complete 是
+            // 无害 no-op(PendingMap::complete 语义), 事件类坏帧不受影响。
+            if bytes.len() >= 8 {
+                let mid =
+                    u64::from(u32::from_le_bytes(bytes[4..8].try_into().expect("8-byte slice")));
+                shared.pending.complete(mid, Err(BridgeError::from(e)));
+            }
             return true; // tolerate and continue; not a link-level failure
         }
     };
@@ -483,3 +493,68 @@ fn handle_binary(shared: &Arc<Shared>, bytes: &[u8]) -> bool {
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 #[allow(dead_code)]
 fn _ws_stream_type_check(_: Option<WsStream>) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Minimal Shared for dispatch-level tests (no real connection involved).
+    fn test_shared() -> Arc<Shared> {
+        let (event_tx, _) = broadcast::channel(16);
+        let (out_tx, _out_rx) = broadcast::channel(16);
+        let (alive_tx, alive_rx) = watch::channel(false);
+        Arc::new(Shared {
+            cfg: BridgeConfig::default(),
+            ids: IdAllocator::new(),
+            pending: PendingMap::new(),
+            event_tx,
+            out_tx,
+            alive_tx,
+            alive_rx,
+            sessions: SessionTable::new(),
+        })
+    }
+
+    /// [R5 返工] 截断响应帧(声明 record len > 实际字节): 等待方必须立刻
+    /// 收到 Codec 截断错误(含声明数字), 而不是饿死成 30s 超时。
+    #[test]
+    fn truncated_response_completes_pending_with_codec_error() {
+        let shared = test_shared();
+        let mut rx = shared.pending.register(7).expect("register waiter");
+
+        let mut bytes = Vec::new();
+        protocol::put_u32(&mut bytes, MessageType::ListVisible.code());
+        protocol::put_u32(&mut bytes, 7); // mid — waiter correlation id
+        protocol::put_u32(&mut bytes, 200);
+        protocol::put_string(&mut bytes, "model1.plasticity");
+        protocol::put_u32(&mut bytes, 0); // version
+        protocol::put_u32(&mut bytes, 1); // object count
+        protocol::put_u32(&mut bytes, 1000); // declared record length
+        bytes.extend_from_slice(&[0u8; 8]); // far short of 1000 → truncated
+
+        assert!(handle_binary(&shared, &bytes));
+
+        let result = rx
+            .try_recv()
+            .expect("oneshot must resolve immediately on truncation");
+        match result {
+            Err(BridgeError::Codec(msg)) => {
+                assert!(msg.contains("截断"), "got: {msg}");
+                assert!(msg.contains("声明 1000B"), "got: {msg}");
+            }
+            other => panic!("expected Codec truncation error, got: {other:?}"),
+        }
+    }
+
+    /// 无主 mid 的坏帧: complete 走 no-op, 链路不掉线、pending 不受污染。
+    #[test]
+    fn undecodable_frame_with_unknown_mid_is_tolerated() {
+        let shared = test_shared();
+        let mut bytes = Vec::new();
+        protocol::put_u32(&mut bytes, MessageType::ListVisible.code());
+        protocol::put_u32(&mut bytes, 9999); // nobody waits on this mid
+        bytes.extend_from_slice(&[0xff; 16]);
+        assert!(handle_binary(&shared, &bytes));
+        assert!(shared.pending.is_empty());
+    }
+}

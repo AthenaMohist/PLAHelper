@@ -297,20 +297,23 @@ pub fn decode(buf: &[u8]) -> Result<Frame, ProtocolError> {
             let mut objects = Vec::with_capacity(n.min(1024));
             for _ in 0..n {
                 let len = r.u32(OP)? as usize;
-                if len > r.buf.len() {
+                let body = r.take(len, OP).map_err(|_| {
                     // Wire-verified 2026-10-20: the device silently truncates
-                    // oversized LIST_VISIBLE responses at ≈368KB — the last
-                    // record's declared length exceeds the frame remainder.
-                    // Fail loud instead of serving a silently incomplete tree.
-                    return Err(ProtocolError::new(
+                    // oversized LIST_VISIBLE/LIST_ALL responses at ≈368KB —
+                    // the last record's declared length exceeds the frame
+                    // remainder. Fail loud with the measured numbers instead
+                    // of serving a silently incomplete tree (R5 fix: 中文 +
+                    // 声明/实收双数字, 直达 UI 错误浮窗; 实收 = 整帧字节数,
+                    // 与 ≈368040B 单帧上限直接可比)。
+                    ProtocolError::new(
                         OP,
                         format!(
-                            "truncated LIST_VISIBLE frame: record declares {len}B, only {}B left (device ~368KB single-frame cap; scene too large for one frame)",
+                            "实体树帧被截断: 声明 {len}B 实收 {}B — 超过单帧上限, 需分片拉取(PLA-004 TODO#9)",
                             r.buf.len()
                         ),
-                    ));
-                }
-                objects.push(r.take(len, OP)?.to_vec());
+                    )
+                })?;
+                objects.push(body.to_vec());
             }
             FramePayload::ListResponse { code, filename, version, objects }
         }
@@ -579,7 +582,11 @@ mod tests {
         assert!(f.is_err(), "truncated frame must error");
         let err = f.unwrap_err();
         assert_eq!(err.op, "decode");
-        assert!(err.detail.contains("truncated"), "got: {}", err.detail);
+        // R5: 截断错误必须带声明/实收双数字(fail-loud 直达 UI 错误浮窗);
+        // 实收 = 整帧 64B(LISTALL_HEAD 全长)。
+        assert!(err.detail.contains("截断"), "got: {}", err.detail);
+        assert!(err.detail.contains("声明 44B"), "got: {}", err.detail);
+        assert!(err.detail.contains("实收 64B"), "got: {}", err.detail);
 
         // With the first record body appended (zeros), decode completes both
         // records: the appended zeros parse as an empty second record.

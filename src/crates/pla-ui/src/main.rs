@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use pla_ui::bridge_thread::{BridgeCmd, BridgeEvent, BridgeHandle};
 use pla_ui::hotkey::{Action, Hotkey, HotkeyMap};
+use pla_ui::round_corners;
 use pla_ui::window_finder;
 
 // ---------------- Plasticity 风格色板 ----------------
@@ -36,7 +37,8 @@ const TOOLBAR_SIZE: [f32; 2] = [264.0, 30.0];
 const BTN_SIZE: f32 = 24.0;
 /// 吸附: 工具栏左缘距目标窗口左缘的偏移(物理像素) —
 /// 停在文件标题区(model1.plasticity 那一段)的右侧, 不遮右上角控件。
-const SNAP_LEFT_OFFSET: f32 = 250.0;
+/// 450 含 Plasticity 文件名区避让(R5 实测 250 不够, 仍遮文件名)。
+const SNAP_LEFT_OFFSET: f32 = 450.0;
 /// 吸附: 相对目标窗口顶边的下移(物理像素)。
 const SNAP_TOP_GAP: i32 = 2;
 /// 吸附/绑定轮询间隔。
@@ -45,6 +47,8 @@ const SNAP_POLL_MS: u64 = 300;
 const SNAP_EPS: f32 = 2.0;
 /// 提示浮窗自动关闭时长。
 const NOTICE_TTL: Duration = Duration::from_secs(6);
+/// Win32 SetWindowRgn 圆角轮询间隔(子视口懒创建, 需定时补套)。
+const ROUND_POLL_MS: u64 = 500;
 
 /// 全局圆角(工具栏/面板/按钮一致)。
 const ROUNDING: f32 = 6.0;
@@ -111,6 +115,10 @@ struct PlaApp {
     /// 本帧悬停按钮的提示 (第一行, 第二行); None = 无悬停。
     hovered_hint: Option<(String, String)>,
     doc_key: String,
+    /// Win32 窗口圆角裁剪状态(已套 Rgn 的 HWND + 尺寸)。
+    round_state: round_corners::RoundState,
+    /// 上次圆角轮询时刻。
+    last_round_poll: Instant,
 }
 
 impl Drop for PlaApp {
@@ -288,6 +296,8 @@ impl PlaApp {
             notice_at: Instant::now(),
             hovered_hint: None,
             doc_key: "model1".into(),
+            round_state: round_corners::RoundState::new(),
+            last_round_poll: Instant::now() - Duration::from_millis(ROUND_POLL_MS),
         }
     }
 
@@ -457,6 +467,12 @@ impl eframe::App for PlaApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_bridge();
         self.update_snap(ctx);
+        // 圆角裁剪: egui 画的圆角在 Windows glow 后端透明不可靠(R5 实测只有
+        // 左上角圆), 由 SetWindowRgn 兜底; 子视口懒创建, 定时枚举补套。
+        if self.last_round_poll.elapsed() >= Duration::from_millis(ROUND_POLL_MS) {
+            self.last_round_poll = Instant::now();
+            round_corners::poll_round_windows(&mut self.round_state);
+        }
 
         // ---- 快捷键触发(全局): 解本帧按键事件, 纯逻辑匹配 ----
         if self.recording.is_none() {
