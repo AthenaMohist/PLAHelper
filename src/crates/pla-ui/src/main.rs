@@ -141,6 +141,8 @@ struct PlaApp {
     snap_pngs: std::collections::HashMap<String, std::sync::Arc<[u8]>>,
     /// 收藏的快照名(含 .plasticity), 与 snapshot/meta.json 同步。
     snap_favs: std::collections::HashSet<String>,
+    /// 快照元数据(名 → (源文档, 拍摄时间)): 开墙/拍/删/改名后整表重读, 悬浮显示用。
+    snap_infos: std::collections::HashMap<String, (String, String)>,
     /// 管理模式: 多选删除。
     snap_manage: bool,
     /// 管理模式勾选集合。
@@ -349,9 +351,7 @@ fn snap_image(
     cell_w: f32,
     max_h: f32,
     uniform: bool,
-    manage: bool,
-    a: &mut SnapItemActions,
-) {
+) -> egui::Response {
     // R7-7: max_size 只限制不撑满(宽屏截图缩到限高后宽度远小于格宽) —
     // 由 IHDR 真实比例反推精确显示尺寸。
     let iw = match png.and_then(|b| png_dims(b)) {
@@ -399,7 +399,7 @@ fn snap_image(
             )
         }
     };
-    let resp = if uniform {
+    if uniform {
         // 统一高模式: 图占满整格高, 水平居中(宽可能小于格宽)
         ui.allocate_ui_with_layout(
             egui::vec2(cell_w, ih),
@@ -409,14 +409,6 @@ fn snap_image(
         .inner
     } else {
         draw(ui)
-    };
-    let clicked = resp.clicked();
-    if manage {
-        if clicked {
-            a.select_toggle = Some(!a.select_toggle.unwrap_or(false));
-        }
-    } else if clicked {
-        a.open = true;
     }
 }
 
@@ -452,6 +444,8 @@ fn snap_item(
     cell_w: f32,
     max_img_h: f32,
     uniform_img: bool,
+    img_tip: Option<(String, String)>,
+    hover_out: &std::cell::RefCell<Option<(String, String)>>,
     is_fav: bool,
     manage: bool,
     selected: bool,
@@ -464,7 +458,21 @@ fn snap_item(
         egui::vec2(cell_w, 36.0),
         egui::Layout::top_down(egui::Align::LEFT),
         |ui| {
-            snap_image(ui, png, name, cell_w, max_img_h, uniform_img, manage, &mut a);
+            let img_resp =
+                snap_image(ui, png, name, cell_w, max_img_h, uniform_img);
+            // 悬浮缩略图 → HUD(工具栏右侧文本框)显示元数据(源文档/拍摄时间)
+            if img_resp.hovered() {
+                if let Some(t) = &img_tip {
+                    *hover_out.borrow_mut() = Some(t.clone());
+                }
+            }
+            if img_resp.clicked() {
+                if manage {
+                    a.select_toggle = Some(!a.select_toggle.unwrap_or(false));
+                } else {
+                    a.open = true;
+                }
+            }
             ui.horizontal(|ui| {
                 if renaming {
                     ui.add_sized(
@@ -600,6 +608,7 @@ impl PlaApp {
             doc_key,
             snap_pngs: std::collections::HashMap::new(),
             snap_favs: std::collections::HashSet::new(),
+            snap_infos: std::collections::HashMap::new(),
             snap_manage: false,
             snap_selected: std::collections::HashSet::new(),
             rename_edit: None,
@@ -637,6 +646,7 @@ impl PlaApp {
                     Ok(name) => {
                         self.snapshots = pla_ui::snapshot::list_snapshots(&self.doc_key);
                         self.snap_pngs.clear(); // 新快照可能有新 PNG, 下次进面板重读
+                        self.snap_infos = pla_ui::snapshot::load_meta_infos(&self.doc_key);
                         self.notice = Some((false, format!("快照已保存: {name}")));
                     }
                     Err(e) => self.notice = Some((true, e)),
@@ -666,6 +676,7 @@ impl PlaApp {
                     // 每次开墙刷新: 快照可能被外部增删(含 Plasticity 侧)
                     self.snapshots = pla_ui::snapshot::list_snapshots(&self.doc_key);
                     self.snap_favs = pla_ui::snapshot::load_favs(&self.doc_key);
+                    self.snap_infos = pla_ui::snapshot::load_meta_infos(&self.doc_key);
                 }
             }
             Action::ToggleEntities => self.show_entities = !self.show_entities,
@@ -1070,12 +1081,8 @@ impl eframe::App for PlaApp {
                     true,
                     |ui| {
                         let mut open_err: Option<String> = None;
-                        let avail_w = ui.available_width();
-                        // R7-8: 用真实 item_spacing 推列宽(写死 8pt 与样式不符时
-                        // 3 列总宽 > 可用宽, 第 3 列被挤出面板右缘)。
-                        let sp = ui.spacing().item_spacing.x;
-                        let fav_cell_w = ((avail_w - sp * 2.0) / 3.0).max(40.0);
-                        let big_cell_w = avail_w;
+                        // 缩略图悬浮元数据槽: 面板视口渲染时写入, 面板关闭后并入 HUD
+                        let tip_slot = std::cell::RefCell::new(None::<(String, String)>);
 
                         // ---- 管理模式操作条(删除立即执行, 列表随后按新数据渲染) ----
                         if self.snap_manage {
@@ -1102,6 +1109,9 @@ impl eframe::App for PlaApp {
                                         Ok(n) => {
                                             self.snapshots =
                                                 pla_ui::snapshot::list_snapshots(&self.doc_key);
+                                            self.snap_infos = pla_ui::snapshot::load_meta_infos(
+                                                &self.doc_key,
+                                            );
                                             for n in &names {
                                                 self.snap_pngs.remove(n);
                                                 self.snap_selected.remove(n);
@@ -1135,6 +1145,29 @@ impl eframe::App for PlaApp {
                         let mut refresh = false;
 
                         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                            // R7-10: 宽度必须在 ScrollArea 内部测 — 竖向滚动条出现后
+                            // 内部可用宽比外部少一个滚动条宽, 在外面测会让每行总宽
+                            // 超出可视区, 第 3 列被裁掉(用户实测"宽度还超了")。
+                            let avail_w = ui.available_width();
+                            let sp = ui.spacing().item_spacing.x;
+                            let fav_cell_w = ((avail_w - sp * 2.0) / 3.0).max(40.0);
+                            let fav_img_h = 56.0_f32;
+                            let fav_row_h = fav_img_h + 20.0; // 图 + 名称行
+                            let big_cell_w = avail_w;
+                            // 悬浮提示文本: SS 短名 + meta 里的源文档/拍摄时间
+                            let tip_of = |s: &str| -> Option<(String, String)> {
+                                let stem = s.trim_end_matches(".plasticity");
+                                match self.snap_infos.get(s) {
+                                    Some((doc, created)) => Some((
+                                        format!("{stem} — {doc}"),
+                                        format!("拍摄于 {created} · 点击在新窗口打开"),
+                                    )),
+                                    None => Some((
+                                        stem.to_string(),
+                                        "点击在新窗口打开".to_string(),
+                                    )),
+                                }
+                            };
                             if self.snapshots.is_empty() {
                                 ui.label(
                                     egui::RichText::new("(暂无快照 — 点右上 📷 拍摄)").color(COL_MUTED),
@@ -1144,42 +1177,64 @@ impl eframe::App for PlaApp {
                                 ui.label(
                                     egui::RichText::new("★ 收藏").small().strong().color(COL_MUTED),
                                 );
-                                // R7-7: 弃 Grid(列宽随内容, 图片缩成小点、放不下 3 个) —
-                                // 改手动行布局, 每项固定宽 fav_cell_w(3 列均分窗口宽)。
+                                // R7-10: 收藏行显式矩形定位(allocate_exact_size + UiBuilder
+                                // .max_rect), 列宽/行高完全确定 — 不依赖 horizontal 累进,
+                                // 无高低差、无宽度外溢。
                                 for trio in fav_list.chunks(3) {
-                                    ui.horizontal(|ui| {
-                                        for s in trio {
-                                            let act = snap_item(
-                                                ui,
-                                                s,
-                                                self.snap_pngs.get(s),
-                                                fav_cell_w,
-                                                56.0,
-                                                true, // 收藏区统一图高, 行内无高低差
-                                                true,
-                                                self.snap_manage,
-                                                self.snap_selected.contains(s),
-                                                self.rename_edit.as_deref()
-                                                    == Some(s.as_str()),
-                                                &mut self.rename_buf,
-                                            );
-                                            if act.open {
-                                                opens.push(s.clone());
-                                            }
-                                            if act.fav_toggle {
-                                                fav_ops.push((s.clone(), false));
-                                            }
-                                            if let Some(on) = act.select_toggle {
-                                                sel_toggles.push((s.clone(), on));
-                                            }
-                                            if act.rename_start && !self.snap_manage {
-                                                rename_start = Some(s.clone());
-                                            }
-                                            rename_commit |= act.rename_commit;
-                                            rename_cancel |= act.rename_cancel;
+                                    let row_rect = ui
+                                        .allocate_exact_size(
+                                            egui::vec2(avail_w, fav_row_h),
+                                            egui::Sense::hover(),
+                                        )
+                                        .0;
+                                    for (ci, s) in trio.iter().enumerate() {
+                                        let cell = egui::Rect::from_min_size(
+                                            egui::pos2(
+                                                row_rect.left()
+                                                    + ci as f32 * (fav_cell_w + sp),
+                                                row_rect.top(),
+                                            ),
+                                            egui::vec2(fav_cell_w, fav_row_h),
+                                        );
+                                        let tip = tip_of(s);
+                                        let act = ui
+                                            .allocate_new_ui(
+                                                egui::UiBuilder::new().max_rect(cell),
+                                                |ui| {
+                                                    snap_item(
+                                                        ui,
+                                                        s,
+                                                        self.snap_pngs.get(s),
+                                                        fav_cell_w,
+                                                        fav_img_h,
+                                                        true, // 统一图高
+                                                        tip,
+                                                        &tip_slot,
+                                                        true,
+                                                        self.snap_manage,
+                                                        self.snap_selected.contains(s),
+                                                        self.rename_edit.as_deref()
+                                                            == Some(s.as_str()),
+                                                        &mut self.rename_buf,
+                                                    )
+                                                },
+                                            )
+                                            .inner;
+                                        if act.open {
+                                            opens.push(s.clone());
                                         }
-                                    });
-                                    ui.add_space(4.0);
+                                        if act.fav_toggle {
+                                            fav_ops.push((s.clone(), false));
+                                        }
+                                        if let Some(on) = act.select_toggle {
+                                            sel_toggles.push((s.clone(), on));
+                                        }
+                                        if act.rename_start && !self.snap_manage {
+                                            rename_start = Some(s.clone());
+                                        }
+                                        rename_commit |= act.rename_commit;
+                                        rename_cancel |= act.rename_cancel;
+                                    }
                                 }
                                 ui.separator();
                                 ui.label(
@@ -1187,6 +1242,7 @@ impl eframe::App for PlaApp {
                                 );
                             }
                             for s in &other_list {
+                                let tip = tip_of(s);
                                 let act = snap_item(
                                     ui,
                                     s,
@@ -1194,6 +1250,8 @@ impl eframe::App for PlaApp {
                                     big_cell_w,
                                     300.0,
                                     false, // 全部区: 撑满格宽
+                                    tip,
+                                    &tip_slot,
                                     self.snap_favs.contains(s),
                                     self.snap_manage,
                                     self.snap_selected.contains(s),
@@ -1217,6 +1275,10 @@ impl eframe::App for PlaApp {
                                 rename_cancel |= act.rename_cancel;
                             }
                         });
+                        // 悬浮缩略图时的元数据 → HUD(工具栏右侧文本框)
+                        if let Some(t) = tip_slot.into_inner() {
+                            self.hovered_hint = Some(t);
+                        }
 
                         // ---- 统一执行采集到的动作(此时列表借用已结束) ----
                         for (s, v) in fav_ops {
@@ -1271,6 +1333,7 @@ impl eframe::App for PlaApp {
                         }
                         if refresh {
                             self.snapshots = pla_ui::snapshot::list_snapshots(&self.doc_key);
+                            self.snap_infos = pla_ui::snapshot::load_meta_infos(&self.doc_key);
                         }
                         for o in opens {
                             if let Err(e) = pla_ui::snapshot::open_in_plasticity(&o, &self.doc_key) {

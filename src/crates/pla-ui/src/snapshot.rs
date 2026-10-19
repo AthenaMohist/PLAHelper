@@ -21,14 +21,54 @@ fn fallback_dir() -> PathBuf {
     exe.join("snapshots")
 }
 
-fn now_stamp() -> String {
-    let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-    // 简易 UTC+8 时间戳格式化(不引 chrono)
-    let days = t / 86400;
+/// 本地时间显示串 "YYYY-MM-DD HH:MM:SS"(快照 meta 元数据用, 含 ':' 无妨 — 不进文件名)。
+pub fn now_local_display() -> String {
+    let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() + 8 * 3600;
+    let (y, mo, d) = civil_from_days((t / 86400) as i64);
     let secs = t % 86400;
-    let (h, m, s) = (secs / 3600 + 8, (secs % 3600) / 60, secs % 60);
-    // 注意: 分隔符必须用 '-', 不能用 ':' — Windows 文件名非法字符(os error 123)。
-    format!("snap-d{days}_{h:02}-{m:02}-{s:02}")
+    format!(
+        "{y:04}-{mo:02}-{d:02} {:02}:{:02}:{:02}",
+        secs / 3600,
+        (secs % 3600) / 60,
+        secs % 60
+    )
+}
+
+/// 天数 → (年, 月, 日)。Howard Hinnant civil_from_days 算法(不引 chrono)。
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// 下一个快照序号名(R7-10): 扫目录里 SS### / ss### 序列取 max+1 → "SS001"。
+/// 短名是产品决定; 源文档/拍摄时间等富信息进 meta.json(R7-10), 不再塞文件名。
+fn next_snapshot_stem(dir: &std::path::Path) -> String {
+    let mut max = 0u32;
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let n = e.file_name().to_string_lossy().to_string();
+            let stem = n
+                .strip_suffix(".plasticity")
+                .or_else(|| n.strip_suffix(".png"))
+                .unwrap_or("");
+            let num = stem
+                .strip_prefix("SS")
+                .or_else(|| stem.strip_prefix("ss"))
+                .unwrap_or("");
+            if let Ok(v) = num.parse::<u32>() {
+                max = max.max(v);
+            }
+        }
+    }
+    format!("SS{:03}", max + 1)
 }
 
 /// Windows 文件名净化: 非法字符 `\/:*?"<>|` → '-', 去首尾空白与结尾点,
@@ -66,24 +106,33 @@ pub fn take_manual_snapshot(doc_key: &str, plasticity_hwnd: Option<isize>) -> Re
              关键字 '{doc_key}' 无命中且无任何 .plasticity 候选。请先在 Plasticity 中 Ctrl+S 保存一次。"
         )
     })?;
-    // 文件名过净化函数: doc 来源 stem + 时间戳均可能含非法字符。
-    let name = sanitize_filename(&format!(
-        "{}-{}",
-        src.file_stem().and_then(|s| s.to_str()).unwrap_or("doc"),
-        now_stamp()
-    ));
     let dir = snapshot_dir_for(Some(&src));
     let _ = std::fs::create_dir_all(&dir);
-    let dst = dir.join(format!("{name}.plasticity"));
+    // R7-10: 简短序号名 SS001/SS002…; 富信息(源文档/拍摄时间)写 meta.json,
+    // 不再拼进文件名。
+    let stem = next_snapshot_stem(&dir);
+    let dst = dir.join(format!("{stem}.plasticity"));
     std::fs::copy(&src, &dst).map_err(|e| format!("复制失败: {e}"))?;
     // 缩略图: PrintWindow 抓 Plasticity 主窗口 → 同名 .png
     if let Some(hwnd) = plasticity_hwnd {
-        let png = dir.join(format!("{name}.png"));
+        let png = dir.join(format!("{stem}.png"));
         if let Err(e) = crate::wincap::capture_window_png(hwnd, &png) {
             eprintln!("[snapshot] 窗口截图失败(不阻断快照): {e}");
         }
     }
-    Ok(name)
+    // 元数据: 源文档 + 拍摄时间(悬浮截图时 HUD 右侧文本框显示)
+    {
+        let (favs, mut info) = load_meta2(doc_key);
+        info.insert(
+            format!("{stem}.plasticity"),
+            (
+                src.file_stem().and_then(|s| s.to_str()).unwrap_or("doc").to_string(),
+                now_local_display(),
+            ),
+        );
+        let _ = save_meta2(doc_key, &favs, &info); // 尽力而为, 失败不阻断
+    }
+    Ok(stem)
 }
 
 /// 当前文档对应的快照目录(不创建)。
@@ -91,27 +140,94 @@ pub fn snapshot_dir_of(doc_key: &str) -> PathBuf {
     snapshot_dir_for(find_latest_doc(doc_key).as_ref())
 }
 
-// ---------------- 收藏/改名/删除(R7-6) ----------------
-/// 收藏状态持久化: 快照目录下 meta.json — {快照文件名(含扩展名): true}。
-/// 轻量边车文件, 不动快照本体; 改名/删除时同步迁移。
+// ---------------- 收藏/改名/删除/元数据(R7-6, R7-10) ----------------
+/// 边车 meta.json 双段结构(R7-10):
+///   { "favs": {快照名: bool}, "info": {快照名: {"doc": 源文档stem, "created": "YYYY-MM-DD HH:MM:SS"}} }
+/// 旧格式(整个对象就是 favs map)读取时自动兼容。轻量边车, 不动快照本体。
 
 fn meta_path(dir: &PathBuf) -> PathBuf {
     dir.join("meta.json")
 }
 
-fn load_meta(doc_key: &str) -> std::collections::HashMap<String, bool> {
+type Meta = (
+    std::collections::HashMap<String, bool>,
+    std::collections::HashMap<String, (String, String)>,
+);
+
+fn load_meta2(doc_key: &str) -> Meta {
     let p = meta_path(&snapshot_dir_of(doc_key));
-    std::fs::read(&p)
+    let v: serde_json::Value = std::fs::read(&p)
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default()
+        .unwrap_or(serde_json::Value::Null);
+    // 旧格式: 根对象没有 "favs" 键 → 整个根就是 favs map
+    let (favs_v, info_v) = match v.get("favs") {
+        Some(f) => (
+            f.clone(),
+            v.get("info").cloned().unwrap_or(serde_json::Value::Null),
+        ),
+        None => (v, serde_json::Value::Null),
+    };
+    let mut favs = std::collections::HashMap::new();
+    if let Some(obj) = favs_v.as_object() {
+        for (k, val) in obj {
+            if val.as_bool().unwrap_or(false) {
+                favs.insert(k.clone(), true);
+            }
+        }
+    }
+    let mut info = std::collections::HashMap::new();
+    if let Some(obj) = info_v.as_object() {
+        for (k, val) in obj {
+            let d = val.get("doc").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let c = val
+                .get("created")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            info.insert(k.clone(), (d, c));
+        }
+    }
+    (favs, info)
 }
 
-fn save_meta(doc_key: &str, meta: &std::collections::HashMap<String, bool>) -> Result<(), String> {
+fn save_meta2(
+    doc_key: &str,
+    favs: &std::collections::HashMap<String, bool>,
+    info: &std::collections::HashMap<String, (String, String)>,
+) -> Result<(), String> {
     let dir = snapshot_dir_of(doc_key);
     let _ = std::fs::create_dir_all(&dir);
-    let bytes = serde_json::to_vec_pretty(meta).map_err(|e| format!("序列化 meta: {e}"))?;
-    std::fs::write(meta_path(&dir), bytes).map_err(|e| format!("写 meta: {e}"))
+    let mut root = serde_json::Map::new();
+    root.insert(
+        "favs".into(),
+        serde_json::to_value(favs).map_err(|e| format!("序列化 favs: {e}"))?,
+    );
+    let mut info_obj = serde_json::Map::new();
+    for (k, (d, c)) in info {
+        info_obj.insert(
+            k.clone(),
+            serde_json::json!({ "doc": d, "created": c }),
+        );
+    }
+    root.insert("info".into(), serde_json::Value::Object(info_obj));
+    std::fs::write(
+        meta_path(&dir),
+        serde_json::to_vec_pretty(&serde_json::Value::Object(root))
+            .map_err(|e| format!("序列化 meta: {e}"))?,
+    )
+    .map_err(|e| format!("写 meta: {e}"))
+}
+
+/// 快照富信息(源文档, 拍摄时间)。快照墙打开时整表读一次, 悬浮显示用。
+pub fn load_meta_infos(
+    doc_key: &str,
+) -> std::collections::HashMap<String, (String, String)> {
+    load_meta2(doc_key).1
+}
+
+fn load_meta(doc_key: &str) -> std::collections::HashMap<String, bool> {
+    load_meta2(doc_key).0
 }
 
 /// 收藏的快照名集合。
@@ -125,9 +241,9 @@ pub fn load_favs(doc_key: &str) -> std::collections::HashSet<String> {
 
 /// 设置/取消收藏。
 pub fn set_fav(doc_key: &str, name: &str, fav: bool) -> Result<(), String> {
-    let mut meta = load_meta(doc_key);
-    meta.insert(name.to_string(), fav);
-    save_meta(doc_key, &meta)
+    let (mut favs, info) = load_meta2(doc_key);
+    favs.insert(name.to_string(), fav);
+    save_meta2(doc_key, &favs, &info)
 }
 
 /// 批量删除快照(.plasticity + 同名 .png + meta 条目)。返回实际删除个数。
@@ -153,11 +269,12 @@ pub fn delete_snapshots(doc_key: &str, names: &[String]) -> Result<usize, String
             removed += 1;
         }
     }
-    let mut meta = load_meta(doc_key);
-    let before = meta.len();
-    meta.retain(|k, _| !names.iter().any(|n| n == k));
-    if meta.len() != before {
-        save_meta(doc_key, &meta)?;
+    let (mut favs, mut info) = load_meta2(doc_key);
+    let before = favs.len() + info.len();
+    favs.retain(|k, _| !names.iter().any(|n| n == k));
+    info.retain(|k, _| !names.iter().any(|n| n == k));
+    if favs.len() + info.len() != before {
+        save_meta2(doc_key, &favs, &info)?;
     }
     if !errs.is_empty() {
         return Err(format!("部分删除失败: {}", errs.join("; ")));
@@ -186,10 +303,18 @@ pub fn rename_snapshot(doc_key: &str, old_name: &str, new_stem: &str) -> Result<
             std::fs::rename(&pa, &pb).map_err(|e| format!("重命名 {} 失败: {e}", pa.display()))?;
         }
     }
-    let mut meta = load_meta(doc_key);
-    if let Some(v) = meta.remove(old_name) {
-        meta.insert(format!("{new_stem}.plasticity"), v);
-        save_meta(doc_key, &meta)?;
+    let (mut favs, mut info) = load_meta2(doc_key);
+    let mut changed = false;
+    if let Some(v) = favs.remove(old_name) {
+        favs.insert(format!("{new_stem}.plasticity"), v);
+        changed = true;
+    }
+    if let Some(v) = info.remove(old_name) {
+        info.insert(format!("{new_stem}.plasticity"), v);
+        changed = true;
+    }
+    if changed {
+        save_meta2(doc_key, &favs, &info)?;
     }
     Ok(format!("{new_stem}.plasticity"))
 }
@@ -499,7 +624,7 @@ mod tests {
         assert_eq!(sanitize_filename("..."), "snapshot");
         assert_eq!(sanitize_filename("end."), "end");
         // 组合名(文档 stem + 时间戳)整体净化后可直接落盘。
-        let name = sanitize_filename(&format!("my{}doc-{}", ":", now_stamp()));
+        let name = sanitize_filename(&format!("my{}doc-{}", ":", now_local_display()));
         let path = std::env::temp_dir().join(format!("{name}.plasticity"));
         std::fs::write(&path, b"probe").expect("净化后文件名仍无法落盘");
         std::fs::remove_file(&path).ok();
@@ -508,7 +633,7 @@ mod tests {
     /// 回归(QA Bug A): 快照文件名不得含 Windows 非法字符, 且能实际落盘。
     #[test]
     fn snapshot_filename_legal_and_writable_on_windows() {
-        let name = format!("test_doc-{}", now_stamp());
+        let name = sanitize_filename(&format!("test_doc-{}", now_local_display()));
         assert!(!name.contains(':'), "文件名含非法字符 ':' : {name}");
         assert!(!name.contains(['\\', '/', '*', '?', '"', '<', '>', '|']));
         let path = std::env::temp_dir().join(format!("{name}.plasticity"));
