@@ -251,6 +251,17 @@ fn find_latest_doc(doc_key: &str) -> Option<PathBuf> {
         }
         // R7-6: 排除我们自己的快照 — 快照墙开进 Plasticity 后会进 Recent,
         // 文件名又含文档名, 不排除会劫持「当前文档」判定(23:10 实测)。
+        // R7-9: 快照的快照防护 — 路径任一层含 snapshot 目录的 .plasticity
+        // 一律不作候选(改名/挪动也逃不掉), 杜绝对快照再拍快照的循环嵌套。
+        let in_snapshot_dir = p.components().any(|c| {
+            c.as_os_str()
+                .to_str()
+                .map(|s| s.eq_ignore_ascii_case("snapshot"))
+                .unwrap_or(false)
+        });
+        if in_snapshot_dir {
+            return;
+        }
         if p.file_name()
             .and_then(|n| n.to_str())
             .map(|n| n.contains("-snap-d"))
