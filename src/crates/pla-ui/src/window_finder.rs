@@ -94,18 +94,16 @@ mod imp {
         path.rsplit(['\\', '/']).next().unwrap_or(path)
     }
 
-    /// 是否为 Plasticity 主窗口: 优先进程映像名 == Plasticity.exe,
-    /// 拿不到映像名时退回标题含 ".plasticity" / "plasticity"。
+    /// 是否为 Plasticity 主窗口。R6 修正: 进程映像名可查时以映像名为准 —
+    /// 之前「标题含 plasticity」的无条件兜底会把标题里恰好带 "plasticity"
+    /// 字样的异己进程窗口(如某预览器渲染的 .plasticity 文档窗)误判为目标,
+    /// 导致工具栏吸错窗口。标题兜底仅在映像名拿不到时生效, 且要求含
+    /// ".plasticity"(比裸词更严)。
     unsafe fn is_plasticity_window(hwnd: HWND, title: &str) -> bool {
-        let by_image = process_image_name(hwnd)
-            .as_deref()
-            .map(|p| image_file_name(p).eq_ignore_ascii_case("plasticity.exe"))
-            .unwrap_or(false);
-        let by_title = {
-            let t = title.to_lowercase();
-            t.contains(".plasticity") || t.contains("plasticity")
-        };
-        by_image || by_title
+        match process_image_name(hwnd) {
+            Some(path) => image_file_name(&path).eq_ignore_ascii_case("plasticity.exe"),
+            None => title.to_lowercase().contains(".plasticity"),
+        }
     }
 
     /// 全部可见的 Plasticity 主窗口, 按 HWND 升序。

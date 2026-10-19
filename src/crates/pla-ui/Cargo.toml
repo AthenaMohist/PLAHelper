@@ -16,11 +16,13 @@ egui = "0.29"
 eframe = { version = "0.29", default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
 
 # Win32: 吸附 Plasticity 主窗口(窗口枚举/矩形/进程映像名/进程创建时间);
-# Graphics_Gdi: SetWindowRgn/CreateRoundRectRgn 圆角裁剪(R5 修复)。
+# Graphics_Gdi: SetWindowRgn/CreateRoundRectRgn 圆角裁剪(R5) + GetDIBits 标题栏探测(R6);
+# Storage_Xps: windows-0.52 把 PrintWindow 归到了这个目录(R6 标题栏探测)。
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.52", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
     "Win32_System_Threading",
     "Win32_Graphics_Gdi",
+    "Win32_Storage_Xps",
 ] }

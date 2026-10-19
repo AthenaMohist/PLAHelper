@@ -35,14 +35,18 @@ const COL_GRAY_DOT: egui::Color32 = egui::Color32::from_rgb(0x77, 0x77, 0x77);
 const TOOLBAR_SIZE: [f32; 2] = [264.0, 30.0];
 /// 方形图标按钮边长。
 const BTN_SIZE: f32 = 24.0;
-/// 吸附: 工具栏左缘距目标窗口左缘的偏移(物理像素) —
-/// 停在文件标题区(model1.plasticity 那一段)的右侧, 不遮右上角控件。
-/// 450 含 Plasticity 文件名区避让(R5 实测 250 不够, 仍遮文件名)。
-const SNAP_LEFT_OFFSET: f32 = 450.0;
+/// 吸附定位(物理像素): 优先像素探测 Plasticity 顶栏「文件名文字块」右缘
+/// (titlebar_probe, PrintWindow 离屏渲染不受本工具栏遮挡), 工具栏停在其右侧;
+/// 探测失败(渲染失败/找不到文字块)降级为本固定偏移 — 预留足够距离越过文件名。
+const SNAP_LEFT_OFFSET: f32 = 500.0;
+/// 探测成功时, 文件名块右缘与工具栏左缘的间隙(物理像素)。
+const SNAP_FILENAME_GAP: f32 = pla_ui::titlebar_probe::FILENAME_GAP_PX;
 /// 吸附: 相对目标窗口顶边的下移(物理像素)。
 const SNAP_TOP_GAP: i32 = 2;
 /// 吸附/绑定轮询间隔。
 const SNAP_POLL_MS: u64 = 300;
+/// 文件名探测间隔(PrintWindow 有渲染开销, 比吸附轮询慢一档)。
+const PROBE_POLL_MS: u64 = 1000;
 /// 位置漂移小于该值(物理像素)不重发定位命令, 避免抖动。
 const SNAP_EPS: f32 = 2.0;
 /// 提示浮窗自动关闭时长。
@@ -93,9 +97,13 @@ struct PlaApp {
     bridge_status: String,
     /// 吸附目标(未绑定 = None)。
     snap_target: Option<window_finder::TargetWindow>,
-    /// 上次吸附定位使用的目标锚点 (left, top), 用于漂移检测。
-    last_snap_anchor: Option<(i32, i32)>,
+    /// 上次吸附定位使用的目标锚点 (left, top, x_phys), 用于漂移检测。
+    /// x_phys 含探测结果 — 文件名长度变化(切换文档)也会触发重定位。
+    last_snap_anchor: Option<(i32, i32, i32)>,
     last_snap_poll: Instant,
+    /// 文件名探测缓存: (目标 hwnd, 文件名块右缘物理 x)。None = 未探测到(降级偏移)。
+    probed_edge: Option<(isize, i32)>,
+    last_probe_poll: Instant,
     entities: Vec<serde_json::Value>,
     snapshots: Vec<String>,
     show_snapshots: bool,
@@ -281,6 +289,8 @@ impl PlaApp {
             snap_target: None,
             last_snap_anchor: None,
             last_snap_poll: Instant::now() - Duration::from_millis(SNAP_POLL_MS),
+            probed_edge: None,
+            last_probe_poll: Instant::now() - Duration::from_millis(PROBE_POLL_MS),
             entities: Vec::new(),
             snapshots: pla_ui::snapshot::list_snapshots(),
             show_snapshots: false,
@@ -361,24 +371,45 @@ impl PlaApp {
     }
 
     /// 吸附定位: 轮询目标窗口, 需要时发 OuterPosition(egui points)。
-    /// 锚点 = 目标窗口 (left, top); 工具栏左缘停在标题区右侧(SNAP_LEFT_OFFSET)。
+    /// 横向定位优先像素探测文件名块右缘(R6), 探测失败降级 SNAP_LEFT_OFFSET。
+    /// 锚点 = (目标 left, top, 本轮 x_phys) — 三者任一漂移超 SNAP_EPS 才重发。
     fn update_snap(&mut self, ctx: &egui::Context) {
         if self.last_snap_poll.elapsed() < Duration::from_millis(SNAP_POLL_MS) {
             return;
         }
         self.last_snap_poll = Instant::now();
         let new_target = window_finder::acquire_target();
-        // 目标锚点(物理像素): (左缘, 顶缘)。
-        let new_anchor = new_target.as_ref().map(|t| (t.left, t.top));
         self.snap_target = new_target;
-        let Some(target) = self.snap_target.as_ref() else {
-            // 未绑定: 清锚点, 等 Plasticity 出现。
+        // 用 owned 克隆避免在 self 上叠加可变借用。
+        let Some(target) = self.snap_target.clone() else {
+            // 未绑定: 清缓存, 等 Plasticity 出现。
             self.last_snap_anchor = None;
+            self.probed_edge = None;
             return;
         };
+        // 文件名探测: 换绑定窗口立即探, 同窗口按 PROBE_POLL_MS 节流
+        // (文件名长度随文档切换变化, 需周期性刷新)。
+        if self.last_probe_poll.elapsed() >= Duration::from_millis(PROBE_POLL_MS)
+            || self.probed_edge.as_ref().map_or(true, |(h, _)| *h != target.hwnd)
+        {
+            let edge = pla_ui::titlebar_probe::probe_filename_right_edge(&target, ctx.pixels_per_point());
+            self.probed_edge = edge.map(|e| (target.hwnd, e));
+            self.last_probe_poll = Instant::now();
+        }
+        // 物理 x: 探测命中 → 文件名右缘+间隙; 否则降级固定偏移。
+        // 两者都按 ppp 缩放: probe/GetWindowRect 在 DPI-aware 进程里是物理像素,
+        // 固定常量是逻辑 px, 不缩放在高 DPI 下会缩水遮文件名(R6 实测 4K/3x)。
+        let ppp = ctx.pixels_per_point();
+        let x_phys = match self.probed_edge {
+            Some((h, edge)) if h == target.hwnd => edge as f32 + SNAP_FILENAME_GAP * ppp,
+            _ => target.left as f32 + SNAP_LEFT_OFFSET * ppp,
+        };
+        let new_anchor = Some((target.left, target.top, x_phys as i32));
         let anchor_changed = match (new_anchor, self.last_snap_anchor) {
-            (Some((nl, nt)), Some((ol, ot))) => {
-                (nl - ol).abs() as f32 > SNAP_EPS || (nt - ot).abs() as f32 > SNAP_EPS
+            (Some(n), Some(o)) => {
+                (n.0 - o.0).abs() as f32 > SNAP_EPS
+                    || (n.1 - o.1).abs() as f32 > SNAP_EPS
+                    || (n.2 - o.2).abs() as f32 > SNAP_EPS
             }
             _ => true,
         };
@@ -387,8 +418,6 @@ impl PlaApp {
         }
         self.last_snap_anchor = new_anchor;
         // 物理 → egui points: OuterPosition 用 points(见 egui 0.29 ViewportInfo)。
-        let ppp = ctx.pixels_per_point();
-        let x_phys = target.left as f32 + SNAP_LEFT_OFFSET;
         let y_phys = target.top as f32 + SNAP_TOP_GAP as f32;
         ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
             x_phys / ppp,
