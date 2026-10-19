@@ -598,7 +598,9 @@ impl eframe::App for PlaApp {
                 // 顶对齐 → 行内偏上 2pt(用户实测)。改为按可用区中心显式
                 // 放置行矩形, 与窗口实际高度解耦。
                 let avail = ui.available_rect_before_wrap();
-                let row_h = TOOLBAR_SIZE[1].min(avail.height());
+                // 行高 = 按钮边长(24), 不能用 TOOLBAR_SIZE[1](30) — min(30, 可用28)
+                // 会把行矩形撑满内容区, 居中形同虚设(R6-2m 首版实测按钮仍偏上)。
+                let row_h = BTN_SIZE.min(avail.height());
                 let row_rect = egui::Rect::from_min_max(
                     egui::pos2(avail.left(), avail.center().y - row_h * 0.5),
                     egui::pos2(avail.right(), avail.center().y + row_h * 0.5),
