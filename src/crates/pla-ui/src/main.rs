@@ -757,20 +757,7 @@ impl PlaApp {
                 self.snapshots = pla_ui::snapshot::list_snapshots(&self.doc_key);
                 self.snap_pngs.clear();
                 self.snap_infos = pla_ui::snapshot::load_meta_infos(&self.doc_key);
-                // 清理策略
-                let removed = pla_ui::snapshot::cleanup_snapshots(
-                    &self.doc_key,
-                    self.snap_max_count.max(0) as usize,
-                    self.snap_max_age_days.max(0) as u64,
-                )
-                .unwrap_or(0);
-                self.snapshots = pla_ui::snapshot::list_snapshots(&self.doc_key);
-                if removed > 0 {
-                    self.set_notice((
-                        false,
-                        format!("自动快照({reason}): {name}；清理 {} 个旧快照", removed),
-                    ));
-                }
+                self.run_snapshot_cleanup();
             }
             Err(_) => {} // 自动快照失败不打扰(如未保存过), 下次再试
         }
@@ -787,6 +774,7 @@ impl PlaApp {
                         self.snapshots = pla_ui::snapshot::list_snapshots(&self.doc_key);
                         self.snap_pngs.clear(); // 新快照可能有新 PNG, 下次进面板重读
                         self.snap_infos = pla_ui::snapshot::load_meta_infos(&self.doc_key);
+                        self.run_snapshot_cleanup();
                         self.notice = Some((false, format!("快照已保存: {name}")));
                     }
                     Err(e) => self.notice = Some((true, e)),
@@ -833,6 +821,32 @@ impl PlaApp {
     /// 吸附定位: 轮询目标窗口, 需要时发 OuterPosition(egui points)。
     /// 横向定位优先像素探测文件名块右缘(R6), 探测失败降级 SNAP_LEFT_OFFSET。
     /// 锚点 = (目标 left, top, 本轮 x_phys) — 三者任一漂移超 SNAP_EPS 才重发。
+    /// 从窗口标题提取 doc_key: "model1.plasticity - Plasticity" → "model1";
+    /// 无标题/未命名 → "untitled"。
+    fn doc_key_from_title(title: &str) -> String {
+        let base = title.split(" - ").next().unwrap_or(title).trim();
+        let base = base.trim_start_matches('*').trim();
+        if base.is_empty() || base.eq_ignore_ascii_case("Plasticity") {
+            return "untitled".into();
+        }
+        base.strip_suffix(".plasticity")
+            .unwrap_or(base)
+            .to_string()
+    }
+
+    /// 手动/自动快照共用的清理策略(R7-17)。
+    fn run_snapshot_cleanup(&mut self) {
+        let removed = pla_ui::snapshot::cleanup_snapshots(
+            &self.doc_key,
+            self.snap_max_count.max(0) as usize,
+            self.snap_max_age_days.max(0) as u64,
+        )
+        .unwrap_or(0);
+        if removed > 0 {
+            self.snapshots = pla_ui::snapshot::list_snapshots(&self.doc_key);
+        }
+    }
+
     fn update_snap(&mut self, ctx: &egui::Context) {
         if self.last_snap_poll.elapsed() < Duration::from_millis(SNAP_POLL_MS) {
             return;
@@ -840,6 +854,22 @@ impl PlaApp {
         self.last_snap_poll = Instant::now();
         let new_target = window_finder::acquire_target(&self.doc_key);
         self.snap_target = new_target;
+        // R7-17: doc_key 跟随绑定窗口标题("model1.plasticity - Plasticity" →
+        // "model1") — 多文档/多窗口时快照/选择集/实体缓存按文档隔离(PRD 验收)。
+        if let Some(target) = self.snap_target.clone() {
+            let derived = Self::doc_key_from_title(&target.title);
+            if derived != self.doc_key {
+                self.doc_key = derived;
+                // 文档切换: 全部按 doc_key 归档的缓存失效重载
+                self.entities.clear();
+                self.snapshots = pla_ui::snapshot::list_snapshots(&self.doc_key);
+                self.snap_pngs.clear();
+                self.snap_favs = pla_ui::snapshot::load_favs(&self.doc_key);
+                self.snap_infos = pla_ui::snapshot::load_meta_infos(&self.doc_key);
+                self.sel_cdp_members.clear();
+                self.dim_loaded = false;
+            }
+        }
         // 用 owned 克隆避免在 self 上叠加可变借用。
         let Some(target) = self.snap_target.clone() else {
             // 未绑定: 清缓存, 等 Plasticity 出现。
@@ -2108,5 +2138,20 @@ impl eframe::App for PlaApp {
 
         // bridge 事件到达时保持重绘(轮询线程 200ms 一跳)。
         ctx.request_repaint_after(Duration::from_millis(250));
+    }
+}
+
+#[cfg(test)]
+mod r717_tests {
+    use super::*;
+
+    #[test]
+    fn doc_key_from_title_parses_plasticity_titles() {
+        assert_eq!(PlaApp::doc_key_from_title("model1.plasticity - Plasticity"), "model1");
+        assert_eq!(PlaApp::doc_key_from_title("*model1.plasticity - Plasticity"), "model1");
+        assert_eq!(PlaApp::doc_key_from_title("Plasticity"), "untitled");
+        assert_eq!(PlaApp::doc_key_from_title(""), "untitled");
+        assert_eq!(PlaApp::doc_key_from_title("untitled - Plasticity"), "untitled");
+        assert_eq!(PlaApp::doc_key_from_title("my-doc_v2.plasticity - Plasticity"), "my-doc_v2");
     }
 }

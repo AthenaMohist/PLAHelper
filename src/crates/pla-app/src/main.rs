@@ -243,6 +243,7 @@ fn main() {
         println!("  dim-list <doc_key>");
         println!("  dim-update <doc_key> <name> <new_value>        走 bridge: 顶点平移写回");
         println!("  entities <doc_key>                            列出 bridge 实体(id/kind/name)");
+        println!("  cdp-eval <js>                                 经 CDP(9333) 在 Plasticity renderer 执行 JS");
         println!("  doc-list / ping");
         return;
     }
@@ -272,6 +273,12 @@ fn main() {
                     println!("{}", serde_json::to_string_pretty(&out).unwrap());
                 }
                 Err(e) => { eprintln!("ERROR: {e}"); std::process::exit(1); }
+            }
+        },
+        "cdp-eval" => { need(1);
+            match rt.block_on(pla_bridge::cdp::cdp_eval_once(9333, &a[0])) {
+                Ok(v) => println!("{v}"),
+                Err(e) => { eprintln!("CDP ERROR: {e}"); std::process::exit(1); }
             }
         },
         "doc-list" => println!("{}", serde_json::to_string_pretty(&state.cmd_doc_list()).unwrap()),

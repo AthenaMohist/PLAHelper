@@ -435,3 +435,50 @@ async fn http_get(port: u16, path: &str) -> anyhow::Result<String> {
     let text = String::from_utf8_lossy(&buf);
     Ok(text.split("\r\n\r\n").nth(1).unwrap_or("").to_string())
 }
+
+/// 一次性 CDP evaluate(R7-17, CLI 调试用): 连 page → Runtime.evaluate → 回包。
+pub async fn cdp_eval_once(port: u16, expr: &str) -> anyhow::Result<String> {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    let body = http_get(port, "/json/list").await?;
+    let v: Value = serde_json::from_str(&body)?;
+    let page = v
+        .as_array()
+        .and_then(|a| {
+            a.iter()
+                .find(|t| t["type"] == "page" && t["title"].as_str().unwrap_or("").contains("Plasticity"))
+        })
+        .or_else(|| v.as_array().and_then(|a| a.iter().find(|t| t["type"] == "page")))
+        .ok_or_else(|| anyhow::anyhow!("no page target"))?;
+    let ws_url = page["webSocketDebuggerUrl"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("no ws url"))?
+        .to_string();
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await?;
+    ws.send(Message::Text(
+        serde_json::json!({"id":1,"method":"Runtime.enable"}).to_string(),
+    ))
+    .await?;
+    ws.send(Message::Text(json_eval(2, expr).to_string())).await?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let msg = tokio::time::timeout_at(deadline, ws.next())
+            .await
+            .map_err(|_| anyhow::anyhow!("timeout"))?
+            .ok_or_else(|| anyhow::anyhow!("ws closed"))?
+            .map_err(|e| anyhow::anyhow!("ws: {e}"))?;
+        if let tokio_tungstenite::tungstenite::Message::Text(t) = msg {
+            let v: Value = serde_json::from_str(&t)?;
+            if v["id"].as_u64() == Some(2) {
+                if let Some(exc) =
+                    v["result"]["exceptionDetails"]["exception"]["description"].as_str()
+                {
+                    return Err(anyhow::anyhow!("js: {exc}"));
+                }
+                return Ok(
+                    serde_json::to_string_pretty(&v["result"]["result"]["value"]).unwrap_or_default(),
+                );
+            }
+        }
+    }
+}
