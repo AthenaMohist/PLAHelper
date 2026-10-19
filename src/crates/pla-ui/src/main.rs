@@ -40,10 +40,9 @@ const TOOLBAR_SIZE: [f32; 2] = [276.0, 30.0];
 /// 面板整体右移微调(逻辑 px, 按 ppp 缩放; R6-2e 用户要求再偏右 10)。
 const SNAP_RIGHT_SHIFT: f32 = 10.0;
 /// 吸附垂直微调(逻辑 pt, 按 ppp 缩放; 仅作用于探测命中分支)。
-/// R6-2l 实测校准: PrintWindow 渲染原点与 GetWindowRect 窗口原点存在
-/// 不可见边框级的系统性偏移, 3pt 结构偏差修复后仍残留 ~1.8pt 偏低,
-/// 以 -2pt 校准(用户 250%DPI 实测; 若换 DPI 后再有偏差, 调此常量)。
-const SNAP_Y_NUDGE_PT: f32 = -2.0;
+/// R6-2l 曾设 -2.0 校准「窗口实际高=请求+4pt」造成的内容偏上, R6-2m 改为
+/// 按 egui 上报的实际内窗高取中心后已无需补偿, 归零留作微调旋钮。
+const SNAP_Y_NUDGE_PT: f32 = 0.0;
 /// 注: 勿对 panel ui 用 min_rect 测尺寸做自适应 — CentralPanel 的 min_rect
 /// 含整个可用区, need=窗口+余量 每帧自增(R6-2b 已回退, 教训留档)。
 /// 方形图标按钮边长。
@@ -444,9 +443,17 @@ impl PlaApp {
         let (x_phys, y_phys) = match &self.probed_edge {
             Some((h, hit)) if *h == target.hwnd => {
                 let x = hit.right as f32 + (SNAP_FILENAME_GAP + SNAP_RIGHT_SHIFT) * ppp;
+                // 实际内窗高(egui 上报): 请求 30pt 但 winit 隐形边框撑到 34pt,
+                // 按实际值取中心, 否则恒偏 2pt(R6-2m)。
+                let h_pt = ctx.input(|i| {
+                    i.viewport()
+                        .inner_rect
+                        .map(|r| r.height())
+                        .unwrap_or(TOOLBAR_SIZE[1])
+                });
                 let y = target.top as f32
                     + (hit.cy as f32 + SNAP_Y_NUDGE_PT * ppp)
-                    - TOOLBAR_SIZE[1] * 0.5 * ppp;
+                    - h_pt * 0.5 * ppp;
                 (x, y)
             }
             _ => (
@@ -585,6 +592,18 @@ impl eframe::App for PlaApp {
         egui::CentralPanel::default()
             .frame(panel_frame())
             .show(ctx, |ui| {
+                // R6-2m: 行显式垂直居中。窗口实际高 = 请求值+4pt(winit 对
+                // undecorated+shadow 窗口保留 WS_THICKFRAME 隐形可调边框,
+                // egui 0.29 无 with_shadow 可关), egui horizontal 对超高行
+                // 顶对齐 → 行内偏上 2pt(用户实测)。改为按可用区中心显式
+                // 放置行矩形, 与窗口实际高度解耦。
+                let avail = ui.available_rect_before_wrap();
+                let row_h = TOOLBAR_SIZE[1].min(avail.height());
+                let row_rect = egui::Rect::from_min_max(
+                    egui::pos2(avail.left(), avail.center().y - row_h * 0.5),
+                    egui::pos2(avail.right(), avail.center().y + row_h * 0.5),
+                );
+                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(row_rect), |ui| {
                 ui.horizontal(|ui| {
                     // 状态圆点区: 未绑定=灰; 已绑定显示 bridge 状态色。
                     let (dot_rect, dot_resp) =
@@ -668,6 +687,7 @@ impl eframe::App for PlaApp {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                 });
+                }); // allocate_new_ui(居中行矩形)
                 // R6-2i: 光晕统一走 paint_panel_glow(与所有弹出面板同款)。
                 paint_panel_glow(ui);
             });
