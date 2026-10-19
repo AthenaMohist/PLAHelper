@@ -31,10 +31,12 @@ const COL_RED: egui::Color32 = egui::Color32::from_rgb(0xd0, 0x50, 0x45);
 const COL_GRAY_DOT: egui::Color32 = egui::Color32::from_rgb(0x77, 0x77, 0x77);
 
 // ---------------- 工具栏形态/吸附参数(可调) ----------------
-/// 工具栏初始逻辑尺寸(横向一行按钮): 圆点+分隔线+6 按钮+分隔线+关闭键。
-/// 宽高仅作初值 — 每帧按内容实测自适应(R6-2: 固定 264 在 emoji 字体实测
-/// 宽度下不够, ✕ 被裁掉 1/3; 改为测量 ui.min_rect() 后回写 InnerSize)。
-const TOOLBAR_SIZE: [f32; 2] = [264.0, 30.0];
+/// 工具栏固定逻辑尺寸(横向一行按钮): 圆点+分隔线+6 按钮+分隔线+关闭键。
+/// 实测推算: 边距 12 + 内容 ~276(264 时 ✕ 被吞 1/3) → 宽 288 留余量;
+/// 高 36 = 边距 12 + 按钮 24(原 30 造成图标底部裁切)。
+/// 注: 曾尝试 min_rect 自适应, 但 CentralPanel 的 min_rect 含整个可用区,
+/// need=窗口+余量 每帧自增, 已回退固定值 — 勿再对 panel ui 做 min_rect 测量。
+const TOOLBAR_SIZE: [f32; 2] = [288.0, 36.0];
 /// 方形图标按钮边长。
 const BTN_SIZE: f32 = 24.0;
 /// 吸附定位(物理像素): 优先像素探测 Plasticity 顶栏「文件名文字块」右缘
@@ -530,8 +532,6 @@ impl eframe::App for PlaApp {
 
         // ---- 横向工具栏本体(单按钮单构建 — Bug 2 修复) ----
         let mut hovered: Option<(String, String)> = None;
-        // R6-2: 内容实测尺寸(min_rect 不受裁剪影响, 超出部分仍计入)。
-        let mut content_size = egui::Vec2::ZERO;
         egui::CentralPanel::default()
             .frame(panel_frame())
             .show(ctx, |ui| {
@@ -618,19 +618,7 @@ impl eframe::App for PlaApp {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                 });
-                content_size = ui.min_rect().size();
             });
-        // R6-2 自适应窗口尺寸: 内容(含 panel_frame 左右/上下各 6 边距)+2px 余量,
-        // 与当前窗口差 >1pt 才回写, 避免命令风暴; 不然 emoji 字体度量一变 ✕ 又被裁。
-        if content_size.x > 0.0 {
-            let need = egui::vec2(content_size.x + 12.0 + 2.0, content_size.y + 12.0 + 1.0);
-            let cur = ctx.input(|i| i.viewport().inner_rect.map(|r| r.size()));
-            if let Some(cur) = cur {
-                if (cur.x - need.x).abs() > 1.0 || (cur.y - need.y).abs() > 1.0 {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(need));
-                }
-            }
-        }
         self.hovered_hint = hovered;
 
         // ---- 工具栏外框基准位置(子视口都锚在它正下方) ----
