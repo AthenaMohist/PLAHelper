@@ -36,7 +36,7 @@ const COL_GRAY_DOT: egui::Color32 = egui::Color32::from_rgb(0x77, 0x77, 0x77);
 /// 高 30: 垂直边距 3+3 + 按钮 24 = 30, 按钮行恰在窗口中心(吸附按中心对齐)。
 /// 窗口 = 面板本体, 不留外侧光晕带 — glow 后端透明窗口不可靠(R5 圆角教训),
 /// 光晕带以黑为底合成会变成「半透明黑框」(R6-2d 实测), 光晕改画面板内侧。
-const TOOLBAR_SIZE: [f32; 2] = [246.0, 30.0];
+const TOOLBAR_SIZE: [f32; 2] = [216.0, 30.0];
 /// 面板整体右移微调(逻辑 px, 按 ppp 缩放; R6-2e 用户要求再偏右 10)。
 const SNAP_RIGHT_SHIFT: f32 = 10.0;
 /// 吸附垂直微调(逻辑 pt, 按 ppp 缩放; 仅作用于探测命中分支)。
@@ -70,10 +70,10 @@ const ROUND_POLL_MS: u64 = 500;
 const ROUNDING: f32 = 10.0;
 
 /// 工具栏按钮列(横向排列, 顺序即产品顺序)。
-/// R7-5: 手动快照移入快照墙头部(图标钮), 一级工具栏不再放 —
-/// 宽度 = 276 - (按钮24 + 间距6) = 246。
-const TOOLBAR_ACTIONS: [Action; 5] = [
-    Action::EntitiesRefresh,
+/// R7-5: 手动快照移入快照墙头部(图标钮); R7-11: 刷新实体移入选择集窗口头部 —
+/// 一级工具栏只留面板开关类按钮。
+/// 宽度 216 = 246 - (按钮24 + 间距6)。
+const TOOLBAR_ACTIONS: [Action; 4] = [
     Action::ToggleSnapshots,
     Action::ToggleEntities,
     Action::ToggleDim,
@@ -1371,7 +1371,30 @@ impl eframe::App for PlaApp {
             let desired = next_pos(&mut stack_y, PANEL_ENTITIES[1]);
             if let Some(desired) = desired {
                 let mut flag = self.show_entities;
-                show_child_window(
+                // R7-11: 刷新实体钮移到本窗口头部(与快照墙同款: 图标 + HUD 悬浮提示)
+                let do_refresh = std::rc::Rc::new(std::cell::Cell::new(false));
+                // Rc<RefCell>: icons Box<dyn FnOnce> 要求 'static, 借用不得
+                let tip_slot = std::rc::Rc::new(std::cell::RefCell::new(None::<(String, String)>));
+                let (dr, ts) = (do_refresh.clone(), tip_slot.clone());
+                let icons: Box<dyn FnOnce(&mut egui::Ui)> = Box::new(move |ui| {
+                    let resp = ui.add(
+                        egui::Button::new(
+                            egui::RichText::new("🔄").size(13.0).color(egui::Color32::WHITE),
+                        )
+                        .frame(false)
+                        .rounding(egui::Rounding::same(4.0)),
+                    );
+                    if resp.hovered() {
+                        *ts.borrow_mut() = Some((
+                            "🔄 刷新实体树".into(),
+                            "经官方桥协议拉取 Plasticity 全树(LIST_VISIBLE)".into(),
+                        ));
+                    }
+                    if resp.clicked() {
+                        dr.set(true);
+                    }
+                });
+                header_extra_and_show(
                     ctx,
                     "panel-entities",
                     "实体树 / 选择集",
@@ -1390,7 +1413,7 @@ impl eframe::App for PlaApp {
                         egui::ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
                             if self.entities.is_empty() {
                                 ui.label(
-                                    egui::RichText::new("(空 — 点工具栏 🔄 刷新实体)").color(COL_MUTED),
+                                    egui::RichText::new("(空 — 点右上 🔄 刷新实体)").color(COL_MUTED),
                                 );
                             }
                             for e in &self.entities {
@@ -1438,7 +1461,15 @@ impl eframe::App for PlaApp {
                             .color(COL_MUTED),
                         );
                     },
+                    Some(icons),
                 );
+                // 悬浮提示 → HUD(工具栏右侧), 与快照墙头部图标同款
+                if let Some(t) = tip_slot.borrow_mut().take() {
+                    self.hovered_hint = Some(t);
+                }
+                if do_refresh.get() {
+                    self.run_action(Action::EntitiesRefresh);
+                }
                 self.show_entities = flag;
             }
         }
