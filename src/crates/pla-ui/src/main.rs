@@ -272,7 +272,7 @@ fn panel_frame() -> egui::Frame {
         .fill(COL_PANEL)
         .rounding(egui::Rounding::same(ROUNDING))
         .inner_margin(egui::Margin::same(6.0))
-        .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_white_alpha(90)))
+        .stroke(egui::Stroke::new(2.0_f32, egui::Color32::from_white_alpha(130)))
 }
 
 /// 子视口面板头: 标题 + 右侧 ✕ 关闭钮。
