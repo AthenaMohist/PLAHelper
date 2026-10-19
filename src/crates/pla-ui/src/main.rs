@@ -31,12 +31,21 @@ const COL_RED: egui::Color32 = egui::Color32::from_rgb(0xd0, 0x50, 0x45);
 const COL_GRAY_DOT: egui::Color32 = egui::Color32::from_rgb(0x77, 0x77, 0x77);
 
 // ---------------- 工具栏形态/吸附参数(可调) ----------------
-/// 工具栏固定逻辑尺寸(横向一行按钮): 圆点+分隔线+6 按钮+分隔线+关闭键。
+/// 工具栏面板可见逻辑尺寸(横向一行按钮): 圆点+分隔线+6 按钮+分隔线+关闭键。
 /// 宽 276 = 264(✕ 被吞 1/3 的旧值)+8 溢出+4 余量, 288 被用户反馈略宽;
 /// 高 30: 内容顶对齐(边距 6+按钮 24=30 恰好贴合, 不裁切)。
+const PANEL_SIZE: [f32; 2] = [276.0, 30.0];
+/// 面板四周羽化光晕带宽度 — 窗口比面板大出的这一圈给 Shadow 留渲染空间,
+/// 否则光晕画到窗口外被裁(R6-2c 教训)。
+const GLOW_PAD: f32 = 12.0;
+/// 窗口实际尺寸 = 可见面板 + 两侧光晕带; 吸附偏移须按 GLOW_PAD 补偿
+/// (update_snap / toolbar_bottom_left), 保证面板可见位置与旧版一致。
+const TOOLBAR_SIZE: [f32; 2] = [
+    PANEL_SIZE[0] + GLOW_PAD * 2.0,
+    PANEL_SIZE[1] + GLOW_PAD * 2.0,
+];
 /// 注: 勿对 panel ui 用 min_rect 测尺寸做自适应 — CentralPanel 的 min_rect
 /// 含整个可用区, need=窗口+余量 每帧自增(R6-2b 已回退, 教训留档)。
-const TOOLBAR_SIZE: [f32; 2] = [276.0, 30.0];
 /// 方形图标按钮边长。
 const BTN_SIZE: f32 = 24.0;
 /// 吸附定位(物理像素): 优先像素探测 Plasticity 顶栏「文件名文字块」右缘
@@ -260,15 +269,36 @@ fn section_header(ui: &mut egui::Ui, text: &str) {
 }
 
 /// 工具栏/子视口共用的圆角深色面板 Frame。
+/// 光晕色: 奶白(用户指定白/奶白, 绿色描边不协调已弃)。
+/// premultiplied 值 = 原色(255,246,224) × alpha 210/255, from_rgba_unmultiplied
+/// 非 const fn, const 上下文只能用 premultiplied 版本。
+const COL_GLOW: egui::Color32 = egui::Color32::from_rgba_premultiplied(210, 202, 184, 210);
+
+/// 工具栏面板帧: 奶白羽化光晕 + 1.5px 白色内描边。
+/// 外侧光晕带由 outer_margin = GLOW_PAD 腾出(窗口比面板大一圈)。
+fn toolbar_frame() -> egui::Frame {
+    egui::Frame::none()
+        .fill(COL_PANEL)
+        .rounding(egui::Rounding::same(ROUNDING))
+        .inner_margin(egui::Margin::same(6.0))
+        .outer_margin(egui::Margin::same(GLOW_PAD))
+        .stroke(egui::Stroke::new(1.5_f32, egui::Color32::from_white_alpha(150)))
+        .shadow(egui::Shadow {
+            offset: egui::Vec2::ZERO,
+            blur: 12.0_f32,
+            spread: 1.0_f32,
+            color: COL_GLOW,
+        })
+}
+
+/// 子视口面板帧: 白色描边轮廓(子窗口尺寸是按内容定的, 没有光晕带,
+/// 画光晕会被窗口边裁掉; 白描边同样起到与主程序的区隔作用)。
 fn panel_frame() -> egui::Frame {
     egui::Frame::none()
         .fill(COL_PANEL)
         .rounding(egui::Rounding::same(ROUNDING))
         .inner_margin(egui::Margin::same(6.0))
-        // R6-2b: 轮廓描边(绿色取自 Plasticity 图标方块), 与主程序视觉区隔。
-        // 窗口=面板本体, 外侧光晕会被窗口边缘裁掉, 故用描边不用 shadow;
-        // 画 2px, 贴窗口边被裁一半后实际可见约 1px。
-        .stroke(egui::Stroke::new(2.0_f32, COL_ACCENT))
+        .stroke(egui::Stroke::new(2.0_f32, egui::Color32::from_white_alpha(160)))
 }
 
 /// 子视口面板头: 标题 + 右侧 ✕ 关闭钮。
@@ -407,10 +437,14 @@ impl PlaApp {
         // 物理 x: 探测命中 → 文件名右缘+间隙; 否则降级固定偏移。
         // 两者都按 ppp 缩放: probe/GetWindowRect 在 DPI-aware 进程里是物理像素,
         // 固定常量是逻辑 px, 不缩放在高 DPI 下会缩水遮文件名(R6 实测 4K/3x)。
+        // 减 GLOW_PAD*ppp: 窗口左缘比面板可见左缘大出一圈光晕带(R6-2d),
+        // 补偿后面板可见位置与旧版一致。
         let ppp = ctx.pixels_per_point();
         let x_phys = match self.probed_edge {
-            Some((h, edge)) if h == target.hwnd => edge as f32 + SNAP_FILENAME_GAP * ppp,
-            _ => target.left as f32 + SNAP_LEFT_OFFSET * ppp,
+            Some((h, edge)) if h == target.hwnd => {
+                edge as f32 + (SNAP_FILENAME_GAP - GLOW_PAD) * ppp
+            }
+            _ => target.left as f32 + (SNAP_LEFT_OFFSET - GLOW_PAD) * ppp,
         };
         let new_anchor = Some((target.left, target.top, x_phys as i32));
         let anchor_changed = match (new_anchor, self.last_snap_anchor) {
@@ -426,7 +460,8 @@ impl PlaApp {
         }
         self.last_snap_anchor = new_anchor;
         // 物理 → egui points: OuterPosition 用 points(见 egui 0.29 ViewportInfo)。
-        let y_phys = target.top as f32 + SNAP_TOP_GAP as f32;
+        // 上移 GLOW_PAD: 同 x 补偿, 窗口顶部光晕带不算入面板可见位置。
+        let y_phys = target.top as f32 + SNAP_TOP_GAP as f32 - GLOW_PAD * ppp;
         ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
             x_phys / ppp,
             y_phys / ppp,
@@ -537,7 +572,7 @@ impl eframe::App for PlaApp {
         // ---- 横向工具栏本体(单按钮单构建 — Bug 2 修复) ----
         let mut hovered: Option<(String, String)> = None;
         egui::CentralPanel::default()
-            .frame(panel_frame())
+            .frame(toolbar_frame())
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     // 状态圆点区: 未绑定=灰; 已绑定显示 bridge 状态色。
@@ -626,10 +661,11 @@ impl eframe::App for PlaApp {
         self.hovered_hint = hovered;
 
         // ---- 工具栏外框基准位置(子视口都锚在它正下方) ----
+        // outer_rect = 含光晕带的整窗; 面板可见左缘/底缘 = 整窗 ∓ GLOW_PAD(R6-2d)。
         let toolbar_bottom_left = ctx.input(|i| {
             i.viewport()
                 .outer_rect
-                .map(|r| egui::pos2(r.left() + 2.0, r.bottom() + 6.0))
+                .map(|r| egui::pos2(r.left() + GLOW_PAD + 2.0, r.bottom() - GLOW_PAD + 6.0))
         });
 
         // ---- 悬停提示: 子视口弹出在工具栏正下方(不遮按钮) ----
