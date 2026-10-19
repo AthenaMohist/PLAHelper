@@ -272,7 +272,7 @@ fn panel_frame() -> egui::Frame {
         .fill(COL_PANEL)
         .rounding(egui::Rounding::same(ROUNDING))
         .inner_margin(egui::Margin::same(6.0))
-        .stroke(egui::Stroke::new(1.5_f32, egui::Color32::from_white_alpha(130)))
+        .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_white_alpha(90)))
 }
 
 /// 子视口面板头: 标题 + 右侧 ✕ 关闭钮。
@@ -628,17 +628,16 @@ impl eframe::App for PlaApp {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                 });
-                // R6-2f 真羽化: 顶点色 Mesh 沿圆角矩形双环插值, GPU 线性渐变,
-                // 无离散描边的色带(R6-2e「框中框」被否决)。首环贴边微亮,
-                // 10pt 内平滑衰减到 0; 奶白色, 整体压暗(用户要求暗而柔)。
-                // ui.max_rect() = 内容区(定值, 与内容无关), 外扩 6 = 面板可见矩形。
+                // R6-2g: 光晕减薄 10pt→3pt(用户反馈太厚), 完全收在 6pt 边距内
+                // 不碰按钮; 上版四角别扭是 10pt 内环(高 30-20)圆角归零成直角所致,
+                // 3pt 深度下内环圆角剩 3pt, 自愈。
                 let panel_rect = ui.max_rect().expand(6.0);
                 let mut glow_mesh = egui::Mesh::default();
                 pla_ui::glow::append_inner_glow(
                     &mut glow_mesh,
                     panel_rect,
                     ROUNDING,
-                    &[(0.0, 60), (5.0, 18), (10.0, 0)],
+                    &[(0.0, 60), (1.5, 22), (3.0, 0)],
                     [255, 246, 228],
                 );
                 ui.painter_at(panel_rect)
