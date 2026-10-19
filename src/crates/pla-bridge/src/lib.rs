@@ -1,5 +1,6 @@
 //! pla-bridge: WebSocket 桥接层（连接、协议、关联、重连、会话表）。
 
+pub mod cdp;
 pub mod connection;
 pub mod error;
 pub mod protocol;

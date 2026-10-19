@@ -75,3 +75,50 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 }
+
+/// CDP 选择集成员(R7-14): kind/id/name 三元组。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CdpMember {
+    pub kind: String,
+    pub id: String,
+    pub name: String,
+}
+
+/// 保存 CDP 选择集(R7-14): exe 同级 `selections-cdp/<doc_key>/<名称>.json`。
+/// 成员为结构化三元组, 与桥 id 空间隔离; 应用走 CDP `Selection.addById`。
+pub fn save_cdp_selection(
+    doc_key: &str,
+    name: &str,
+    members: &[(String, String, String)],
+) -> Result<String, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("选择集名称为空 — 请先在名称框输入".into());
+    }
+    if members.is_empty() {
+        return Err("实时选择勾选为空".into());
+    }
+    let exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let dir = exe.join("selections-cdp").join(sanitize(doc_key));
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建目录失败: {e}"))?;
+    let items: Vec<CdpMember> = members
+        .iter()
+        .map(|(k, i, n)| CdpMember {
+            kind: k.clone(),
+            id: i.clone(),
+            name: n.clone(),
+        })
+        .collect();
+    let json = serde_json::json!({
+        "doc_key": doc_key,
+        "name": name,
+        "members": items,
+    });
+    let path = dir.join(format!("{}.json", sanitize(name)));
+    std::fs::write(&path, serde_json::to_string_pretty(&json).map_err(|e| e.to_string())?)
+        .map_err(|e| format!("写文件失败: {e}"))?;
+    Ok(path.display().to_string())
+}

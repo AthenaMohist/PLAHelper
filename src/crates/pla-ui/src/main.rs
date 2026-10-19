@@ -126,6 +126,15 @@ struct PlaApp {
     show_settings: bool,
     sel_name: String,
     sel_members: Vec<String>,
+    /// CDP 会话句柄(R7-14): 实时选择/实体树通道(Plasticity 需 PLA-CDP 补丁版启动)。
+    cdp: pla_bridge::cdp::CdpHandle,
+    cdp_status: String,
+    /// 实时选择快照 (kind, id, name, ctor)。
+    live_sel: Vec<(String, String, String, String)>,
+    /// CDP 实体树平铺 (name, ctor, indent, selected)。
+    cdp_tree: Vec<(String, String, i64, bool)>,
+    /// CDP 选择集勾选成员 (kind, id, name)。
+    sel_cdp_members: Vec<(String, String, String)>,
     dim_value: f64,
     hotkeys: HotkeyMap,
     /// 正在录制快捷键的动作名 (None = 未在录制)。
@@ -599,6 +608,11 @@ impl PlaApp {
             show_settings: false,
             sel_name: String::new(),
             sel_members: Vec::new(),
+            cdp: pla_bridge::cdp::CdpHandle::spawn(9333),
+            cdp_status: "CDP 连接中…".into(),
+            live_sel: Vec::new(),
+            cdp_tree: Vec::new(),
+            sel_cdp_members: Vec::new(),
             dim_value: 0.0,
             hotkeys: HotkeyMap::default(),
             recording: None,
@@ -627,6 +641,31 @@ impl PlaApp {
                 BridgeEvent::Error(e) => {
                     self.notice = Some((true, e));
                     self.notice_at = Instant::now();
+                }
+            }
+        }
+        // CDP 事件: 实时选择/实体树/状态(R7-14)。
+        while let Some(ev) = self.cdp.poll() {
+            match ev {
+                pla_bridge::cdp::CdpEvent::Status(s) => self.cdp_status = s,
+                pla_bridge::cdp::CdpEvent::Selection(snap) => {
+                    if snap.ok {
+                        self.live_sel = snap
+                            .items
+                            .into_iter()
+                            .map(|i| (i.kind.to_string(), i.id, i.name, i.ctor))
+                            .collect();
+                    } else if self.live_sel.is_empty() && snap.state == "no-editor" {
+                        // 编辑器尚未就绪: 保持状态行即可
+                    } else {
+                        self.live_sel.clear();
+                    }
+                }
+                pla_bridge::cdp::CdpEvent::Tree(nodes) => {
+                    self.cdp_tree = nodes
+                        .into_iter()
+                        .map(|n| (n.name, n.ctor, n.indent, n.selected))
+                        .collect();
                 }
             }
         }
@@ -1409,6 +1448,84 @@ impl eframe::App for PlaApp {
                                 .small()
                                 .color(COL_MUTED),
                         );
+                        // ---- R7-14: 实时选择(CDP) — 视口里选什么这里实时显示什么 ----
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new(format!("实时选择: {}", self.cdp_status))
+                                    .small()
+                                    .color(COL_MUTED),
+                            );
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.small_button("清空勾选").clicked() {
+                                    self.sel_cdp_members.clear();
+                                }
+                            });
+                        });
+                        if !self.live_sel.is_empty() {
+                            egui::ScrollArea::vertical()
+                                .id_salt("live-sel")
+                                .max_height(90.0)
+                                .show(ui, |ui| {
+                                    for (kind, id, name, ctor) in self.live_sel.clone() {
+                                        let key = format!("{kind}:{id}:{name}");
+                                        let mut on = self
+                                            .sel_cdp_members
+                                            .iter()
+                                            .any(|(k, i, n)| format!("{k}:{i}:{n}") == key);
+                                        let label = if name.is_empty() {
+                                            format!("{ctor} ({kind})")
+                                        } else {
+                                            format!("{name} ({kind})")
+                                        };
+                                        if ui.checkbox(&mut on, label).changed() {
+                                            if on {
+                                                self.sel_cdp_members
+                                                    .push((kind.clone(), id.clone(), name.clone()));
+                                            } else {
+                                                self.sel_cdp_members
+                                                    .retain(|(k, i, n)| format!("{k}:{i}:{n}") != key);
+                                            }
+                                        }
+                                    }
+                                });
+                        } else {
+                            ui.label(
+                                egui::RichText::new("(空 — 在 Plasticity 视口/树里选择实体)")
+                                    .small()
+                                    .color(COL_MUTED),
+                            );
+                        }
+                        ui.separator();
+                        // ---- CDP 实体树: 含 bridge 不下发的 curves/instances ----
+                        if !self.cdp_tree.is_empty() {
+                            section_header(ui, "TREE (CDP)");
+                            egui::ScrollArea::vertical()
+                                .id_salt("cdp-tree")
+                                .max_height(120.0)
+                                .show(ui, |ui| {
+                                    for (name, ctor, indent, sel) in self.cdp_tree.clone() {
+                                        ui.horizontal(|ui| {
+                                            ui.add_space(indent as f32 * 12.0);
+                                            let color = if sel {
+                                                COL_ACCENT
+                                            } else {
+                                                COL_TEXT
+                                            };
+                                            ui.label(
+                                                egui::RichText::new(name)
+                                                    .small()
+                                                    .color(color),
+                                            );
+                                            ui.label(
+                                                egui::RichText::new(ctor)
+                                                    .small()
+                                                    .color(COL_MUTED),
+                                            );
+                                        });
+                                    }
+                                });
+                            ui.separator();
+                        }
                         ui.separator();
                         egui::ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
                             if self.entities.is_empty() {
@@ -1450,6 +1567,51 @@ impl eframe::App for PlaApp {
                             }
                             if ui.button("应用").clicked() {
                                 self.run_action(Action::SelApply);
+                            }
+                        });
+                        // ---- R7-14: CDP 选择集 —— 保存勾选的实时选择 + 一键应用回 Plasticity ----
+                        ui.horizontal(|ui| {
+                            if ui.button("保存实时选择").clicked() {
+                                let name = self.sel_name.trim().to_string();
+                                if name.is_empty() {
+                                    self.set_notice((true, "请先在名称框输入选择集名称".into()));
+                                } else if self.sel_cdp_members.is_empty() {
+                                    self.set_notice((true, "实时选择勾选为空".into()));
+                                } else {
+                                    match pla_ui::selection::save_cdp_selection(
+                                        &self.doc_key,
+                                        &name,
+                                        &self.sel_cdp_members.clone(),
+                                    ) {
+                                        Ok(path) => self.set_notice((
+                                            false,
+                                            format!(
+                                                "已保存 {} ({} 项) → {}",
+                                                name,
+                                                self.sel_cdp_members.len(),
+                                                path
+                                            ),
+                                        )),
+                                        Err(e) => self.set_notice((true, e)),
+                                    }
+                                }
+                            }
+                            if ui.button("应用到 Plasticity").clicked() {
+                                let ids: Vec<u32> = self
+                                    .sel_cdp_members
+                                    .iter()
+                                    .filter_map(|(_, id, _)| id.parse::<u32>().ok())
+                                    .collect();
+                                if ids.is_empty() {
+                                    self.set_notice((true, "勾选项无可用的数值 id".into()));
+                                } else {
+                                    let n = ids.len();
+                                    self.cdp.send(pla_bridge::cdp::CdpCmd::ApplyIds(ids));
+                                    self.set_notice((
+                                        false,
+                                        format!("已应用 {n} 项选择到 Plasticity"),
+                                    ));
+                                }
                             }
                         });
                         ui.label(
