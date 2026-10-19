@@ -33,7 +33,7 @@ const COL_GRAY_DOT: egui::Color32 = egui::Color32::from_rgb(0x77, 0x77, 0x77);
 // ---------------- 工具栏形态/吸附参数(可调) ----------------
 /// 工具栏固定逻辑尺寸(横向一行按钮): 圆点+分隔线+6 按钮+分隔线+关闭键。
 /// 宽 276 = 264(✕ 被吞 1/3 的旧值)+8 溢出+4 余量, 288 被用户反馈略宽;
-/// 高 30: 内容顶对齐(边距 6+按钮 24=30 恰好贴合, 不裁切)。
+/// 高 30: 垂直边距 3+3 + 按钮 24 = 30, 按钮行恰在窗口中心(吸附按中心对齐)。
 /// 窗口 = 面板本体, 不留外侧光晕带 — glow 后端透明窗口不可靠(R5 圆角教训),
 /// 光晕带以黑为底合成会变成「半透明黑框」(R6-2d 实测), 光晕改画面板内侧。
 const TOOLBAR_SIZE: [f32; 2] = [276.0, 30.0];
@@ -271,14 +271,21 @@ fn panel_frame() -> egui::Frame {
     egui::Frame::none()
         .fill(COL_PANEL)
         .rounding(egui::Rounding::same(ROUNDING))
-        .inner_margin(egui::Margin::same(6.0))
+        .inner_margin(egui::Margin { left: 6.0, right: 6.0, top: 3.0, bottom: 3.0 })
         .stroke(egui::Stroke::new(2.0_f32, egui::Color32::from_white_alpha(130)))
 }
 
 /// 面板内侧羽化光晕(所有面板统一: 工具栏 + 悬浮提示 + 功能面板, R6-2i)。
-/// ui.max_rect() = 内容区(定值, 与内容无关), 外扩 6 = 面板可见矩形。
+/// ui.max_rect() = 内容区(定值, 与内容无关), 按非对称边距外扩 = 面板可见矩形。
+/// 注意: 外扩量必须与 panel_frame() 的 inner_margin 保持联动
+/// (左右 6 / 上下 3), 改边距必须同步改这里, 否则光晕会被窗口边缘裁掉。
 fn paint_panel_glow(ui: &egui::Ui) {
-    let panel_rect = ui.max_rect().expand(6.0);
+    // 非对称内边距, 不能用统一 expand: 上下外扩 3、左右外扩 6。
+    let m = ui.max_rect();
+    let panel_rect = egui::Rect::from_min_max(
+        egui::pos2(m.left() - 6.0, m.top() - 3.0),
+        egui::pos2(m.right() + 6.0, m.bottom() + 3.0),
+    );
     let mut glow_mesh = egui::Mesh::default();
     pla_ui::glow::append_inner_glow(
         &mut glow_mesh,
