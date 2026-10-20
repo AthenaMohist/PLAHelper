@@ -370,6 +370,20 @@ async fn session_loop(
   else throw 'topology '+e.id+' 未找到(几何已变更?)'\
  }}catch(err2){{ fail++; err(err2) }} }});\
  keyed.forEach(function(e){{ try{{ var f=fn[e.kind]; if(!f) throw 'no-fn:'+e.kind; s[f](JSON.parse(e.key)); ok++ }}catch(err3){{ fail++; err(err3) }} }});\
+ // R7-22: UI 唤醒 — 纯写 selection 数据改得动内核选区但 UI 无感(面不高亮、
+ //   push face 面板不弹)。 hook 全部 53 路信号做差集后确认: UI 真实 pick 会
+ //   额外发 selectionDelta / highlighted / visibleLayersChanged /
+ //   selectionModeChanged / renderPrepared, 且跑一整个 ClickChangeSelectionCommand
+ //   命令周期。 这里按差集补发(全都不依赖相机/屏幕坐标), 补完 UI 高亮与面板出现。\
+ try{{ var es=ed.selection.signals;\
+  es.selectionDelta.dispatch({{_didChange:true}});\
+  es.selectionModeChanged.dispatch();\
+  es.visibleLayersChanged.dispatch();\
+  es.highlighted.dispatch();\
+  es.selectionChanged.dispatch();\
+  es.renderPrepared.dispatch();\
+  ed.selection.selectedSignals.selectionChanged.dispatch();\
+ }}catch(eS){{ err('signal '+String(eS).slice(0,40)) }}\
  return JSON.stringify({{ok:ok,fail:fail,errs:errs}}) }})()",
                     ents = serde_json::to_string(&
                         entries
