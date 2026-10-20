@@ -340,20 +340,15 @@ async fn session_loop(
                 //    注意 addFace(裸 {id,versionId} 或 ref 本体) 会抛
                 //    "undefined reading versionId" — 必须传 ref.view。
                 //  对象形 key 兜底: lookup 失败或无 db 时原样回放, 失败计数如实上报。
+                // (JS 内不得写 // 注释: 该模板用反斜杠续行, 生成的是一整行 JS,
+                //  行注释会把后面的代码全部吞掉 → SyntaxError: Unexpected end of input。
+                //  说明一律写在 Rust 侧, 如上。)
                 let js = format!(
                     "(function(){{ var ed=window.__PLA_EDITOR__; if(!ed||!ed.selection) return JSON.stringify({{ok:0,fail:0,errs:['no-editor']}}); var s=ed.selection.selected; var ents={ents}; var ok=0, fail=0, errs=[];\
  function err(m){{ if(errs.length<4) errs.push(String(m).slice(0,60)) }}\
- // === R7-23 主路径: 选区状态存取(SelectionMemento) ===\
- //   saveToMemento() 得到 {{ids: Set<\"tag:id\">}}; 恢复 = 取任意 memento 实例、\
- //   替换其 ids 为存档集合后 restoreFromMemento()。 这条路不经 pick 流程,\
- //   因此不受遮挡/剖面/相机影响, 内部面也能选中, 且实测持久不回滚\
- //   (对比: addFace(ref.view) 写入会被 Plasticity 回滚; 合成点击需屏幕坐标)。\
- //   tag 映射(2026-10-21 实测): edge=0, face=2, solid=4, sheet=5。\
  var TAGS={{edge:0,face:2,solid:4,sheet:5}};\
  var db=null; try{{ db=s.cache().db }}catch(eD){{}}\
  var memIds=[], unknown=[], groups={{}};\
- // 父实体登记: 面/边必须写入 parentsWithSelectedChildren(父实体 -> 被选子项),\
- //   否则命令层(如 Duplicate)遍历时拿到 null, 报 object null is not iterable。\
  function parentOf(id){{ try{{ var v=db.lookupTopologyItemById(String(id)).view; var fg=v&&v.parent; var solid=fg&&fg.parent;\
    return (solid&&solid.versionId!==undefined)?String(solid.versionId):null }}catch(e){{ return null }} }}\
  ents.forEach(function(e){{\
@@ -370,7 +365,6 @@ async fn session_loop(
    Object.keys(groups).forEach(function(p){{ pc.counts.set(p, groups[p].length); pc.values.set(p, groups[p]) }}) }}\
   s.clear();\
   s.restoreFromMemento(m);\
-  // 逐项核对实际进了哪个桶, 才敢计成功\
   var got=0;\
   ents.forEach(function(e){{\
    var v=null;\
@@ -381,20 +375,7 @@ async fn session_loop(
   }});\
   ok=got; fail=ents.length-got;\
  }}catch(eM){{ err('memento '+String(eM).slice(0,50)); fail=ents.length }}\
- // 未知类型(segment/curve/group 等, tag 未实测) → 放弃并如实上报\
  unknown.forEach(function(e){{ err('kind '+e.kind+' 暂无 tag, 未恢复') }});\
- // R7-22: UI 唤醒 — 纯写 selection 数据改得动内核选区但 UI 无感(面不高亮、
- //   push face 面板不弹)。 hook 全部 53 路信号做差集后确认: UI 真实 pick 会
- //   额外发 selectionDelta / highlighted / visibleLayersChanged /
- //   selectionModeChanged / renderPrepared, 且跑一整个 ClickChangeSelectionCommand
- //   命令周期。 这里按差集补发(全都不依赖相机/屏幕坐标), 补完 UI 高亮与面板出现。\
- try{{ var es=ed.selection.signals;\
-  // 逐个容错: selectionModeChanged / renderPrepared 缺合法 payload 会抛错,\
-  // 若整段共用一个 try, 一次抛出会让后面所有补发被跳过(UI 因此仍不刷新)。\
-  var wakes=[['selectionDelta',{{_didChange:true}}],['selectionModeChanged',null],['visibleLayersChanged',null],['highlighted',null],['selectionChanged',null],['renderPrepared',null]];\
-  wakes.forEach(function(w){{ try{{ var sg=es[w[0]]; if(!sg) return; if(w[1]===null) sg.dispatch(); else sg.dispatch(w[1]) }}catch(eW){{}} }});\
-  try{{ ed.selection.selectedSignals.selectionChanged.dispatch() }}catch(eS2){{}}\
- }}catch(eS){{ err('signal '+String(eS).slice(0,40)) }}\
  return JSON.stringify({{ok:ok,fail:fail,errs:errs}}) }})()",
                     ents = serde_json::to_string(&
                         entries
