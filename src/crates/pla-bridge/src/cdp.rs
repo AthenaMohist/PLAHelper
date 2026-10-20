@@ -343,52 +343,22 @@ async fn session_loop(
                 // (JS 内不得写 // 注释: 该模板用反斜杠续行, 生成的是一整行 JS,
                 //  行注释会把后面的代码全部吞掉 → SyntaxError: Unexpected end of input。
                 //  说明一律写在 Rust 侧, 如上。)
-                let js = format!(
-                    "(function(){{ var ed=window.__PLA_EDITOR__; if(!ed||!ed.selection) return JSON.stringify({{ok:0,fail:0,errs:['no-editor']}}); var s=ed.selection.selected; var ents={ents}; var ok=0, fail=0, errs=[];\
- function err(m){{ if(errs.length<4) errs.push(String(m).slice(0,60)) }}\
- var TAGS={{edge:0,face:2,solid:4,sheet:5}};\
- var db=null; try{{ db=s.cache().db }}catch(eD){{}}\
- var memIds=[], unknown=[], groups={{}};\
- function parentOf(id){{ try{{ var v=db.lookupTopologyItemById(String(id)).view; var fg=v&&v.parent; var solid=fg&&fg.parent;\
-   return (solid&&solid.versionId!==undefined)?String(solid.versionId):null }}catch(e){{ return null }} }}\
- ents.forEach(function(e){{\
-  var t=TAGS[e.kind];\
-  if(t===undefined){{ unknown.push(e); return }}\
-  var memId=t+':'+e.id; memIds.push(memId);\
-  if(e.kind==='face'||e.kind==='edge'){{ var p=parentOf(e.id); if(p){{ if(!groups[p]) groups[p]=[]; groups[p].push(memId) }} }}\
- }});\
- try{{\
-  var m=s.saveToMemento();\
-  m.ids=new Set(memIds);\
-  var pc=m.parentsWithSelectedChildren;\
-  if(pc){{ pc.counts=new Map(); pc.values=new Map();\
-   Object.keys(groups).forEach(function(p){{ pc.counts.set(p, groups[p].length); pc.values.set(p, groups[p]) }}) }}\
-  s.clear();\
-  s.restoreFromMemento(m);\
-  var got=0;\
-  ents.forEach(function(e){{\
-   var v=null;\
-   try{{ v=(e.kind==='face')?s.faceIds:(e.kind==='edge')?s.edgeIds:(e.kind==='solid')?s.solidIds:(e.kind==='sheet')?s.sheetIds:null }}catch(eV){{}}\
-   if(!v) return;\
-   var has=false; v.forEach(function(x){{ if(String(x&&x.versionId!==undefined?x.versionId:x)===String(e.id)) has=true }});\
-   if(has) got++; else err('id '+e.id+' 未命中(几何已变更?)');\
-  }});\
-  ok=got; fail=ents.length-got;\
- }}catch(eM){{ err('memento '+String(eM).slice(0,50)); fail=ents.length }}\
- unknown.forEach(function(e){{ err('kind '+e.kind+' 暂无 tag, 未恢复') }});\
- return JSON.stringify({{ok:ok,fail:fail,errs:errs}}) }})()",
-                    ents = serde_json::to_string(&
-                        entries
-                            .iter()
-                            .map(|e| serde_json::json!({
-                                "kind": e.kind,
-                                "id": e.id,
-                                "key": e.key,
-                            }))
-                            .collect::<Vec<_>>()
-                    )?
-                );
-                let res = eval_roundtrip(ws, &mut mid, &js).await.unwrap_or_default();
+                let js = apply_sel_js(&entries)?;
+                // R7-24: eval 失败不再静默吞成「0 项成功」— 旧代码
+                // `unwrap_or_default()` 把超时/异常/断连一律变成空串 → JSON 解析
+                // 失败 → v=Null → ok=0,fail=0 → UI 显示「选择集已应用: 0 项成功」,
+                // 把 hy4 的 JS 语法错误活生生藏了若干轮。现在错误如实上报。
+                let res = match eval_roundtrip(ws, &mut mid, &js).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("[pla-cdp] ApplySel eval failed: {e:#}");
+                        let _ = ev_tx.send(CdpEvent::Status(format!(
+                            "选择集应用失败: {e}（CDP 通道异常, 非选择数据问题）"
+                        )));
+                        continue;
+                    }
+                };
+                eprintln!("[pla-cdp] ApplySel raw result: {res}");
                 let v: Value = serde_json::from_str(&res).unwrap_or(Value::Null);
                 let ok = v["ok"].as_i64().unwrap_or(0);
                 let fail = v["fail"].as_i64().unwrap_or(0);
@@ -396,11 +366,16 @@ async fn session_loop(
                     .as_array()
                     .map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(" | "))
                     .unwrap_or_default();
-                let _ = ev_tx.send(CdpEvent::Status(if fail == 0 {
-                    format!("选择集已应用: {ok} 项成功")
-                } else {
+                let msg = if fail > 0 || !errs.is_empty() {
                     format!("选择集应用: {ok} 项成功, {fail} 项失败 {errs}")
-                }));
+                } else if ok == 0 {
+                    // R7-24: 空成员不该走到这(UI 侧已拦), 到了说明 entries 为空 —
+                    // 明确告知, 不要伪装成「0 项成功」。
+                    "选择集应用: 成员为空, 未发送任何项".to_string()
+                } else {
+                    format!("选择集已应用: {ok} 项成功")
+                };
+                let _ = ev_tx.send(CdpEvent::Status(msg));
             }
             Err(TryRecvError::Disconnected) => return Err(anyhow::anyhow!("ui gone")),
             Err(_) => {}
@@ -500,6 +475,59 @@ fn json_eval(mid: u64, expr: &str) -> Value {
         "method": "Runtime.evaluate",
         "params": {"expression": expr, "returnByValue": true, "awaitPromise": true, "userGesture": true}
     })
+}
+
+/// 生成 ApplySel 的回放 JS(R7-23c: SelectionMemento 状态存取)。
+/// 抽成纯函数以便单测把真实生成的 JS 打出来与手跑复刻版 diff。
+/// 注意: 模板用 `\` 续行, Rust 会拼成**一整行** JS —
+/// JS 内一律不得写 `//` 注释(会把后面的代码连同 `return`/`})()` 一起吞掉,
+/// 报 SyntaxError: Unexpected end of input; 说明只写 Rust 侧注释。
+fn apply_sel_js(entries: &[ApplyEntry]) -> anyhow::Result<String> {
+    let ents = serde_json::to_string(
+        &entries
+            .iter()
+            .map(|e| serde_json::json!({
+                "kind": e.kind,
+                "id": e.id,
+                "key": e.key,
+            }))
+            .collect::<Vec<_>>(),
+    )?;
+    Ok(format!(
+        "(function(){{ var ed=window.__PLA_EDITOR__; if(!ed||!ed.selection) return JSON.stringify({{ok:0,fail:0,errs:['no-editor']}}); var s=ed.selection.selected; var ents={ents}; var ok=0, fail=0, errs=[];\
+ function err(m){{ if(errs.length<4) errs.push(String(m).slice(0,60)) }}\
+ var TAGS={{edge:0,face:2,solid:4,sheet:5}};\
+ var db=null; try{{ db=s.cache().db }}catch(eD){{}}\
+ var memIds=[], unknown=[], groups={{}};\
+ function parentOf(id){{ try{{ var v=db.lookupTopologyItemById(String(id)).view; var fg=v&&v.parent; var solid=fg&&fg.parent;\
+   return (solid&&solid.versionId!==undefined)?String(solid.versionId):null }}catch(e){{ return null }} }}\
+ ents.forEach(function(e){{\
+  var t=TAGS[e.kind];\
+  if(t===undefined){{ unknown.push(e); return }}\
+  var memId=t+':'+e.id; memIds.push(memId);\
+  if(e.kind==='face'||e.kind==='edge'){{ var p=parentOf(e.id); if(p){{ if(!groups[p]) groups[p]=[]; groups[p].push(memId) }} }}\
+ }});\
+ try{{\
+  var m=s.saveToMemento();\
+  m.ids=new Set(memIds);\
+  var pc=m.parentsWithSelectedChildren;\
+  if(pc){{ pc.counts=new Map(); pc.values=new Map();\
+   Object.keys(groups).forEach(function(p){{ pc.counts.set(p, groups[p].length); pc.values.set(p, groups[p]) }}) }}\
+  s.clear();\
+  s.restoreFromMemento(m);\
+  var got=0;\
+  ents.forEach(function(e){{\
+   var v=null;\
+   try{{ v=(e.kind==='face')?s.faceIds:(e.kind==='edge')?s.edgeIds:(e.kind==='solid')?s.solidIds:(e.kind==='sheet')?s.sheetIds:null }}catch(eV){{}}\
+   if(!v) return;\
+   var has=false; v.forEach(function(x){{ if(String(x&&x.versionId!==undefined?x.versionId:x)===String(e.id)) has=true }});\
+   if(has) got++; else err('id '+e.id+' 未命中(几何已变更?)');\
+  }});\
+  ok=got; fail=ents.length-got;\
+ }}catch(eM){{ err('memento '+String(eM).slice(0,50)); fail=ents.length }}\
+ unknown.forEach(function(e){{ err('kind '+e.kind+' 暂无 tag, 未恢复') }});\
+ return JSON.stringify({{ok:ok,fail:fail,errs:errs}}) }})()"
+    ))
 }
 
 async fn ws_send(ws: &mut WsStream, v: Value) -> anyhow::Result<()> {
@@ -634,5 +662,27 @@ pub async fn cdp_eval_once(port: u16, expr: &str) -> anyhow::Result<String> {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dump_apply_sel_js() {
+        let entries = vec![
+            ApplyEntry { kind: "face".into(), id: "14f2025".into(), key: None },
+            ApplyEntry { kind: "edge".into(), id: "14e1984".into(), key: None },
+            ApplyEntry { kind: "solid".into(), id: "7".into(), key: None },
+        ];
+        let js = apply_sel_js(&entries).unwrap();
+        eprintln!("===GENERATED-JS-BEGIN===");
+        eprintln!("{js}");
+        eprintln!("===GENERATED-JS-END===");
+        // 基本健全性: 不得含 // 注释痕迹, 必须完整收尾
+        assert!(!js.contains("//"), "JS 内含 // 注释会吞掉后续代码");
+        assert!(js.ends_with("})()"), "JS 未完整收尾");
+        assert!(js.contains("14f2025"), "ents 未注入");
     }
 }
