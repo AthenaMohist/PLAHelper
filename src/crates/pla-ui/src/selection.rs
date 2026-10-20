@@ -54,7 +54,7 @@ mod tests {
     #[test]
     fn cdp_sel_fav_rename_delete_flow() {
         let doc = format!("__test_{}", std::process::id());
-        let mem = || vec![("solid".to_string(), "1".to_string(), "n".to_string())];
+        let mem = || vec![("solid".to_string(), "1".to_string(), "n".to_string(), None)];
         save_cdp_selection(&doc, "meta_a", &mem()).unwrap();
         // 旧文件/缺省: fav=false
         let m = cdp_sel_meta(&doc, "meta_a").unwrap();
@@ -104,20 +104,24 @@ mod tests {
     }
 }
 
-/// CDP 选择集成员(R7-14): kind/id/name 三元组。
+/// CDP 选择集成员(R7-14): kind/id/name 三元组 + R7-21 原始 id 元素 key。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CdpMember {
     pub kind: String,
     pub id: String,
+    #[serde(default)]
     pub name: String,
+    /// 快照采集的原始 id 元素 JSON(对象形 {id,versionId,...}); None = 纯数值 id。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
 }
 
 /// 保存 CDP 选择集(R7-14): exe 同级 `selections-cdp/<doc_key>/<名称>.json`。
-/// 成员为结构化三元组, 与桥 id 空间隔离; 应用走 CDP `Selection.addById`。
+/// 成员为结构化四元组, 与桥 id 空间隔离; 应用走 CDP ApplySel 按类型回放。
 pub fn save_cdp_selection(
     doc_key: &str,
     name: &str,
-    members: &[(String, String, String)],
+    members: &[(String, String, String, Option<String>)],
 ) -> Result<String, String> {
     let name = name.trim();
     if name.is_empty() {
@@ -134,10 +138,11 @@ pub fn save_cdp_selection(
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建目录失败: {e}"))?;
     let items: Vec<CdpMember> = members
         .iter()
-        .map(|(k, i, n)| CdpMember {
+        .map(|(k, i, n, key)| CdpMember {
             kind: k.clone(),
             id: i.clone(),
             name: n.clone(),
+            key: key.clone(),
         })
         .collect();
     let json = serde_json::json!({
@@ -272,6 +277,7 @@ pub fn load_cdp_selection(doc_key: &str, name: &str) -> Option<Vec<CdpMember>> {
                         kind: m["kind"].as_str().unwrap_or("").to_string(),
                         id: m["id"].as_str().unwrap_or("").to_string(),
                         name: m["name"].as_str().unwrap_or("").to_string(),
+                        key: m.get("key").and_then(|k| k.as_str()).map(String::from),
                     })
                     .collect()
             })

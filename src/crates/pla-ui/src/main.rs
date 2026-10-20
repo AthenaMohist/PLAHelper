@@ -130,11 +130,11 @@ struct PlaApp {
     cdp: pla_bridge::cdp::CdpHandle,
     cdp_status: String,
     /// 实时选择快照 (kind, id, name, ctor)。
-    live_sel: Vec<(String, String, String, String)>,
+    live_sel: Vec<pla_bridge::cdp::SelItem>,
     /// CDP 实体树平铺 (name, ctor, indent, selected)。
     cdp_tree: Vec<(String, String, i64, bool)>,
-    /// CDP 选择集勾选成员 (kind, id, name)。
-    sel_cdp_members: Vec<(String, String, String)>,
+    /// CDP 选择集勾选成员 (kind, id, name, key=原始 id 元素 JSON)。
+    sel_cdp_members: Vec<(String, String, String, Option<String>)>,
     /// R7-20: 已保存 CDP 选择集(收藏优先); 打开面板/变更后置 sel_saved_loaded=false 重载。
     sel_saved: Vec<pla_ui::selection::CdpSelMeta>,
     sel_saved_loaded: bool,
@@ -670,11 +670,7 @@ impl PlaApp {
                         self.cdp_undo = snap.undo_len;
                     }
                     if snap.ok {
-                        self.live_sel = snap
-                            .items
-                            .into_iter()
-                            .map(|i| (i.kind.to_string(), i.id, i.name, i.ctor))
-                            .collect();
+                        self.live_sel = snap.items;
                     } else if self.live_sel.is_empty() && snap.state == "no-editor" {
                         // 编辑器尚未就绪: 保持状态行即可
                     } else {
@@ -1526,29 +1522,6 @@ impl eframe::App for PlaApp {
             let desired = next_pos(&mut stack_y, PANEL_ENTITIES[1]);
             if let Some(desired) = desired {
                 let mut flag = self.show_entities;
-                // R7-11: 刷新实体钮移到本窗口头部(与快照墙同款: 图标 + HUD 悬浮提示)
-                let do_refresh = std::rc::Rc::new(std::cell::Cell::new(false));
-                // Rc<RefCell>: icons Box<dyn FnOnce> 要求 'static, 借用不得
-                let tip_slot = std::rc::Rc::new(std::cell::RefCell::new(None::<(String, String)>));
-                let (dr, ts) = (do_refresh.clone(), tip_slot.clone());
-                let icons: Box<dyn FnOnce(&mut egui::Ui)> = Box::new(move |ui| {
-                    let resp = ui.add(
-                        egui::Button::new(
-                            egui::RichText::new("🔄").size(13.0).color(egui::Color32::WHITE),
-                        )
-                        .frame(false)
-                        .rounding(egui::Rounding::same(4.0)),
-                    );
-                    if resp.hovered() {
-                        *ts.borrow_mut() = Some((
-                            "🔄 刷新实体树".into(),
-                            "经官方桥协议拉取 Plasticity 全树(LIST_VISIBLE)".into(),
-                        ));
-                    }
-                    if resp.clicked() {
-                        dr.set(true);
-                    }
-                });
                 header_extra_and_show(
                     ctx,
                     "panel-entities",
@@ -1575,16 +1548,21 @@ impl eframe::App for PlaApp {
                                 if ui.small_button("清空勾选").clicked() {
                                     self.sel_cdp_members.clear();
                                 }
-                                // R7-20: 一键全选当前实时选择(去重后追加进勾选区)。
+                                // R7-20: 一键全选当前实时选择(按 kind:id 去重后追加进勾选区)。
                                 if ui.small_button("全选").clicked() {
-                                    for (kind, id, name, _) in self.live_sel.clone() {
-                                        let key = format!("{kind}:{id}:{name}");
+                                    for it in self.live_sel.clone() {
+                                        let key = format!("{}:{}", it.kind, it.id);
                                         if !self
                                             .sel_cdp_members
                                             .iter()
-                                            .any(|(k, i, n)| format!("{k}:{i}:{n}") == key)
+                                            .any(|(k, i, _, _)| format!("{k}:{i}") == key)
                                         {
-                                            self.sel_cdp_members.push((kind, id, name));
+                                            self.sel_cdp_members.push((
+                                                it.kind.to_string(),
+                                                it.id.clone(),
+                                                it.name.clone(),
+                                                it.key.clone(),
+                                            ));
                                         }
                                     }
                                 }
@@ -1595,24 +1573,28 @@ impl eframe::App for PlaApp {
                                 .id_salt("live-sel")
                                 .max_height(90.0)
                                 .show(ui, |ui| {
-                                    for (kind, id, name, ctor) in self.live_sel.clone() {
-                                        let key = format!("{kind}:{id}:{name}");
+                                    for it in self.live_sel.clone() {
+                                        let key = format!("{}:{}", it.kind, it.id);
                                         let mut on = self
                                             .sel_cdp_members
                                             .iter()
-                                            .any(|(k, i, n)| format!("{k}:{i}:{n}") == key);
-                                        let label = if name.is_empty() {
-                                            format!("{ctor} ({kind})")
+                                            .any(|(k, i, _, _)| format!("{k}:{i}") == key);
+                                        let label = if it.name.is_empty() {
+                                            format!("{} ({})", it.ctor, it.kind)
                                         } else {
-                                            format!("{name} ({kind})")
+                                            format!("{} ({})", it.name, it.kind)
                                         };
                                         if ui.checkbox(&mut on, label).changed() {
                                             if on {
-                                                self.sel_cdp_members
-                                                    .push((kind.clone(), id.clone(), name.clone()));
+                                                self.sel_cdp_members.push((
+                                                    it.kind.to_string(),
+                                                    it.id.clone(),
+                                                    it.name.clone(),
+                                                    it.key.clone(),
+                                                ));
                                             } else {
                                                 self.sel_cdp_members
-                                                    .retain(|(k, i, n)| format!("{k}:{i}:{n}") != key);
+                                                    .retain(|(k, i, _, _)| format!("{k}:{i}") != key);
                                             }
                                         }
                                     }
@@ -1625,78 +1607,12 @@ impl eframe::App for PlaApp {
                             );
                         }
                         ui.separator();
-                        // ---- CDP 实体树: 含 bridge 不下发的 curves/instances ----
-                        if !self.cdp_tree.is_empty() {
-                            section_header(ui, "TREE (CDP)");
-                            egui::ScrollArea::vertical()
-                                .id_salt("cdp-tree")
-                                .max_height(120.0)
-                                .show(ui, |ui| {
-                                    for (name, ctor, indent, sel) in self.cdp_tree.clone() {
-                                        ui.horizontal(|ui| {
-                                            ui.add_space(indent as f32 * 12.0);
-                                            let color = if sel {
-                                                COL_ACCENT
-                                            } else {
-                                                COL_TEXT
-                                            };
-                                            ui.label(
-                                                egui::RichText::new(name)
-                                                    .small()
-                                                    .color(color),
-                                            );
-                                            ui.label(
-                                                egui::RichText::new(ctor)
-                                                    .small()
-                                                    .color(COL_MUTED),
-                                            );
-                                        });
-                                    }
-                                });
-                            ui.separator();
-                        }
-                        ui.separator();
-                        egui::ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
-                            if self.entities.is_empty() {
-                                ui.label(
-                                    egui::RichText::new("(空 — 点右上 🔄 刷新实体)").color(COL_MUTED),
-                                );
-                            }
-                            for e in &self.entities {
-                                let name =
-                                    e.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-                                let kind =
-                                    e.get("kind").and_then(|v| v.as_str()).unwrap_or("?");
-                                let id = match e.get("id") {
-                                    Some(serde_json::Value::String(s)) => s.clone(),
-                                    Some(serde_json::Value::Number(n)) => n.to_string(),
-                                    _ => "?".into(),
-                                };
-                                let mut checked = self.sel_members.iter().any(|m| m == &id);
-                                if ui.checkbox(&mut checked, format!("{name} ({kind})")).changed() {
-                                    if let Some(pos) =
-                                        self.sel_members.iter().position(|m| m == &id)
-                                    {
-                                        self.sel_members.remove(pos);
-                                    } else {
-                                        self.sel_members.push(id);
-                                    }
-                                }
-                            }
-                        });
-                        ui.separator();
+                        // ---- R7-21: 旧"刷新实体"按钮与旧实体列表已删(用户不使用;
+                        //      旧实体树(bridge LIST_VISIBLE)UI 随之移除) ----
                         section_header(ui, "SELECTION");
                         ui.horizontal(|ui| {
                             ui.label("名称:");
                             ui.text_edit_singleline(&mut self.sel_name);
-                        });
-                        ui.horizontal(|ui| {
-                            if ui.button("保存(本地 JSON)").clicked() {
-                                self.run_action(Action::SelSave);
-                            }
-                            if ui.button("应用").clicked() {
-                                self.run_action(Action::SelApply);
-                            }
                         });
                         // ---- R7-14: CDP 选择集 —— 保存勾选的实时选择 + 一键应用回 Plasticity ----
                         ui.horizontal(|ui| {
@@ -1712,33 +1628,43 @@ impl eframe::App for PlaApp {
                                         &name,
                                         &self.sel_cdp_members.clone(),
                                     ) {
-                                        Ok(path) => self.set_notice((
-                                            false,
-                                            format!(
-                                                "已保存 {} ({} 项) → {}",
-                                                name,
-                                                self.sel_cdp_members.len(),
-                                                path
-                                            ),
-                                        )),
+                                        Ok(path) => {
+                                            // R7-21: 保存成功立即刷新 SAVED SELECTIONS 墙。
+                                            self.sel_saved_loaded = false;
+                                            self.set_notice((
+                                                false,
+                                                format!(
+                                                    "已保存 {} ({} 项) → {}",
+                                                    name,
+                                                    self.sel_cdp_members.len(),
+                                                    path
+                                                ),
+                                            ));
+                                        }
                                         Err(e) => self.set_notice((true, e)),
                                     }
                                 }
                             }
                             if ui.button("应用到 Plasticity").clicked() {
-                                let ids: Vec<u32> = self
+                                // R7-21: 按成员类型回放 — solid/sheet=addById(数值);
+                                // face/edge 等对象形走 add<Kind>({id,versionId,...}) 原样回放。
+                                let entries: Vec<pla_bridge::cdp::ApplyEntry> = self
                                     .sel_cdp_members
                                     .iter()
-                                    .filter_map(|(_, id, _)| id.parse::<u32>().ok())
+                                    .map(|(k, i, _, key)| pla_bridge::cdp::ApplyEntry {
+                                        kind: k.clone(),
+                                        id: i.clone(),
+                                        key: key.clone(),
+                                    })
                                     .collect();
-                                if ids.is_empty() {
-                                    self.set_notice((true, "勾选项无可用的数值 id".into()));
+                                if entries.is_empty() {
+                                    self.set_notice((true, "勾选项为空".into()));
                                 } else {
-                                    let n = ids.len();
-                                    self.cdp.send(pla_bridge::cdp::CdpCmd::ApplyIds(ids));
+                                    let n = entries.len();
+                                    self.cdp.send(pla_bridge::cdp::CdpCmd::ApplySel(entries));
                                     self.set_notice((
                                         false,
-                                        format!("已应用 {n} 项选择到 Plasticity"),
+                                        format!("正在应用 {n} 项选择到 Plasticity…"),
                                     ));
                                 }
                             }
@@ -1842,7 +1768,7 @@ impl eframe::App for PlaApp {
                                                         let n = members.len();
                                                         self.sel_cdp_members = members
                                                             .into_iter()
-                                                            .map(|m| (m.kind, m.id, m.name))
+                                                            .map(|m| (m.kind, m.id, m.name, m.key))
                                                             .collect();
                                                         self.sel_name = meta.name.clone();
                                                         self.set_notice((
@@ -1897,26 +1823,28 @@ impl eframe::App for PlaApp {
                                                             &self.doc_key, &meta.name,
                                                         ) {
                                                             Some(members) => {
-                                                                let ids: Vec<u32> = members
+                                                                let entries: Vec<pla_bridge::cdp::ApplyEntry> = members
                                                                     .iter()
-                                                                    .filter_map(|m| {
-                                                                        m.id.parse::<u32>().ok()
+                                                                    .map(|m| pla_bridge::cdp::ApplyEntry {
+                                                                        kind: m.kind.clone(),
+                                                                        id: m.id.clone(),
+                                                                        key: m.key.clone(),
                                                                     })
                                                                     .collect();
-                                                                if ids.is_empty() {
+                                                                if entries.is_empty() {
                                                                     self.set_notice((
                                                                         true,
-                                                                        "该选择集无可用的数值 id".into(),
+                                                                        "该选择集没有成员".into(),
                                                                     ));
                                                                 } else {
-                                                                    let n = ids.len();
+                                                                    let n = entries.len();
                                                                     self.cdp.send(
-                                                                        pla_bridge::cdp::CdpCmd::ApplyIds(ids),
+                                                                        pla_bridge::cdp::CdpCmd::ApplySel(entries),
                                                                     );
                                                                     self.set_notice((
                                                                         false,
                                                                         format!(
-                                                                            "已应用「{}」{n} 项到 Plasticity",
+                                                                            "正在应用「{}」{n} 项到 Plasticity…",
                                                                             meta.name
                                                                         ),
                                                                     ));
@@ -1936,21 +1864,14 @@ impl eframe::App for PlaApp {
                         ui.label(
                             egui::RichText::new(format!(
                                 "已勾选 {} 个成员",
-                                self.sel_members.len()
+                                self.sel_cdp_members.len()
                             ))
                             .small()
                             .color(COL_MUTED),
                         );
                     },
-                    Some(icons),
+                    None,
                 );
-                // 悬浮提示 → HUD(工具栏右侧), 与快照墙头部图标同款
-                if let Some(t) = tip_slot.borrow_mut().take() {
-                    self.hovered_hint = Some(t);
-                }
-                if do_refresh.get() {
-                    self.run_action(Action::EntitiesRefresh);
-                }
                 self.show_entities = flag;
             }
         }
@@ -2010,19 +1931,23 @@ impl eframe::App for PlaApp {
                                 };
                                 match pla_ui::selection::load_cdp_selection(&self.doc_key, &name) {
                                     Some(members) => {
-                                        let ids: Vec<u32> = members
+                                        let entries: Vec<pla_bridge::cdp::ApplyEntry> = members
                                             .iter()
-                                            .filter_map(|m| m.id.parse::<u32>().ok())
+                                            .map(|m| pla_bridge::cdp::ApplyEntry {
+                                                kind: m.kind.clone(),
+                                                id: m.id.clone(),
+                                                key: m.key.clone(),
+                                            })
                                             .collect();
-                                        if ids.is_empty() {
-                                            self.set_notice((true, "选择集无可用的数值 id".into()));
+                                        if entries.is_empty() {
+                                            self.set_notice((true, "选择集没有成员".into()));
                                         } else {
-                                            let n = ids.len();
+                                            let n = entries.len();
                                             self.cdp
-                                                .send(pla_bridge::cdp::CdpCmd::ApplyIds(ids));
+                                                .send(pla_bridge::cdp::CdpCmd::ApplySel(entries));
                                             self.set_notice((
                                                 false,
-                                                format!("已选中 {n} 项 ({name})"),
+                                                format!("正在选中 {n} 项 ({name})…"),
                                             ));
                                         }
                                     }

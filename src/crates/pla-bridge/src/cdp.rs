@@ -20,13 +20,22 @@ use serde_json::Value;
 /// UI → CDP 线程命令。
 #[derive(Debug)]
 pub enum CdpCmd {
-    /// 应用选择集: 把数值 id 列表 addById 进当前选择。
-    ApplyIds(Vec<u32>),
+    /// 应用选择集: 按成员类型回放(solid/sheet=addById(数值); 其余=add<Kind>({id,versionId,...}))。
+    ApplySel(Vec<ApplyEntry>),
     /// 立即拉一次实体树。
     RefreshTree,
     /// 通用 evaluate(R7-16): 尺寸驱动命令派发等自动化尝试。
     Eval(String),
     Shutdown,
+}
+
+/// 一条待回放的选择成员。
+#[derive(Debug, Clone)]
+pub struct ApplyEntry {
+    pub kind: String,
+    pub id: String,
+    /// 保存时采集的原始 id 元素 JSON(对象形); None = 纯数值 id。
+    pub key: Option<String>,
 }
 
 /// CDP 线程 → UI 事件。
@@ -43,12 +52,15 @@ pub enum CdpEvent {
 }
 
 /// 一个选中条目。
+/// key = id 元素的原始 JSON(对象形 id 如 face/edge 的 {id,versionId,...});
+/// None = 纯数值 id(solid/sheet 的 kernel item id)。应用时原样回放。
 #[derive(Debug, Clone)]
 pub struct SelItem {
     pub kind: &'static str,
     pub id: String,
     pub name: String,
     pub ctor: String,
+    pub key: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -113,17 +125,20 @@ const SEL_SNAPSHOT_JS: &str = r#"(function(){
   if (!ed || !ed.selection) return JSON.stringify({st:'no-editor'});
   var s = ed.selection.selected;
   if (!s) return JSON.stringify({st:'no-sel'});
-  function idset(n){ try{ var v=s[n]; if(v&&typeof v.forEach==='function'){ var o=[]; v.forEach(function(x){ o.push(String(x)) }); return o } return [] }catch(e){ return [] } }
-  var all = [];
-  try { (s.all||[]).forEach(function(x){ if(x&&typeof x==='object') all.push({
-      ctor: (x.constructor&&x.constructor.name)||'',
-      id: String(x.entityId!==undefined? x.entityId : (x.id===undefined? '' : x.id)),
-      name: String(x.name||''),
-      parent: (x.parent&&x.parent.constructor)? x.parent.constructor.name : ''
-  }) }) } catch(e){}
+  // R7-21: id 集合元素保真采集 — 纯数值原样; 对象形(face/edge 的 {id,versionId,...})
+  // 抽 own 可枚举属性 + __ctor + __str(String 化), 应用时按原结构回放。
+  function idset(n){ try{ var v=s[n]; if(v&&typeof v.forEach==='function'){ var o=[]; v.forEach(function(x){
+      if(x===null||x===undefined){ o.push(null) }
+      else if(typeof x==='object'){
+        var c={__ctor:(x.constructor&&x.constructor.name)||''};
+        try{ Object.keys(x).forEach(function(k){ var val=x[k]; if(val===null||typeof val!=='object') c[k]=val }) }catch(e){}
+        try{ c.__str=String(x) }catch(e2){}
+        o.push(c)
+      } else { o.push(x) }
+  }); return o } return [] }catch(e){ return [] } }
   var undo=-1, geoVer=-1;
   try{ undo = ed.history._undoStack.length }catch(e){}
-  try{ geoVer = ed.geo._version }catch(e){}
+  try{ geoVer = ed.geo._version!==undefined? ed.geo._version : ed.geo.version }catch(e){}
   return JSON.stringify({ st:'ok', size: (typeof s.size==='number')? s.size : -1,
     undo: undo, geoVer: geoVer,
     ids: idset('ids'),
@@ -131,7 +146,7 @@ const SEL_SNAPSHOT_JS: &str = r#"(function(){
     faceIds: idset('faceIds'), edgeIds: idset('edgeIds'),
     segmentIds: idset('segmentIds'), curveIds: idset('curveIds'),
     curveVertexIds: idset('curveVertexIds'), groupIds: idset('groupIds'),
-    planeIds: idset('planeIds'), all: all });
+    planeIds: idset('planeIds') });
 })()"#;
 
 const TREE_JS: &str = r#"(function(){
@@ -311,13 +326,57 @@ async fn session_loop(
                     ));
                 }
             }
-            Ok(CdpCmd::ApplyIds(ids)) => {
+            Ok(CdpCmd::ApplySel(entries)) => {
+                // R7-21b: 回放策略(全部活体验证) —
+                //  solid/sheet 数值 id: harvest 法 — SelectAll<Kind>Command 暴露全部
+                //    Object3D, 与 idSet 顺序配对成 id→Object3D 映射, s.clear() 后先还原
+                //    用户原选择(s.add(对象引用)), 再 s.add(目标)。数字直加(addById/
+                //    addSolid(数字))实测产生 NaN 幽灵条目, 禁用。
+                //  对象形 key(face/edge 的 {id,versionId,...}): add<Kind>(原样回放),
+                //    失败计数如实上报(等 keySample 拿到真实元素结构后调优)。
                 let js = format!(
-                    "(function(){{ var ed=window.__PLA_EDITOR__; if(!ed||!ed.selection) return 'no-editor'; var s=ed.selection.selected; var out=[]; var ids={}; for(var i=0;i<ids.length;i++){{ try{{ s.addById(ids[i]); out.push(ids[i]) }}catch(e){{}} }} return JSON.stringify(out) }})()",
-                    serde_json::to_string(&ids)?
+                    "(function(){{ var ed=window.__PLA_EDITOR__; if(!ed||!ed.selection) return JSON.stringify({{ok:0,fail:0,errs:['no-editor']}}); var s=ed.selection.selected; var ents={ents}; var ok=0, fail=0, errs=[];\
+ function err(m){{ if(errs.length<3) errs.push(String(m).slice(0,60)) }}\
+ function runC(N){{ var C=ed.commands[N]; var inst; try{{inst=new C(ed)}}catch(e1){{inst=new C()}} inst.execute() }}\
+ var fn={{face:'addFace',edge:'addEdge',segment:'addSegment',curve:'addCurve',curveVertex:'addVertex',group:'addGroup',plane:'addPlane',solid:'addSolid',sheet:'addSheet'}};\
+ var nums={{solid:[],sheet:[]}}, keyed=[];\
+ ents.forEach(function(e){{ if(e.key){{ keyed.push(e) }} else if(e.kind==='solid'||e.kind==='sheet'){{ nums[e.kind].push(e.id) }} else {{ fail++; err('kind '+e.kind+' 无 key 暂不支持') }} }});\
+ for(var ph in nums){{ var want=nums[ph]; if(!want.length) continue;\
+  try{{ var cur=[]; try{{ cur=(s.all||[]).slice() }}catch(e0){{ }}\
+   s.clear(); runC(ph==='solid'?'SelectAllSolidsCommand':'SelectAllSheetsCommand');\
+   var idsArr=[], idSet=(ph==='solid')?s.solidIds:s.sheetIds; idSet.forEach(function(x){{ idsArr.push(String(x)) }});\
+   var allArr=(s.all||[]).slice(); var map={{}};\
+   for(var i=0;i<idsArr.length&&i<allArr.length;i++) map[idsArr[i]]=allArr[i];\
+   s.clear();\
+   cur.forEach(function(o){{ try{{ s.add(o) }}catch(e3){{}} }});\
+   want.forEach(function(id){{ var o=map[id]; if(o){{ try{{ s.add(o); ok++ }}catch(e4){{ fail++; err(e4) }} }} else {{ fail++; err('id '+id+' 未找到(几何已变更)') }} }});\
+  }}catch(e5){{ fail+=want.length; err(e5) }} }}\
+ keyed.forEach(function(e){{ try{{ var f=fn[e.kind]; if(!f) throw 'no-fn:'+e.kind; s[f](JSON.parse(e.key)); ok++ }}catch(err2){{ fail++; err(err2) }} }});\
+ return JSON.stringify({{ok:ok,fail:fail,errs:errs}}) }})()",
+                    ents = serde_json::to_string(&
+                        entries
+                            .iter()
+                            .map(|e| serde_json::json!({
+                                "kind": e.kind,
+                                "id": e.id,
+                                "key": e.key,
+                            }))
+                            .collect::<Vec<_>>()
+                    )?
                 );
-                let _ = eval_roundtrip(ws, &mut mid, &js).await?;
-                let _ = ev_tx.send(CdpEvent::Status("选择集已应用".into()));
+                let res = eval_roundtrip(ws, &mut mid, &js).await.unwrap_or_default();
+                let v: Value = serde_json::from_str(&res).unwrap_or(Value::Null);
+                let ok = v["ok"].as_i64().unwrap_or(0);
+                let fail = v["fail"].as_i64().unwrap_or(0);
+                let errs = v["errs"]
+                    .as_array()
+                    .map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(" | "))
+                    .unwrap_or_default();
+                let _ = ev_tx.send(CdpEvent::Status(if fail == 0 {
+                    format!("选择集已应用: {ok} 项成功")
+                } else {
+                    format!("选择集应用: {ok} 项成功, {fail} 项失败 {errs}")
+                }));
             }
             Err(TryRecvError::Disconnected) => return Err(anyhow::anyhow!("ui gone")),
             Err(_) => {}
@@ -332,7 +391,8 @@ async fn session_loop(
                 let v: Value = serde_json::from_str(&raw)?;
                 if v["st"] == "ok" {
                     let mut items = Vec::new();
-                    // 每类型 id 集(Set of hex id 字符串) → SelItem
+                    // R7-21: 元素分型 — 纯数值(solid/sheet kernel id)→key=None;
+                    // 对象形(face/edge {id,versionId,...})→key=原始 JSON 原样保存/回放。
                     for (kind, key) in [
                         ("solid", "solidIds"),
                         ("sheet", "sheetIds"),
@@ -346,24 +406,33 @@ async fn session_loop(
                     ] {
                         if let Some(arr) = v[key].as_array() {
                             for it in arr {
+                                let (id, raw) = match it {
+                                    Value::String(sv) => (sv.clone(), None),
+                                    Value::Number(nv) => (nv.to_string(), None),
+                                    Value::Object(ov) => {
+                                        let raw = Value::Object(ov.clone()).to_string();
+                                        let id = ov
+                                            .get("id")
+                                            .map(|x| match x {
+                                                Value::String(s) => s.clone(),
+                                                other => other.to_string(),
+                                            })
+                                            .or_else(|| {
+                                                ov.get("__str").and_then(|s| s.as_str()).map(String::from)
+                                            })
+                                            .unwrap_or_default();
+                                        (id, Some(raw))
+                                    }
+                                    _ => (String::new(), None),
+                                };
                                 items.push(SelItem {
                                     kind,
-                                    id: it.as_str().unwrap_or("").to_string(),
+                                    id,
                                     name: String::new(),
                                     ctor: kind.to_string(),
+                                    key: raw,
                                 });
                             }
-                        }
-                    }
-                    // all: 实体对象(含 entityId/name/parent ctor) — 补充名称
-                    if let Some(arr) = v["all"].as_array() {
-                        for it in arr {
-                            items.push(SelItem {
-                                kind: "item",
-                                id: it["id"].as_str().unwrap_or("").to_string(),
-                                name: it["name"].as_str().unwrap_or("").to_string(),
-                                ctor: it["ctor"].as_str().unwrap_or("").to_string(),
-                            });
                         }
                     }
                     let _ = ev_tx.send(CdpEvent::Selection(SelectionSnapshot {
