@@ -188,15 +188,21 @@ fn cdp_thread_main(port: u16, cmd_rx: Receiver<CdpCmd>, ev_tx: std::sync::mpsc::
     };
     rt.block_on(async move {
         loop {
-            // 连接阶段: 反复重试(应用未启动/未打补丁时静默等待)
-            match connect_page(port).await {
-                Ok(mut ws) => {
+            // 连接阶段: 反复重试(应用未启动/未打补丁时静默等待)。
+            // R7-19: 整个连接尝试套 5s 超时 — Plasticity 刚启动几秒内 renderer
+            // 未就绪时 /json/list 或 WS 握手可能不响应, http_get/connect_async
+            // 本身无超时, 线程会永久卡死且一个事件都发不出(UI 永远停在
+            // 「CDP 连接中…」)。超时丢弃本次尝试, 下轮重试即恢复。
+            match tokio::time::timeout(Duration::from_secs(5), connect_page(port)).await {
+                Ok(Ok(mut ws)) => {
                     let _ = ev_tx.send(CdpEvent::Status("CDP 已连接".into()));
                     if let Err(e) = session_loop(&mut ws, &cmd_rx, &ev_tx).await {
+                        eprintln!("[pla-cdp] session err: {e:#}");
                         let _ = ev_tx.send(CdpEvent::Status(format!("CDP 断开: {e}")));
                     }
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
+                    eprintln!("[pla-cdp] connect err: {e:#}");
                     // R7-19: 10061(拒连)=9333 无监听 — 补丁版 index.js 任意启动都会
                     // appendSwitch 9333, 拒连只可能是: Plasticity 未启动, 或运行中的
                     // 实例是补丁部署前启动的旧实例(index.js 是启动时加载的)。
@@ -208,6 +214,12 @@ fn cdp_thread_main(port: u16, cmd_rx: Receiver<CdpCmd>, ev_tx: std::sync::mpsc::
                         ""
                     };
                     let _ = ev_tx.send(CdpEvent::Status(format!("CDP 等待中({e}){hint}")));
+                }
+                Err(_) => {
+                    eprintln!("[pla-cdp] connect timeout(5s)");
+                    // 5s 超时: 连接挂起(典型为 Plasticity 启动初期 renderer 未就绪),
+                    // 丢弃重试 — 状态照常上报, UI 不会永远停在「连接中」。
+                    let _ = ev_tx.send(CdpEvent::Status("CDP 连接超时, 重试中…".into()));
                 }
             }
             // 断开冷却 + 处理积压命令
@@ -239,7 +251,12 @@ async fn connect_page(port: u16) -> anyhow::Result<WsStream> {
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("no ws url"))?
         .to_string();
-
+    // R7-19: Chromium 按 Host 头生成 ws url — Host 缺端口时返回
+    // ws://127.0.0.1/...(连 80 被拒)。Host 已带端口, 这里再兜底补一次。
+    let ws_url = match ws_url.strip_prefix("ws://127.0.0.1/") {
+        Some(rest) => format!("ws://127.0.0.1:{port}/{rest}"),
+        None => ws_url,
+    };
     let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await?;
     // 双发握手: Runtime.enable + 注入 hook
     ws_send(&mut ws, serde_json::json!({"id":1,"method":"Runtime.enable"})).await?;
@@ -437,13 +454,47 @@ async fn http_get(port: u16, path: &str) -> anyhow::Result<String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port)).await?;
     s.write_all(
-        format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n").as_bytes(),
+        format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n")
+            .as_bytes(),
     )
     .await?;
-    let mut buf = Vec::new();
-    s.read_to_end(&mut buf).await?;
-    let text = String::from_utf8_lossy(&buf);
-    Ok(text.split("\r\n\r\n").nth(1).unwrap_or("").to_string())
+    // R7-19: 不能 read_to_end(等 EOF) — 沙箱代理/启动初期的 Chromium 都可能
+    // 不关连接, 读会永久挂起。改为按 header 分帧: 读到 \r\n\r\n 解析
+    // Content-Length, 收满即停; EOF 作兜底。
+    let mut buf: Vec<u8> = Vec::with_capacity(8192);
+    let mut tmp = [0u8; 8192];
+    let body: Vec<u8> = loop {
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            let head = String::from_utf8_lossy(&buf[..pos]).to_ascii_lowercase();
+            let clen: Option<usize> = head.lines().find_map(|l| {
+                l.strip_prefix("content-length:")
+                    .map(|v| v.trim().parse::<usize>().ok())?
+            });
+            let head_end = pos + 4;
+            if let Some(n) = clen {
+                while buf.len() < head_end + n {
+                    let got = s.read(&mut tmp).await?;
+                    if got == 0 { break; }
+                    buf.extend_from_slice(&tmp[..got]);
+                }
+                break buf[head_end..(head_end + n).min(buf.len())].to_vec();
+            }
+            // 无 Content-Length: 退回读到 EOF(有外层 5s 超时兜底)
+            loop {
+                let got = s.read(&mut tmp).await?;
+                if got == 0 { break; }
+                buf.extend_from_slice(&tmp[..got]);
+            }
+            break buf[head_end..].to_vec();
+        }
+        let got = s.read(&mut tmp).await?;
+        if got == 0 {
+            // EOF 且没找到 header 结束 — 异常响应
+            anyhow::bail!("http: EOF before headers, got {} bytes", buf.len());
+        }
+        buf.extend_from_slice(&tmp[..got]);
+    };
+    Ok(String::from_utf8_lossy(&body).to_string())
 }
 
 /// 一次性 CDP evaluate(R7-17, CLI 调试用): 连 page → Runtime.evaluate → 回包。
