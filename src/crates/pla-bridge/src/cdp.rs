@@ -342,47 +342,45 @@ async fn session_loop(
                 //  对象形 key 兜底: lookup 失败或无 db 时原样回放, 失败计数如实上报。
                 let js = format!(
                     "(function(){{ var ed=window.__PLA_EDITOR__; if(!ed||!ed.selection) return JSON.stringify({{ok:0,fail:0,errs:['no-editor']}}); var s=ed.selection.selected; var ents={ents}; var ok=0, fail=0, errs=[];\
- var db=null; try{{ db=s.cache().db }}catch(eD){{}}\
- function err(m){{ if(errs.length<3) errs.push(String(m).slice(0,60)) }}\
- function runC(N){{ var C=ed.commands[N]; var inst; try{{inst=new C(ed)}}catch(e1){{inst=new C()}} inst.execute() }}\
- var fn={{face:'addFace',edge:'addEdge',segment:'addSegment',curve:'addCurve',curveVertex:'addVertex',group:'addGroup',plane:'addPlane',solid:'addSolid',sheet:'addSheet'}};\
- var topo={{face:1,edge:1,segment:1,curve:1,curveVertex:1}};\
- var nums={{solid:[],sheet:[]}}, topl=[], keyed=[];\
- ents.forEach(function(e){{\
-  if(e.kind==='solid'||e.kind==='sheet'){{ nums[e.kind].push(e) }}\
-  else if(topo[e.kind]){{ topl.push(e) }}\
-  else if(e.key){{ keyed.push(e) }}\
-  else {{ fail++; err('kind '+e.kind+' 无 key 暂不支持') }} }});\
- for(var ph in nums){{ var want=nums[ph]; if(!want.length) continue;\
-  try{{ var cur=[]; try{{ cur=(s.all||[]).slice() }}catch(e0){{ }}\
-   s.clear(); runC(ph==='solid'?'SelectAllSolidsCommand':'SelectAllSheetsCommand');\
-   var idsArr=[], idSet=(ph==='solid')?s.solidIds:s.sheetIds; idSet.forEach(function(x){{ idsArr.push(String(x)) }});\
-   var allArr=(s.all||[]).slice(); var map={{}};\
-   for(var i=0;i<idsArr.length&&i<allArr.length;i++) map[idsArr[i]]=allArr[i];\
-   s.clear();\
-   cur.forEach(function(o){{ try{{ s.add(o) }}catch(e3){{}} }});\
-   want.forEach(function(e){{ var o=map[e.id]; if(o){{ try{{ s.add(o); ok++ }}catch(e4){{ fail++; err(e4) }} }} else {{ fail++; err('id '+e.id+' 未找到(几何已变更)') }} }});\
-  }}catch(e5){{ fail+=want.length; err(e5) }} }}\
- topl.forEach(function(e){{ try{{ var f=fn[e.kind]; if(!f) throw 'no-fn:'+e.kind;\
-  var ref=(db&&db.lookupTopologyItemById)?db.lookupTopologyItemById(String(e.id)):null;\
-  if(ref&&ref.view){{ s[f](ref.view); ok++ }}\
-  else if(e.key){{ s[f](JSON.parse(e.key)); ok++ }}\
-  else throw 'topology '+e.id+' 未找到(几何已变更?)'\
- }}catch(err2){{ fail++; err(err2) }} }});\
- keyed.forEach(function(e){{ try{{ var f=fn[e.kind]; if(!f) throw 'no-fn:'+e.kind; s[f](JSON.parse(e.key)); ok++ }}catch(err3){{ fail++; err(err3) }} }});\
+ function err(m){{ if(errs.length<4) errs.push(String(m).slice(0,60)) }}\
+ // === R7-23 主路径: 选区状态存取(SelectionMemento) ===\
+ //   saveToMemento() 得到 {{ids: Set<\"tag:id\">}}; 恢复 = 取任意 memento 实例、\
+ //   替换其 ids 为存档集合后 restoreFromMemento()。 这条路不经 pick 流程,\
+ //   因此不受遮挡/剖面/相机影响, 内部面也能选中, 且实测持久不回滚\
+ //   (对比: addFace(ref.view) 写入会被 Plasticity 回滚; 合成点击需屏幕坐标)。\
+ //   tag 映射(2026-10-21 实测): edge=0, face=2, solid=4, sheet=5。\
+ var TAGS={{edge:0,face:2,solid:4,sheet:5}};\
+ var memIds=[], unknown=[];\
+ ents.forEach(function(e){{ var t=TAGS[e.kind]; if(t===undefined){{ unknown.push(e) }} else {{ memIds.push(t+':'+e.id) }} }});\
+ try{{\
+  var m=s.saveToMemento();\
+  m.ids=new Set(memIds);\
+  s.clear();\
+  s.restoreFromMemento(m);\
+  // 逐项核对实际进了哪个桶, 才敢计成功\
+  var got=0;\
+  ents.forEach(function(e){{\
+   var v=null;\
+   try{{ v=(e.kind==='face')?s.faceIds:(e.kind==='edge')?s.edgeIds:(e.kind==='solid')?s.solidIds:(e.kind==='sheet')?s.sheetIds:null }}catch(eV){{}}\
+   if(!v) return;\
+   var has=false; v.forEach(function(x){{ if(String(x&&x.versionId!==undefined?x.versionId:x)===String(e.id)) has=true }});\
+   if(has) got++; else err('id '+e.id+' 未命中(几何已变更?)');\
+  }});\
+  ok=got; fail=ents.length-got;\
+ }}catch(eM){{ err('memento '+String(eM).slice(0,50)); fail=ents.length }}\
+ // 未知类型(segment/curve/group 等, tag 未实测) → 放弃并如实上报\
+ unknown.forEach(function(e){{ err('kind '+e.kind+' 暂无 tag, 未恢复') }});\
  // R7-22: UI 唤醒 — 纯写 selection 数据改得动内核选区但 UI 无感(面不高亮、
  //   push face 面板不弹)。 hook 全部 53 路信号做差集后确认: UI 真实 pick 会
  //   额外发 selectionDelta / highlighted / visibleLayersChanged /
  //   selectionModeChanged / renderPrepared, 且跑一整个 ClickChangeSelectionCommand
  //   命令周期。 这里按差集补发(全都不依赖相机/屏幕坐标), 补完 UI 高亮与面板出现。\
  try{{ var es=ed.selection.signals;\
-  es.selectionDelta.dispatch({{_didChange:true}});\
-  es.selectionModeChanged.dispatch();\
-  es.visibleLayersChanged.dispatch();\
-  es.highlighted.dispatch();\
-  es.selectionChanged.dispatch();\
-  es.renderPrepared.dispatch();\
-  ed.selection.selectedSignals.selectionChanged.dispatch();\
+  // 逐个容错: selectionModeChanged / renderPrepared 缺合法 payload 会抛错,\
+  // 若整段共用一个 try, 一次抛出会让后面所有补发被跳过(UI 因此仍不刷新)。\
+  var wakes=[['selectionDelta',{{_didChange:true}}],['selectionModeChanged',null],['visibleLayersChanged',null],['highlighted',null],['selectionChanged',null],['renderPrepared',null]];\
+  wakes.forEach(function(w){{ try{{ var sg=es[w[0]]; if(!sg) return; if(w[1]===null) sg.dispatch(); else sg.dispatch(w[1]) }}catch(eW){{}} }});\
+  try{{ ed.selection.selectedSignals.selectionChanged.dispatch() }}catch(eS2){{}}\
  }}catch(eS){{ err('signal '+String(eS).slice(0,40)) }}\
  return JSON.stringify({{ok:ok,fail:fail,errs:errs}}) }})()",
                     ents = serde_json::to_string(&
