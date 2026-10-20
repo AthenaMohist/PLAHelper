@@ -34,8 +34,7 @@ const COL_GRAY_DOT: egui::Color32 = egui::Color32::from_rgb(0x77, 0x77, 0x77);
 /// 工具栏固定逻辑尺寸(横向一行按钮): 圆点+分隔线+5 按钮+分隔线+关闭键。
 /// 宽 246 = 276(6 按钮旧值) - 30(手动快照按钮 24 + 间距 6 移入快照墙, R7-5);
 /// 高 30: 垂直边距 3+3 + 按钮 24 = 30, 按钮行恰在窗口中心(吸附按中心对齐)。
-/// 窗口 = 面板本体, 不留外侧光晕带 — glow 后端透明窗口不可靠(R5 圆角教训),
-/// 光晕带以黑为底合成会变成「半透明黑框」(R6-2d 实测), 光晕改画面板内侧。
+/// 窗口 = 面板本体, 极简细描边(R7-19: 光晕被用户否决移除)。
 const TOOLBAR_SIZE: [f32; 2] = [216.0, 30.0];
 /// 面板整体右移微调(逻辑 px, 按 ppp 缩放; R6-2e 用户要求再偏右 10)。
 const SNAP_RIGHT_SHIFT: f32 = 10.0;
@@ -309,37 +308,14 @@ fn section_header(ui: &mut egui::Ui, text: &str) {
 }
 
 /// 工具栏/子视口共用的圆角深色面板 Frame。
-/// 工具栏/子面板帧: 深色填充 + 1.5px 半透明白描边(贴窗裁半后可见约 1px)。
-/// 光晕不在此画 — 外侧光晕被窗口裁、内侧光晕在 update 里用多圈描边画
-/// (见 show_ui 内 R6-2e 注释)。
+/// R7-19: 面板边框 = 按钮悬停同款(egui 默认 hovered bg_stroke: 1px 灰150) —
+/// 用户实测否决内侧羽化光晕(奶白渐变太亮), 改极简细描边。
 fn panel_frame() -> egui::Frame {
     egui::Frame::none()
         .fill(COL_PANEL)
         .rounding(egui::Rounding::same(ROUNDING))
         .inner_margin(egui::Margin { left: 6.0, right: 6.0, top: 3.0, bottom: 3.0 })
-        .stroke(egui::Stroke::new(2.0_f32, egui::Color32::from_white_alpha(130)))
-}
-
-/// 面板内侧羽化光晕(所有面板统一: 工具栏 + 悬浮提示 + 功能面板, R6-2i)。
-/// ui.max_rect() = 内容区(定值, 与内容无关), 按非对称边距外扩 = 面板可见矩形。
-/// 注意: 外扩量必须与 panel_frame() 的 inner_margin 保持联动
-/// (左右 6 / 上下 3), 改边距必须同步改这里, 否则光晕会被窗口边缘裁掉。
-fn paint_panel_glow(ui: &egui::Ui) {
-    // 非对称内边距, 不能用统一 expand: 上下外扩 3、左右外扩 6。
-    let m = ui.max_rect();
-    let panel_rect = egui::Rect::from_min_max(
-        egui::pos2(m.left() - 6.0, m.top() - 3.0),
-        egui::pos2(m.right() + 6.0, m.bottom() + 3.0),
-    );
-    let mut glow_mesh = egui::Mesh::default();
-    pla_ui::glow::append_inner_glow(
-        &mut glow_mesh,
-        panel_rect,
-        ROUNDING,
-        &[(0.0, 60), (1.5, 22), (3.0, 0)],
-        [255, 246, 228],
-    );
-    ui.painter_at(panel_rect).add(egui::Shape::mesh(glow_mesh));
+        .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(150)))
 }
 
 /// 快照项交互结果(由 snap_item 采集, 调用方统一执行)。
@@ -1001,7 +977,6 @@ fn header_extra_and_show(
                         .show(ctx, |ui| {
                             panel_header(ui, title, &mut flag, icons.take());
                             contents(ui);
-                            paint_panel_glow(ui);
                         });
                     // 跟随工具栏: 外框漂移超阈值即重定位。
                     let cur = ctx.input(|i| i.viewport().outer_rect);
@@ -1159,8 +1134,6 @@ impl eframe::App for PlaApp {
                     }
                 });
                 }); // allocate_new_ui(居中行矩形)
-                // R6-2i: 光晕统一走 paint_panel_glow(与所有弹出面板同款)。
-                paint_panel_glow(ui);
             });
         self.hovered_hint = hovered;
 
@@ -2071,10 +2044,7 @@ impl eframe::App for PlaApp {
                             egui::ViewportClass::Immediate => {
                                 egui::CentralPanel::default()
                                     .frame(panel_frame())
-                                    .show(hctx, |ui| {
-                                        show_ui(ui, &mut open_flag);
-                                        paint_panel_glow(ui);
-                                    });
+                                    .show(hctx, |ui| show_ui(ui, &mut open_flag));
                                 let cur = hctx.input(|i| i.viewport().outer_rect);
                                 if let Some(r) = cur {
                                     if (r.left() - desired.x).abs() > SNAP_EPS

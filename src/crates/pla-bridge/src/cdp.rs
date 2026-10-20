@@ -197,7 +197,17 @@ fn cdp_thread_main(port: u16, cmd_rx: Receiver<CdpCmd>, ev_tx: std::sync::mpsc::
                     }
                 }
                 Err(e) => {
-                    let _ = ev_tx.send(CdpEvent::Status(format!("CDP 等待中({e})")));
+                    // R7-19: 10061(拒连)=9333 无监听 — 补丁版 index.js 任意启动都会
+                    // appendSwitch 9333, 拒连只可能是: Plasticity 未启动, 或运行中的
+                    // 实例是补丁部署前启动的旧实例(index.js 是启动时加载的)。
+                    // 给出可执行指引, 不再让用户对着「积极拒绝」猜。
+                    let msg = format!("{e}");
+                    let hint = if msg.contains("10061") {
+                        " — 9333 无监听: Plasticity 未启动, 或是补丁部署前启动的旧实例。保存文件并重启 Plasticity 即可(补丁已装, 普通启动即生效)"
+                    } else {
+                        ""
+                    };
+                    let _ = ev_tx.send(CdpEvent::Status(format!("CDP 等待中({e}){hint}")));
                 }
             }
             // 断开冷却 + 处理积压命令
