@@ -350,11 +350,24 @@ async fn session_loop(
  //   (对比: addFace(ref.view) 写入会被 Plasticity 回滚; 合成点击需屏幕坐标)。\
  //   tag 映射(2026-10-21 实测): edge=0, face=2, solid=4, sheet=5。\
  var TAGS={{edge:0,face:2,solid:4,sheet:5}};\
- var memIds=[], unknown=[];\
- ents.forEach(function(e){{ var t=TAGS[e.kind]; if(t===undefined){{ unknown.push(e) }} else {{ memIds.push(t+':'+e.id) }} }});\
+ var db=null; try{{ db=s.cache().db }}catch(eD){{}}\
+ var memIds=[], unknown=[], groups={{}};\
+ // 父实体登记: 面/边必须写入 parentsWithSelectedChildren(父实体 -> 被选子项),\
+ //   否则命令层(如 Duplicate)遍历时拿到 null, 报 object null is not iterable。\
+ function parentOf(id){{ try{{ var v=db.lookupTopologyItemById(String(id)).view; var fg=v&&v.parent; var solid=fg&&fg.parent;\
+   return (solid&&solid.versionId!==undefined)?String(solid.versionId):null }}catch(e){{ return null }} }}\
+ ents.forEach(function(e){{\
+  var t=TAGS[e.kind];\
+  if(t===undefined){{ unknown.push(e); return }}\
+  var memId=t+':'+e.id; memIds.push(memId);\
+  if(e.kind==='face'||e.kind==='edge'){{ var p=parentOf(e.id); if(p){{ if(!groups[p]) groups[p]=[]; groups[p].push(memId) }} }}\
+ }});\
  try{{\
   var m=s.saveToMemento();\
   m.ids=new Set(memIds);\
+  var pc=m.parentsWithSelectedChildren;\
+  if(pc){{ pc.counts=new Map(); pc.values=new Map();\
+   Object.keys(groups).forEach(function(p){{ pc.counts.set(p, groups[p].length); pc.values.set(p, groups[p]) }}) }}\
   s.clear();\
   s.restoreFromMemento(m);\
   // 逐项核对实际进了哪个桶, 才敢计成功\
