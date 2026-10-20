@@ -327,20 +327,32 @@ async fn session_loop(
                 }
             }
             Ok(CdpCmd::ApplySel(entries)) => {
-                // R7-21b: 回放策略(全部活体验证) —
+                // R7-21c: 回放策略(全部活体验证, 2026-10-20 22:4x 会话) —
                 //  solid/sheet 数值 id: harvest 法 — SelectAll<Kind>Command 暴露全部
                 //    Object3D, 与 idSet 顺序配对成 id→Object3D 映射, s.clear() 后先还原
                 //    用户原选择(s.add(对象引用)), 再 s.add(目标)。数字直加(addById/
                 //    addSolid(数字))实测产生 NaN 幽灵条目, 禁用。
-                //  对象形 key(face/edge 的 {id,versionId,...}): add<Kind>(原样回放),
-                //    失败计数如实上报(等 keySample 拿到真实元素结构后调优)。
+                //  face/edge/segment/curve/curveVertex: GeometryDatabase.
+                //    lookupTopologyItemById(hex) 返回 {view, model, topologyId},
+                //    ref.view 即 renderer Face/ShellEdge Object3D proxy,
+                //    s.addFace(ref.view)/addEdge(ref.view) 实测精确复原
+                //    (face '9f1624' + edge '14e1984' 双双命中, 无幽灵)。
+                //    注意 addFace(裸 {id,versionId} 或 ref 本体) 会抛
+                //    "undefined reading versionId" — 必须传 ref.view。
+                //  对象形 key 兜底: lookup 失败或无 db 时原样回放, 失败计数如实上报。
                 let js = format!(
                     "(function(){{ var ed=window.__PLA_EDITOR__; if(!ed||!ed.selection) return JSON.stringify({{ok:0,fail:0,errs:['no-editor']}}); var s=ed.selection.selected; var ents={ents}; var ok=0, fail=0, errs=[];\
+ var db=null; try{{ db=s.cache().db }}catch(eD){{}}\
  function err(m){{ if(errs.length<3) errs.push(String(m).slice(0,60)) }}\
  function runC(N){{ var C=ed.commands[N]; var inst; try{{inst=new C(ed)}}catch(e1){{inst=new C()}} inst.execute() }}\
  var fn={{face:'addFace',edge:'addEdge',segment:'addSegment',curve:'addCurve',curveVertex:'addVertex',group:'addGroup',plane:'addPlane',solid:'addSolid',sheet:'addSheet'}};\
- var nums={{solid:[],sheet:[]}}, keyed=[];\
- ents.forEach(function(e){{ if(e.key){{ keyed.push(e) }} else if(e.kind==='solid'||e.kind==='sheet'){{ nums[e.kind].push(e.id) }} else {{ fail++; err('kind '+e.kind+' 无 key 暂不支持') }} }});\
+ var topo={{face:1,edge:1,segment:1,curve:1,curveVertex:1}};\
+ var nums={{solid:[],sheet:[]}}, topl=[], keyed=[];\
+ ents.forEach(function(e){{\
+  if(e.kind==='solid'||e.kind==='sheet'){{ nums[e.kind].push(e) }}\
+  else if(topo[e.kind]){{ topl.push(e) }}\
+  else if(e.key){{ keyed.push(e) }}\
+  else {{ fail++; err('kind '+e.kind+' 无 key 暂不支持') }} }});\
  for(var ph in nums){{ var want=nums[ph]; if(!want.length) continue;\
   try{{ var cur=[]; try{{ cur=(s.all||[]).slice() }}catch(e0){{ }}\
    s.clear(); runC(ph==='solid'?'SelectAllSolidsCommand':'SelectAllSheetsCommand');\
@@ -349,9 +361,15 @@ async fn session_loop(
    for(var i=0;i<idsArr.length&&i<allArr.length;i++) map[idsArr[i]]=allArr[i];\
    s.clear();\
    cur.forEach(function(o){{ try{{ s.add(o) }}catch(e3){{}} }});\
-   want.forEach(function(id){{ var o=map[id]; if(o){{ try{{ s.add(o); ok++ }}catch(e4){{ fail++; err(e4) }} }} else {{ fail++; err('id '+id+' 未找到(几何已变更)') }} }});\
+   want.forEach(function(e){{ var o=map[e.id]; if(o){{ try{{ s.add(o); ok++ }}catch(e4){{ fail++; err(e4) }} }} else {{ fail++; err('id '+e.id+' 未找到(几何已变更)') }} }});\
   }}catch(e5){{ fail+=want.length; err(e5) }} }}\
- keyed.forEach(function(e){{ try{{ var f=fn[e.kind]; if(!f) throw 'no-fn:'+e.kind; s[f](JSON.parse(e.key)); ok++ }}catch(err2){{ fail++; err(err2) }} }});\
+ topl.forEach(function(e){{ try{{ var f=fn[e.kind]; if(!f) throw 'no-fn:'+e.kind;\
+  var ref=(db&&db.lookupTopologyItemById)?db.lookupTopologyItemById(String(e.id)):null;\
+  if(ref&&ref.view){{ s[f](ref.view); ok++ }}\
+  else if(e.key){{ s[f](JSON.parse(e.key)); ok++ }}\
+  else throw 'topology '+e.id+' 未找到(几何已变更?)'\
+ }}catch(err2){{ fail++; err(err2) }} }});\
+ keyed.forEach(function(e){{ try{{ var f=fn[e.kind]; if(!f) throw 'no-fn:'+e.kind; s[f](JSON.parse(e.key)); ok++ }}catch(err3){{ fail++; err(err3) }} }});\
  return JSON.stringify({{ok:ok,fail:fail,errs:errs}}) }})()",
                     ents = serde_json::to_string(&
                         entries
