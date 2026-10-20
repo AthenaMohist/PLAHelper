@@ -82,7 +82,8 @@ const TOOLBAR_ACTIONS: [Action; 4] = [
 /// 面板逻辑尺寸 (宽, 高) — 子视口 OS 窗口大小。
 /// R7-6: 快照墙改窄加高(232x480) — 一行一个快照, 缩略图撑满内容宽。
 const PANEL_SNAPSHOTS: [f32; 2] = [232.0, 480.0];
-const PANEL_ENTITIES: [f32; 2] = [280.0, 410.0];
+/// R7-20: 加高放选择集墙(96 滚动区)。
+const PANEL_ENTITIES: [f32; 2] = [280.0, 540.0];
 const PANEL_DIM: [f32; 2] = [280.0, 170.0];
 const PANEL_SETTINGS: [f32; 2] = [300.0, 560.0];
 
@@ -134,6 +135,12 @@ struct PlaApp {
     cdp_tree: Vec<(String, String, i64, bool)>,
     /// CDP 选择集勾选成员 (kind, id, name)。
     sel_cdp_members: Vec<(String, String, String)>,
+    /// R7-20: 已保存 CDP 选择集(收藏优先); 打开面板/变更后置 sel_saved_loaded=false 重载。
+    sel_saved: Vec<pla_ui::selection::CdpSelMeta>,
+    sel_saved_loaded: bool,
+    /// R7-20: 选择集改名中(正在改的原名 + 编辑缓冲)。
+    sel_rename: Option<String>,
+    sel_rename_buf: String,
     /// 自动快照(R7-15, PRD P0-1): 定时(分钟, 0=关) + 定步数(undo 增量, 0=关)。
     auto_snap_enabled: bool,
     auto_interval_min: i32,
@@ -606,6 +613,10 @@ impl PlaApp {
             live_sel: Vec::new(),
             cdp_tree: Vec::new(),
             sel_cdp_members: Vec::new(),
+            sel_saved: Vec::new(),
+            sel_saved_loaded: false,
+            sel_rename: None,
+            sel_rename_buf: String::new(),
             auto_snap_enabled: true,
             auto_interval_min: 10,
             auto_steps: 20,
@@ -843,6 +854,7 @@ impl PlaApp {
                 self.snap_favs = pla_ui::snapshot::load_favs(&self.doc_key);
                 self.snap_infos = pla_ui::snapshot::load_meta_infos(&self.doc_key);
                 self.sel_cdp_members.clear();
+                self.sel_saved_loaded = false;
                 self.dim_loaded = false;
             }
         }
@@ -1563,6 +1575,19 @@ impl eframe::App for PlaApp {
                                 if ui.small_button("清空勾选").clicked() {
                                     self.sel_cdp_members.clear();
                                 }
+                                // R7-20: 一键全选当前实时选择(去重后追加进勾选区)。
+                                if ui.small_button("全选").clicked() {
+                                    for (kind, id, name, _) in self.live_sel.clone() {
+                                        let key = format!("{kind}:{id}:{name}");
+                                        if !self
+                                            .sel_cdp_members
+                                            .iter()
+                                            .any(|(k, i, n)| format!("{k}:{i}:{n}") == key)
+                                        {
+                                            self.sel_cdp_members.push((kind, id, name));
+                                        }
+                                    }
+                                }
                             });
                         });
                         if !self.live_sel.is_empty() {
@@ -1718,6 +1743,196 @@ impl eframe::App for PlaApp {
                                 }
                             }
                         });
+                        // ---- R7-20: 已保存选择集墙(参考快照墙: 收藏/改名/删除, 无截图) ----
+                        ui.separator();
+                        section_header(ui, "SAVED SELECTIONS");
+                        if !self.sel_saved_loaded {
+                            self.sel_saved =
+                                pla_ui::selection::list_cdp_selections_meta(&self.doc_key);
+                            self.sel_saved_loaded = true;
+                        }
+                        if self.sel_saved.is_empty() {
+                            ui.label(
+                                egui::RichText::new("(空 — 勾选实时选择后保存)")
+                                    .small()
+                                    .color(COL_MUTED),
+                            );
+                        }
+                        egui::ScrollArea::vertical()
+                            .id_salt("sel-saved")
+                            .max_height(96.0)
+                            .show(ui, |ui| {
+                                for meta in self.sel_saved.clone() {
+                                    ui.horizontal(|ui| {
+                                        if self.sel_rename.as_deref()
+                                            == Some(meta.name.as_str())
+                                        {
+                                            // 改名行: 编辑框 + √/× (回车确认 / Esc 取消)
+                                            ui.add_sized(
+                                                egui::vec2(110.0, 18.0),
+                                                egui::TextEdit::singleline(
+                                                    &mut self.sel_rename_buf,
+                                                ),
+                                            )
+                                            .request_focus();
+                                            let (enter, esc) = ui.input(|i| {
+                                                (
+                                                    i.key_pressed(egui::Key::Enter),
+                                                    i.key_pressed(egui::Key::Escape),
+                                                )
+                                            });
+                                            if ui.small_button("√").clicked() || enter {
+                                                let old = meta.name.clone();
+                                                let new = self.sel_rename_buf.clone();
+                                                match pla_ui::selection::rename_cdp_selection(
+                                                    &self.doc_key, &old, &new,
+                                                ) {
+                                                    Ok(_) => {
+                                                        self.sel_rename = None;
+                                                        self.sel_saved_loaded = false;
+                                                        self.set_notice((
+                                                            false,
+                                                            format!(
+                                                                "已改名: {old} → {}",
+                                                                new.trim()
+                                                            ),
+                                                        ));
+                                                    }
+                                                    Err(e) => self.set_notice((true, e)),
+                                                }
+                                            }
+                                            if ui.small_button("×").clicked() || esc {
+                                                self.sel_rename = None;
+                                            }
+                                        } else {
+                                            // 收藏星(收藏优先由列表排序保证)
+                                            let star = if meta.fav { "★" } else { "☆" };
+                                            let star_btn = egui::Button::new(
+                                                egui::RichText::new(star).color(if meta.fav {
+                                                    COL_YELLOW
+                                                } else {
+                                                    COL_MUTED
+                                                }),
+                                            )
+                                            .frame(false);
+                                            if ui.add(star_btn).clicked() {
+                                                match pla_ui::selection::set_cdp_selection_fav(
+                                                    &self.doc_key,
+                                                    &meta.name,
+                                                    !meta.fav,
+                                                ) {
+                                                    Ok(_) => self.sel_saved_loaded = false,
+                                                    Err(e) => self.set_notice((true, e)),
+                                                }
+                                            }
+                                            // 名称: 点击 = 载入勾选区(可编辑后重存)
+                                            if ui
+                                                .selectable_label(
+                                                    false,
+                                                    egui::RichText::new(&meta.name)
+                                                        .color(COL_TEXT),
+                                                )
+                                                .clicked()
+                                            {
+                                                match pla_ui::selection::load_cdp_selection(
+                                                    &self.doc_key,
+                                                    &meta.name,
+                                                ) {
+                                                    Some(members) => {
+                                                        let n = members.len();
+                                                        self.sel_cdp_members = members
+                                                            .into_iter()
+                                                            .map(|m| (m.kind, m.id, m.name))
+                                                            .collect();
+                                                        self.sel_name = meta.name.clone();
+                                                        self.set_notice((
+                                                            false,
+                                                            format!(
+                                                                "已载入「{}」({n} 项) — 可编辑后重新保存",
+                                                                meta.name
+                                                            ),
+                                                        ));
+                                                    }
+                                                    None => {
+                                                        self.set_notice((true, "读取失败".into()))
+                                                    }
+                                                }
+                                            }
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "({})",
+                                                    meta.n_members
+                                                ))
+                                                .small()
+                                                .color(COL_MUTED),
+                                            );
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    if ui.small_button("删").clicked() {
+                                                        match pla_ui::selection::
+                                                            delete_cdp_selection(
+                                                                &self.doc_key, &meta.name,
+                                                            ) {
+                                                            Ok(_) => {
+                                                                self.sel_saved_loaded = false;
+                                                                self.set_notice((
+                                                                    false,
+                                                                    format!(
+                                                                        "已删除「{}」",
+                                                                        meta.name
+                                                                    ),
+                                                                ));
+                                                            }
+                                                            Err(e) => self.set_notice((true, e)),
+                                                        }
+                                                    }
+                                                    if ui.small_button("改").clicked() {
+                                                        self.sel_rename = Some(meta.name.clone());
+                                                        self.sel_rename_buf = meta.name.clone();
+                                                    }
+                                                    // 直接应用: 不经勾选区, 一键复原到 Plasticity
+                                                    if ui.small_button("应用").clicked() {
+                                                        match pla_ui::selection::load_cdp_selection(
+                                                            &self.doc_key, &meta.name,
+                                                        ) {
+                                                            Some(members) => {
+                                                                let ids: Vec<u32> = members
+                                                                    .iter()
+                                                                    .filter_map(|m| {
+                                                                        m.id.parse::<u32>().ok()
+                                                                    })
+                                                                    .collect();
+                                                                if ids.is_empty() {
+                                                                    self.set_notice((
+                                                                        true,
+                                                                        "该选择集无可用的数值 id".into(),
+                                                                    ));
+                                                                } else {
+                                                                    let n = ids.len();
+                                                                    self.cdp.send(
+                                                                        pla_bridge::cdp::CdpCmd::ApplyIds(ids),
+                                                                    );
+                                                                    self.set_notice((
+                                                                        false,
+                                                                        format!(
+                                                                            "已应用「{}」{n} 项到 Plasticity",
+                                                                            meta.name
+                                                                        ),
+                                                                    ));
+                                                                }
+                                                            }
+                                                            None => {
+                                                                self.set_notice((true, "读取失败".into()))
+                                                            }
+                                                        }
+                                                    }
+                                                },
+                                            );
+                                        }
+                                    });
+                                }
+                            });
                         ui.label(
                             egui::RichText::new(format!(
                                 "已勾选 {} 个成员",
