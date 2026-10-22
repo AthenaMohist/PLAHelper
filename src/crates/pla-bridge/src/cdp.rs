@@ -149,6 +149,12 @@ const SEL_SNAPSHOT_JS: &str = r#"(function(){
     planeIds: idset('planeIds') });
 })()"#;
 
+/// 探活: hook 与 editor 引用是否还在页面里(页面重载会清掉)。
+/// 返回 "1" = 健在, "0" = 需要重新注入。
+const HOOK_PROBE_JS: &str = r#"(function(){
+  return (window.__PLA_HOOK__ && window.__PLA_EDITOR__) ? "1" : "0";
+})()"#;
+
 const TREE_JS: &str = r#"(function(){
   var root = document.getElementById('root');
   if (!root || !root.__k) return JSON.stringify([]);
@@ -384,6 +390,21 @@ async fn session_loop(
         // --- 轮询选择快照(每 2 个 tick ≈ 1s; 500ms 底噪) ---
         sel_tick += 1;
         if sel_tick % 2 == 0 {
+            // R7-25: 页面上下文可能被重置 — Plasticity renderer reload(切文档/
+            // 崩溃恢复)会产生**新的 CDP target**(实测 target id 由 66CCF320… 变为
+            // 97D532B6…), 旧 target 上注入的 window.__PLA_HOOK__ / __PLA_EDITOR__
+            // 随之蒸发。此时所有 JS 都拿不到 editor → 选择快照恒空、ApplySel 报
+            // no-editor。轮询前先探活, 缺失就重新注入(INJECT_JS 幂等)。
+            match eval_roundtrip(ws, &mut mid, HOOK_PROBE_JS).await {
+                Ok(p) if p.trim() == "1" => {}
+                Ok(_) => {
+                    eprintln!("[pla-cdp] hook 丢失(页面已重载?), 重新注入");
+                    let _ = eval_roundtrip(ws, &mut mid, INJECT_JS).await;
+                }
+                Err(e) => {
+                    eprintln!("[pla-cdp] hook 探活失败: {e:#}");
+                }
+            }
             let raw = eval_roundtrip(ws, &mut mid, SEL_SNAPSHOT_JS).await?;
             if raw != last_snapshot {
                 last_snapshot = raw.clone();
@@ -494,7 +515,9 @@ fn apply_sel_js(entries: &[ApplyEntry]) -> anyhow::Result<String> {
             .collect::<Vec<_>>(),
     )?;
     Ok(format!(
-        "(function(){{ var ed=window.__PLA_EDITOR__; if(!ed||!ed.selection) return JSON.stringify({{ok:0,fail:0,errs:['no-editor']}}); var s=ed.selection.selected; var ents={ents}; var ok=0, fail=0, errs=[];\
+        "(function(){{ var ed=window.__PLA_EDITOR__;\
+ if(!ed||!ed.selection){{ var f=window.__PLA_HOOK__; if(f) ed=f.findEditor(); if(ed) window.__PLA_EDITOR__=ed; }}\
+ if(!ed||!ed.selection) return JSON.stringify({{ok:0,fail:0,errs:['no-editor']}}); var s=ed.selection.selected; var ents={ents}; var ok=0, fail=0, errs=[];\
  function err(m){{ if(errs.length<4) errs.push(String(m).slice(0,60)) }}\
  var TAGS={{edge:0,face:2,solid:4,sheet:5}};\
  var db=null; try{{ db=s.cache().db }}catch(eD){{}}\
