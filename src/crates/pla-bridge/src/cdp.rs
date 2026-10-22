@@ -22,11 +22,32 @@ use serde_json::Value;
 pub enum CdpCmd {
     /// 应用选择集: 按成员类型回放(solid/sheet=addById(数值); 其余=add<Kind>({id,versionId,...}))。
     ApplySel(Vec<ApplyEntry>),
+    /// R7-28: 应用选择集 + 先「重新武装」应用侧选择状态。
+    /// 先发 shift+D(duplicate, 跑一个完整命令周期)再 ESC 取消 gizmo, 然后才恢复 —
+    /// 实测这样恢复后 G/E 等 gizmo 命令立即可用, 高亮也出现。
+    /// 副作用: shift+D 会复制当前选择(用户可 ctrl+Z 撤销, 撤销后需再次应用)。
+    ApplySelRearm(Vec<ApplyEntry>),
+    /// R7-28: 派发一个按键(经 CDP Input.dispatchKeyEvent)。
+    /// 注意: CDP 输入要求 Plasticity 窗口持有 OS 焦点, 否则事件被丢弃。
+    Key(KeySpec),
     /// 立即拉一次实体树。
     RefreshTree,
     /// 通用 evaluate(R7-16): 尺寸驱动命令派发等自动化尝试。
     Eval(String),
     Shutdown,
+}
+
+/// 一次按键派发的参数(R7-28)。
+#[derive(Debug, Clone)]
+pub struct KeySpec {
+    /// `KeyboardEvent.key`, 如 "d" / "Escape"。
+    pub key: String,
+    /// `KeyboardEvent.code`, 如 "KeyD" / "Escape"。
+    pub code: String,
+    /// Windows 虚拟键码(如 68 / 27)。
+    pub vk: u32,
+    /// 修饰键位掩码: 8=Shift, 2=Ctrl, 4=Alt。
+    pub modifiers: u32,
 }
 
 /// 一条待回放的选择成员。
@@ -49,6 +70,8 @@ pub enum CdpEvent {
     Tree(Vec<TreeNode>),
     /// Eval 回包。
     EvalResult(String),
+    /// R7-28: 请 UI 把前台焦点交还 Plasticity(武装按键丢失时重试前置)。
+    RequestFocus,
 }
 
 /// 一个选中条目。
@@ -398,13 +421,7 @@ async fn session_loop(
                     }
                 };
                 eprintln!("[pla-cdp] ApplySel raw result: {res}");
-                let v: Value = serde_json::from_str(&res).unwrap_or(Value::Null);
-                let ok = v["ok"].as_i64().unwrap_or(0);
-                let fail = v["fail"].as_i64().unwrap_or(0);
-                let errs = v["errs"]
-                    .as_array()
-                    .map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(" | "))
-                    .unwrap_or_default();
+                let (ok, fail, errs) = parse_apply_result(&res);
                 let msg = if fail > 0 || !errs.is_empty() {
                     format!("选择集应用: {ok} 项成功, {fail} 项失败 {errs}")
                 } else if ok == 0 {
@@ -415,6 +432,94 @@ async fn session_loop(
                     format!("选择集已应用: {ok} 项成功")
                 };
                 let _ = ev_tx.send(CdpEvent::Status(msg));
+            }
+            // R7-28: 先「重新武装」再恢复 — 见 CdpCmd::ApplySelRearm 注释。
+            Ok(CdpCmd::ApplySelRearm(entries)) => {
+                if entries.is_empty() {
+                    let _ = ev_tx.send(CdpEvent::Status("选择集应用: 成员为空".into()));
+                    continue;
+                }
+                // 1) shift+D — duplicate 跑一个完整命令周期, 把应用侧选择状态
+                //    重新武装(实测: 不武装时 G 静默无反应, 武装后立即可用)。
+                //    CDP 按键偶发不被应用处理(焦点被夺/事件丢失), 故用 undo 深度
+                //    验证并重试, 最多 3 轮 — 否则会静默退回"未武装"的老问题。
+                let undo_before = eval_roundtrip(ws, &mut mid, UNDO_DEPTH_JS)
+                    .await
+                    .ok()
+                    .and_then(|s| s.trim().parse::<i64>().ok())
+                    .unwrap_or(-1);
+                let mut armed = false;
+                for attempt in 1..=3 {
+                    let _ = dispatch_key(
+                        ws,
+                        &mut mid,
+                        &KeySpec { key: "d".into(), code: "KeyD".into(), vk: 68, modifiers: 8 },
+                    )
+                    .await;
+                    tokio::time::sleep(Duration::from_millis(1300)).await;
+                    let undo_after = eval_roundtrip(ws, &mut mid, UNDO_DEPTH_JS)
+                        .await
+                        .ok()
+                        .and_then(|s| s.trim().parse::<i64>().ok())
+                        .unwrap_or(-1);
+                    if undo_after > undo_before {
+                        armed = true;
+                        break;
+                    }
+                    eprintln!(
+                        "[pla-cdp] rearm: shift+D 未生效(undo {undo_before}→{undo_after}), 第 {attempt}/3 次重试"
+                    );
+                    // 重试前把焦点抢回 Plasticity(按键丢失的常见原因)
+                    let _ = ev_tx.send(CdpEvent::RequestFocus);
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                }
+                if !armed {
+                    let _ = ev_tx.send(CdpEvent::Status(
+                        "重新武装失败: shift+D 未被 Plasticity 接收（请确认 Plasticity 窗口在前台）, 已直接恢复".into(),
+                    ));
+                }
+                // 2) ESC — 取消 duplicate 留下的移动 gizmo
+                let _ = dispatch_key(
+                    ws,
+                    &mut mid,
+                    &KeySpec { key: "Escape".into(), code: "Escape".into(), vk: 27, modifiers: 0 },
+                )
+                .await;
+                tokio::time::sleep(Duration::from_millis(1000)).await;
+                // 3) 恢复
+                let js = match apply_sel_js(&entries) {
+                    Ok(j) => j,
+                    Err(e) => {
+                        let _ = ev_tx.send(CdpEvent::Status(format!("选择集应用失败: {e}")));
+                        continue;
+                    }
+                };
+                let res = match eval_roundtrip(ws, &mut mid, &js).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = ev_tx.send(CdpEvent::Status(format!(
+                            "选择集应用失败: {e}（CDP 通道异常, 非选择数据问题）"
+                        )));
+                        continue;
+                    }
+                };
+                eprintln!("[pla-cdp] ApplySel(rearm) raw result: {res}");
+                let (ok, fail, errs) = parse_apply_result(&res);
+                let msg = if fail > 0 || !errs.is_empty() {
+                    format!("选择集应用: {ok} 项成功, {fail} 项失败 {errs}")
+                } else if ok == 0 {
+                    "选择集应用: 成员为空, 未发送任何项".to_string()
+                } else {
+                    format!(
+                        "选择集已应用: {ok} 项成功（已重新武装, G/E 等命令可直接用）"
+                    )
+                };
+                let _ = ev_tx.send(CdpEvent::Status(msg));
+            }
+            Ok(CdpCmd::Key(spec)) => {
+                if let Err(e) = dispatch_key(ws, &mut mid, &spec).await {
+                    let _ = ev_tx.send(CdpEvent::Status(format!("按键派发失败: {e}")));
+                }
             }
             Err(TryRecvError::Disconnected) => return Err(anyhow::anyhow!("ui gone")),
             Err(_) => {}
@@ -609,11 +714,97 @@ fn apply_sel_js(entries: &[ApplyEntry]) -> anyhow::Result<String> {
     ))
 }
 
+/// R7-28: 探活 — 取 undo 栈深度(用于验证按键是否真被应用处理)。
+/// CDP 按键要求 Plasticity 持有 OS 焦点, 偶发丢失; 用 undo 深度变化判定成败。
+const UNDO_DEPTH_JS: &str = r#"(function(){
+  var ed = window.__PLA_EDITOR__;
+  if (!ed || !ed.selection) { var f = window.__PLA_HOOK__; if (f) ed = f.findEditor(); if (ed) window.__PLA_EDITOR__ = ed; }
+  if (!ed) return "-1";
+  try { return String(ed.history._undoStack.length); } catch(e){ return "-1"; }
+})()"#;
+
+/// R7-28: 解析 ApplySel JS 的 JSON 回包 → (ok, fail, errs 串)。
+fn parse_apply_result(res: &str) -> (i64, i64, String) {
+    let v: Value = serde_json::from_str(res).unwrap_or(Value::Null);
+    let ok = v["ok"].as_i64().unwrap_or(0);
+    let fail = v["fail"].as_i64().unwrap_or(0);
+    let errs = v["errs"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str())
+                .collect::<Vec<_>>()
+                .join(" | ")
+        })
+        .unwrap_or_default();
+    (ok, fail, errs)
+}
+
 async fn ws_send(ws: &mut WsStream, v: Value) -> anyhow::Result<()> {
     use futures_util::SinkExt;
     ws.send(tokio_tungstenite::tungstenite::Message::Text(v.to_string()))
         .await
         .map_err(|e| anyhow::anyhow!("ws send: {e}"))
+}
+
+/// R7-28: 经 CDP Input 派发一次完整按键(修饰键先下后起)。
+/// **前置条件**: Plasticity 窗口必须持有 OS 焦点, 否则 Chromium 丢弃该事件
+/// (实测: 前台是别的窗口时, 按键完全无声; 助手在应用完成后本就会把焦点交还)。
+async fn dispatch_key(ws: &mut WsStream, mid: &mut u64, spec: &KeySpec) -> anyhow::Result<()> {
+    let m = *mid;
+    *mid += 1;
+    // 修饰键先按下(Shift 需要 rawKeyDown, 否则 text 为空会被应用忽略)
+    if spec.modifiers & 8 != 0 {
+        ws_send(
+            ws,
+            serde_json::json!({"id": m, "method": "Input.dispatchKeyEvent", "params": {
+                "type": "rawKeyDown", "key": "Shift", "code": "ShiftLeft",
+                "windowsVirtualKeyCode": 16, "nativeVirtualKeyCode": 16, "modifiers": 8
+            }}),
+        )
+        .await?;
+    }
+    let mut params = serde_json::json!({
+        "type": "keyDown",
+        "key": spec.key, "code": spec.code,
+        "text": spec.key, "unmodifiedText": spec.key,
+        "modifiers": spec.modifiers,
+        "windowsVirtualKeyCode": spec.vk, "nativeVirtualKeyCode": spec.vk,
+    });
+    if let Some(o) = params.as_object_mut() {
+        o.remove("text");
+        if spec.key.chars().count() == 1 {
+            o.insert("text".into(), serde_json::json!(spec.key));
+        }
+    }
+    ws_send(
+        ws,
+        serde_json::json!({"id": m, "method": "Input.dispatchKeyEvent", "params": params}),
+    )
+    .await?;
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    ws_send(
+        ws,
+        serde_json::json!({"id": m, "method": "Input.dispatchKeyEvent", "params": {
+            "type": "keyUp",
+            "key": spec.key, "code": spec.code,
+            "modifiers": spec.modifiers,
+            "windowsVirtualKeyCode": spec.vk, "nativeVirtualKeyCode": spec.vk,
+        }}),
+    )
+    .await?;
+    if spec.modifiers & 8 != 0 {
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        ws_send(
+            ws,
+            serde_json::json!({"id": m, "method": "Input.dispatchKeyEvent", "params": {
+                "type": "keyUp", "key": "Shift", "code": "ShiftLeft",
+                "windowsVirtualKeyCode": 16, "nativeVirtualKeyCode": 16, "modifiers": 0
+            }}),
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 /// 发 evaluate 并收对应 id 的回包(跳过事件帧)。

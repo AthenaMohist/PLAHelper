@@ -135,6 +135,10 @@ struct PlaApp {
     live_sel_keys: Vec<String>,
     /// R7-26: 已发出「应用」命令, 等 CDP 回包后把焦点交还 Plasticity。
     pending_focus: bool,
+    /// R7-28: 应用后先「重新武装」应用侧选择状态(shift+D + ESC)再恢复。
+    /// 不武装时 G/E 等 gizmo 命令对恢复出来的选择无反应(实测根因)。
+    /// 副作用: shift+D 会复制当前选择, 用户可 ctrl+Z 撤销。
+    sel_rearm: bool,
     /// CDP 实体树平铺 (name, ctor, indent, selected)。
     cdp_tree: Vec<(String, String, i64, bool)>,
     /// CDP 选择集勾选成员 (kind, id, name, key=原始 id 元素 JSON)。
@@ -620,6 +624,7 @@ impl PlaApp {
             live_sel: Vec::new(),
             live_sel_keys: Vec::new(),
             pending_focus: false,
+            sel_rearm: true,
             cdp_tree: Vec::new(),
             sel_cdp_members: Vec::new(),
             sel_saved: Vec::new(),
@@ -727,6 +732,7 @@ impl PlaApp {
                 pla_bridge::cdp::CdpEvent::EvalResult(s) => {
                     self.set_notice((false, format!("CDP: {}", s)));
                 }
+                pla_bridge::cdp::CdpEvent::RequestFocus => self.focus_plasticity(),
                 pla_bridge::cdp::CdpEvent::Tree(nodes) => {
                     self.cdp_tree = nodes
                         .into_iter()
@@ -846,6 +852,21 @@ impl PlaApp {
     fn set_notice(&mut self, n: (bool, String)) {
         self.notice = Some(n);
         self.notice_at = Instant::now();
+    }
+
+    /// R7-28: 发送「应用」命令 — 按 sel_rearm 决定是否先重新武装。
+    fn send_apply(&mut self, entries: Vec<pla_bridge::cdp::ApplyEntry>) {
+        // 重新武装要走 CDP 真实按键, 前置条件 = Plasticity 持有 OS 焦点,
+        // 否则按键被 Chromium 丢弃(实测: 前台是别的窗口时按键完全无声)。
+        if self.sel_rearm {
+            self.focus_plasticity();
+        }
+        if self.sel_rearm {
+            self.cdp
+                .send(pla_bridge::cdp::CdpCmd::ApplySelRearm(entries));
+        } else {
+            self.cdp.send(pla_bridge::cdp::CdpCmd::ApplySel(entries));
+        }
     }
 
     /// R7-26: 把前台焦点交还 Plasticity 窗口。
@@ -1712,6 +1733,11 @@ impl eframe::App for PlaApp {
                                     }
                                 }
                             }
+                            // R7-28: 重新武装开关 — 不武装时 G/E 对恢复的选择无反应
+                            ui.checkbox(&mut self.sel_rearm, "重新武装")
+                                .on_hover_text(
+                                    "应用前先 shift+D+ESC 跑一个完整命令周期。\n                                     不武装时, 恢复出来的选择按 G/E 等 gizmo 命令无反应\n                                     (实测根因: 程序化恢复不建立应用侧选择状态)。\n                                     副作用: shift+D 会复制当前选择, 可 Ctrl+Z 撤销。",
+                                );
                             if ui.button("应用到 Plasticity").clicked() {
                                 // R7-21: 按成员类型回放 — solid/sheet=addById(数值);
                                 // face/edge 等对象形走 add<Kind>({id,versionId,...}) 原样回放。
@@ -1728,7 +1754,7 @@ impl eframe::App for PlaApp {
                                     self.set_notice((true, "勾选项为空".into()));
                                 } else {
                                     let n = entries.len();
-                                    self.cdp.send(pla_bridge::cdp::CdpCmd::ApplySel(entries));
+                                    self.send_apply(entries);
                                     // R7-26: 应用完成后把焦点还给 Plasticity。
                                     self.pending_focus = true;
                                     self.set_notice((
@@ -1907,9 +1933,7 @@ impl eframe::App for PlaApp {
                                                                     ));
                                                                 } else {
                                                                     let n = entries.len();
-                                                                    self.cdp.send(
-                                                                        pla_bridge::cdp::CdpCmd::ApplySel(entries),
-                                                                    );
+                                                                    self.send_apply(entries);
                                                                     // R7-26: 应用完成后把焦点还给 Plasticity。
                                                                     self.pending_focus = true;
                                                                     self.set_notice((
@@ -2014,8 +2038,7 @@ impl eframe::App for PlaApp {
                                             self.set_notice((true, "选择集没有成员".into()));
                                         } else {
                                             let n = entries.len();
-                                            self.cdp
-                                                .send(pla_bridge::cdp::CdpCmd::ApplySel(entries));
+                                            self.send_apply(entries);
                                             // R7-26: 应用完成后把焦点还给 Plasticity。
                                             self.pending_focus = true;
                                             self.set_notice((
