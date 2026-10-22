@@ -131,6 +131,10 @@ struct PlaApp {
     cdp_status: String,
     /// 实时选择快照 (kind, id, name, ctor)。
     live_sel: Vec<pla_bridge::cdp::SelItem>,
+    /// R7-26: 上一次实时选择的 key 集合("kind:id"), 用于侦测选择变化。
+    live_sel_keys: Vec<String>,
+    /// R7-26: 已发出「应用」命令, 等 CDP 回包后把焦点交还 Plasticity。
+    pending_focus: bool,
     /// CDP 实体树平铺 (name, ctor, indent, selected)。
     cdp_tree: Vec<(String, String, i64, bool)>,
     /// CDP 选择集勾选成员 (kind, id, name, key=原始 id 元素 JSON)。
@@ -611,6 +615,8 @@ impl PlaApp {
             cdp: pla_bridge::cdp::CdpHandle::spawn(9333),
             cdp_status: "CDP 连接中…".into(),
             live_sel: Vec::new(),
+            live_sel_keys: Vec::new(),
+            pending_focus: false,
             cdp_tree: Vec::new(),
             sel_cdp_members: Vec::new(),
             sel_saved: Vec::new(),
@@ -664,12 +670,39 @@ impl PlaApp {
         // CDP 事件: 实时选择/实体树/状态(R7-14)。
         while let Some(ev) = self.cdp.poll() {
             match ev {
-                pla_bridge::cdp::CdpEvent::Status(s) => self.cdp_status = s,
+                pla_bridge::cdp::CdpEvent::Status(s) => {
+                    self.cdp_status = s;
+                    // R7-26: 「应用」回包后把焦点交还 Plasticity ——
+                    // 工具栏是独立窗口, 焦点留在它上面时 Plasticity 收不到键盘
+                    // 事件, 主程序"任何操作都不生效"(用户实测)。
+                    if self.pending_focus {
+                        self.pending_focus = false;
+                        self.focus_plasticity();
+                    }
+                }
                 pla_bridge::cdp::CdpEvent::Selection(snap) => {
                     if snap.undo_len >= 0 {
                         self.cdp_undo = snap.undo_len;
                     }
                     if snap.ok {
+                        // R7-26: 实时选择一变, 勾选区里"已不在当前选择中"的成员
+                        // 立即剔除 — 否则「全选 → 保存」会跨次累计(上次的面被带进
+                        // 这次的集, 用户实测: 第一次存面, 第二次存边却把面也带上)。
+                        // 注意只在选择真正变化时做, 且选择为空(全不选)时不清空
+                        // 勾选区(那可能是"载入已存选择集待编辑"的中间态)。
+                        let mut new_keys: Vec<String> = snap
+                            .items
+                            .iter()
+                            .map(|it| pla_ui::selection::member_key(it.kind, &it.id))
+                            .collect();
+                        new_keys.sort();
+                        if new_keys != self.live_sel_keys {
+                            self.live_sel_keys = new_keys.clone();
+                            pla_ui::selection::prune_members_to_live(
+                                &mut self.sel_cdp_members,
+                                &new_keys,
+                            );
+                        }
                         self.live_sel = snap.items;
                     } else if self.live_sel.is_empty() && snap.state == "no-editor" {
                         // 编辑器尚未就绪: 保持状态行即可
@@ -799,6 +832,26 @@ impl PlaApp {
     fn set_notice(&mut self, n: (bool, String)) {
         self.notice = Some(n);
         self.notice_at = Instant::now();
+    }
+
+    /// R7-26: 把前台焦点交还 Plasticity 窗口。
+    /// 辅助工具栏是独立无边框浮窗, 用户点完「应用」后焦点停在工具栏上,
+    /// Plasticity 收不到键盘事件 → 主程序任何操作都不生效(用户实测)。
+    /// 应用完成后主动把焦点还回去, 用户的下一步(shift+D / E / G)可直接按。
+    fn focus_plasticity(&mut self) {
+        let target = match self.snap_target.as_ref() {
+            Some(t) => t.clone(),
+            None => match window_finder::acquire_target(&self.doc_key) {
+                Some(t) => t,
+                None => return,
+            },
+        };
+        if window_finder::focus_window(target.hwnd) {
+            self.hovered_hint = Some((
+                "焦点已交还 Plasticity".into(),
+                format!("已聚焦: {}", target.title),
+            ));
+        }
     }
 
     /// 吸附定位: 轮询目标窗口, 需要时发 OuterPosition(egui points)。
@@ -1662,6 +1715,8 @@ impl eframe::App for PlaApp {
                                 } else {
                                     let n = entries.len();
                                     self.cdp.send(pla_bridge::cdp::CdpCmd::ApplySel(entries));
+                                    // R7-26: 应用完成后把焦点还给 Plasticity。
+                                    self.pending_focus = true;
                                     self.set_notice((
                                         false,
                                         format!("正在应用 {n} 项选择到 Plasticity…"),
@@ -1841,6 +1896,8 @@ impl eframe::App for PlaApp {
                                                                     self.cdp.send(
                                                                         pla_bridge::cdp::CdpCmd::ApplySel(entries),
                                                                     );
+                                                                    // R7-26: 应用完成后把焦点还给 Plasticity。
+                                                                    self.pending_focus = true;
                                                                     self.set_notice((
                                                                         false,
                                                                         format!(
@@ -1945,6 +2002,8 @@ impl eframe::App for PlaApp {
                                             let n = entries.len();
                                             self.cdp
                                                 .send(pla_bridge::cdp::CdpCmd::ApplySel(entries));
+                                            // R7-26: 应用完成后把焦点还给 Plasticity。
+                                            self.pending_focus = true;
                                             self.set_notice((
                                                 false,
                                                 format!("正在选中 {n} 项 ({name})…"),

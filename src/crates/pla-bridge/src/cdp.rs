@@ -548,6 +548,16 @@ fn apply_sel_js(entries: &[ApplyEntry]) -> anyhow::Result<String> {
   }});\
   ok=got; fail=ents.length-got;\
  }}catch(eM){{ err('memento '+String(eM).slice(0,50)); fail=ents.length }}\
+ var es=null; try{{ es=ed.selection.signals }}catch(xE){{}}\
+ if(es){{ function fire(f){{ try{{ f() }}catch(x){{ err('wake '+String(x&&x.message||x).slice(0,40)) }} }}\
+  fire(function(){{ es.selectionDelta.dispatch({{_didChange:true}}) }});\
+  fire(function(){{ es.selectionModeChanged.dispatch(ed.selection.mode) }});\
+  fire(function(){{ es.visibleLayersChanged.dispatch() }});\
+  fire(function(){{ es.highlighted.dispatch() }});\
+  fire(function(){{ es.selectionChanged.dispatch() }});\
+  fire(function(){{ ed.selection.selectedSignals.selectionChanged.dispatch() }});\
+  fire(function(){{ var vp=ed._activeViewport; if(vp&&vp.setNeedsRender) vp.setNeedsRender() }});\
+ }}\
  unknown.forEach(function(e){{ err('kind '+e.kind+' 暂无 tag, 未恢复') }});\
  return JSON.stringify({{ok:ok,fail:fail,errs:errs}}) }})()"
     ))

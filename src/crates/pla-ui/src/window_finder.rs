@@ -11,11 +11,12 @@ mod imp {
     use windows::core::PWSTR;
     use windows::Win32::Foundation::{CloseHandle, BOOL, FILETIME, HWND, LPARAM, RECT};
     use windows::Win32::System::Threading::{
-        GetProcessTimes, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
-        PROCESS_QUERY_LIMITED_INFORMATION,
+        AttachThreadInput, GetCurrentThreadId, GetProcessTimes, OpenProcess,
+        QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetWindowTextW, GetWindowRect, GetWindowThreadProcessId, IsWindowVisible,
+        EnumWindows, GetForegroundWindow, GetWindowTextW, GetWindowRect, GetWindowThreadProcessId,
+        IsWindowVisible, SetForegroundWindow,
     };
 
     /// 一个可吸附的目标窗口(Plasticity 主窗口)。
@@ -223,6 +224,34 @@ mod imp {
         }
         all.into_iter().nth(idx)
     }
+
+    /// 把前台焦点交还给定窗口(R7-26)。
+    /// 辅助工具栏是独立无边框窗口, 用户点完「应用」后焦点留在工具栏,
+    /// Plasticity 收不到键盘事件 → 主程序"任何操作都不生效"。
+    /// 这里在应用完成后把焦点还给 Plasticity, 用户的下一步(shift+D / E / G)
+    /// 可以直接按。
+    pub fn focus_window(hwnd: isize) -> bool {
+        if hwnd == 0 {
+            return false;
+        }
+        unsafe {
+            // AttachThreadInput: 工具栏与 Plasticity 属不同输入队列时,
+            // SetForegroundWindow 可能被系统拒绝, 先挂上目标线程再调用。
+            let target = HWND(hwnd);
+            let fg = GetForegroundWindow();
+            let fg_thread = GetWindowThreadProcessId(fg, None);
+            let cur_thread = GetCurrentThreadId();
+            let attached = fg_thread != cur_thread && fg_thread != 0;
+            if attached {
+                let _ = AttachThreadInput(cur_thread, fg_thread, true);
+            }
+            let ok = SetForegroundWindow(target).as_bool();
+            if attached {
+                let _ = AttachThreadInput(cur_thread, fg_thread, false);
+            }
+            ok
+        }
+    }
 }
 
 #[cfg(not(windows))]
@@ -247,6 +276,11 @@ mod imp {
 
     pub fn acquire_target() -> Option<TargetWindow> {
         None
+    }
+
+    /// 非 Windows 平台占位: 无焦点操作。
+    pub fn focus_window(_hwnd: isize) -> bool {
+        false
     }
 }
 
