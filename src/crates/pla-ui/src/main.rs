@@ -157,6 +157,9 @@ struct PlaApp {
     last_auto_mtime: Option<std::time::SystemTime>,
     /// CDP 侧 undo 栈深度(步数计数源)。
     cdp_undo: i64,
+    /// R7-27: Plasticity 侧最近一次命令报错(原文 + 堆栈)。
+    cdp_err_msg: Option<String>,
+    cdp_err_stack: String,
     dim_value: f64,
     /// 尺寸驱动(R7-16): 关联选择集 + 方向 + 数值(PRD P1-1 定义)。
     dim_sets: Vec<String>,
@@ -632,6 +635,8 @@ impl PlaApp {
             last_auto_step: -1,
             last_auto_mtime: None,
             cdp_undo: -1,
+            cdp_err_msg: None,
+            cdp_err_stack: String::new(),
             dim_value: 0.0,
             dim_sets: Vec::new(),
             dim_set_sel: 0,
@@ -683,6 +688,15 @@ impl PlaApp {
                 pla_bridge::cdp::CdpEvent::Selection(snap) => {
                     if snap.undo_len >= 0 {
                         self.cdp_undo = snap.undo_len;
+                    }
+                    // R7-27: Plasticity 侧命令报错(例如 G 移动的 "reading 'active'")
+                    // 直接显示在助手面板, 不用只盯着 Plasticity 的弹窗。
+                    if let Some((msg, stack)) = snap.error.as_ref() {
+                        if self.cdp_err_msg.as_deref() != Some(msg.as_str()) {
+                            self.cdp_err_msg = Some(msg.clone());
+                            self.cdp_err_stack = stack.clone();
+                            self.set_notice((true, format!("Plasticity 报错: {msg}")));
+                        }
                     }
                     if snap.ok {
                         // R7-26: 实时选择一变, 勾选区里"已不在当前选择中"的成员

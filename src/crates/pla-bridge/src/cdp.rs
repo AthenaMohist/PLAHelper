@@ -73,6 +73,8 @@ pub struct SelectionSnapshot {
     pub undo_len: i64,
     /// 几何数据库版本号(编辑即增)。
     pub geo_ver: i64,
+    /// R7-27: Plasticity 侧最近一次命令报错(原文 + 堆栈), 供 UI 显示。
+    pub error: Option<(String, String)>,
 }
 
 /// 实体树节点（平铺, indent 表层级）。
@@ -139,8 +141,10 @@ const SEL_SNAPSHOT_JS: &str = r#"(function(){
   var undo=-1, geoVer=-1;
   try{ undo = ed.history._undoStack.length }catch(e){}
   try{ geoVer = ed.geo._version!==undefined? ed.geo._version : ed.geo.version }catch(e){}
+  var lastErr = null;
+  try{ var le = window.__PLA_LAST_ERROR__; if(le && le.msg) lastErr = { msg: String(le.msg).slice(0,200), stack: String(le.stack||'').slice(0,600), ts: le.ts }; }catch(e){}
   return JSON.stringify({ st:'ok', size: (typeof s.size==='number')? s.size : -1,
-    undo: undo, geoVer: geoVer,
+    undo: undo, geoVer: geoVer, err: lastErr,
     ids: idset('ids'),
     solidIds: idset('solidIds'), sheetIds: idset('sheetIds'),
     faceIds: idset('faceIds'), edgeIds: idset('edgeIds'),
@@ -196,6 +200,33 @@ const INJECT_JS: &str = r#"(function(){
     }catch(e){}
     return null;
   }};
+  return 'ok';
+})()"#;
+
+/// R7-27: 错误捕获注入 — 页面重载后钩子会丢, 故与 INJECT_JS 合并一次注入。
+/// Plasticity 把命令期异常经 `ed.signals.environmentChanged` 派发(载荷是 Error 实例,
+/// 带 stack); 助手把它抓下来存进 window.__PLA_LAST_ERROR__, 由 SEL_SNAPSHOT_JS
+/// 带回 Rust 侧显示 —— 用户在助手面板就能看到 "Move Item / ...reading 'active'" 这类
+/// 报错原文, 不必只盯着 Plasticity 的弹窗。
+const ERR_HOOK_JS: &str = r#"(function(){
+  if (window.__PLA_ERR_HOOK__) return 'already';
+  var ed = null;
+  try{ var f = window.__PLA_HOOK__; if (f) ed = f.findEditor(); }catch(e){}
+  if (!ed || !ed.signals || !ed.signals.environmentChanged) return 'no-editor';
+  window.__PLA_ERR_HOOK__ = true;
+  window.__PLA_LAST_ERROR__ = null;
+  try {
+    ed.signals.environmentChanged.add(function(p){
+      try {
+        if (!p) return;
+        var isErr = (p instanceof Error) || (p && p.message && p.stack);
+        if (!isErr) return;
+        window.__PLA_LAST_ERROR__ = { msg: String(p.message || p).slice(0,200),
+                                      stack: String(p.stack || '').slice(0,800),
+                                      ts: Date.now() };
+      } catch(e){}
+    });
+  } catch(e){ return 'hook-fail'; }
   return 'ok';
 })()"#;
 
@@ -295,6 +326,8 @@ async fn session_loop(
     let mut last_snapshot = String::new();
     let mut last_tree = String::new();
     let mut sel_tick: u32 = 0;
+    /// R7-27: 错误钩子补注节流计数(每 5 轮 ≈ 2.5s 探一次)。
+    let mut hook_tick: u32 = 0;
 
     // 注入 hook(读取结果丢弃)
     ws_send(ws, json_eval(mid, INJECT_JS)).await?;
@@ -405,6 +438,12 @@ async fn session_loop(
                     eprintln!("[pla-cdp] hook 探活失败: {e:#}");
                 }
             }
+            // R7-27: 错误捕获钩子随页面重载一起丢, 缺了就补注(否则助手看不到
+            // Plasticity 侧的命令报错, 例如 G 移动的 "reading 'active'")。
+            if hook_tick % 5 == 0 {
+                let _ = eval_roundtrip(ws, &mut mid, ERR_HOOK_JS).await;
+            }
+            hook_tick += 1;
             let raw = eval_roundtrip(ws, &mut mid, SEL_SNAPSHOT_JS).await?;
             if raw != last_snapshot {
                 last_snapshot = raw.clone();
@@ -462,6 +501,12 @@ async fn session_loop(
                         items,
                         undo_len: v["undo"].as_i64().unwrap_or(-1),
                         geo_ver: v["geoVer"].as_i64().unwrap_or(-1),
+                        error: v["err"]["msg"].as_str().map(|m| {
+                            (
+                                m.to_string(),
+                                v["err"]["stack"].as_str().unwrap_or("").to_string(),
+                            )
+                        }),
                     }));
                 } else {
                     let _ = ev_tx.send(CdpEvent::Selection(SelectionSnapshot {
@@ -471,6 +516,7 @@ async fn session_loop(
                         items: Vec::new(),
                         undo_len: -1,
                         geo_ver: -1,
+                        error: None,
                     }));
                 }
             }
@@ -531,6 +577,7 @@ fn apply_sel_js(entries: &[ApplyEntry]) -> anyhow::Result<String> {
   if(e.kind==='face'||e.kind==='edge'){{ var p=parentOf(e.id); if(p){{ if(!groups[p]) groups[p]=[]; groups[p].push(memId) }} }}\
  }});\
  try{{\
+  var beforeIds=new Set(); try{{ s.ids.forEach(function(x){{ beforeIds.add(x) }}) }}catch(eB){{}}\
   var m=s.saveToMemento();\
   m.ids=new Set(memIds);\
   var pc=m.parentsWithSelectedChildren;\
@@ -550,11 +597,10 @@ fn apply_sel_js(entries: &[ApplyEntry]) -> anyhow::Result<String> {
  }}catch(eM){{ err('memento '+String(eM).slice(0,50)); fail=ents.length }}\
  var es=null; try{{ es=ed.selection.signals }}catch(xE){{}}\
  if(es){{ function fire(f){{ try{{ f() }}catch(x){{ err('wake '+String(x&&x.message||x).slice(0,40)) }} }}\
-  fire(function(){{ es.selectionDelta.dispatch({{_didChange:true}}) }});\
-  fire(function(){{ es.selectionModeChanged.dispatch(ed.selection.mode) }});\
+  fire(function(){{ es.selectionDelta.dispatch({{_didChange:true, before:beforeIds, after:new Set(memIds)}}) }});\
+  fire(function(){{ es.selectionChanged.dispatch() }});\
   fire(function(){{ es.visibleLayersChanged.dispatch() }});\
   fire(function(){{ es.highlighted.dispatch() }});\
-  fire(function(){{ es.selectionChanged.dispatch() }});\
   fire(function(){{ ed.selection.selectedSignals.selectionChanged.dispatch() }});\
   fire(function(){{ var vp=ed._activeViewport; if(vp&&vp.setNeedsRender) vp.setNeedsRender() }});\
  }}\
