@@ -135,9 +135,10 @@ struct PlaApp {
     live_sel_keys: Vec<String>,
     /// R7-26: 已发出「应用」命令, 等 CDP 回包后把焦点交还 Plasticity。
     pending_focus: bool,
-    /// R7-28: 应用后先「重新武装」应用侧选择状态(shift+D + ESC)再恢复。
-    /// 不武装时 G/E 等 gizmo 命令对恢复出来的选择无反应(实测根因)。
-    /// 副作用: shift+D 会复制当前选择, 用户可 ctrl+Z 撤销。
+    /// R7-30: 应用后先「重新武装」应用侧选择状态(shift+D + ESC)再恢复。
+    /// 用户实测: 武装后 G 确实能启动, 但作用在 shift+D 复制出的副本上,
+    /// 且 ctrl+Z 退回「什么都没选」而非原始面 —— 对本工作流无用, 故默认关闭,
+    /// 保留仅为对照/排查。
     sel_rearm: bool,
     /// CDP 实体树平铺 (name, ctor, indent, selected)。
     cdp_tree: Vec<(String, String, i64, bool)>,
@@ -624,7 +625,7 @@ impl PlaApp {
             live_sel: Vec::new(),
             live_sel_keys: Vec::new(),
             pending_focus: false,
-            sel_rearm: true,
+            sel_rearm: false,
             cdp_tree: Vec::new(),
             sel_cdp_members: Vec::new(),
             sel_saved: Vec::new(),

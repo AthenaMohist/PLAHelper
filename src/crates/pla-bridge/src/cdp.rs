@@ -702,6 +702,11 @@ fn apply_sel_js(entries: &[ApplyEntry]) -> anyhow::Result<String> {
  }}catch(eM){{ err('memento '+String(eM).slice(0,50)); fail=ents.length }}\
  var es=null; try{{ es=ed.selection.signals }}catch(xE){{}}\
  if(es){{ function fire(f){{ try{{ f() }}catch(x){{ err('wake '+String(x&&x.message||x).slice(0,40)) }} }}\
+  fire(function(){{ if(!ed._activeViewport&&ed.viewports&&ed.viewports.size>0){{\
+    var vv=null; ed.viewports.forEach(function(v){{ if(!vv) vv=v }});\
+    if(vv){{ ed._activeViewport=vv;\
+      if(typeof ed.onViewportActivated==='function') ed.onViewportActivated(vv);\
+      ed.signals.viewportActivated.dispatch(vv) }} }} }});\
   fire(function(){{ es.selectionDelta.dispatch({{_didChange:true, before:beforeIds, after:new Set(memIds)}}) }});\
   fire(function(){{ es.selectionChanged.dispatch() }});\
   fire(function(){{ es.visibleLayersChanged.dispatch() }});\
