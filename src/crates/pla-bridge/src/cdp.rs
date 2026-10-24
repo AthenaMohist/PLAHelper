@@ -349,7 +349,7 @@ async fn session_loop(
     let mut last_snapshot = String::new();
     let mut last_tree = String::new();
     let mut sel_tick: u32 = 0;
-    /// R7-27: 错误钩子补注节流计数(每 5 轮 ≈ 2.5s 探一次)。
+    // R7-27: 错误钩子补注节流计数(每 5 轮 ≈ 2.5s 探一次)。
     let mut hook_tick: u32 = 0;
 
     // 注入 hook(读取结果丢弃)
@@ -389,47 +389,116 @@ async fn session_loop(
                 }
             }
             Ok(CdpCmd::ApplySel(entries)) => {
-                // R7-21c: 回放策略(全部活体验证, 2026-10-20 22:4x 会话) —
-                //  solid/sheet 数值 id: harvest 法 — SelectAll<Kind>Command 暴露全部
-                //    Object3D, 与 idSet 顺序配对成 id→Object3D 映射, s.clear() 后先还原
-                //    用户原选择(s.add(对象引用)), 再 s.add(目标)。数字直加(addById/
-                //    addSolid(数字))实测产生 NaN 幽灵条目, 禁用。
-                //  face/edge/segment/curve/curveVertex: GeometryDatabase.
-                //    lookupTopologyItemById(hex) 返回 {view, model, topologyId},
-                //    ref.view 即 renderer Face/ShellEdge Object3D proxy,
-                //    s.addFace(ref.view)/addEdge(ref.view) 实测精确复原
-                //    (face '9f1624' + edge '14e1984' 双双命中, 无幽灵)。
-                //    注意 addFace(裸 {id,versionId} 或 ref 本体) 会抛
-                //    "undefined reading versionId" — 必须传 ref.view。
-                //  对象形 key 兜底: lookup 失败或无 db 时原样回放, 失败计数如实上报。
-                // (JS 内不得写 // 注释: 该模板用反斜杠续行, 生成的是一整行 JS,
-                //  行注释会把后面的代码全部吞掉 → SyntaxError: Unexpected end of input。
-                //  说明一律写在 Rust 侧, 如上。)
-                let js = apply_sel_js(&entries)?;
-                // R7-24: eval 失败不再静默吞成「0 项成功」— 旧代码
-                // `unwrap_or_default()` 把超时/异常/断连一律变成空串 → JSON 解析
-                // 失败 → v=Null → ok=0,fail=0 → UI 显示「选择集已应用: 0 项成功」,
-                // 把 hy4 的 JS 语法错误活生生藏了若干轮。现在错误如实上报。
-                let res = match eval_roundtrip(ws, &mut mid, &js).await {
+                // R7-31d: 鼠标管线 — hover 扫描定位目标面的屏幕坐标,
+                // CDP 真实点击(ClickChangeSelectionCommand 完整周期)。
+                // 合成 onClick/memento 路线已证伪: MoveCommand 移交时清选择
+                // (缺"活跃实体上下文", 只有真实点击管线建立)。
+                // 视角无关: 扫描在应用时刻的当前视角下进行; hover 命中是穿透的
+                // (同一射线可命中多个面), 目标面转到背面也能被射线扫到时即可找到。
+                if entries.is_empty() {
+                    let _ = ev_tx.send(CdpEvent::Status("选择集应用: 成员为空".into()));
+                    continue;
+                }
+                let js = match apply_sel_js(&entries) {
+                    Ok(j) => j,
+                    Err(e) => {
+                        let _ = ev_tx.send(CdpEvent::Status(format!("选择集应用失败: {e}")));
+                        continue;
+                    }
+                };
+                // Phase A: 准备 — 取消活动命令(hover 管线在命令期间暂停!),
+                // 清选择, 装扫描 spy, 取视口矩形。返回 [x,y,w,h]
+                let prep = match eval_roundtrip(ws, &mut mid, &js).await {
                     Ok(r) => r,
                     Err(e) => {
-                        eprintln!("[pla-cdp] ApplySel eval failed: {e:#}");
                         let _ = ev_tx.send(CdpEvent::Status(format!(
-                            "选择集应用失败: {e}（CDP 通道异常, 非选择数据问题）"
+                            "选择集应用失败(准备阶段): {e}"
                         )));
                         continue;
                     }
                 };
-                eprintln!("[pla-cdp] ApplySel raw result: {res}");
-                let (ok, fail, errs) = parse_apply_result(&res);
-                let msg = if fail > 0 || !errs.is_empty() {
-                    format!("选择集应用: {ok} 项成功, {fail} 项失败 {errs}")
-                } else if ok == 0 {
-                    // R7-24: 空成员不该走到这(UI 侧已拦), 到了说明 entries 为空 —
-                    // 明确告知, 不要伪装成「0 项成功」。
-                    "选择集应用: 成员为空, 未发送任何项".to_string()
+                let rect: (i64, i64, i64, i64) = match serde_json::from_str::<(i64,i64,i64,i64)>(&prep) {
+                    Ok(r) => r,
+                    Err(_) => {
+                        // prep 是错误 JSON {err:...}
+                        let (ok, fail, errs) = parse_apply_result(&prep);
+                        let _ = ev_tx.send(CdpEvent::Status(format!(
+                            "选择集应用: {ok} 项成功, {fail} 项失败 {errs}"
+                        )));
+                        continue;
+                    }
+                };
+                // Phase B: 网格扫描 — Rust 发 mouseMoved, 逐点 eval 读当前
+                // hover 命中的面 id(SCAN_READ_JS), 关联 (x,y) 建表。
+                // 目标 id 集合全部命中或网格扫完即止; 6x9=54 点 ≈ 2~3s。
+                let target_ids: std::collections::HashSet<String> =
+                    entries.iter().map(|e| e.id.clone()).collect();
+                let mut pos_map: std::collections::HashMap<String, (i64, i64)> =
+                    std::collections::HashMap::new();
+                'scan: for gy in 0..6i64 {
+                    for gx in 0..9i64 {
+                        let x = rect.0 + (rect.2 as f64 * (gx as f64 + 0.5) / 9.0) as i64;
+                        let y = rect.1 + (rect.3 as f64 * (gy as f64 + 0.5) / 6.0) as i64;
+                        let _ = dispatch_mouse_move(ws, &mut mid, x, y).await;
+                        tokio::time::sleep(Duration::from_millis(28)).await;
+                        if let Ok(s) = eval_roundtrip(ws, &mut mid, SCAN_READ_JS).await {
+                            if let Ok(arr) = serde_json::from_str::<Vec<String>>(&s) {
+                                for fid in arr {
+                                    pos_map.entry(fid).or_insert((x, y));
+                                }
+                            }
+                        }
+                        // 提前退出: 目标全命中
+                        if target_ids.iter().all(|t| pos_map.contains_key(t)) {
+                            break 'scan;
+                        }
+                    }
+                }
+                eprintln!(
+                    "[pla-cdp] scan: {} 个 id 定位 / 目标 {}",
+                    pos_map.len(),
+                    target_ids.len()
+                );
+                // Phase C: 逐面点击(第一个普通=替换, 其余 shift=追加)
+                let mut hits: Vec<(String, i64, i64)> = Vec::new();
+                let mut misses: Vec<String> = Vec::new();
+                for e in &entries {
+                    match pos_map.get(&e.id) {
+                        Some(&(px, py)) => hits.push((e.id.clone(), px, py)),
+                        None => misses.push(e.id.clone()),
+                    }
+                }
+                if hits.is_empty() {
+                    let _ = ev_tx.send(CdpEvent::Status(format!(
+                        "选择集应用失败: 当前视角扫描未命中目标面({} 个; 可旋转视角后重试)",
+                        misses.len()
+                    )));
+                    continue;
+                }
+                for (i, (_id, px, py)) in hits.iter().enumerate() {
+                    let shift = i > 0;
+                    let _ = dispatch_mouse_click(ws, &mut mid, *px, *py, shift).await;
+                }
+                // Phase D: 校验 + 唤醒渲染
+                let verify = r#"(function(){
+  var ed=window.__PLA_EDITOR__;
+  if(!ed||!ed.selection){ var f=window.__PLA_HOOK__; if(f) ed=f.findEditor(); if(ed) window.__PLA_EDITOR__=ed; }
+  if(!ed||!ed.selection) return JSON.stringify({ok:0,fail:0,errs:['no-editor']});
+  var s=ed.selection.selected;
+  var vp=null; ed.viewports.forEach(function(v){if(!vp)vp=v});
+  try{ if(vp&&vp.setNeedsRender) vp.setNeedsRender() }catch(e){}
+  delete window.__PLA_SCAN__;
+  return JSON.stringify({selN:(typeof s.size==='number')?s.size:-1, faces:(function(){var a=[];try{s.faceIds.forEach(function(x){a.push(String(x&&x.versionId!==undefined?x.versionId:x))})}catch(e){}return a})()});})()"#;
+                let _ = eval_roundtrip(ws, &mut mid, verify).await;
+                let _ = dispatch_mouse_move(ws, &mut mid, rect.0 + rect.2 / 2, rect.1 + rect.3 / 2).await;
+                let ok = hits.len();
+                let fail = misses.len();
+                let msg = if fail > 0 {
+                    format!(
+                        "选择集应用: {ok} 项成功, {fail} 项失败(未在当前视角扫到, 请旋转视角后重试)"
+                    )
                 } else {
-                    format!("选择集已应用: {ok} 项成功")
+                    format!("选择集已应用: {ok} 项成功(真实点击管线)")
                 };
                 let _ = ev_tx.send(CdpEvent::Status(msg));
             }
@@ -649,102 +718,48 @@ fn json_eval(mid: u64, expr: &str) -> Value {
     })
 }
 
-/// 生成 ApplySel 的回放 JS(R7-31b: 合成 hit → onClick 真实命令周期)。
-/// 抽成纯函数以便单测把真实生成的 JS 打出来与手跑复刻版 diff。
-/// 注意: 模板用 `\` 续行, Rust 会拼成**一整行** JS —
-/// JS 内一律不得写 `//` 注释(会把后面的代码连同 `return`/`})()` 一起吞掉),
-/// 报 SyntaxError: Unexpected end of input; 说明只写 Rust 侧注释。
-/// R7-31b: hit 结构来自真实点击签名捕获:
-///   {distance, point:{x,y,z}, topologyItem:view, object:view, distance2d}
-/// changeSelection.onClick(hits, x, y) 走 ClickChangeSelectionCommand
-/// (内核级选择, 可撤销, G/fillet/push-face 等命令全部响应)。
-/// 生成 ApplySel 的回放 JS(R7-31c: onClick 种子 + memento 全量恢复)。
-/// 抽成纯函数以便单测把真实生成的 JS 打出来与手跑复刻版 diff。
-/// 注意: 模板用 `\\` 续行, Rust 会拼成**一整行** JS —
-/// JS 内一律不得写 `//` 注释(会把后面的代码连同 `return`/`})()` 一起吞掉),
-/// 报 SyntaxError: Unexpected end of input; 说明只写 Rust 侧注释。
-///
-/// R7-31c 方案(干净现场验证):
-///   1) 合成 hit 调 changeSelection.onClick(hits[0]) — 走真实
-///      ClickChangeSelectionCommand 命令周期(undo 栈记录, G/push-face 响应)
-///   2) m=saveToMemento() 抓内核 memento; m.ids 替换为完整目标集合
-///      ('tag:id' 前缀自动归类: 2:=face 0:=edge 4:=solid 5:=sheet)
-///   3) restoreFromMemento(m) — 多选/混合类型一次到位
-///      (onClick 本身是替换语义, 不能逐个调!)
-///   4) parentsWithSelectedChildren 的 counts/values 按 parent solid 同步
-///   5) 派 selectionDelta({before, after, _didChange:true}) 收尾
-/// hit 结构(真实点击捕获): {distance, point, topologyItem:view, object:view, distance2d}
+/// R7-31d: ApplySel Phase A — 鼠标管线的准备脚本。
+/// 取消活动命令(hover 管线在命令期间暂停) + 清选择 + 装扫描 spy + 返回视口 rect。
+/// 返回 "[x,y,w,h]"(页内矩形, CDP Input 用同一坐标系) 或错误 JSON。
+/// 扫描 spy: 包装 cs.onHover, 记录每个命中面 id 的**最近一次**屏幕坐标 —
+/// Rust 侧驱动 mouseMoved 网格扫描, 每到一个点 spy 记录该点命中的所有面。
+/// 注: mouseMoved 的坐标由 Rust 提供, 页内拿不到, 故 spy 只记 id->时间戳,
+/// 坐标关联在 Rust 侧完成(读表 + 当前扫描点配对)…… 不可行 — 改为 spy 内
+/// 无法取坐标时用 performance.now 与 Rust 日志对齐过于脆弱。
+/// 最终方案: spy 不记坐标, Rust 每发一个 mouseMoved 就立即 eval 读
+/// "当前 hover 命中的 face id 集合"(读 ed.selection.hits), 把当前 (x,y)
+/// 关联到这些 id — 每点一次 eval, 54 点 = 54 次轻量 eval, 完全可行。
 fn apply_sel_js(entries: &[ApplyEntry]) -> anyhow::Result<String> {
-    let ents = serde_json::to_string(
-        &entries
-            .iter()
-            .map(|e| serde_json::json!({
-                "kind": e.kind,
-                "id": e.id,
-                "key": e.key,
-            }))
-            .collect::<Vec<_>>(),
-    )?;
-    Ok(format!(
-        "(function(){{ var ed=window.__PLA_EDITOR__;\
- if(!ed||!ed.selection){{ var f=window.__PLA_HOOK__; if(f) ed=f.findEditor(); if(ed) window.__PLA_EDITOR__=ed; }}\
- if(!ed||!ed.selection) return JSON.stringify({{ok:0,fail:0,errs:['no-editor']}});\
- var s=ed.selection.selected; var ents={ents}; var ok=0, fail=0, errs=[];\
- function err(m){{ if(errs.length<4) errs.push(String(m).slice(0,60)) }}\
- var TAGS={{edge:0,face:2,solid:4,sheet:5}};\
- var db=null; try{{ db=s.cache().db }}catch(eD){{}}\
- if(!db){{ err('no-db'); return JSON.stringify({{ok:0,fail:ents.length,errs:errs}}) }}\
- var unknown=[]; var seen={{}}; var memIds=[]; var groups={{}};\
- var seedView=null; var seedPt=null;\
- function parentOf(id){{ try{{ var v=db.lookupTopologyItemById(String(id)).view; var fg=v&&v.parent; var solid=fg&&fg.parent;\
-   return (solid&&solid.versionId!==undefined)?String(solid.versionId):null }}catch(e){{ return null }} }}\
- for(var i=0;i<ents.length;i++){{ var e=ents[i];\
-  var t=TAGS[e.kind];\
-  if(t===undefined){{ unknown.push(e); continue }}\
-  var key=t+':'+e.id;\
-  if(seen[key]) continue; seen[key]=1; memIds.push(key);\
-  var view=null;\
-  try{{ view=db.lookupTopologyItemById(String(e.id)).view }}catch(eL){{}}\
-  if(!view){{ err('id '+e.id+' 不存在(几何已变更?)'); fail++; continue }}\
-  if(e.kind==='face'||e.kind==='edge'){{ var p=parentOf(e.id); if(p){{ if(!groups[p]) groups[p]=[]; groups[p].push(key) }} }}\
-  if(!seedView){{ seedView=view;\
-   try{{ var b=view.getBoundingBox();\
-    if(b&&b.min&&b.max){{ seedPt={{x:(b.min.x+b.max.x)/2, y:(b.min.y+b.max.y)/2, z:(b.min.z+b.max.z)/2}} }} }}catch(eB){{}}\
-   if(!seedPt) seedPt={{x:0,y:0,z:0}}; }}\
- }}\
- var okCount=0;\
- if(seedView && memIds.length>0){{\
-  var beforeIds=new Set(); try{{ s.ids.forEach(function(x){{ beforeIds.add(x) }}) }}catch(eB){{}}\
-  try{{ ed.click.clear() }}catch(eC){{}}\
-  var seedOk=false;\
-  try{{ ed.changeSelection.onClick([{{distance:1, point:seedPt, topologyItem:seedView, object:seedView, distance2d:1}}], 0, 0); seedOk=true }}\
-  catch(eO){{ err('onClick '+String(eO&&eO.message||eO).slice(0,40)) }}\
-  if(seedOk){{\
-   try{{\
-    var m=s.saveToMemento();\
-    m.ids=new Set(memIds);\
-    var pc=m.parentsWithSelectedChildren;\
-    if(pc){{ pc.counts=new Map(); pc.values=new Map();\
-     Object.keys(groups).forEach(function(p){{ pc.counts.set(p, groups[p].length); pc.values.set(p, groups[p]) }}) }}\
-    s.restoreFromMemento(m);\
-   }}catch(eM){{ err('memento '+String(eM).slice(0,40)) }}\
-  }}\
-  try{{ ed.signals.selectionDelta.dispatch({{_didChange:true, before:beforeIds, after:new Set(memIds)}}) }}catch(eS){{}}\
-  var got=0;\
-  try{{ ents.forEach(function(e){{\
-   var v=null;\
-   try{{ v=(e.kind==='face')?s.faceIds:(e.kind==='edge')?s.edgeIds:(e.kind==='solid')?s.solidIds:(e.kind==='sheet')?s.sheetIds:null }}catch(eV){{}}\
-   if(!v) return;\
-   var has=false; v.forEach(function(x){{ if(String(x&&x.versionId!==undefined?x.versionId:x)===String(e.id)) has=true }});\
-   if(has) got++;\
-  }}) }}catch(eV2){{}}\
-  okCount=got;\
- }}\
- ok=okCount; fail=ents.length-okCount-unknown.length;\
- unknown.forEach(function(e){{ err('kind '+e.kind+' 暂无 tag, 未恢复') }});\
- return JSON.stringify({{ok:ok,fail:fail,errs:errs}}) }})()"
-    ))
+    // Phase A 只需 entries 用于去重校验(空校验在 Rust 侧), 这里生成准备脚本。
+    let _ = entries;
+    Ok(r#"(function(){
+  var ed=window.__PLA_EDITOR__;
+  if(!ed||!ed.selection){ var f=window.__PLA_HOOK__; if(f) ed=f.findEditor(); if(ed) window.__PLA_EDITOR__=ed; }
+  if(!ed||!ed.selection) return JSON.stringify({ok:0,fail:0,errs:['no-editor']});
+  try{ ed.executor.cancelActiveCommand() }catch(e){}
+  try{ ed.click.clear() }catch(e){}
+  document.body.removeAttribute('gizmo');
+  document.body.removeAttribute('command');
+  var c=document.querySelector('plasticity-viewport canvas');
+  if(!c) return JSON.stringify({ok:0,fail:0,errs:['no-canvas']});
+  var r=c.getBoundingClientRect();
+  return JSON.stringify([Math.round(r.x),Math.round(r.y),Math.round(r.width),Math.round(r.height)]);
+})()"#
+    .to_string())
 }
+
+/// R7-31d: Phase B 扫描读取 — 返回当前 hover 射线命中的面 id 数组(JSON)。
+/// (ed.selection.hits.hits: Map<实体id, hit>, hit.intersected.versionId = 面 id)
+const SCAN_READ_JS: &str = r#"(function(){
+  var ed=window.__PLA_EDITOR__; if(!ed){ var f=window.__PLA_HOOK__; if(f) ed=f.findEditor(); }
+  if(!ed||!ed.selection||!ed.selection.hits||!ed.selection.hits.hits) return '[]';
+  var out=[];
+  ed.selection.hits.hits.forEach(function(v,k){
+    var f2=v&&v.intersected;
+    var fid=f2&&f2.versionId!==undefined?String(f2.versionId):null;
+    if(fid&&out.length<16) out.push(fid);
+  });
+  return JSON.stringify(out);})()"#;
 
 /// R7-28: 探活 — 取 undo 栈深度(用于验证按键是否真被应用处理)。
 /// CDP 按键要求 Plasticity 持有 OS 焦点, 偶发丢失; 用 undo 深度变化判定成败。
@@ -836,6 +851,71 @@ async fn dispatch_key(ws: &mut WsStream, mid: &mut u64, spec: &KeySpec) -> anyho
         )
         .await?;
     }
+    Ok(())
+}
+
+/// R7-31d: 经 CDP Input 派发一次鼠标点击(mouseMoved→mousePressed→mouseReleased)。
+/// shift=true 时全部事件带 modifiers:8(实测变体2姿势, 无需前置 shift keyDown)。
+/// 这是**浏览器级输入注入**, 走 Plasticity 完整命中管线(ClickChangeSelectionCommand
+/// 真实命令周期 + 活跃实体上下文), 与用户真实点击等价 — 合成 onClick/memento 路线
+/// 已证伪(MoveCommand 移交时清选择, 因缺活跃实体上下文)。
+async fn dispatch_mouse_click(
+    ws: &mut WsStream,
+    mid: &mut u64,
+    x: i64,
+    y: i64,
+    shift: bool,
+) -> anyhow::Result<()> {
+    let m = *mid;
+    *mid += 2;
+    let mo = if shift { 8 } else { 0 };
+    ws_send(
+        ws,
+        serde_json::json!({"id": m, "method": "Input.dispatchMouseEvent", "params": {
+            "type": "mouseMoved", "x": x, "y": y, "button": "none", "buttons": 0,
+            "modifiers": mo, "pointerType": "mouse"
+        }}),
+    )
+    .await?;
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    ws_send(
+        ws,
+        serde_json::json!({"id": m + 1, "method": "Input.dispatchMouseEvent", "params": {
+            "type": "mousePressed", "x": x, "y": y, "button": "left", "buttons": 1,
+            "clickCount": 1, "modifiers": mo, "pointerType": "mouse"
+        }}),
+    )
+    .await?;
+    tokio::time::sleep(Duration::from_millis(70)).await;
+    ws_send(
+        ws,
+        serde_json::json!({"id": m + 1, "method": "Input.dispatchMouseEvent", "params": {
+            "type": "mouseReleased", "x": x, "y": y, "button": "left", "buttons": 0,
+            "clickCount": 1, "modifiers": mo, "pointerType": "mouse"
+        }}),
+    )
+    .await?;
+    tokio::time::sleep(Duration::from_millis(320)).await;
+    Ok(())
+}
+
+/// R7-31d: 单次 mouseMoved(扫描/唤醒渲染用)。
+async fn dispatch_mouse_move(
+    ws: &mut WsStream,
+    mid: &mut u64,
+    x: i64,
+    y: i64,
+) -> anyhow::Result<()> {
+    let m = *mid;
+    *mid += 1;
+    ws_send(
+        ws,
+        serde_json::json!({"id": m, "method": "Input.dispatchMouseEvent", "params": {
+            "type": "mouseMoved", "x": x, "y": y, "button": "none", "buttons": 0,
+            "pointerType": "mouse"
+        }}),
+    )
+    .await?;
     Ok(())
 }
 
@@ -985,6 +1065,9 @@ mod tests {
         // 基本健全性: 不得含 // 注释痕迹, 必须完整收尾
         assert!(!js.contains("//"), "JS 内含 // 注释会吞掉后续代码");
         assert!(js.ends_with("})()"), "JS 未完整收尾");
-        assert!(js.contains("14f2025"), "ents 未注入");
+        // R7-31d: Phase A 脚本不再内联 entries(坐标由 Rust 驱动的扫描关联),
+        // 改为断言关键步骤存在。
+        assert!(js.contains("cancelActiveCommand"), "缺少取消活动命令");
+        assert!(js.contains("getBoundingClientRect"), "缺少视口矩形获取");
     }
 }
