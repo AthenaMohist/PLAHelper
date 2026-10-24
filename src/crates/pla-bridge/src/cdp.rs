@@ -658,7 +658,22 @@ fn json_eval(mid: u64, expr: &str) -> Value {
 ///   {distance, point:{x,y,z}, topologyItem:view, object:view, distance2d}
 /// changeSelection.onClick(hits, x, y) 走 ClickChangeSelectionCommand
 /// (内核级选择, 可撤销, G/fillet/push-face 等命令全部响应)。
-/// 多选: 先 click.clear() 再逐个 onClick(命令自带 toggle, 故对重复 id 去重)。
+/// 生成 ApplySel 的回放 JS(R7-31c: onClick 种子 + memento 全量恢复)。
+/// 抽成纯函数以便单测把真实生成的 JS 打出来与手跑复刻版 diff。
+/// 注意: 模板用 `\\` 续行, Rust 会拼成**一整行** JS —
+/// JS 内一律不得写 `//` 注释(会把后面的代码连同 `return`/`})()` 一起吞掉),
+/// 报 SyntaxError: Unexpected end of input; 说明只写 Rust 侧注释。
+///
+/// R7-31c 方案(干净现场验证):
+///   1) 合成 hit 调 changeSelection.onClick(hits[0]) — 走真实
+///      ClickChangeSelectionCommand 命令周期(undo 栈记录, G/push-face 响应)
+///   2) m=saveToMemento() 抓内核 memento; m.ids 替换为完整目标集合
+///      ('tag:id' 前缀自动归类: 2:=face 0:=edge 4:=solid 5:=sheet)
+///   3) restoreFromMemento(m) — 多选/混合类型一次到位
+///      (onClick 本身是替换语义, 不能逐个调!)
+///   4) parentsWithSelectedChildren 的 counts/values 按 parent solid 同步
+///   5) 派 selectionDelta({before, after, _didChange:true}) 收尾
+/// hit 结构(真实点击捕获): {distance, point, topologyItem:view, object:view, distance2d}
 fn apply_sel_js(entries: &[ApplyEntry]) -> anyhow::Result<String> {
     let ents = serde_json::to_string(
         &entries
@@ -679,39 +694,53 @@ fn apply_sel_js(entries: &[ApplyEntry]) -> anyhow::Result<String> {
  var TAGS={{edge:0,face:2,solid:4,sheet:5}};\
  var db=null; try{{ db=s.cache().db }}catch(eD){{}}\
  if(!db){{ err('no-db'); return JSON.stringify({{ok:0,fail:ents.length,errs:errs}}) }}\
- var unknown=[]; var seen={{}}; var hits=[];\
+ var unknown=[]; var seen={{}}; var memIds=[]; var groups={{}};\
+ var seedView=null; var seedPt=null;\
+ function parentOf(id){{ try{{ var v=db.lookupTopologyItemById(String(id)).view; var fg=v&&v.parent; var solid=fg&&fg.parent;\
+   return (solid&&solid.versionId!==undefined)?String(solid.versionId):null }}catch(e){{ return null }} }}\
  for(var i=0;i<ents.length;i++){{ var e=ents[i];\
   var t=TAGS[e.kind];\
   if(t===undefined){{ unknown.push(e); continue }}\
   var key=t+':'+e.id;\
-  if(seen[key]) continue; seen[key]=1;\
+  if(seen[key]) continue; seen[key]=1; memIds.push(key);\
   var view=null;\
-  try{{ view=db.lookupTopologyItemById(String(e.id)).view }}catch(eL){{ err('id '+e.id+' lookup失败'); fail++; continue }}\
+  try{{ view=db.lookupTopologyItemById(String(e.id)).view }}catch(eL){{}}\
   if(!view){{ err('id '+e.id+' 不存在(几何已变更?)'); fail++; continue }}\
-  var pt=null;\
-  try{{ var b=view.getBoundingBox();\
-   if(b&&b.min&&b.max){{ pt={{x:(b.min.x+b.max.x)/2, y:(b.min.y+b.max.y)/2, z:(b.min.z+b.max.z)/2}} }} }}catch(eB){{}}\
-  if(!pt) pt={{x:0,y:0,z:0}};\
-  hits.push({{distance:1, point:pt, topologyItem:view, object:view, distance2d:1}});\
+  if(e.kind==='face'||e.kind==='edge'){{ var p=parentOf(e.id); if(p){{ if(!groups[p]) groups[p]=[]; groups[p].push(key) }} }}\
+  if(!seedView){{ seedView=view;\
+   try{{ var b=view.getBoundingBox();\
+    if(b&&b.min&&b.max){{ seedPt={{x:(b.min.x+b.max.x)/2, y:(b.min.y+b.max.y)/2, z:(b.min.z+b.max.z)/2}} }} }}catch(eB){{}}\
+   if(!seedPt) seedPt={{x:0,y:0,z:0}}; }}\
  }}\
- if(hits.length>0){{\
-  try{{ ed.click.clear() }}catch(eC){{ err('clear '+String(eC).slice(0,40)) }}\
-  for(var j=0;j<hits.length;j++){{\
-   try{{ ed.changeSelection.onClick([hits[j]], 0, 0) }}\
-   catch(eO){{ err('onClick '+String(eO&&eO.message||eO).slice(0,40)) }}\
+ var okCount=0;\
+ if(seedView && memIds.length>0){{\
+  var beforeIds=new Set(); try{{ s.ids.forEach(function(x){{ beforeIds.add(x) }}) }}catch(eB){{}}\
+  try{{ ed.click.clear() }}catch(eC){{}}\
+  var seedOk=false;\
+  try{{ ed.changeSelection.onClick([{{distance:1, point:seedPt, topologyItem:seedView, object:seedView, distance2d:1}}], 0, 0); seedOk=true }}\
+  catch(eO){{ err('onClick '+String(eO&&eO.message||eO).slice(0,40)) }}\
+  if(seedOk){{\
+   try{{\
+    var m=s.saveToMemento();\
+    m.ids=new Set(memIds);\
+    var pc=m.parentsWithSelectedChildren;\
+    if(pc){{ pc.counts=new Map(); pc.values=new Map();\
+     Object.keys(groups).forEach(function(p){{ pc.counts.set(p, groups[p].length); pc.values.set(p, groups[p]) }}) }}\
+    s.restoreFromMemento(m);\
+   }}catch(eM){{ err('memento '+String(eM).slice(0,40)) }}\
   }}\
- }}\
- var got=0;\
- try{{\
-  ents.forEach(function(e){{\
+  try{{ ed.signals.selectionDelta.dispatch({{_didChange:true, before:beforeIds, after:new Set(memIds)}}) }}catch(eS){{}}\
+  var got=0;\
+  try{{ ents.forEach(function(e){{\
    var v=null;\
    try{{ v=(e.kind==='face')?s.faceIds:(e.kind==='edge')?s.edgeIds:(e.kind==='solid')?s.solidIds:(e.kind==='sheet')?s.sheetIds:null }}catch(eV){{}}\
    if(!v) return;\
    var has=false; v.forEach(function(x){{ if(String(x&&x.versionId!==undefined?x.versionId:x)===String(e.id)) has=true }});\
    if(has) got++;\
-  }});\
-  ok=got; fail=ents.length-got-unknown.length;\
- }}catch(eV2){{}}\
+  }}) }}catch(eV2){{}}\
+  okCount=got;\
+ }}\
+ ok=okCount; fail=ents.length-okCount-unknown.length;\
  unknown.forEach(function(e){{ err('kind '+e.kind+' 暂无 tag, 未恢复') }});\
  return JSON.stringify({{ok:ok,fail:fail,errs:errs}}) }})()"
     ))
