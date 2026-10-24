@@ -389,12 +389,16 @@ async fn session_loop(
                 }
             }
             Ok(CdpCmd::ApplySel(entries)) => {
-                // R7-31d: 鼠标管线 — hover 扫描定位目标面的屏幕坐标,
-                // CDP 真实点击(ClickChangeSelectionCommand 完整周期)。
-                // 合成 onClick/memento 路线已证伪: MoveCommand 移交时清选择
-                // (缺"活跃实体上下文", 只有真实点击管线建立)。
-                // 视角无关: 扫描在应用时刻的当前视角下进行; hover 命中是穿透的
-                // (同一射线可命中多个面), 目标面转到背面也能被射线扫到时即可找到。
+                // v5(替换 v4 网格扫描): 累积式 hover spy + 零 per-point eval
+                // 快速网格 + 加密网格兜底 + CDP 真实点击(不变)。
+                // v4→v5 动因: v4 每点一次 eval 读 ed.selection.hits — 已实测该
+                // 数据源是 stale 点击会话(合成 onClick 也会写它), 禁用; 且 54 次
+                // eval 往返拖慢扫描(2~3s)。v5 spy 在页面侧自读 vp.lastPointerEvent
+                // 坐标累积进 window.__PLA_MAP__, Rust 只发 mouseMoved, 实测 1.7s 内。
+                // 点击管线保持: 真实 CDP 点击(ClickChangeSelectionCommand 完整
+                // 周期), 合成 onClick/memento 路线已证伪(MoveCommand 移交时清选择,
+                // 缺活跃实体上下文)。视角无关: hover 命中穿透(一射线多面), 目标面
+                // 转到背面也能被射线扫到时即可找到。
                 if entries.is_empty() {
                     let _ = ev_tx.send(CdpEvent::Status("选择集应用: 成员为空".into()));
                     continue;
@@ -428,34 +432,55 @@ async fn session_loop(
                         continue;
                     }
                 };
-                // Phase B: 网格扫描 — Rust 发 mouseMoved, 逐点 eval 读当前
-                // hover 命中的面 id(SCAN_READ_JS), 关联 (x,y) 建表。
-                // 目标 id 集合全部命中或网格扫完即止; 6x9=54 点 ≈ 2~3s。
+                // Phase B(v5): 快速网格扫描 — spy 在页面侧自读坐标并累积进
+                // __PLA_MAP__, Rust 只发 mouseMoved(零 per-point eval), 每扫完
+                // 一行(9 点)一次进度 eval, 目标全中即提前退。54 点实测 1.7s 内。
                 let target_ids: std::collections::HashSet<String> =
                     entries.iter().map(|e| e.id.clone()).collect();
                 let mut pos_map: std::collections::HashMap<String, (i64, i64)> =
                     std::collections::HashMap::new();
-                'scan: for gy in 0..6i64 {
-                    for gx in 0..9i64 {
-                        let x = rect.0 + (rect.2 as f64 * (gx as f64 + 0.5) / 9.0) as i64;
-                        let y = rect.1 + (rect.3 as f64 * (gy as f64 + 0.5) / 6.0) as i64;
+                let missing = |pm: &std::collections::HashMap<String, (i64, i64)>| -> usize {
+                    target_ids.iter().filter(|t| !pm.contains_key(*t)).count()
+                };
+                'scan: for gy in 0..SCAN_ROWS_COARSE {
+                    for gx in 0..SCAN_COLS_COARSE {
+                        let x = rect.0 + (rect.2 as f64 * (gx as f64 + 0.5)
+                            / SCAN_COLS_COARSE as f64) as i64;
+                        let y = rect.1 + (rect.3 as f64 * (gy as f64 + 0.5)
+                            / SCAN_ROWS_COARSE as f64) as i64;
                         let _ = dispatch_mouse_move(ws, &mut mid, x, y).await;
-                        tokio::time::sleep(Duration::from_millis(28)).await;
-                        if let Ok(s) = eval_roundtrip(ws, &mut mid, SCAN_READ_JS).await {
-                            if let Ok(arr) = serde_json::from_str::<Vec<String>>(&s) {
-                                for fid in arr {
-                                    pos_map.entry(fid).or_insert((x, y));
-                                }
+                        tokio::time::sleep(Duration::from_millis(SCAN_STEP_MS)).await;
+                    }
+                    if let Ok(s) = eval_roundtrip(ws, &mut mid, MAP_READ_JS).await {
+                        absorb_map(&s, &mut pos_map);
+                    }
+                    if missing(&pos_map) == 0 {
+                        break 'scan;
+                    }
+                }
+                // 兜底: 仍缺的 id 再扫一轮 12x18 加密网格(只补缺失)。
+                let coarse_missing = missing(&pos_map);
+                if coarse_missing > 0 {
+                    'fine: for gy in 0..SCAN_ROWS_FINE {
+                        for gx in 0..SCAN_COLS_FINE {
+                            if missing(&pos_map) == 0 {
+                                break 'fine;
                             }
+                            let x = rect.0 + (rect.2 as f64 * (gx as f64 + 0.5)
+                                / SCAN_COLS_FINE as f64) as i64;
+                            let y = rect.1 + (rect.3 as f64 * (gy as f64 + 0.5)
+                                / SCAN_ROWS_FINE as f64) as i64;
+                            let _ = dispatch_mouse_move(ws, &mut mid, x, y).await;
+                            tokio::time::sleep(Duration::from_millis(SCAN_STEP_MS)).await;
                         }
-                        // 提前退出: 目标全命中
-                        if target_ids.iter().all(|t| pos_map.contains_key(t)) {
-                            break 'scan;
+                        if let Ok(s) = eval_roundtrip(ws, &mut mid, MAP_READ_JS).await {
+                            absorb_map(&s, &mut pos_map);
                         }
                     }
                 }
+                let rescued = coarse_missing.saturating_sub(missing(&pos_map));
                 eprintln!(
-                    "[pla-cdp] scan: {} 个 id 定位 / 目标 {}",
+                    "[pla-cdp] scan(v5): {} 个 id 定位 / 目标 {} / 兜底补中 {rescued}",
                     pos_map.len(),
                     target_ids.len()
                 );
@@ -491,12 +516,18 @@ async fn session_loop(
   return JSON.stringify({selN:(typeof s.size==='number')?s.size:-1, faces:(function(){var a=[];try{s.faceIds.forEach(function(x){a.push(String(x&&x.versionId!==undefined?x.versionId:x))})}catch(e){}return a})()});})()"#;
                 let _ = eval_roundtrip(ws, &mut mid, verify).await;
                 let _ = dispatch_mouse_move(ws, &mut mid, rect.0 + rect.2 / 2, rect.1 + rect.3 / 2).await;
+                // 唤醒 hover 后清累积表: 点击完成后的正常 hover 又会写入新命中,
+                // 留着既无用途也会无限增长(甚至干扰下次应用), 统一在收尾清零。
+                let clear_map = r#"(function(){ try{ if(window.__PLA_MAP__) window.__PLA_MAP__={} }catch(e){} return '1' })()"#;
+                let _ = eval_roundtrip(ws, &mut mid, clear_map).await;
                 let ok = hits.len();
                 let fail = misses.len();
                 let msg = if fail > 0 {
                     format!(
                         "选择集应用: {ok} 项成功, {fail} 项失败(未在当前视角扫到, 请旋转视角后重试)"
                     )
+                } else if rescued > 0 {
+                    format!("选择集已应用: {ok} 项成功({rescued} 项经加密扫描)")
                 } else {
                     format!("选择集已应用: {ok} 项成功(真实点击管线)")
                 };
@@ -718,17 +749,22 @@ fn json_eval(mid: u64, expr: &str) -> Value {
     })
 }
 
-/// R7-31d: ApplySel Phase A — 鼠标管线的准备脚本。
-/// 取消活动命令(hover 管线在命令期间暂停) + 清选择 + 装扫描 spy + 返回视口 rect。
-/// 返回 "[x,y,w,h]"(页内矩形, CDP Input 用同一坐标系) 或错误 JSON。
-/// 扫描 spy: 包装 cs.onHover, 记录每个命中面 id 的**最近一次**屏幕坐标 —
-/// Rust 侧驱动 mouseMoved 网格扫描, 每到一个点 spy 记录该点命中的所有面。
-/// 注: mouseMoved 的坐标由 Rust 提供, 页内拿不到, 故 spy 只记 id->时间戳,
-/// 坐标关联在 Rust 侧完成(读表 + 当前扫描点配对)…… 不可行 — 改为 spy 内
-/// 无法取坐标时用 performance.now 与 Rust 日志对齐过于脆弱。
-/// 最终方案: spy 不记坐标, Rust 每发一个 mouseMoved 就立即 eval 读
-/// "当前 hover 命中的 face id 集合"(读 ed.selection.hits), 把当前 (x,y)
-/// 关联到这些 id — 每点一次 eval, 54 点 = 54 次轻量 eval, 完全可行。
+/// v5: ApplySel Phase A — 鼠标管线的准备脚本(累积式 hover spy 版)。
+/// 取消活动命令(hover 管线在命令期间暂停) + 清选择 + 清 gizmo/command body
+/// 属性 + 装累积 spy + 清零累积表 + 返回视口 rect "[x,y,w,h]" 或错误 JSON。
+///
+/// 累积式 spy(v5 提速核心, 已实测): 包装 ed.changeSelection.onHover 信号,
+/// 回调内**自读** vp.lastPointerEvent.clientX/Y(=页面坐标, CDP Input 同一
+/// 坐标系; onHover 自带的 x/y 参数恒 0 不可用), 把本次 hits 里每个
+/// topologyItem||object 的 versionId 累积进 window.__PLA_MAP__(id→{x,y},
+/// **只记首次出现** — 后续命中不覆盖, 保证坐标来自确定扫过的点)。
+/// Rust 侧扫描只发 mouseMoved, 零 per-point eval, 行级读一次表即可。
+///
+/// 幂等: window.__PLA_SPY5B__ 标记已装; 已装时仅清空 __PLA_MAP__ 复用。
+/// (调试期页面里可能残留旧版 spy — 只要 __PLA_MAP__ 由本 spy 写入即兼容。)
+///
+/// 数据源铁律: 本管线只信 spy 累积表; ed.selection.hits.hits 是 stale 点击
+/// 会话(合成 onClick 也会写它), 绝不可作扫描数据源(v4 的教训)。
 fn apply_sel_js(entries: &[ApplyEntry]) -> anyhow::Result<String> {
     // Phase A 只需 entries 用于去重校验(空校验在 Rust 侧), 这里生成准备脚本。
     let _ = entries;
@@ -742,24 +778,76 @@ fn apply_sel_js(entries: &[ApplyEntry]) -> anyhow::Result<String> {
   document.body.removeAttribute('command');
   var c=document.querySelector('plasticity-viewport canvas');
   if(!c) return JSON.stringify({ok:0,fail:0,errs:['no-canvas']});
+  var cs = ed.changeSelection;
+  if(cs && cs.onHover && !window.__PLA_SPY5B__){
+    var orig = cs.onHover;
+    var wrapped = function(hits){
+      try{
+        var vp=null; ed.viewports.forEach(function(v){if(!vp)vp=v});
+        var pe = vp && vp.lastPointerEvent;
+        var px = pe && typeof pe.clientX==='number' ? pe.clientX : null;
+        var py = pe && typeof pe.clientY==='number' ? pe.clientY : null;
+        if(px!==null && py!==null && hits && hits.length){
+          var m = window.__PLA_MAP__;
+          if(!m){ m={}; window.__PLA_MAP__=m }
+          for(var i=0;i<hits.length;i++){
+            var t = hits[i] && (hits[i].topologyItem || hits[i].object);
+            var vid = t && t.versionId!==undefined ? String(t.versionId) : null;
+            if(vid && !m[vid]) m[vid]={x:px,y:py};
+          }
+        }
+      }catch(e2){}
+      if(typeof orig==='function'){ try{ return orig.apply(cs, arguments) }catch(e3){} }
+      return undefined;
+    };
+    try{ Object.defineProperty(wrapped,'name',{value:'__plaSpy5b'}) }catch(e4){}
+    cs.onHover = wrapped;
+    window.__PLA_SPY5B__ = true;
+  }
+  window.__PLA_MAP__ = {};
   var r=c.getBoundingClientRect();
   return JSON.stringify([Math.round(r.x),Math.round(r.y),Math.round(r.width),Math.round(r.height)]);
 })()"#
     .to_string())
 }
 
-/// R7-31d: Phase B 扫描读取 — 返回当前 hover 射线命中的面 id 数组(JSON)。
-/// (ed.selection.hits.hits: Map<实体id, hit>, hit.intersected.versionId = 面 id)
-const SCAN_READ_JS: &str = r#"(function(){
-  var ed=window.__PLA_EDITOR__; if(!ed){ var f=window.__PLA_HOOK__; if(f) ed=f.findEditor(); }
-  if(!ed||!ed.selection||!ed.selection.hits||!ed.selection.hits.hits) return '[]';
-  var out=[];
-  ed.selection.hits.hits.forEach(function(v,k){
-    var f2=v&&v.intersected;
-    var fid=f2&&f2.versionId!==undefined?String(f2.versionId):null;
-    if(fid&&out.length<16) out.push(fid);
-  });
-  return JSON.stringify(out);})()"#;
+/// v5: 读取累积表 — 返回 spy 在扫描中累积的全部 id→[x,y](JSON 对象, 值为
+/// 数组形, 与 Rust 侧 (i64,i64) 元组反序列化匹配)。表空/未装 spy → "{}"。
+const MAP_READ_JS: &str = r#"(function(){
+  var m = window.__PLA_MAP__;
+  if(!m) return '{}';
+  var o={}; var n=0;
+  for(var k in m){
+    if(!Object.prototype.hasOwnProperty.call(m,k)) continue;
+    var v=m[k];
+    if(v && typeof v.x==='number' && typeof v.y==='number'){
+      o[k]=[Math.round(v.x),Math.round(v.y)];
+      if(++n>=512) break;
+    }
+  }
+  return JSON.stringify(o);})()"#;
+
+/// v5: 吸收 MAP_READ_JS 回包(JSON 对象字符串)进 pos_map。
+/// 回包异常时不吞错误 — 打日志供诊断, 已定位的不受影响。
+fn absorb_map(raw: &str, pos_map: &mut std::collections::HashMap<String, (i64, i64)>) {
+    match serde_json::from_str::<std::collections::HashMap<String, (i64, i64)>>(raw) {
+        Ok(m) => {
+            for (fid, xy) in m {
+                pos_map.entry(fid).or_insert(xy);
+            }
+        }
+        Err(e) => eprintln!("[pla-cdp] map read 解析失败: {e} (raw: {raw})"),
+    }
+}
+
+/// v5: 粗网格行×列(6x9=54 点, 实测 1.7s 内扫完)。
+const SCAN_ROWS_COARSE: i64 = 6;
+const SCAN_COLS_COARSE: i64 = 9;
+/// v5: 兜底加密网格行×列(12x18=216 点, 仅粗网格后仍缺目标时触发)。
+const SCAN_ROWS_FINE: i64 = 12;
+const SCAN_COLS_FINE: i64 = 18;
+/// v5: 扫描点间隔 — mouseMoved 后等 onHover 回调把命中写入累积表。
+const SCAN_STEP_MS: u64 = 25;
 
 /// R7-28: 探活 — 取 undo 栈深度(用于验证按键是否真被应用处理)。
 /// CDP 按键要求 Plasticity 持有 OS 焦点, 偶发丢失; 用 undo 深度变化判定成败。
@@ -1065,9 +1153,54 @@ mod tests {
         // 基本健全性: 不得含 // 注释痕迹, 必须完整收尾
         assert!(!js.contains("//"), "JS 内含 // 注释会吞掉后续代码");
         assert!(js.ends_with("})()"), "JS 未完整收尾");
-        // R7-31d: Phase A 脚本不再内联 entries(坐标由 Rust 驱动的扫描关联),
-        // 改为断言关键步骤存在。
+        // v5: Phase A 关键步骤存在
         assert!(js.contains("cancelActiveCommand"), "缺少取消活动命令");
         assert!(js.contains("getBoundingClientRect"), "缺少视口矩形获取");
+        // v5: 累积式 hover spy 装配
+        assert!(js.contains("__PLA_SPY5B__"), "缺少 spy 幂等标记");
+        assert!(js.contains("__PLA_MAP__"), "缺少累积表");
+        assert!(js.contains("lastPointerEvent"), "缺少页面侧自读坐标");
+        assert!(js.contains("changeSelection"), "缺少 onHover 信号包装");
+        // v5 铁律: 不得读 stale 点击会话
+        assert!(!js.contains("selection.hits"), "Phase A 禁用 stale hits 数据源");
+    }
+
+    #[test]
+    fn map_read_js_sane() {
+        assert!(!MAP_READ_JS.contains("//"), "JS 内含 // 注释");
+        assert!(MAP_READ_JS.ends_with("})()"), "MAP_READ_JS 未完整收尾");
+        assert!(MAP_READ_JS.contains("__PLA_MAP__"));
+    }
+
+    #[test]
+    fn absorb_map_merges_and_keeps_first() {
+        let mut m = std::collections::HashMap::new();
+        absorb_map(r#"{"a":[10,20],"b":[30,40]}"#, &mut m);
+        assert_eq!(m.get("a"), Some(&(10, 20)));
+        assert_eq!(m.get("b"), Some(&(30, 40)));
+        // 首次坐标优先(or_insert): 后到的不覆盖
+        absorb_map(r#"{"a":[99,99],"c":[1,2]}"#, &mut m);
+        assert_eq!(m.get("a"), Some(&(10, 20)), "首次记录不可被覆盖");
+        assert_eq!(m.get("c"), Some(&(1, 2)));
+        // 坏回包不 panic、不清已有数据
+        absorb_map("not-json", &mut m);
+        absorb_map("{}", &mut m);
+        assert_eq!(m.len(), 3);
+    }
+
+    #[test]
+    fn scan_grid_geometry_covers_viewport() {
+        // 网格几何: 任意 rect 下, 粗/细网格列数行数均为正, 点位落在 rect 内
+        assert!(SCAN_COLS_COARSE > 0 && SCAN_ROWS_COARSE > 0);
+        assert!(SCAN_COLS_FINE > SCAN_COLS_COARSE && SCAN_ROWS_FINE > SCAN_ROWS_COARSE);
+        let rect = (100, 50, 900, 600);
+        for gx in 0..SCAN_COLS_COARSE {
+            let x = rect.0 + (rect.2 as f64 * (gx as f64 + 0.5) / SCAN_COLS_COARSE as f64) as i64;
+            assert!(x >= rect.0 && x < rect.0 + rect.2, "粗网格 x 越界: {x}");
+        }
+        for gy in 0..SCAN_ROWS_FINE {
+            let y = rect.1 + (rect.3 as f64 * (gy as f64 + 0.5) / SCAN_ROWS_FINE as f64) as i64;
+            assert!(y >= rect.1 && y < rect.1 + rect.3, "细网格 y 越界: {y}");
+        }
     }
 }
