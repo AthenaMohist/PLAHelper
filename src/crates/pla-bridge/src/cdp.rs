@@ -713,18 +713,7 @@ fn apply_sel_js(entries: &[ApplyEntry]) -> anyhow::Result<String> {
   fire(function(){{ es.highlighted.dispatch() }});\
   fire(function(){{ ed.selection.selectedSignals.selectionChanged.dispatch() }});\
   fire(function(){{ var vp=ed._activeViewport; if(vp&&vp.setNeedsRender) vp.setNeedsRender() }});\
-  fire(function(){{\
-    var h=ed.highlight; if(!h) return;\
-    try{{ h.select() }}catch(eH){{}}\
-    try{{ h.state={{tag:'selection'}} }}catch(eS){{}}\
-    var vp=ed._activeViewport; if(!vp&&ed.viewports&&ed.viewports.size>0){{ var vv2=null; ed.viewports.forEach(function(v){{ if(!vv2) vv2=v }}); vp=vv2; }}\
-    if(vp&&vp.composer&&vp.composer.outlinePassSelection&&h._outlineSelection&&h._outlineSelection.length>0){{\
-      var op=vp.composer.outlinePassSelection;\
-      op.selectedObjects.length=0;\
-      for(var i=0;i<h._outlineSelection.length;i++) op.selectedObjects.push(h._outlineSelection[i]);\
-      try{{ vp.handleRender(typeof performance!=='undefined'?performance.now():Date.now()) }}catch(eR){{}}\
-    }}\
-  }});\
+  fire(function(){{ var h=ed.highlight; if(h){{ try{{ h.select() }}catch(eH){{}} }} }});\
  }}\
  unknown.forEach(function(e){{ err('kind '+e.kind+' 暂无 tag, 未恢复') }});\
  return JSON.stringify({{ok:ok,fail:fail,errs:errs}}) }})()"
