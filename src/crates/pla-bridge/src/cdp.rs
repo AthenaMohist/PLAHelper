@@ -451,8 +451,11 @@ async fn session_loop(
                         let _ = dispatch_mouse_move(ws, &mut mid, x, y).await;
                         tokio::time::sleep(Duration::from_millis(SCAN_STEP_MS)).await;
                     }
-                    if let Ok(s) = eval_roundtrip(ws, &mut mid, MAP_READ_JS).await {
-                        absorb_map(&s, &mut pos_map);
+                    match eval_roundtrip(ws, &mut mid, MAP_READ_JS).await {
+                        Ok(s) => absorb_map(&s, &mut pos_map),
+                        Err(e) => {
+                            eprintln!("[pla-cdp] map read(粗网格行级) 传输失败: {e:#}");
+                        }
                     }
                     if missing(&pos_map) == 0 {
                         break 'scan;
@@ -473,8 +476,11 @@ async fn session_loop(
                             let _ = dispatch_mouse_move(ws, &mut mid, x, y).await;
                             tokio::time::sleep(Duration::from_millis(SCAN_STEP_MS)).await;
                         }
-                        if let Ok(s) = eval_roundtrip(ws, &mut mid, MAP_READ_JS).await {
-                            absorb_map(&s, &mut pos_map);
+                        match eval_roundtrip(ws, &mut mid, MAP_READ_JS).await {
+                            Ok(s) => absorb_map(&s, &mut pos_map),
+                            Err(e) => {
+                                eprintln!("[pla-cdp] map read(细网格行级) 传输失败: {e:#}");
+                            }
                         }
                     }
                 }
@@ -508,9 +514,27 @@ async fn session_loop(
                     located.len(),
                     click_points.len()
                 );
+                // 发送成功的组目标参与 Phase D 校验; 发送失败的整组直接计失败 —
+                // 点击丢失时其目标必然不在 faceIds, 若混进校验会被误标为遮挡。
+                let mut clicked: Vec<(String, i64, i64)> = Vec::new();
+                let mut click_failed: Vec<String> = Vec::new();
                 for (i, (px, py)) in click_points.iter().enumerate() {
                     let shift = i > 0;
-                    let _ = dispatch_mouse_click(ws, &mut mid, *px, *py, shift).await;
+                    let sent = dispatch_mouse_click(ws, &mut mid, *px, *py, shift).await;
+                    let group = click_group(&located, *px, *py);
+                    match sent {
+                        Ok(()) => {
+                            for (id, lx, ly) in group {
+                                clicked.push((id.clone(), *lx, *ly));
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[pla-cdp] click 发送失败 @({px},{py}): {e:#}");
+                            for (id, _lx, _ly) in group {
+                                click_failed.push(id.clone());
+                            }
+                        }
+                    }
                 }
                 // Phase D(v5.1): 校验 + 唤醒渲染。verify 回读 faceIds, 对每个
                 // 已定位目标 id 求交集 — 没进 faceIds 的即同坐标组里被遮挡的,
@@ -539,7 +563,7 @@ async fn session_loop(
                     None => {
                         let _ = ev_tx.send(CdpEvent::Status(format!(
                             "选择集应用: {} 项已点击, 但校验读取失败(可查看选择状态确认)",
-                            located.len()
+                            clicked.len()
                         )));
                         let _ = dispatch_mouse_move(
                             ws,
@@ -552,25 +576,26 @@ async fn session_loop(
                         continue;
                     }
                 };
-                let tally = tally_occlusion(&located, &face_ids);
+                let tally = tally_occlusion(&clicked, &face_ids);
                 let ok = tally.confirmed;
-                let fail = misses.len() + tally.occluded;
+                let fail = misses.len() + tally.occluded + click_failed.len();
                 let _ = dispatch_mouse_move(ws, &mut mid, rect.0 + rect.2 / 2, rect.1 + rect.3 / 2).await;
                 // 唤醒 hover 后清累积表: 点击完成后的正常 hover 又会写入新命中,
                 // 留着既无用途也会无限增长(甚至干扰下次应用), 统一在收尾清零。
                 let _ = eval_roundtrip(ws, &mut mid, CLEAR_MAP_JS).await;
                 let msg = if fail > 0 {
-                    match (tally.occluded, misses.len()) {
-                        (occ, 0) => format!(
-                            "选择集应用: {ok} 项成功, {fail} 项失败({occ} 项被遮挡, 请旋转视角分离后重试)"
-                        ),
-                        (0, _) => format!(
-                            "选择集应用: {ok} 项成功, {fail} 项失败(未在当前视角扫到, 请旋转视角后重试)"
-                        ),
-                        (occ, scan_miss) => format!(
-                            "选择集应用: {ok} 项成功, {fail} 项失败({occ} 项被遮挡, {scan_miss} 项未扫到, 请旋转视角后重试)"
-                        ),
+                    let mut parts: Vec<String> = Vec::new();
+                    if tally.occluded > 0 {
+                        parts.push(format!("{} 项被遮挡", tally.occluded));
                     }
+                    if misses.len() > 0 {
+                        parts.push(format!("{} 项未扫到", misses.len()));
+                    }
+                    if !click_failed.is_empty() {
+                        parts.push(format!("{} 项点击发送失败", click_failed.len()));
+                    }
+                    let detail = parts.join(", ");
+                    format!("选择集应用: {ok} 项成功, {fail} 项失败({detail}, 请旋转视角后重试)")
                 } else if rescued > 0 {
                     format!("选择集已应用: {ok} 项成功({rescued} 项经加密扫描)")
                 } else {
@@ -913,6 +938,19 @@ fn plan_clicks(located: &[(String, i64, i64)]) -> Vec<(i64, i64)> {
         }
     }
     out
+}
+
+/// v5.1(O2): 取点击计划中某坐标组的全部成员 — 发送失败时整组计失败,
+/// 发送成功时整组参与 Phase D 校验; 组划分保证每个 located 目标恰好落组一次。
+fn click_group<'a>(
+    located: &'a [(String, i64, i64)],
+    px: i64,
+    py: i64,
+) -> Vec<&'a (String, i64, i64)> {
+    located
+        .iter()
+        .filter(|(_, lx, ly)| (*lx, *ly) == (px, py))
+        .collect()
 }
 
 /// v5.1: 点击后校验结果。
@@ -1372,5 +1410,48 @@ mod tests {
         // faces 缺失 / 非 JSON → None(走校验异常分支, 不吞错误)
         assert_eq!(extract_face_ids(r#"{"selN":-1}"#), None);
         assert_eq!(extract_face_ids("not-json"), None);
+    }
+
+    #[test]
+    fn click_groups_partition_targets_exactly_once() {
+        // O2: 点击计划与坐标分组必须恰好划分全部 located 目标(无遗漏/无重复) —
+        // 这是 ok+fail=总数 恒成立的根。
+        let located = vec![
+            ("4f718".to_string(), 983, 193),
+            ("17f3640".to_string(), 983, 193),
+            ("5f758".to_string(), 412, 507),
+        ];
+        let plan = plan_clicks(&located);
+        let mut seen: Vec<&String> = Vec::new();
+        for (px, py) in &plan {
+            for (id, _lx, _ly) in click_group(&located, *px, *py) {
+                assert!(!seen.contains(&&id), "目标 {id} 被划入多个组");
+                seen.push(id);
+            }
+            // 组内成员坐标与组坐标一致
+            for (_id, lx, ly) in click_group(&located, *px, *py) {
+                assert_eq!((*lx, *ly), (*px, *py));
+            }
+        }
+        assert_eq!(seen.len(), located.len(), "每个目标必须恰好落组一次");
+        // 模拟一组发送失败: fail = misses + occluded + click_failed 保持总数恒等
+        let clicked: Vec<(String, i64, i64)> = click_group(&located, plan[0].0, plan[0].1)
+            .into_iter()
+            .cloned()
+            .collect();
+        let click_failed: Vec<String> = click_group(&located, plan[1].0, plan[1].1)
+            .into_iter()
+            .map(|(id, _, _)| id.clone())
+            .collect();
+        let misses: Vec<String> = Vec::new();
+        let faces = vec!["4f718".to_string()]; // 只有最前面那面真被选中
+        let tally = tally_occlusion(&clicked, &faces);
+        let ok = tally.confirmed;
+        let fail = misses.len() + tally.occluded + click_failed.len();
+        assert_eq!(ok + fail, located.len() + misses.len());
+        // 分组语义: 同坐标组(983,193) 2 员, 独立点(412,507) 1 员
+        assert_eq!(click_group(&located, 983, 193).len(), 2);
+        assert_eq!(click_group(&located, 412, 507).len(), 1);
+        assert_eq!(click_group(&located, 1, 1).len(), 0);
     }
 }
