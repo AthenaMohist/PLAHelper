@@ -649,11 +649,16 @@ fn json_eval(mid: u64, expr: &str) -> Value {
     })
 }
 
-/// 生成 ApplySel 的回放 JS(R7-23c: SelectionMemento 状态存取)。
+/// 生成 ApplySel 的回放 JS(R7-31b: 合成 hit → onClick 真实命令周期)。
 /// 抽成纯函数以便单测把真实生成的 JS 打出来与手跑复刻版 diff。
 /// 注意: 模板用 `\` 续行, Rust 会拼成**一整行** JS —
-/// JS 内一律不得写 `//` 注释(会把后面的代码连同 `return`/`})()` 一起吞掉,
+/// JS 内一律不得写 `//` 注释(会把后面的代码连同 `return`/`})()` 一起吞掉),
 /// 报 SyntaxError: Unexpected end of input; 说明只写 Rust 侧注释。
+/// R7-31b: hit 结构来自真实点击签名捕获:
+///   {distance, point:{x,y,z}, topologyItem:view, object:view, distance2d}
+/// changeSelection.onClick(hits, x, y) 走 ClickChangeSelectionCommand
+/// (内核级选择, 可撤销, G/fillet/push-face 等命令全部响应)。
+/// 多选: 先 click.clear() 再逐个 onClick(命令自带 toggle, 故对重复 id 去重)。
 fn apply_sel_js(entries: &[ApplyEntry]) -> anyhow::Result<String> {
     let ents = serde_json::to_string(
         &entries
@@ -668,53 +673,45 @@ fn apply_sel_js(entries: &[ApplyEntry]) -> anyhow::Result<String> {
     Ok(format!(
         "(function(){{ var ed=window.__PLA_EDITOR__;\
  if(!ed||!ed.selection){{ var f=window.__PLA_HOOK__; if(f) ed=f.findEditor(); if(ed) window.__PLA_EDITOR__=ed; }}\
- if(!ed||!ed.selection) return JSON.stringify({{ok:0,fail:0,errs:['no-editor']}}); var s=ed.selection.selected; var ents={ents}; var ok=0, fail=0, errs=[];\
+ if(!ed||!ed.selection) return JSON.stringify({{ok:0,fail:0,errs:['no-editor']}});\
+ var s=ed.selection.selected; var ents={ents}; var ok=0, fail=0, errs=[];\
  function err(m){{ if(errs.length<4) errs.push(String(m).slice(0,60)) }}\
  var TAGS={{edge:0,face:2,solid:4,sheet:5}};\
  var db=null; try{{ db=s.cache().db }}catch(eD){{}}\
- var memIds=[], unknown=[], groups={{}};\
- function parentOf(id){{ try{{ var v=db.lookupTopologyItemById(String(id)).view; var fg=v&&v.parent; var solid=fg&&fg.parent;\
-   return (solid&&solid.versionId!==undefined)?String(solid.versionId):null }}catch(e){{ return null }} }}\
- ents.forEach(function(e){{\
+ if(!db){{ err('no-db'); return JSON.stringify({{ok:0,fail:ents.length,errs:errs}}) }}\
+ var unknown=[]; var seen={{}}; var hits=[];\
+ for(var i=0;i<ents.length;i++){{ var e=ents[i];\
   var t=TAGS[e.kind];\
-  if(t===undefined){{ unknown.push(e); return }}\
-  var memId=t+':'+e.id; memIds.push(memId);\
-  if(e.kind==='face'||e.kind==='edge'){{ var p=parentOf(e.id); if(p){{ if(!groups[p]) groups[p]=[]; groups[p].push(memId) }} }}\
- }});\
+  if(t===undefined){{ unknown.push(e); continue }}\
+  var key=t+':'+e.id;\
+  if(seen[key]) continue; seen[key]=1;\
+  var view=null;\
+  try{{ view=db.lookupTopologyItemById(String(e.id)).view }}catch(eL){{ err('id '+e.id+' lookup失败'); fail++; continue }}\
+  if(!view){{ err('id '+e.id+' 不存在(几何已变更?)'); fail++; continue }}\
+  var pt=null;\
+  try{{ var b=view.getBoundingBox();\
+   if(b&&b.min&&b.max){{ pt={{x:(b.min.x+b.max.x)/2, y:(b.min.y+b.max.y)/2, z:(b.min.z+b.max.z)/2}} }} }}catch(eB){{}}\
+  if(!pt) pt={{x:0,y:0,z:0}};\
+  hits.push({{distance:1, point:pt, topologyItem:view, object:view, distance2d:1}});\
+ }}\
+ if(hits.length>0){{\
+  try{{ ed.click.clear() }}catch(eC){{ err('clear '+String(eC).slice(0,40)) }}\
+  for(var j=0;j<hits.length;j++){{\
+   try{{ ed.changeSelection.onClick([hits[j]], 0, 0) }}\
+   catch(eO){{ err('onClick '+String(eO&&eO.message||eO).slice(0,40)) }}\
+  }}\
+ }}\
+ var got=0;\
  try{{\
-  var beforeIds=new Set(); try{{ s.ids.forEach(function(x){{ beforeIds.add(x) }}) }}catch(eB){{}}\
-  var m=s.saveToMemento();\
-  m.ids=new Set(memIds);\
-  var pc=m.parentsWithSelectedChildren;\
-  if(pc){{ pc.counts=new Map(); pc.values=new Map();\
-   Object.keys(groups).forEach(function(p){{ pc.counts.set(p, groups[p].length); pc.values.set(p, groups[p]) }}) }}\
-  s.clear();\
-  s.restoreFromMemento(m);\
-  var got=0;\
   ents.forEach(function(e){{\
    var v=null;\
    try{{ v=(e.kind==='face')?s.faceIds:(e.kind==='edge')?s.edgeIds:(e.kind==='solid')?s.solidIds:(e.kind==='sheet')?s.sheetIds:null }}catch(eV){{}}\
    if(!v) return;\
    var has=false; v.forEach(function(x){{ if(String(x&&x.versionId!==undefined?x.versionId:x)===String(e.id)) has=true }});\
-   if(has) got++; else err('id '+e.id+' 未命中(几何已变更?)');\
+   if(has) got++;\
   }});\
-  ok=got; fail=ents.length-got;\
- }}catch(eM){{ err('memento '+String(eM).slice(0,50)); fail=ents.length }}\
- var es=null; try{{ es=ed.selection.signals }}catch(xE){{}}\
- if(es){{ function fire(f){{ try{{ f() }}catch(x){{ err('wake '+String(x&&x.message||x).slice(0,40)) }} }}\
-  fire(function(){{ if(!ed._activeViewport&&ed.viewports&&ed.viewports.size>0){{\
-    var vv=null; ed.viewports.forEach(function(v){{ if(!vv) vv=v }});\
-    if(vv){{ ed._activeViewport=vv;\
-      if(typeof ed.onViewportActivated==='function') ed.onViewportActivated(vv);\
-      ed.signals.viewportActivated.dispatch(vv) }} }} }});\
-  fire(function(){{ es.selectionDelta.dispatch({{_didChange:true, before:beforeIds, after:new Set(memIds)}}) }});\
-  fire(function(){{ es.selectionChanged.dispatch() }});\
-  fire(function(){{ es.visibleLayersChanged.dispatch() }});\
-  fire(function(){{ es.highlighted.dispatch() }});\
-  fire(function(){{ ed.selection.selectedSignals.selectionChanged.dispatch() }});\
-  fire(function(){{ var vp=ed._activeViewport; if(vp&&vp.setNeedsRender) vp.setNeedsRender() }});\
-  fire(function(){{ var h=ed.highlight; if(h){{ try{{ h.select() }}catch(eH){{}} }} }});\
- }}\
+  ok=got; fail=ents.length-got-unknown.length;\
+ }}catch(eV2){{}}\
  unknown.forEach(function(e){{ err('kind '+e.kind+' 暂无 tag, 未恢复') }});\
  return JSON.stringify({{ok:ok,fail:fail,errs:errs}}) }})()"
     ))
