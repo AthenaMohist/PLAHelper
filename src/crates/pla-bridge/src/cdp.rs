@@ -484,27 +484,37 @@ async fn session_loop(
                     pos_map.len(),
                     target_ids.len()
                 );
-                // Phase C: 逐面点击(第一个普通=替换, 其余 shift=追加)
-                let mut hits: Vec<(String, i64, i64)> = Vec::new();
+                // Phase C(v5.1): 遮挡感知点击分组 — hover 穿透把同射线前后遮挡面
+                // 记到同一坐标, 但 shift+click 不穿透(只命中最前面的面)。同坐标
+                // 组只点一次(无论组内几个目标 id), 谁被选中交给点击后校验判定。
+                let mut located: Vec<(String, i64, i64)> = Vec::new();
                 let mut misses: Vec<String> = Vec::new();
                 for e in &entries {
                     match pos_map.get(&e.id) {
-                        Some(&(px, py)) => hits.push((e.id.clone(), px, py)),
+                        Some(&(px, py)) => located.push((e.id.clone(), px, py)),
                         None => misses.push(e.id.clone()),
                     }
                 }
-                if hits.is_empty() {
+                if located.is_empty() {
                     let _ = ev_tx.send(CdpEvent::Status(format!(
                         "选择集应用失败: 当前视角扫描未命中目标面({} 个; 可旋转视角后重试)",
                         misses.len()
                     )));
                     continue;
                 }
-                for (i, (_id, px, py)) in hits.iter().enumerate() {
+                let click_points = plan_clicks(&located);
+                eprintln!(
+                    "[pla-cdp] click(v5.1): {} 个目标 → {} 次点击(同坐标组去重)",
+                    located.len(),
+                    click_points.len()
+                );
+                for (i, (px, py)) in click_points.iter().enumerate() {
                     let shift = i > 0;
                     let _ = dispatch_mouse_click(ws, &mut mid, *px, *py, shift).await;
                 }
-                // Phase D: 校验 + 唤醒渲染
+                // Phase D(v5.1): 校验 + 唤醒渲染。verify 回读 faceIds, 对每个
+                // 已定位目标 id 求交集 — 没进 faceIds 的即同坐标组里被遮挡的,
+                // 如实计失败(旋转视角分离是标准解法, 不尝试自动分离)。
                 let verify = r#"(function(){
   var ed=window.__PLA_EDITOR__;
   if(!ed||!ed.selection){ var f=window.__PLA_HOOK__; if(f) ed=f.findEditor(); if(ed) window.__PLA_EDITOR__=ed; }
@@ -514,18 +524,53 @@ async fn session_loop(
   try{ if(vp&&vp.setNeedsRender) vp.setNeedsRender() }catch(e){}
   delete window.__PLA_SCAN__;
   return JSON.stringify({selN:(typeof s.size==='number')?s.size:-1, faces:(function(){var a=[];try{s.faceIds.forEach(function(x){a.push(String(x&&x.versionId!==undefined?x.versionId:x))})}catch(e){}return a})()});})()"#;
-                let _ = eval_roundtrip(ws, &mut mid, verify).await;
+                let verify_raw = eval_roundtrip(ws, &mut mid, verify).await;
+                if let Err(ref e) = verify_raw {
+                    eprintln!("[pla-cdp] verify eval 失败: {e:#}");
+                }
+                let faces_opt = match verify_raw {
+                    Ok(ref s) => extract_face_ids(s),
+                    Err(_) => None,
+                };
+                // 校验读取失败(通道异常/回包无法解析)时如实上报, 不谎报成败 —
+                // faceIds 区分不了"没选中"与"没读到", 不能当作遮挡计数。
+                let face_ids = match faces_opt {
+                    Some(f) => f,
+                    None => {
+                        let _ = ev_tx.send(CdpEvent::Status(format!(
+                            "选择集应用: {} 项已点击, 但校验读取失败(可查看选择状态确认)",
+                            located.len()
+                        )));
+                        let _ = dispatch_mouse_move(
+                            ws,
+                            &mut mid,
+                            rect.0 + rect.2 / 2,
+                            rect.1 + rect.3 / 2,
+                        )
+                        .await;
+                        let _ = eval_roundtrip(ws, &mut mid, CLEAR_MAP_JS).await;
+                        continue;
+                    }
+                };
+                let tally = tally_occlusion(&located, &face_ids);
+                let ok = tally.confirmed;
+                let fail = misses.len() + tally.occluded;
                 let _ = dispatch_mouse_move(ws, &mut mid, rect.0 + rect.2 / 2, rect.1 + rect.3 / 2).await;
                 // 唤醒 hover 后清累积表: 点击完成后的正常 hover 又会写入新命中,
                 // 留着既无用途也会无限增长(甚至干扰下次应用), 统一在收尾清零。
-                let clear_map = r#"(function(){ try{ if(window.__PLA_MAP__) window.__PLA_MAP__={} }catch(e){} return '1' })()"#;
-                let _ = eval_roundtrip(ws, &mut mid, clear_map).await;
-                let ok = hits.len();
-                let fail = misses.len();
+                let _ = eval_roundtrip(ws, &mut mid, CLEAR_MAP_JS).await;
                 let msg = if fail > 0 {
-                    format!(
-                        "选择集应用: {ok} 项成功, {fail} 项失败(未在当前视角扫到, 请旋转视角后重试)"
-                    )
+                    match (tally.occluded, misses.len()) {
+                        (occ, 0) => format!(
+                            "选择集应用: {ok} 项成功, {fail} 项失败({occ} 项被遮挡, 请旋转视角分离后重试)"
+                        ),
+                        (0, _) => format!(
+                            "选择集应用: {ok} 项成功, {fail} 项失败(未在当前视角扫到, 请旋转视角后重试)"
+                        ),
+                        (occ, scan_miss) => format!(
+                            "选择集应用: {ok} 项成功, {fail} 项失败({occ} 项被遮挡, {scan_miss} 项未扫到, 请旋转视角后重试)"
+                        ),
+                    }
                 } else if rescued > 0 {
                     format!("选择集已应用: {ok} 项成功({rescued} 项经加密扫描)")
                 } else {
@@ -811,6 +856,12 @@ fn apply_sel_js(entries: &[ApplyEntry]) -> anyhow::Result<String> {
     .to_string())
 }
 
+/// v5: 收尾清累积表 — 点击完成后的正常 hover 又会写入新命中, 表留着既无用
+/// 又会无限增长(甚至污染下次应用), Phase D 唤醒 hover 后统一清零。
+const CLEAR_MAP_JS: &str = r#"(function(){
+  try{ if(window.__PLA_MAP__) window.__PLA_MAP__={} }catch(e){}
+  return '1';})()"#;
+
 /// v5: 读取累积表 — 返回 spy 在扫描中累积的全部 id→[x,y](JSON 对象, 值为
 /// 数组形, 与 Rust 侧 (i64,i64) 元组反序列化匹配)。表空/未装 spy → "{}"。
 const MAP_READ_JS: &str = r#"(function(){
@@ -848,6 +899,61 @@ const SCAN_ROWS_FINE: i64 = 12;
 const SCAN_COLS_FINE: i64 = 18;
 /// v5: 扫描点间隔 — mouseMoved 后等 onHover 回调把命中写入累积表。
 const SCAN_STEP_MS: u64 = 25;
+
+/// v5.1: 点击计划 — 对已定位目标按 (px,py) 完全相同分组去重。
+/// hover 穿透把同射线前后遮挡面记到同一坐标, 而 shift+click 不穿透(只命中
+/// 最前面的面), 同坐标组点多次既无效又浪费一次完整点击周期(≤300ms/次)。
+/// 返回去重后的点击坐标序列(保持首次出现顺序, 首坐标=普通点击替换选择)。
+fn plan_clicks(located: &[(String, i64, i64)]) -> Vec<(i64, i64)> {
+    let mut seen: std::collections::HashSet<(i64, i64)> = std::collections::HashSet::new();
+    let mut out: Vec<(i64, i64)> = Vec::new();
+    for (_id, px, py) in located {
+        if seen.insert((*px, *py)) {
+            out.push((*px, *py));
+        }
+    }
+    out
+}
+
+/// v5.1: 点击后校验结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OcclusionTally {
+    /// 确认进入 faceIds 的目标数。
+    confirmed: usize,
+    /// 已点击但未进入 faceIds 的目标数(同坐标组里被遮挡的)。
+    occluded: usize,
+}
+
+/// v5.1: 遮挡判定 — 把每个已定位目标 id 与点击后 faceIds 求交集。
+/// faceIds 无法区分“确实没选中”与“校验读取失败”, 故调用方在读取失败时
+/// 直接走校验异常分支, 不会把通道故障误报成遮挡。
+fn tally_occlusion(located: &[(String, i64, i64)], face_ids: &[String]) -> OcclusionTally {
+    let sel: std::collections::HashSet<&str> =
+        face_ids.iter().map(|s| s.as_str()).collect();
+    let mut confirmed = 0usize;
+    let mut occluded = 0usize;
+    for (id, _px, _py) in located {
+        if sel.contains(id.as_str()) {
+            confirmed += 1;
+        } else {
+            occluded += 1;
+        }
+    }
+    OcclusionTally { confirmed, occluded }
+}
+
+/// v5.1: 解析 Phase D verify 回包 → faceIds 列表。
+/// 回包应为 {selN, faces:[id,...]} JSON; 解析失败时如实返回 None(不吞错误),
+/// 由调用方走校验异常分支。
+fn extract_face_ids(raw: &str) -> Option<Vec<String>> {
+    let v: Value = serde_json::from_str(raw).ok()?;
+    let arr = v["faces"].as_array()?;
+    Some(
+        arr.iter()
+            .filter_map(|x| x.as_str().map(String::from))
+            .collect(),
+    )
+}
 
 /// R7-28: 探活 — 取 undo 栈深度(用于验证按键是否真被应用处理)。
 /// CDP 按键要求 Plasticity 持有 OS 焦点, 偶发丢失; 用 undo 深度变化判定成败。
@@ -1202,5 +1308,69 @@ mod tests {
             let y = rect.1 + (rect.3 as f64 * (gy as f64 + 0.5) / SCAN_ROWS_FINE as f64) as i64;
             assert!(y >= rect.1 && y < rect.1 + rect.3, "细网格 y 越界: {y}");
         }
+    }
+
+    #[test]
+    fn plan_clicks_dedupes_same_coord_group() {
+        // 真机场景复刻: 4f718 与 17f3640 同坐标 (983,193)(同射线前后遮挡),
+        // 5f758 屏幕分离独立坐标 — 3 目标只应产生 2 次点击。
+        let located = vec![
+            ("4f718".to_string(), 983, 193),
+            ("17f3640".to_string(), 983, 193),
+            ("5f758".to_string(), 412, 507),
+        ];
+        let clicks = plan_clicks(&located);
+        assert_eq!(clicks, vec![(983, 193), (412, 507)], "同坐标组必须去重为一次点击");
+        // 首坐标 = 普通点击(替换选择), 后续 = shift 追加 — 顺序保持首现次序
+        assert_eq!(clicks.len(), located.len() - 1);
+        // 全独立坐标: 不去重
+        let solo = vec![
+            ("a".to_string(), 1, 1),
+            ("b".to_string(), 2, 2),
+        ];
+        assert_eq!(plan_clicks(&solo).len(), 2);
+        // 三面同坐标: 仍只点一次
+        let triple = vec![
+            ("a".to_string(), 5, 5),
+            ("b".to_string(), 5, 5),
+            ("c".to_string(), 5, 5),
+        ];
+        assert_eq!(plan_clicks(&triple).len(), 1);
+    }
+
+    #[test]
+    fn tally_occlusion_counts_confirmed_and_occluded() {
+        let located = vec![
+            ("4f718".to_string(), 983, 193),
+            ("17f3640".to_string(), 983, 193),
+            ("5f758".to_string(), 412, 507),
+        ];
+        // 点击后 faceIds 只剩最前面的 4f718 + 独立面 → 17f3640 被遮挡计失败
+        let faces = vec!["4f718".to_string(), "5f758".to_string()];
+        let t = tally_occlusion(&located, &faces);
+        assert_eq!(t, OcclusionTally { confirmed: 2, occluded: 1 });
+        // 全中
+        let all = vec!["4f718".to_string(), "17f3640".to_string(), "5f758".to_string()];
+        assert_eq!(
+            tally_occlusion(&located, &all),
+            OcclusionTally { confirmed: 3, occluded: 0 }
+        );
+        // 全被遮挡(faceIds 空)
+        assert_eq!(
+            tally_occlusion(&located, &[]),
+            OcclusionTally { confirmed: 0, occluded: 3 }
+        );
+    }
+
+    #[test]
+    fn extract_face_ids_parses_verify_payload() {
+        let raw = r#"{"selN":2,"faces":["4f718","5f758"]}"#;
+        assert_eq!(
+            extract_face_ids(raw),
+            Some(vec!["4f718".to_string(), "5f758".to_string()])
+        );
+        // faces 缺失 / 非 JSON → None(走校验异常分支, 不吞错误)
+        assert_eq!(extract_face_ids(r#"{"selN":-1}"#), None);
+        assert_eq!(extract_face_ids("not-json"), None);
     }
 }
