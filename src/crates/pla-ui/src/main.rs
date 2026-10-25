@@ -363,11 +363,14 @@ fn panel_frame() -> egui::Frame {
         .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(150)))
 }
 
-/// R8b: 本帧面板拖动累计位移(header 手柄写入, 面板循环读)。
 thread_local! {
-    static PANEL_DRAG_DELTA: std::cell::RefCell<egui::Vec2> =
-        std::cell::RefCell::new(egui::Vec2::ZERO);
     static PANEL_DRAG_HINT: std::cell::RefCell<bool> =
+        const { std::cell::RefCell::new(false) };
+    /// R8d: 标题行正在被拖动(本帧) — 面板视口据此发 StartDrag(OS 级移窗)。
+    static PANEL_DRAG_ACTIVE: std::cell::RefCell<bool> =
+        const { std::cell::RefCell::new(false) };
+    /// StartDrag 已发出(拖动会话进行中, 读完一帧置 false 由 ACTIVE 边沿续期)。
+    static PANEL_DRAG_STARTED: std::cell::RefCell<bool> =
         const { std::cell::RefCell::new(false) };
     /// 面板id → 用户拖到的绝对位置(逻辑 pt)。主循环渲染时优先于默认跟随位;
     /// 面板关闭后由主循环清除(重开回默认)。
@@ -525,8 +528,9 @@ fn snap_item(
 ) -> SnapItemActions {
     let mut a = SnapItemActions::default();
     let stem = name.trim_end_matches(".plasticity").to_string();
+    // R8d: 两行(名称+按钮) → 预留高度 52(36 单行 + 16 按钮行)。
     ui.allocate_ui_with_layout(
-        egui::vec2(cell_w, 36.0),
+        egui::vec2(cell_w, 52.0),
         egui::Layout::top_down(egui::Align::LEFT),
         |ui| {
             let img_resp =
@@ -544,6 +548,8 @@ fn snap_item(
                     a.open = true;
                 }
             }
+            // R8d(用户拍板): 名称一行、按钮一行 — 三列收藏卡(~66px)塞不下
+            // 名称+3钮, 挤压重叠。第一行名称独占(truncate), 第二行按钮组。
             ui.horizontal(|ui| {
                 if renaming {
                     ui.add_sized(
@@ -570,13 +576,9 @@ fn snap_item(
                     }
                 }
                 let name_resp = {
-                    // R7-8: 名称行各元素全部定宽 — 之前 Button 自带 padding 使
-                    // 单元格内容最小宽 > cell_w, 收藏第 3 列被挤出面板右缘。
-                    // R8b: 现在名称行有 3 个图标钮(★ ✎ 🗑)+管理勾选, 全部预留,
-                    // 否则垃圾桶被挤出可视区点不到。
                     let sp = ui.spacing().item_spacing.x;
                     let reserve = if manage { 16.0 + sp } else { 0.0 };
-                    let rem = (cell_w - (14.0 + sp) * 3.0 - reserve).max(24.0);
+                    let rem = (cell_w - reserve).max(24.0);
                     let nr = ui
                         .allocate_ui_with_layout(
                             egui::vec2(rem, 14.0),
@@ -597,6 +599,9 @@ fn snap_item(
                 if name_resp.clicked() && !manage {
                     a.open = true;
                 }
+            });
+            // 第二行: 按钮组(★ ✎ 🗑), 名称行不再挤
+            ui.horizontal(|ui| {
                 // 收藏星: 定宽 14, painter 画字(Button 自带 padding 撑宽单元格)
                 let star_col = if is_fav {
                     egui::Color32::from_rgb(255, 200, 60)
@@ -621,7 +626,7 @@ fn snap_item(
                 if pencil_button(ui).on_hover_text("改名").clicked() {
                     a.rename_start = true;
                 }
-                // R8-2: 单项删除(🗑 画出来的垃圾桶, 点击后调用方弹确认)。
+                // R8-2: 单项删除(垃圾桶, 点击后调用方弹确认)。
                 let (drect, dresp) =
                     ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::click());
                 let dcol = if dresp.hovered() { COL_RED } else { COL_MUTED };
@@ -756,21 +761,16 @@ fn confirm_popup(
 }
 
 fn panel_header(ui: &mut egui::Ui, title: &str, open: &mut bool, icons: Option<Box<dyn FnOnce(&mut egui::Ui)>>) {
+    // R8d: 整个标题行都是拖动区 — 按下并移动即触发 OS 级窗口拖动(StartDrag,
+    // 与系统标题栏同款, 丝滑)。标题/按钮的点击不受影响(轻点=点击, 拖=移窗)。
+    // 拖动把手保留 2列×3点 作为视觉提示(SimHei 无 ⋮ 字形 → 矢量绘制)。
     ui.horizontal(|ui| {
-        // R8b: 拖动手柄 — 矢量画 2 列×3 点(SimHei 无 ⋮ 字形, 文本会渲染成豆腐块)。
-        let (hr, hresp) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::drag());
+        let (hr, hresp) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
         let col = if hresp.hovered() { COL_TEXT } else { COL_MUTED };
         for cx in [hr.left() + 4.0, hr.left() + 9.0] {
             for cy in [hr.top() + 3.5, hr.center().y, hr.bottom() - 3.5] {
                 ui.painter().circle_filled(egui::pos2(cx, cy), 1.3, col);
             }
-        }
-        if hresp.dragged() {
-            PANEL_DRAG_DELTA.with(|d| {
-                let mut d2 = d.borrow_mut();
-                let cur = hresp.drag_delta();
-                *d2 += cur;
-            });
         }
         if hresp.hovered() {
             PANEL_DRAG_HINT.with(|d| *d.borrow_mut() = true);
@@ -790,6 +790,11 @@ fn panel_header(ui: &mut egui::Ui, title: &str, open: &mut bool, icons: Option<B
                 extra(ui);
             }
         });
+        // R8d: 标题行整体拖动 — 行背景 drag 检测(按钮已各自消费点击, 不冒泡)。
+        let row_resp = ui.response();
+        if row_resp.dragged_by(egui::PointerButton::Primary) {
+            PANEL_DRAG_ACTIVE.with(|d| *d.borrow_mut() = true);
+        }
     });
     ui.separator();
 }
@@ -1474,33 +1479,44 @@ fn header_extra_and_show(
                             panel_header(ui, title, &mut flag, icons.take());
                             contents(ui);
                         });
-                    // R8b: 手柄拖动 → 面板自己的外框 + 位移 = 新绝对位置。
-                    // 存 PANEL_USER_POS(挪过后不再拉回默认位) + 即时移窗。
-                    let drag_delta = PANEL_DRAG_DELTA.with(|d| {
+                    // R8d: 标题行拖动 → StartDrag(OS 级移窗, 丝滑)。
+                    // 拖动期间 OS 移动窗口, outer_rect 实时变化 — 跟随逻辑必须
+                    // 让路(否则两个写入者打架 = 之前"面板一直跳"的根因)。
+                    let drag_active = PANEL_DRAG_ACTIVE.with(|d| {
                         let v = *d.borrow();
-                        *d.borrow_mut() = egui::Vec2::ZERO;
+                        *d.borrow_mut() = false;
                         v
                     });
-                    let cur = ctx.input(|i| i.viewport().outer_rect);
-                    if drag_delta != egui::Vec2::ZERO {
-                        if let Some(r) = cur {
-                            let np =
-                                egui::pos2(r.left() + drag_delta.x, r.top() + drag_delta.y);
+                    if drag_active {
+                        PANEL_DRAG_STARTED.with(|st| *st.borrow_mut() = true);
+                        ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                    } else if PANEL_DRAG_STARTED.with(|st| *st.borrow()) {
+                        // 拖动刚结束: 记录落点(OS 已把窗口移到位, 读实际外框)。
+                        PANEL_DRAG_STARTED.with(|st| *st.borrow_mut() = false);
+                        if let Some(r) = ctx.input(|i| i.viewport().outer_rect) {
                             PANEL_USER_POS.with(|u| {
-                                u.borrow_mut().insert(id, np);
+                                u.borrow_mut().insert(id, r.min);
                             });
-                            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(np));
                         }
                     }
-                    // 跟随: 用户位置优先(挪过后不再跟随工具栏); 否则默认锚。
-                    let follow =
-                        PANEL_USER_POS.with(|u| u.borrow().get(id).copied()).unwrap_or(desired);
-                    let cur = ctx.input(|i| i.viewport().outer_rect);
-                    if let Some(r) = cur {
-                        if (r.left() - follow.x).abs() > SNAP_EPS
-                            || (r.top() - follow.y).abs() > SNAP_EPS
+                    // 跟随: 仅当未被用户挪过(user_pos 为空 = 从未拖动/刚重开)。
+                    let user_pos = PANEL_USER_POS.with(|u| u.borrow().get(id).copied());
+                    if let Some(fp) = user_pos {
+                        // 拖动期间不干预; 拖完每帧钉在落点(OS 抖动兜底)
+                        if !PANEL_DRAG_STARTED.with(|st| *st.borrow()) {
+                            if let Some(r) = ctx.input(|i| i.viewport().outer_rect) {
+                                if (r.left() - fp.x).abs() > SNAP_EPS
+                                    || (r.top() - fp.y).abs() > SNAP_EPS
+                                {
+                                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(fp));
+                                }
+                            }
+                        }
+                    } else if let Some(r) = ctx.input(|i| i.viewport().outer_rect) {
+                        if (r.left() - desired.x).abs() > SNAP_EPS
+                            || (r.top() - desired.y).abs() > SNAP_EPS
                         {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(follow));
+                            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(desired));
                         }
                     }
                 }
@@ -1861,7 +1877,7 @@ impl eframe::App for PlaApp {
                             let sp = ui.spacing().item_spacing.x;
                             let fav_cell_w = ((avail_w - sp * 2.0) / 3.0).max(40.0);
                             let fav_img_h = 56.0_f32;
-                            let fav_row_h = fav_img_h + 20.0; // 图 + 名称行
+                            let fav_row_h = fav_img_h + 38.0; // 图 + 名称行 + 按钮行(R8d 两行)
                             let big_cell_w = avail_w;
                             // 悬浮提示文本: SS 短名 + meta 里的源文档/拍摄时间
                             let tip_of = |s: &str| -> Option<(String, String)> {
@@ -2198,7 +2214,7 @@ impl eframe::App for PlaApp {
                                     let mut fav = false;
                                     let mut rn = false;
                                     ui.allocate_ui_with_layout(
-                                        egui::vec2(w, img_h + 20.0),
+                                        egui::vec2(w, img_h + 38.0),
                                         egui::Layout::top_down(egui::Align::LEFT),
                                         |ui| {
                                             // 截图(点击 = 应用; 悬浮 = 信息入 tip 槽)
@@ -2248,7 +2264,8 @@ impl eframe::App for PlaApp {
                                                     if enter { rename_commit = true; }
                                                     if esc { rename_cancel = true; }
                                                 } else {
-                                                    let name_w = (w - (14.0 + sp) * 3.0 - if self.sel_manage { 16.0 + sp } else { 0.0 }).max(30.0);
+                                                    // R8d: 名称独占一行
+                                                    let name_w = (w - if self.sel_manage { 16.0 + sp } else { 0.0 }).max(30.0);
                                                     let nr = ui.allocate_ui_with_layout(
                                                         egui::vec2(name_w, 14.0),
                                                         egui::Layout::left_to_right(egui::Align::Center),
@@ -2258,13 +2275,13 @@ impl eframe::App for PlaApp {
                                                         apply_now = Some(meta.name.clone());
                                                     }
                                                 }
-                                                // ★
+                                            });
+                                            // R8d: 第二行按钮组(★ ✎ 🗑)
+                                            ui.horizontal(|ui| {
                                                 let (srect, sresp) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::click());
                                                 ui.painter().text(srect.center(), egui::Align2::CENTER_CENTER, if meta.fav { "★" } else { "☆" }, egui::FontId::proportional(13.0), if meta.fav { egui::Color32::from_rgb(255,200,60) } else { COL_MUTED });
                                                 if sresp.on_hover_text(if meta.fav { "取消收藏" } else { "收藏(置顶)" }).clicked() { fav = true; }
-                                                // ✎
                                                 if pencil_button(ui).on_hover_text("改名").clicked() { rn = true; }
-                                                // 🗑
                                                 let (drect, dresp) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::click());
                                                 let dcol = if dresp.hovered() { COL_RED } else { COL_MUTED };
                                                 let p = |x: f32, y: f32| egui::pos2(drect.left() + x, drect.top() + y);
@@ -2285,7 +2302,7 @@ impl eframe::App for PlaApp {
                                 if !fav_list.is_empty() {
                                     ui.label(egui::RichText::new("★ 收藏").small().strong().color(COL_MUTED));
                                     let fav_img_h = 56.0;
-                                    let fav_row_h = fav_img_h + 20.0;
+                                    let fav_row_h = fav_img_h + 38.0; // R8d: 图+名称+按钮两行
                                     for trio in fav_list.chunks(3) {
                                         let row_rect = ui.allocate_exact_size(egui::vec2(avail_w, fav_row_h), egui::Sense::hover()).0;
                                         for (ci, meta) in trio.iter().enumerate() {
@@ -2598,7 +2615,7 @@ impl eframe::App for PlaApp {
                                 let mut item = |ui: &mut egui::Ui, meta: &pla_ui::vpstate::VpStateMeta, w: f32, img_h: f32| {
                                     let mut del = false; let mut fav = false; let mut rn = false;
                                     ui.allocate_ui_with_layout(
-                                        egui::vec2(w, img_h + 20.0),
+                                        egui::vec2(w, img_h + 38.0),
                                         egui::Layout::top_down(egui::Align::LEFT),
                                         |ui| {
                                             let png = self.vp_pngs.get(&meta.name);
@@ -2641,7 +2658,8 @@ impl eframe::App for PlaApp {
                                                     if enter { rename_commit = true; }
                                                     if esc { rename_cancel = true; }
                                                 } else {
-                                                    let name_w = (w - (14.0 + sp) * 3.0).max(30.0);
+                                                    // R8d: 名称独占一行
+                                                    let name_w = w.max(30.0);
                                                     let nr = ui.allocate_ui_with_layout(
                                                         egui::vec2(name_w, 14.0),
                                                         egui::Layout::left_to_right(egui::Align::Center),
@@ -2651,6 +2669,9 @@ impl eframe::App for PlaApp {
                                                         apply_now = Some(meta.name.clone());
                                                     }
                                                 }
+                                            });
+                                            // R8d: 第二行按钮组(★ ✎ 🗑)
+                                            ui.horizontal(|ui| {
                                                 let (srect, sresp) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::click());
                                                 ui.painter().text(srect.center(), egui::Align2::CENTER_CENTER, if meta.fav { "★" } else { "☆" }, egui::FontId::proportional(13.0), if meta.fav { egui::Color32::from_rgb(255,200,60) } else { COL_MUTED });
                                                 if sresp.on_hover_text(if meta.fav { "取消收藏" } else { "收藏(置顶)" }).clicked() { fav = true; }
@@ -2674,7 +2695,7 @@ impl eframe::App for PlaApp {
                                 if !fav_list.is_empty() {
                                     ui.label(egui::RichText::new("★ 收藏").small().strong().color(COL_MUTED));
                                     let fav_img_h = 56.0;
-                                    let fav_row_h = fav_img_h + 20.0;
+                                    let fav_row_h = fav_img_h + 38.0; // R8d: 图+名称+按钮两行
                                     for trio in fav_list.chunks(3) {
                                         let row_rect = ui.allocate_exact_size(egui::vec2(avail_w, fav_row_h), egui::Sense::hover()).0;
                                         for (ci, meta) in trio.iter().enumerate() {
