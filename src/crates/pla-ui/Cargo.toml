@@ -28,6 +28,9 @@ eframe = { version = "0.29", default-features = false, features = ["glow", "defa
 windows = { version = "0.52", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
+    # UI_Input_KeyboardAndMouse: SetCapture/ReleaseCapture — R9 自管窗口拖动
+    # (鼠标移出小窗口也能继续收到移动事件)。
+    "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",
     "Win32_System_Threading",
     "Win32_System_Com",

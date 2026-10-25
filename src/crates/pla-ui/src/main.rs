@@ -132,6 +132,10 @@ struct PlaApp {
     /// R8b: 工具栏拖动位置(None=自动吸附; Some=用户拖到的位置, 逻辑 pt)。
     toolbar_drag_pos: Option<egui::Pos2>,
     toolbar_dragging: bool,
+    /// R9: 自管拖动的起始鼠标位置(**屏幕物理像素**, 不能用窗口内相对坐标)。
+    drag_origin_cursor: Option<(f32, f32)>,
+    /// R9: 自管拖动的起始窗口外框左上角(逻辑 pt, 屏幕坐标系)。
+    drag_origin_win: Option<egui::Pos2>,
     sel_name: String,
     sel_members: Vec<String>,
     /// CDP 会话句柄(R7-14): 实时选择/实体树通道(Plasticity 需 PLA-CDP 补丁版启动)。
@@ -366,16 +370,42 @@ fn panel_frame() -> egui::Frame {
 thread_local! {
     static PANEL_DRAG_HINT: std::cell::RefCell<bool> =
         const { std::cell::RefCell::new(false) };
-    /// R8d: 标题行正在被拖动(本帧) — 面板视口据此发 StartDrag(OS 级移窗)。
+    /// R8d: 标题行正在被拖动(本帧) — 面板视口据此启动拖动会话。
     static PANEL_DRAG_ACTIVE: std::cell::RefCell<bool> =
         const { std::cell::RefCell::new(false) };
-    /// StartDrag 已发出(拖动会话进行中, 读完一帧置 false 由 ACTIVE 边沿续期)。
-    static PANEL_DRAG_STARTED: std::cell::RefCell<bool> =
-        const { std::cell::RefCell::new(false) };
+    /// R9: 面板 id → 进行中的拖动会话(起始指针/起始窗口位/是否接管)。
+    static PANEL_DRAG: std::cell::RefCell<std::collections::HashMap<&'static str, PanelDragState>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+    /// R9: 面板 id → 最近一次下发的定位目标。目标没变就不重发 OuterPosition
+    /// (DPI 取整会让「实际-目标」永远差零点几 pt, 不记目标就会每帧 SetWindowPos
+    /// = 面板抖动/瞬移的元凶之一)。
+    static PANEL_LAST_CMD: std::cell::RefCell<std::collections::HashMap<&'static str, egui::Pos2>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
     /// 面板id → 用户拖到的绝对位置(逻辑 pt)。主循环渲染时优先于默认跟随位;
     /// 面板关闭后由主循环清除(重开回默认)。
     static PANEL_USER_POS: std::cell::RefCell<std::collections::HashMap<&'static str, egui::Pos2>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// R9: 面板拖动会话状态(自管拖动: SetCapture + 指针 delta)。
+#[derive(Clone, Copy)]
+struct PanelDragState {
+    /// true = 已接管(拿到 hwnd 并 SetCapture); false = 降级给 OS StartDrag。
+    active: bool,
+    /// 按下瞬间的鼠标位置(**屏幕物理像素**)。
+    origin_cursor: (f32, f32),
+    /// 按下瞬间的窗口外框左上角(逻辑 pt, 屏幕坐标系)。
+    origin_win: egui::Pos2,
+}
+
+impl Default for PanelDragState {
+    fn default() -> Self {
+        Self {
+            active: false,
+            origin_cursor: (0.0, 0.0),
+            origin_win: egui::Pos2::ZERO,
+        }
+    }
 }
 
 /// R8b: 二级面板标识(互斥用)。
@@ -554,7 +584,8 @@ fn snap_item(
             // 两行模式按钮行上移贴近名称(负 spacing 补偿)。
             let wide = cell_w >= 140.0;
             if !wide {
-                ui.add_space(-2.0); // 按钮行上移, 收窄与名称的间隙
+                // R9: 名称行整体上移贴近缩略图(用户反馈: 与按钮之间空隙太大)
+                ui.add_space(-2.0);
             }
             ui.horizontal(|ui| {
                 if renaming {
@@ -612,8 +643,10 @@ fn snap_item(
                     draw_item_buttons(ui, is_fav, &mut a);
                 }
             });
-            // 窄卡第二行: 按钮组(★ ✎ 🗑), 11px 紧凑
+            // 窄卡第二行: 按钮组(★ ✎ 🗑), 11px 紧凑。
+            // R9: 负 spacing 把按钮行压到名称行紧贴(R8e 的 -2 用户仍嫌大)。
             if !wide {
+                ui.add_space(-5.0);
                 ui.horizontal(|ui| {
                     draw_item_buttons(ui, is_fav, &mut a);
                 });
@@ -864,8 +897,11 @@ impl PlaApp {
             show_dim: false,
             show_settings: false,
             show_vpstate: false,
-            toolbar_drag_pos: None,
-            toolbar_dragging: false,
+    toolbar_drag_pos: None,
+    toolbar_dragging: false,
+    // R9: 自管拖动的起始基准(鼠标屏幕位置/窗口位), 松手即清。
+    drag_origin_cursor: None,
+    drag_origin_win: None,
             sel_name: String::new(),
             sel_members: Vec::new(),
             cdp: pla_bridge::cdp::CdpHandle::spawn(9333),
@@ -1526,44 +1562,90 @@ fn header_extra_and_show(
                             panel_header(ui, title, &mut flag, icons.take());
                             contents(ui);
                         });
-                    // R8d: 标题行拖动 → StartDrag(OS 级移窗, 丝滑)。
-                    // 拖动期间 OS 移动窗口, outer_rect 实时变化 — 跟随逻辑必须
-                    // 让路(否则两个写入者打架 = 之前"面板一直跳"的根因)。
-                    let drag_active = PANEL_DRAG_ACTIVE.with(|d| {
+                    // ---- R9: 面板拖动(自管 SetCapture + delta) + 跟随 ----
+                    // 读一帧清一帧的拖动信号(标题行的 drag 层写入)。
+                    let drag_signal = PANEL_DRAG_ACTIVE.with(|d| {
                         let v = *d.borrow();
                         *d.borrow_mut() = false;
                         v
                     });
-                    if drag_active {
-                        PANEL_DRAG_STARTED.with(|st| *st.borrow_mut() = true);
-                        ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
-                    } else if PANEL_DRAG_STARTED.with(|st| *st.borrow()) {
-                        // 拖动刚结束: 记录落点(OS 已把窗口移到位, 读实际外框)。
-                        PANEL_DRAG_STARTED.with(|st| *st.borrow_mut() = false);
-                        if let Some(r) = ctx.input(|i| i.viewport().outer_rect) {
-                            PANEL_USER_POS.with(|u| {
-                                u.borrow_mut().insert(id, r.min);
-                            });
-                        }
-                    }
-                    // 跟随: 仅当未被用户挪过(user_pos 为空 = 从未拖动/刚重开)。
-                    let user_pos = PANEL_USER_POS.with(|u| u.borrow().get(id).copied());
-                    if let Some(fp) = user_pos {
-                        // 拖动期间不干预; 拖完每帧钉在落点(OS 抖动兜底)
-                        if !PANEL_DRAG_STARTED.with(|st| *st.borrow()) {
-                            if let Some(r) = ctx.input(|i| i.viewport().outer_rect) {
-                                if (r.left() - fp.x).abs() > SNAP_EPS
-                                    || (r.top() - fp.y).abs() > SNAP_EPS
-                                {
-                                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(fp));
-                                }
+                    // 同工具栏: delta 用屏幕绝对坐标(窗口内相对坐标会自我抵消)。
+                    let cur = pla_ui::window_drag::cursor_pos_phys();
+                    let down = ctx.input(|i| i.pointer.primary_down());
+                    let mut st = PANEL_DRAG.with(|m| m.borrow().get(id).copied());
+                    let dragging = st.map_or(false, |s| s.active);
+                    if !dragging && drag_signal {
+                        // 按标题+宽度定位本窗口 hwnd; 拿不到(非 Win/未创建)
+                        // 或取不到光标才降级 OS StartDrag。
+                        match (
+                            cur,
+                            ctx.input(|i| i.viewport().outer_rect),
+                            pla_ui::window_drag::find_own_window(
+                                title,
+                                size.x,
+                                ctx.pixels_per_point(),
+                            ),
+                        ) {
+                            (Some(c), Some(r), Some(h)) => {
+                                pla_ui::window_drag::set_capture(h);
+                                st = Some(PanelDragState {
+                                    active: true,
+                                    origin_cursor: c,
+                                    origin_win: r.min,
+                                });
+                            }
+                            _ => {
+                                ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                                st = None;
                             }
                         }
-                    } else if let Some(r) = ctx.input(|i| i.viewport().outer_rect) {
-                        if (r.left() - desired.x).abs() > SNAP_EPS
-                            || (r.top() - desired.y).abs() > SNAP_EPS
-                        {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(desired));
+                    }
+                    if let Some(mut s) = st {
+                        if s.active {
+                            if !down {
+                                // 松手: 会话收口(之后不再跟随, 保持落点)
+                                s.active = false;
+                                pla_ui::window_drag::release_capture();
+                            } else if let Some(c) = cur {
+                                let ppp = ctx.pixels_per_point().max(0.01);
+                                let target = s.origin_win
+                                    + egui::vec2((c.0 - s.origin_cursor.0) / ppp, (c.1 - s.origin_cursor.1) / ppp);
+                                PANEL_USER_POS.with(|u| {
+                                    u.borrow_mut().insert(id, target);
+                                });
+                                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(target));
+                            }
+                            PANEL_DRAG.with(|m| m.borrow_mut().insert(id, s));
+                        }
+                    }
+                    // 跟随: 用户拖过 → 钉在落点; 否则跟随工具栏下方的默认位。
+                    let target = PANEL_USER_POS
+                        .with(|u| u.borrow().get(id).copied())
+                        .unwrap_or(desired);
+                    if let Some(r) = ctx.input(|i| i.viewport().outer_rect) {
+                        let off = (r.left() - target.x).abs().max((r.top() - target.y).abs());
+                        // 目标变了才发; 目标没变但偏得离谱(>8pt, 别人挪的)也纠正。
+                        // 这样既跟得紧(0.5pt 阈值 ≈ 亚像素), 又不会因 DPI 取整
+                        // 每帧重复 SetWindowPos(= 面板疯狂瞬移的根因)。
+                        if off > 0.5 {
+                            let changed = PANEL_LAST_CMD.with(|m| {
+                                let mut m = m.borrow_mut();
+                                match m.get(id) {
+                                    Some(l)
+                                        if (l.x - target.x).abs() <= 0.25
+                                            && (l.y - target.y).abs() <= 0.25 =>
+                                    {
+                                        false
+                                    }
+                                    _ => {
+                                        m.insert(id, target);
+                                        true
+                                    }
+                                }
+                            });
+                            if changed || off > 8.0 {
+                                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(target));
+                            }
                         }
                     }
                 }
@@ -1579,7 +1661,10 @@ impl eframe::App for PlaApp {
         self.update_snap(ctx);
         // 圆角裁剪: egui 画的圆角在 Windows glow 后端透明不可靠(R5 实测只有
         // 左上角圆), 由 SetWindowRgn 兜底; 子视口懒创建, 定时枚举补套。
-        if self.last_round_poll.elapsed() >= Duration::from_millis(ROUND_POLL_MS) {
+        // R9: 拖动会话期间不枚举窗口/套 Rgn(避免与自管移动抢 SetWindowPos)。
+        if !self.toolbar_dragging
+            && self.last_round_poll.elapsed() >= Duration::from_millis(ROUND_POLL_MS)
+        {
             self.last_round_poll = Instant::now();
             round_corners::poll_round_windows(
                 &mut self.round_state,
@@ -1718,20 +1803,52 @@ impl eframe::App for PlaApp {
                     }
                 });
                 }); // allocate_new_ui(居中行矩形)
-                // R8e: StartDrag(OS 原生移窗) — 拖动会话持续到鼠标释放
-                // (OS 模态循环期间 egui 收不到事件, 用 primary_down 边沿收口)。
-                if tb_drag.dragged_by(egui::PointerButton::Primary)
-                    && !self.toolbar_dragging
+                // R9: 自管拖动(SetCapture + 屏幕坐标 delta) — 取代 OS 模态循环。
+                // 帧循环照常运行 → 二级面板在同一帧拿到同一个权威坐标, 与工具栏
+                // 同步平移(不再"疯狂瞬移"); 鼠标移出小窗口也不断流。
+                // delta 一律用屏幕绝对坐标(GetCursorPos): egui 的 pointer 是窗口
+                // 内相对坐标, 窗口一移动它就变, 用它算 delta 会自我抵消。
+                let cur_now = pla_ui::window_drag::cursor_pos_phys();
+                let down_now = ctx.input(|i| i.pointer.primary_down());
+                if !self.toolbar_dragging
+                    && tb_drag.dragged_by(egui::PointerButton::Primary)
                 {
-                    self.toolbar_dragging = true;
-                    ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                    self.toolbar_dragging = match (
+                        cur_now,
+                        ctx.input(|i| i.viewport().outer_rect),
+                        pla_ui::window_drag::find_own_window(
+                            "PLA Toolbar",
+                            TOOLBAR_SIZE[0],
+                            ctx.pixels_per_point(),
+                        ),
+                    ) {
+                        (Some(c), Some(r), Some(h)) => {
+                            pla_ui::window_drag::set_capture(h);
+                            self.drag_origin_cursor = Some(c);
+                            self.drag_origin_win = Some(r.min);
+                            true
+                        }
+                        // 拿不到 hwnd / 取不到光标(非 Win 或窗口未就绪): 降级 OS 拖动
+                        _ => false,
+                    };
+                    if !self.toolbar_dragging {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                    }
                 }
-                if self.toolbar_dragging
-                    && !ctx.input(|i| i.pointer.primary_down())
-                {
-                    self.toolbar_dragging = false;
-                    if let Some(rect) = ctx.input(|i| i.viewport().outer_rect) {
-                        self.toolbar_drag_pos = Some(rect.min);
+                if self.toolbar_dragging {
+                    if !down_now {
+                        self.toolbar_dragging = false;
+                        pla_ui::window_drag::release_capture();
+                        self.drag_origin_cursor = None;
+                        self.drag_origin_win = None;
+                    } else if let (Some(oc), Some(ow), Some(c)) =
+                        (self.drag_origin_cursor, self.drag_origin_win, cur_now)
+                    {
+                        let ppp = ctx.pixels_per_point().max(0.01);
+                        let target = ow
+                            + egui::vec2((c.0 - oc.0) / ppp, (c.1 - oc.1) / ppp);
+                        self.toolbar_drag_pos = Some(target);
+                        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(target));
                     }
                 }
             });
@@ -1759,6 +1876,12 @@ impl eframe::App for PlaApp {
             PANEL_USER_POS.with(|u| {
                 u.borrow_mut().retain(|k, _| open.contains(k));
             });
+            PANEL_LAST_CMD.with(|u| {
+                u.borrow_mut().retain(|k, _| open.contains(k));
+            });
+            PANEL_DRAG.with(|u| {
+                u.borrow_mut().retain(|k, _| open.contains(k));
+            });
         }
 
         // R8b: 拖动落位后每帧钉住位置(吸附轮询已短路, 防 egui/OS 抖动回弹)。
@@ -1775,10 +1898,18 @@ impl eframe::App for PlaApp {
         }
 
         // ---- 工具栏外框基准位置(功能面板锚正下方, HUD 锚右侧) ----
+        // R9: 面板锚点必须取「权威坐标」而不是每帧回读的实际外框 — 回读值比
+        // 拖动目标滞后一帧, 面板按滞后值追 → 拖动时二级面板乱跳。拖动中/拖过
+        // 之后用自算的 toolbar_drag_pos(与二级面板同帧同源 → 同步平移)。
         let toolbar_rect = ctx
             .input(|i| i.viewport().outer_rect);
-        let toolbar_bottom_left =
-            toolbar_rect.map(|r| egui::pos2(r.left() + 2.0, r.bottom() + 6.0));
+        let tb_h = toolbar_rect
+            .map(|r| r.height())
+            .unwrap_or(TOOLBAR_SIZE[1] + 4.0);
+        let tb_origin = self
+            .toolbar_drag_pos
+            .or_else(|| toolbar_rect.map(|r| r.min));
+        let toolbar_bottom_left = tb_origin.map(|p| egui::pos2(p.x + 2.0, p.y + tb_h + 6.0));
 
         // ---- HUD 视口实际渲染点已移到所有功能面板之后(R7-9) —
         // 面板内按钮(如快照墙头部图标)的 hover 在面板视口渲染时才写入
@@ -1928,7 +2059,7 @@ impl eframe::App for PlaApp {
                             let sp = ui.spacing().item_spacing.x;
                             let fav_cell_w = ((avail_w - sp * 2.0) / 3.0).max(40.0);
                             let fav_img_h = 56.0_f32;
-                            let fav_row_h = fav_img_h + 32.0; // 图 + 名称 + 紧凑按钮行(R8e)
+                            let fav_row_h = fav_img_h + 26.0; // 图 + 名称 + 紧凑按钮行(R8e)
                             let big_cell_w = avail_w;
                             // 悬浮提示文本: SS 短名 + meta 里的源文档/拍摄时间
                             let tip_of = |s: &str| -> Option<(String, String)> {
@@ -2353,7 +2484,7 @@ impl eframe::App for PlaApp {
                                 if !fav_list.is_empty() {
                                     ui.label(egui::RichText::new("★ 收藏").small().strong().color(COL_MUTED));
                                     let fav_img_h = 56.0;
-                                    let fav_row_h = fav_img_h + 32.0; // R8e: 图+名称+紧凑按钮行
+                                    let fav_row_h = fav_img_h + 26.0; // R8e: 图+名称+紧凑按钮行
                                     for trio in fav_list.chunks(3) {
                                         let row_rect = ui.allocate_exact_size(egui::vec2(avail_w, fav_row_h), egui::Sense::hover()).0;
                                         for (ci, meta) in trio.iter().enumerate() {
@@ -2746,7 +2877,7 @@ impl eframe::App for PlaApp {
                                 if !fav_list.is_empty() {
                                     ui.label(egui::RichText::new("★ 收藏").small().strong().color(COL_MUTED));
                                     let fav_img_h = 56.0;
-                                    let fav_row_h = fav_img_h + 32.0; // R8e: 图+名称+紧凑按钮行
+                                    let fav_row_h = fav_img_h + 26.0; // R8e: 图+名称+紧凑按钮行
                                     for trio in fav_list.chunks(3) {
                                         let row_rect = ui.allocate_exact_size(egui::vec2(avail_w, fav_row_h), egui::Sense::hover()).0;
                                         for (ci, meta) in trio.iter().enumerate() {
@@ -3101,14 +3232,15 @@ impl eframe::App for PlaApp {
         // 渲染点在所有功能面板之后(R7-9): 面板视口本帧写入的 hover 才能被
         // 本帧渲染, 且不会被下一帧工具栏的帧首覆盖抢先清掉。
         if self.hovered_hint.is_some() || self.notice.is_some() {
-            if let Some(tr) = toolbar_rect {
+            // R9: 同面板 — 用权威锚点(拖动中不滞后)
+            if let Some(tr) = tb_origin {
                 let hint = self.hovered_hint.clone();
                 let notice = self.notice.clone();
                 let size = egui::vec2(
                     260.0,
                     if hint.is_some() && notice.is_some() { 104.0 } else { 56.0 },
                 );
-                let desired = egui::pos2(tr.right() + 8.0, tr.top() + 2.0);
+                let desired = egui::pos2(tr.x + TOOLBAR_SIZE[0] + 8.0, tr.y + 2.0);
                 let mut hud = Some((hint, notice));
                 let mut open_flag = true; // notice 的 × 关闭经它传出
                 let builder = egui::ViewportBuilder::default()

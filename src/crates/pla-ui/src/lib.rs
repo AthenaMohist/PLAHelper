@@ -6,4 +6,5 @@ pub mod snapshot;
 pub mod titlebar_probe;
 pub mod vpstate;
 pub mod wincap;
+pub mod window_drag;
 pub mod window_finder;
