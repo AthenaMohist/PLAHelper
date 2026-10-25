@@ -22,11 +22,6 @@ use serde_json::Value;
 pub enum CdpCmd {
     /// 应用选择集: 按成员类型回放(solid/sheet=addById(数值); 其余=add<Kind>({id,versionId,...}))。
     ApplySel(Vec<ApplyEntry>),
-    /// R7-28: 应用选择集 + 先「重新武装」应用侧选择状态。
-    /// 先发 shift+D(duplicate, 跑一个完整命令周期)再 ESC 取消 gizmo, 然后才恢复 —
-    /// 实测这样恢复后 G/E 等 gizmo 命令立即可用, 高亮也出现。
-    /// 副作用: shift+D 会复制当前选择(用户可 ctrl+Z 撤销, 撤销后需再次应用)。
-    ApplySelRearm(Vec<ApplyEntry>),
     /// R7-28: 派发一个按键(经 CDP Input.dispatchKeyEvent)。
     /// 注意: CDP 输入要求 Plasticity 窗口持有 OS 焦点, 否则事件被丢弃。
     Key(KeySpec),
@@ -769,89 +764,8 @@ async fn session_loop(
                 }
                 let _ = ev_tx.send(CdpEvent::Status(msg));
             }
-            // R7-28: 先「重新武装」再恢复 — 见 CdpCmd::ApplySelRearm 注释。
-            Ok(CdpCmd::ApplySelRearm(entries)) => {
-                if entries.is_empty() {
-                    let _ = ev_tx.send(CdpEvent::Status("选择集应用: 成员为空".into()));
-                    continue;
-                }
-                // 1) shift+D — duplicate 跑一个完整命令周期, 把应用侧选择状态
-                //    重新武装(实测: 不武装时 G 静默无反应, 武装后立即可用)。
-                //    CDP 按键偶发不被应用处理(焦点被夺/事件丢失), 故用 undo 深度
-                //    验证并重试, 最多 3 轮 — 否则会静默退回"未武装"的老问题。
-                let undo_before = eval_roundtrip(ws, &mut mid, UNDO_DEPTH_JS)
-                    .await
-                    .ok()
-                    .and_then(|s| s.trim().parse::<i64>().ok())
-                    .unwrap_or(-1);
-                let mut armed = false;
-                for attempt in 1..=3 {
-                    let _ = dispatch_key(
-                        ws,
-                        &mut mid,
-                        &KeySpec { key: "d".into(), code: "KeyD".into(), vk: 68, modifiers: 8 },
-                    )
-                    .await;
-                    tokio::time::sleep(Duration::from_millis(1300)).await;
-                    let undo_after = eval_roundtrip(ws, &mut mid, UNDO_DEPTH_JS)
-                        .await
-                        .ok()
-                        .and_then(|s| s.trim().parse::<i64>().ok())
-                        .unwrap_or(-1);
-                    if undo_after > undo_before {
-                        armed = true;
-                        break;
-                    }
-                    eprintln!(
-                        "[pla-cdp] rearm: shift+D 未生效(undo {undo_before}→{undo_after}), 第 {attempt}/3 次重试"
-                    );
-                    // 重试前把焦点抢回 Plasticity(按键丢失的常见原因)
-                    let _ = ev_tx.send(CdpEvent::RequestFocus);
-                    tokio::time::sleep(Duration::from_millis(400)).await;
-                }
-                if !armed {
-                    let _ = ev_tx.send(CdpEvent::Status(
-                        "重新武装失败: shift+D 未被 Plasticity 接收（请确认 Plasticity 窗口在前台）, 已直接恢复".into(),
-                    ));
-                }
-                // 2) ESC — 取消 duplicate 留下的移动 gizmo
-                let _ = dispatch_key(
-                    ws,
-                    &mut mid,
-                    &KeySpec { key: "Escape".into(), code: "Escape".into(), vk: 27, modifiers: 0 },
-                )
-                .await;
-                tokio::time::sleep(Duration::from_millis(1000)).await;
-                // 3) 恢复
-                let js = match apply_sel_js(&entries) {
-                    Ok(j) => j,
-                    Err(e) => {
-                        let _ = ev_tx.send(CdpEvent::Status(format!("选择集应用失败: {e}")));
-                        continue;
-                    }
-                };
-                let res = match eval_roundtrip(ws, &mut mid, &js).await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        let _ = ev_tx.send(CdpEvent::Status(format!(
-                            "选择集应用失败: {e}（CDP 通道异常, 非选择数据问题）"
-                        )));
-                        continue;
-                    }
-                };
-                eprintln!("[pla-cdp] ApplySel(rearm) raw result: {res}");
-                let (ok, fail, errs) = parse_apply_result(&res);
-                let msg = if fail > 0 || !errs.is_empty() {
-                    format!("选择集应用: {ok} 项成功, {fail} 项失败 {errs}")
-                } else if ok == 0 {
-                    "选择集应用: 成员为空, 未发送任何项".to_string()
-                } else {
-                    format!(
-                        "选择集已应用: {ok} 项成功（已重新武装, G/E 等命令可直接用）"
-                    )
-                };
-                let _ = ev_tx.send(CdpEvent::Status(msg));
-            }
+            // (R7-28「重新武装」ApplySelRearm 已于 R7-32 移除 — 方案被用户否决;
+            //  v4+ 真实点击管线自身建立活跃实体上下文, 无需武装。)
             Ok(CdpCmd::Key(spec)) => {
                 if let Err(e) = dispatch_key(ws, &mut mid, &spec).await {
                     let _ = ev_tx.send(CdpEvent::Status(format!("按键派发失败: {e}")));
@@ -1205,15 +1119,6 @@ fn extract_face_ids(raw: &str) -> Option<Vec<String>> {
             .collect(),
     )
 }
-
-/// R7-28: 探活 — 取 undo 栈深度(用于验证按键是否真被应用处理)。
-/// CDP 按键要求 Plasticity 持有 OS 焦点, 偶发丢失; 用 undo 深度变化判定成败。
-const UNDO_DEPTH_JS: &str = r#"(function(){
-  var ed = window.__PLA_EDITOR__;
-  if (!ed || !ed.selection) { var f = window.__PLA_HOOK__; if (f) ed = f.findEditor(); if (ed) window.__PLA_EDITOR__ = ed; }
-  if (!ed) return "-1";
-  try { return String(ed.history._undoStack.length); } catch(e){ return "-1"; }
-})()"#;
 
 /// R7-28: 解析 ApplySel JS 的 JSON 回包 → (ok, fail, errs 串)。
 fn parse_apply_result(res: &str) -> (i64, i64, String) {

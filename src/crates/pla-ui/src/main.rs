@@ -135,14 +135,11 @@ struct PlaApp {
     live_sel_keys: Vec<String>,
     /// R7-26: 已发出「应用」命令, 等 CDP 回包后把焦点交还 Plasticity。
     pending_focus: bool,
-    /// R7-30: 应用后先「重新武装」应用侧选择状态(shift+D + ESC)再恢复。
-    /// 用户实测: 武装后 G 确实能启动, 但作用在 shift+D 复制出的副本上,
-    /// 且 ctrl+Z 退回「什么都没选」而非原始面 —— 对本工作流无用, 故默认关闭,
-    /// 保留仅为对照/排查。
-    sel_rearm: bool,
     /// CDP 实体树平铺 (name, ctor, indent, selected)。
     cdp_tree: Vec<(String, String, i64, bool)>,
-    /// CDP 选择集勾选成员 (kind, id, name, key=原始 id 元素 JSON)。
+    /// 当前选择镜像 (kind, id, name, key=原始 id 元素 JSON, camera=选中时刻相机)。
+    /// v7(R7-32): 纯镜像 — 与实时选择严格同步(选中即入/取消即删/空选择清空),
+    /// 面板只读展示, 无勾选交互(用户决策: 避免误操作 + 相机绑定选中时刻)。
     sel_cdp_members: Vec<(String, String, String, Option<String>, Option<String>)>,
     /// v6: 最新实时相机(来自选择快照流), 保存选择集时随集存储。
     sel_camera: Option<String>,
@@ -627,7 +624,6 @@ impl PlaApp {
             live_sel: Vec::new(),
             live_sel_keys: Vec::new(),
             pending_focus: false,
-            sel_rearm: false,
             cdp_tree: Vec::new(),
             sel_cdp_members: Vec::new(),
             sel_camera: None,
@@ -712,11 +708,10 @@ impl PlaApp {
                         }
                     }
                     if snap.ok {
-                        // R7-26: 实时选择一变, 勾选区里"已不在当前选择中"的成员
-                        // 立即剔除 — 否则「全选 → 保存」会跨次累计(上次的面被带进
-                        // 这次的集, 用户实测: 第一次存面, 第二次存边却把面也带上)。
-                        // 注意只在选择真正变化时做, 且选择为空(全不选)时不清空
-                        // 勾选区(那可能是"载入已存选择集待编辑"的中间态)。
+                        // v7(R7-32): 勾选区 = 实时选择的纯镜像。选择一变就整表重建:
+                        // 选中即入(相机绑定"选中时刻"的同拍快照), 取消即删,
+                        // 全不选 → 清空(旧 R7-26 语义"空选择不动勾选区"是为
+                        // 手动勾选/载入编辑而设, 交互移除后不再成立)。
                         let mut new_keys: Vec<String> = snap
                             .items
                             .iter()
@@ -724,33 +719,20 @@ impl PlaApp {
                             .collect();
                         new_keys.sort();
                         if new_keys != self.live_sel_keys {
-                            // v6.2(用户建议): 新选中项自动勾选 — 相机绑定
-                            // "面被选中"时刻(本快照的 cam, 与选择事件同拍),
-                            // 而非"用户来勾选"时刻(可能已转过视角)。
-                            // 已勾选的成员不动(保留其原相机)。
-                            for it in snap.items.iter() {
-                                let key = pla_ui::selection::member_key(it.kind, &it.id);
-                                let already = self
-                                    .sel_cdp_members
-                                    .iter()
-                                    .any(|(k, i, _, _, _)| {
-                                        pla_ui::selection::member_key(k, i) == key
-                                    });
-                                if !already {
-                                    self.sel_cdp_members.push((
+                            self.sel_cdp_members = snap
+                                .items
+                                .iter()
+                                .map(|it| {
+                                    (
                                         it.kind.to_string(),
                                         it.id.clone(),
                                         it.name.clone(),
                                         it.key.clone(),
                                         snap.camera.clone(),
-                                    ));
-                                }
-                            }
-                            self.live_sel_keys = new_keys.clone();
-                            pla_ui::selection::prune_members_to_live(
-                                &mut self.sel_cdp_members,
-                                &new_keys,
-                            );
+                                    )
+                                })
+                                .collect();
+                            self.live_sel_keys = new_keys;
                         }
                         self.live_sel = snap.items;
                     } else if self.live_sel.is_empty() && snap.state == "no-editor" {
@@ -884,19 +866,10 @@ impl PlaApp {
         self.notice_at = Instant::now();
     }
 
-    /// R7-28: 发送「应用」命令 — 按 sel_rearm 决定是否先重新武装。
+    /// 发送「应用」命令。
+    /// (旧"重新武装"分支 R7-32 移除 — 该方案已被用户否决, v7 镜像模式不再需要。)
     fn send_apply(&mut self, entries: Vec<pla_bridge::cdp::ApplyEntry>) {
-        // 重新武装要走 CDP 真实按键, 前置条件 = Plasticity 持有 OS 焦点,
-        // 否则按键被 Chromium 丢弃(实测: 前台是别的窗口时按键完全无声)。
-        if self.sel_rearm {
-            self.focus_plasticity();
-        }
-        if self.sel_rearm {
-            self.cdp
-                .send(pla_bridge::cdp::CdpCmd::ApplySelRearm(entries));
-        } else {
-            self.cdp.send(pla_bridge::cdp::CdpCmd::ApplySel(entries));
-        }
+        self.cdp.send(pla_bridge::cdp::CdpCmd::ApplySel(entries));
     }
 
     /// R7-26: 把前台焦点交还 Plasticity 窗口。
@@ -1651,41 +1624,18 @@ impl eframe::App for PlaApp {
                     |ui| {
                         section_header(ui, "ENTITIES");
                         ui.label(
-                            egui::RichText::new(format!("doc: {} — 勾选进选择集", self.doc_key))
+                            egui::RichText::new(format!("doc: {} — 视口选择镜像", self.doc_key))
                                 .small()
                                 .color(COL_MUTED),
                         );
                         // ---- R7-14: 实时选择(CDP) — 视口里选什么这里实时显示什么 ----
+                        // v7(R7-32): 只读镜像, 无勾选交互(勾选框/全选/清空已移除)。
                         ui.horizontal(|ui| {
                             ui.label(
                                 egui::RichText::new(format!("实时选择: {}", self.cdp_status))
                                     .small()
                                     .color(COL_MUTED),
                             );
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.small_button("清空勾选").clicked() {
-                                    self.sel_cdp_members.clear();
-                                }
-                                // R7-20: 一键全选当前实时选择(按 kind:id 去重后追加进勾选区)。
-                                if ui.small_button("全选").clicked() {
-                                    for it in self.live_sel.clone() {
-                                        let key = format!("{}:{}", it.kind, it.id);
-                                        if !self
-                                            .sel_cdp_members
-                                            .iter()
-                                            .any(|(k, i, _, _, _)| format!("{k}:{i}") == key)
-                                        {
-                                            self.sel_cdp_members.push((
-                                                it.kind.to_string(),
-                                                it.id.clone(),
-                                                it.name.clone(),
-                                                it.key.clone(),
-                                                self.sel_camera.clone(),
-                                            ));
-                                        }
-                                    }
-                                }
-                            });
                         });
                         if !self.live_sel.is_empty() {
                             egui::ScrollArea::vertical()
@@ -1693,30 +1643,20 @@ impl eframe::App for PlaApp {
                                 .max_height(90.0)
                                 .show(ui, |ui| {
                                     for it in self.live_sel.clone() {
-                                        let key = format!("{}:{}", it.kind, it.id);
-                                        let mut on = self
-                                            .sel_cdp_members
-                                            .iter()
-                                            .any(|(k, i, _, _, _)| format!("{k}:{i}") == key);
                                         let label = if it.name.is_empty() {
                                             format!("{} ({})", it.ctor, it.kind)
                                         } else {
                                             format!("{} ({})", it.name, it.kind)
                                         };
-                                        if ui.checkbox(&mut on, label).changed() {
-                                            if on {
-                                                self.sel_cdp_members.push((
-                                                    it.kind.to_string(),
-                                                    it.id.clone(),
-                                                    it.name.clone(),
-                                                    it.key.clone(),
-                                                    self.sel_camera.clone(),
-                                                ));
-                                            } else {
-                                                self.sel_cdp_members
-                                                    .retain(|(k, i, _, _, _)| format!("{k}:{i}") != key);
-                                            }
-                                        }
+                                        ui.label(
+                                            egui::RichText::new(format!("● {}", label)).color(
+                                                if it.kind == "face" {
+                                                    COL_YELLOW
+                                                } else {
+                                                    COL_TEXT
+                                                },
+                                            ),
+                                        );
                                     }
                                 });
                         } else {
@@ -1741,7 +1681,7 @@ impl eframe::App for PlaApp {
                                 if name.is_empty() {
                                     self.set_notice((true, "请先在名称框输入选择集名称".into()));
                                 } else if self.sel_cdp_members.is_empty() {
-                                    self.set_notice((true, "实时选择勾选为空".into()));
+                                    self.set_notice((true, "实时选择为空 — 请先在视口里选中目标".into()));
                                 } else {
                                     match pla_ui::selection::save_cdp_selection_with_camera(
                                         &self.doc_key,
@@ -1766,11 +1706,7 @@ impl eframe::App for PlaApp {
                                     }
                                 }
                             }
-                            // R7-28: 重新武装开关 — 不武装时 G/E 对恢复的选择无反应
-                            ui.checkbox(&mut self.sel_rearm, "重新武装")
-                                .on_hover_text(
-                                    "应用前先 shift+D+ESC 跑一个完整命令周期。\n                                     不武装时, 恢复出来的选择按 G/E 等 gizmo 命令无反应\n                                     (实测根因: 程序化恢复不建立应用侧选择状态)。\n                                     副作用: shift+D 会复制当前选择, 可 Ctrl+Z 撤销。",
-                                );
+                            // R7-28: 旧「重新武装」开关已随 v7 镜像模式移除(方案已否决)。
                             if ui.button("应用到 Plasticity").clicked() {
                                 // R7-21: 按成员类型回放 — solid/sheet=addById(数值);
                                 // face/edge 等对象形走 add<Kind>({id,versionId,...}) 原样回放。
@@ -1808,7 +1744,7 @@ impl eframe::App for PlaApp {
                         }
                         if self.sel_saved.is_empty() {
                             ui.label(
-                                egui::RichText::new("(空 — 勾选实时选择后保存)")
+                                egui::RichText::new("(空 — 选中实时选择后保存)")
                                     .small()
                                     .color(COL_MUTED),
                             );
@@ -1881,6 +1817,8 @@ impl eframe::App for PlaApp {
                                                 }
                                             }
                                             // 名称: 点击 = 载入勾选区(可编辑后重存)
+                                            // v7(R7-32): 镜像模式下点击名称 = 只填入名称框。
+                                            // 编辑流程: 「应用」→ 视口里调整选择 → 同名保存(覆盖)。
                                             if ui
                                                 .selectable_label(
                                                     false,
@@ -1889,29 +1827,14 @@ impl eframe::App for PlaApp {
                                                 )
                                                 .clicked()
                                             {
-                                                match pla_ui::selection::load_cdp_selection(
-                                                    &self.doc_key,
-                                                    &meta.name,
-                                                ) {
-                                                    Some(members) => {
-                                                        let n = members.len();
-                                                        self.sel_cdp_members = members
-                                                            .into_iter()
-                                                            .map(|m| (m.kind, m.id, m.name, m.key, m.camera))
-                                                            .collect();
-                                                        self.sel_name = meta.name.clone();
-                                                        self.set_notice((
-                                                            false,
-                                                            format!(
-                                                                "已载入「{}」({n} 项) — 可编辑后重新保存",
-                                                                meta.name
-                                                            ),
-                                                        ));
-                                                    }
-                                                    None => {
-                                                        self.set_notice((true, "读取失败".into()))
-                                                    }
-                                                }
+                                                self.sel_name = meta.name.clone();
+                                                self.set_notice((
+                                                    false,
+                                                    format!(
+                                                        "已填入名称「{}」— 应用后可在视口调整, 再点「保存实时选择」覆盖",
+                                                        meta.name
+                                                    ),
+                                                ));
                                             }
                                             ui.label(
                                                 egui::RichText::new(format!(
@@ -1993,7 +1916,7 @@ impl eframe::App for PlaApp {
                             });
                         ui.label(
                             egui::RichText::new(format!(
-                                "已勾选 {} 个成员",
+                                "当前选择 {} 项(视口实时镜像)",
                                 self.sel_cdp_members.len()
                             ))
                             .small()
