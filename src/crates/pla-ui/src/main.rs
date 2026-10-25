@@ -724,6 +724,28 @@ impl PlaApp {
                             .collect();
                         new_keys.sort();
                         if new_keys != self.live_sel_keys {
+                            // v6.2(用户建议): 新选中项自动勾选 — 相机绑定
+                            // "面被选中"时刻(本快照的 cam, 与选择事件同拍),
+                            // 而非"用户来勾选"时刻(可能已转过视角)。
+                            // 已勾选的成员不动(保留其原相机)。
+                            for it in snap.items.iter() {
+                                let key = pla_ui::selection::member_key(it.kind, &it.id);
+                                let already = self
+                                    .sel_cdp_members
+                                    .iter()
+                                    .any(|(k, i, _, _, _)| {
+                                        pla_ui::selection::member_key(k, i) == key
+                                    });
+                                if !already {
+                                    self.sel_cdp_members.push((
+                                        it.kind.to_string(),
+                                        it.id.clone(),
+                                        it.name.clone(),
+                                        it.key.clone(),
+                                        snap.camera.clone(),
+                                    ));
+                                }
+                            }
                             self.live_sel_keys = new_keys.clone();
                             pla_ui::selection::prune_members_to_live(
                                 &mut self.sel_cdp_members,
