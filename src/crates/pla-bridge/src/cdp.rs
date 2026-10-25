@@ -581,13 +581,16 @@ async fn session_loop(
                 // Phase E(v5.2): 遮挡自动补救 — 快照相机 → addById 临时选中
                 // 被遮挡面 → navigateToSelection() 转到该面正视 → 扫描定位 →
                 // shift+click 补选 → 处理完恢复用户原相机。用户全程无感知。
-                if tally.occluded > 0 {
+                if tally.occluded > 0 || !misses.is_empty() {
                     let mut rescued_occ: Vec<String> = Vec::new();
-                    let occluded_ids: Vec<String> = clicked
+                    // 补救对象 = 被遮挡面 + 扫描未命中面(小面/背对面:
+                    // 当前视角射线扫不到 — 自动转到该面正视即可见, v5.4)
+                    let mut occluded_ids: Vec<String> = clicked
                         .iter()
                         .filter(|(id, _, _)| !face_ids.contains(id))
                         .map(|(id, _, _)| id.clone())
                         .collect();
+                    occluded_ids.extend(misses.iter().cloned());
                     // 相机快照(position/quaternion 直写直读已验证; 不碰投影矩阵)
                     let snap = eval_roundtrip(ws, &mut mid, CAM_SNAPSHOT_JS).await;
                     let cam_saved = snap.unwrap_or_else(|e| {
@@ -656,14 +659,26 @@ async fn session_loop(
                             eprintln!("[pla-cdp] 相机恢复失败: {e:#}");
                         }
                         let _ = dispatch_mouse_move(ws, &mut mid, rect.0 + rect.2 / 2, rect.1 + rect.3 / 2).await;
-                        // 重算 tally: 救回的从遮挡计数移入成功
+                        // 重算 tally: 救回的计入成功(从遮挡/缺失两侧移除)
                         if !rescued_occ.is_empty() {
+                            // 归因: 救回目标原本来自"被遮挡"还是"未扫到"
+                            let occl_set: std::collections::HashSet<&String> = clicked
+                                .iter()
+                                .filter(|(id, _, _)| !face_ids.contains(id))
+                                .map(|(id, _, _)| id)
+                                .collect();
+                            let rescued_from_occ =
+                                rescued_occ.iter().filter(|r| occl_set.contains(*r)).count();
+                            let rescued_from_miss = rescued_occ.len().saturating_sub(rescued_from_occ);
                             tally.confirmed += rescued_occ.len();
-                            tally.occluded -= rescued_occ.len();
+                            tally.occluded = tally.occluded.saturating_sub(rescued_from_occ);
+                            misses.retain(|m| !rescued_occ.contains(m));
                             let _ = ev_tx.send(CdpEvent::Status(format!(
-                                "遮挡自动补救: {}/{} 项经自动转视角补选",
+                                "自动转视角补救: {}/{} 项补选成功(遮挡 {} + 未扫到 {})",
                                 rescued_occ.len(),
-                                occluded_ids.len()
+                                occluded_ids.len(),
+                                rescued_from_occ,
+                                rescued_from_miss
                             )));
                         }
                     }
