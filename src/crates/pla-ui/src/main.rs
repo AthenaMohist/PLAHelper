@@ -464,7 +464,7 @@ fn snap_image(
             ui.add_sized(
                 egui::vec2(iw, ih),
                 egui::Label::new(
-                    egui::RichText::new("📷").size(if cell_w > 100.0 { 30.0 } else { 16.0 }),
+                    egui::RichText::new("无截图").small().color(COL_MUTED),
                 )
                 .sense(egui::Sense::click()),
             )
@@ -643,17 +643,128 @@ fn snap_item(
 }
 
 
+/// R8b: 头部图标按钮种类(SimHei 无 emoji 字形, 全部矢量绘制)。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IconKind {
+    Trash,
+    Folder,
+    Camera,
+    Save,
+}
+
+/// 矢量图标钮: 14x14 画布上按 kind 画线稿。返回点击响应。
+fn vector_icon_button(
+    ui: &mut egui::Ui,
+    kind: IconKind,
+    tip: &str,
+    tip_slot: &std::cell::RefCell<Option<(String, String)>>,
+) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(16.0, 14.0), egui::Sense::click());
+    let col = if resp.hovered() { COL_TEXT } else { COL_MUTED };
+    let p = |x: f32, y: f32| egui::pos2(rect.left() + x, rect.top() + y);
+    let st = egui::Stroke::new(1.3, col);
+    match kind {
+        IconKind::Trash => {
+            // 桶身+盖+提手
+            ui.painter().line_segment([p(3.0, 4.0), p(11.0, 4.0)], st);
+            ui.painter().line_segment([p(5.5, 4.0), p(5.5, 2.5)], st);
+            ui.painter().line_segment([p(8.5, 4.0), p(8.5, 2.5)], st);
+            ui.painter().line_segment([p(6.0, 2.5), p(8.0, 2.5)], st);
+            ui.painter().line_segment([p(4.2, 4.0), p(5.2, 12.0)], st);
+            ui.painter().line_segment([p(9.8, 4.0), p(8.8, 12.0)], st);
+            ui.painter().line_segment([p(5.2, 12.0), p(8.8, 12.0)], st);
+            // 桶内竖线
+            ui.painter().line_segment([p(7.0, 6.0), p(7.0, 10.0)], egui::Stroke::new(1.0, col));
+        }
+        IconKind::Folder => {
+            // 文件夹: 顶舌 + 盒体
+            ui.painter().line_segment([p(2.0, 4.0), p(5.0, 4.0)], st);
+            ui.painter().line_segment([p(5.0, 4.0), p(6.0, 2.8)], st);
+            ui.painter().line_segment([p(6.0, 2.8), p(9.0, 2.8)], st);
+            ui.painter().line_segment([p(9.0, 2.8), p(14.0, 2.8)], st);
+            ui.painter().line_segment([p(14.0, 2.8), p(14.0, 11.5)], st);
+            ui.painter().line_segment([p(14.0, 11.5), p(2.0, 11.5)], st);
+            ui.painter().line_segment([p(2.0, 11.5), p(2.0, 4.0)], st);
+        }
+        IconKind::Camera => {
+            // 相机: 机身 + 镜头圆
+            ui.painter().line_segment([p(2.0, 4.5), p(4.0, 4.5)], st);
+            ui.painter().line_segment([p(4.0, 4.5), p(5.2, 3.0)], st);
+            ui.painter().line_segment([p(5.2, 3.0), p(9.8, 3.0)], st);
+            ui.painter().line_segment([p(9.8, 3.0), p(11.0, 4.5)], st);
+            ui.painter().line_segment([p(11.0, 4.5), p(14.0, 4.5)], st);
+            ui.painter().line_segment([p(14.0, 4.5), p(14.0, 11.5)], st);
+            ui.painter().line_segment([p(14.0, 11.5), p(2.0, 11.5)], st);
+            ui.painter().line_segment([p(2.0, 11.5), p(2.0, 4.5)], st);
+            ui.painter()
+                .circle_stroke(egui::pos2(rect.left() + 8.0, rect.top() + 8.0), 2.2, st);
+        }
+        IconKind::Save => {
+            // 软盘: 外框 + 上缺口标签 + 下标签线
+            ui.painter().line_segment([p(2.0, 2.5), p(11.0, 2.5)], st);
+            ui.painter().line_segment([p(11.0, 2.5), p(14.0, 5.5)], st);
+            ui.painter().line_segment([p(14.0, 5.5), p(14.0, 11.5)], st);
+            ui.painter().line_segment([p(14.0, 11.5), p(2.0, 11.5)], st);
+            ui.painter().line_segment([p(2.0, 11.5), p(2.0, 2.5)], st);
+            ui.painter().line_segment([p(5.0, 2.5), p(5.0, 6.0)], st);
+            ui.painter().line_segment([p(5.0, 6.0), p(10.5, 6.0)], st);
+            ui.painter().line_segment([p(10.5, 6.0), p(10.5, 2.5)], st);
+            ui.painter().line_segment([p(5.0, 9.5), p(11.0, 9.5)], st);
+        }
+    }
+    if resp.hovered() {
+        *tip_slot.borrow_mut() = Some((tip.to_string(), String::new()));
+    }
+    resp
+}
+
+/// R8b: 通用删除确认弹层 — 覆盖在面板视口顶部居中(egui::Area + 新 layer)。
+/// 不占内容流空间(行内确认条会被 auto_shrink 滚动区推出可视区, 实测不可见)。
+/// 返回 Some(true)=确认, Some(false)=取消, None=仍在展示。
+fn confirm_popup(
+    ctx: &egui::Context,
+    id: &str,
+    text: &str,
+) -> Option<bool> {
+    let mut result = None;
+    egui::Area::new(egui::Id::new(format!("confirm-{id}")))
+        .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 24.0))
+        .order(egui::Order::Foreground)
+        .interactable(true)
+        .show(ctx, |ui| {
+            egui::Frame::none()
+                .fill(egui::Color32::from_rgb(0x24, 0x24, 0x24))
+                .rounding(egui::Rounding::same(8.0))
+                .stroke(egui::Stroke::new(1.0, COL_RED))
+                .inner_margin(egui::Margin::same(10.0))
+                .show(ui, |ui| {
+                    ui.set_min_width(200.0);
+                    ui.label(
+                        egui::RichText::new(text).small().color(COL_RED),
+                    );
+                    ui.horizontal(|ui| {
+                        if ui.button("确认删除").clicked() {
+                            result = Some(true);
+                        }
+                        if ui.button("取消").clicked() {
+                            result = Some(false);
+                        }
+                    });
+                });
+        });
+    result
+}
+
 fn panel_header(ui: &mut egui::Ui, title: &str, open: &mut bool, icons: Option<Box<dyn FnOnce(&mut egui::Ui)>>) {
     ui.horizontal(|ui| {
-        // R8b: 拖动手柄(⋮⋮) — 拖动整个面板。位移经 header_drag 传出。
-        let (hr, hresp) = ui.allocate_exact_size(egui::vec2(16.0, 14.0), egui::Sense::drag());
-        ui.painter().text(
-            hr.center(),
-            egui::Align2::CENTER_CENTER,
-            "⋮⋮",
-            egui::FontId::proportional(9.0),
-            COL_MUTED,
-        );
+        // R8b: 拖动手柄 — 矢量画 2 列×3 点(SimHei 无 ⋮ 字形, 文本会渲染成豆腐块)。
+        let (hr, hresp) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::drag());
+        let col = if hresp.hovered() { COL_TEXT } else { COL_MUTED };
+        for cx in [hr.left() + 4.0, hr.left() + 9.0] {
+            for cy in [hr.top() + 3.5, hr.center().y, hr.bottom() - 3.5] {
+                ui.painter().circle_filled(egui::pos2(cx, cy), 1.3, col);
+            }
+        }
         if hresp.dragged() {
             PANEL_DRAG_DELTA.with(|d| {
                 let mut d2 = d.borrow_mut();
@@ -1647,31 +1758,26 @@ impl eframe::App for PlaApp {
                     tip_slot.clone(),
                 );
                 let icons: Box<dyn FnOnce(&mut egui::Ui)> = Box::new(move |ui| {
-                    let icon_btn = |ui: &mut egui::Ui,
-                                    glyph: &str,
-                                    tip: &str,
-                                    hit: &std::cell::Cell<bool>,
-                                    ts: &std::cell::RefCell<Option<(String, String)>>| {
-                        let resp = ui.add(
-                            egui::Button::new(
-                                egui::RichText::new(glyph)
-                                    .size(13.0)
-                                    .color(egui::Color32::WHITE),
-                            )
-                            .frame(false)
-                            .rounding(egui::Rounding::same(4.0)),
-                        );
-                        if resp.hovered() {
-                            *ts.borrow_mut() = Some((format!("{glyph} {tip}"), String::new()));
-                        }
+                    let vbtn = |ui: &mut egui::Ui,
+                                kind: IconKind,
+                                tip: &str,
+                                hit: &std::cell::Cell<bool>,
+                                ts: &std::cell::RefCell<Option<(String, String)>>| {
+                        let resp = vector_icon_button(ui, kind, tip, ts);
                         if resp.clicked() {
                             hit.set(true);
                         }
                     };
-                    // right_to_left 布局: 先加的靠右 → 视觉顺序 🗑 📂 📷 ×(右→左)
-                    icon_btn(ui, "🗑", "管理 — 多选删除", &dm, &ts);
-                    icon_btn(ui, "📂", "打开快照文件夹", &dod, &ts);
-                    icon_btn(ui, "📷", "手动快照 — 保存文档副本 + 截图当前画面", &ds, &ts);
+                    // right_to_left: 视觉顺序(右→左) = 🗑 📂 📷 ×
+                    vbtn(ui, IconKind::Trash, "管理 — 多选删除", &dm, &ts);
+                    vbtn(ui, IconKind::Folder, "打开快照文件夹", &dod, &ts);
+                    vbtn(
+                        ui,
+                        IconKind::Camera,
+                        "手动快照 — 保存文档副本 + 截图当前画面",
+                        &ds,
+                        &ts,
+                    );
                 });
                 header_extra_and_show(
                     ctx,
@@ -1696,7 +1802,7 @@ impl eframe::App for PlaApp {
                                 );
                                 let del = ui.add(
                                     egui::Button::new(
-                                        egui::RichText::new("🗑 删除所选")
+                                        egui::RichText::new("删除所选")
                                             .small()
                                             .color(egui::Color32::WHITE),
                                     )
@@ -1773,7 +1879,7 @@ impl eframe::App for PlaApp {
                             };
                             if self.snapshots.is_empty() {
                                 ui.label(
-                                    egui::RichText::new("(暂无快照 — 点右上 📷 拍摄)").color(COL_MUTED),
+                                    egui::RichText::new("(暂无快照 — 点右上相机图标拍摄)").color(COL_MUTED),
                                 );
                             }
                             if !fav_list.is_empty() {
@@ -1888,19 +1994,14 @@ impl eframe::App for PlaApp {
                         if let Some(t) = tip_slot.into_inner() {
                             self.hovered_hint = Some(t);
                         }
-                        // R8-2: 单删确认(行内, 不遮内容)
+                        // R8b: 单删确认 — 弹层(行内条会被滚动区推出可视区, 实测不可见)
                         if let Some(name) = self.snap_delete_confirm.clone() {
-                            ui.separator();
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "删除「{}」? 含截图, 不可恢复",
-                                        name.trim_end_matches(".plasticity")
-                                    ))
-                                    .small()
-                                    .color(COL_RED),
-                                );
-                                if ui.small_button("确认删除").clicked() {
+                            let text = format!(
+                                "删除「{}」? 含截图, 不可恢复",
+                                name.trim_end_matches(".plasticity")
+                            );
+                            match confirm_popup(ui.ctx(), "snap-del", &text) {
+                                Some(true) => {
                                     match pla_ui::snapshot::delete_snapshots(
                                         &self.doc_key,
                                         &[name.clone()],
@@ -1921,10 +2022,9 @@ impl eframe::App for PlaApp {
                                     }
                                     self.snap_delete_confirm = None;
                                 }
-                                if ui.small_button("取消").clicked() {
-                                    self.snap_delete_confirm = None;
-                                }
-                            });
+                                Some(false) => self.snap_delete_confirm = None,
+                                None => {}
+                            }
                         }
                         if let Some(n) = delete_ask {
                             self.snap_delete_confirm = Some(n);
@@ -2028,22 +2128,15 @@ impl eframe::App for PlaApp {
                 let tip_slot = std::rc::Rc::new(std::cell::RefCell::new(None::<(String, String)>));
                 let (dsv, dodv, dmv, tsv) = (do_save.clone(), do_open_dir.clone(), do_manage.clone(), tip_slot.clone());
                 let icons: Box<dyn FnOnce(&mut egui::Ui)> = Box::new(move |ui| {
-                    let icon_btn = |ui: &mut egui::Ui, glyph: &str, tip: &str, hit: &std::cell::Cell<bool>, ts: &std::cell::RefCell<Option<(String, String)>>| {
-                        let resp = ui.add(
-                            egui::Button::new(egui::RichText::new(glyph).size(13.0).color(egui::Color32::WHITE))
-                                .frame(false)
-                                .rounding(egui::Rounding::same(4.0)),
-                        );
-                        if resp.hovered() {
-                            *ts.borrow_mut() = Some((format!("{glyph} {tip}"), String::new()));
-                        }
+                    let vbtn = |ui: &mut egui::Ui, kind: IconKind, tip: &str, hit: &std::cell::Cell<bool>, ts: &std::cell::RefCell<Option<(String, String)>>| {
+                        let resp = vector_icon_button(ui, kind, tip, ts);
                         if resp.clicked() {
                             hit.set(true);
                         }
                     };
-                    icon_btn(ui, "🗑", "批量删除", &dmv, &tsv);
-                    icon_btn(ui, "📂", "打开选择集文件夹", &dodv, &tsv);
-                    icon_btn(ui, "💾", "保存当前选择(SG 自动命名 + 截图)", &dsv, &tsv);
+                    vbtn(ui, IconKind::Trash, "批量删除", &dmv, &tsv);
+                    vbtn(ui, IconKind::Folder, "打开选择集文件夹", &dodv, &tsv);
+                    vbtn(ui, IconKind::Save, "保存当前选择(SG 自动命名 + 截图)", &dsv, &tsv);
                 });
                 header_extra_and_show(
                     ctx,
@@ -2076,7 +2169,7 @@ impl eframe::App for PlaApp {
                         let (fav_list, other_list): (Vec<_>, Vec<_>) =
                             self.sel_saved.iter().cloned().partition(|m| m.fav);
                         if self.sel_saved.is_empty() {
-                            ui.label(egui::RichText::new("(空 — 视口选中后点 💾 保存)").small().color(COL_MUTED));
+                            ui.label(egui::RichText::new("(空 — 视口选中后点右上软盘图标保存)").small().color(COL_MUTED));
                         }
                         let mut delete_ask: Option<String> = None;
                         let mut apply_now: Option<String> = None;
@@ -2129,7 +2222,7 @@ impl eframe::App for PlaApp {
                                                 }
                                                 _ => ui.add_sized(
                                                     egui::vec2(w, img_h),
-                                                    egui::Label::new(egui::RichText::new("🎯").size(20.0)).sense(egui::Sense::click()),
+                                                    egui::Label::new(egui::RichText::new("无截图").small().color(COL_MUTED)).sense(egui::Sense::click()),
                                                 ),
                                             };
                                             if img_resp.hovered() {
@@ -2222,13 +2315,15 @@ impl eframe::App for PlaApp {
                                     }
                                 }
                             });
-                        // 删除确认
+                        // 删除确认(R8b: 弹层)
                         if let Some(name) = self.sel_delete_confirm.clone() {
-                            ui.separator();
-                            ui.horizontal(|ui| {
-                                ui.label(egui::RichText::new(format!("删除「{name}」? 含截图, 不可恢复")).small().color(COL_RED));
-                                if ui.small_button("确认删除").clicked() {
-                                    match pla_ui::selection::delete_cdp_selections_batch(&self.doc_key, &[name.clone()]) {
+                            let text = format!("删除「{name}」? 含截图, 不可恢复");
+                            match confirm_popup(ui.ctx(), "sel-del", &text) {
+                                Some(true) => {
+                                    match pla_ui::selection::delete_cdp_selections_batch(
+                                        &self.doc_key,
+                                        &[name.clone()],
+                                    ) {
                                         Ok(_) => {
                                             self.sel_saved_loaded = false;
                                             self.sel_pngs.remove(&name);
@@ -2239,10 +2334,9 @@ impl eframe::App for PlaApp {
                                     }
                                     self.sel_delete_confirm = None;
                                 }
-                                if ui.small_button("取消").clicked() {
-                                    self.sel_delete_confirm = None;
-                                }
-                            });
+                                Some(false) => self.sel_delete_confirm = None,
+                                None => {}
+                            }
                         }
                         if let Some(n) = delete_ask {
                             self.sel_delete_confirm = Some(n);
@@ -2251,7 +2345,7 @@ impl eframe::App for PlaApp {
                         if self.sel_manage {
                             ui.horizontal(|ui| {
                                 ui.label(egui::RichText::new(format!("已选 {}", self.sel_selected.len())).small().color(COL_MUTED));
-                                if ui.small_button("🗑 删除所选").clicked() && !self.sel_selected.is_empty() {
+                                if ui.small_button("删除所选").clicked() && !self.sel_selected.is_empty() {
                                     let names: Vec<String> = self.sel_selected.iter().cloned().collect();
                                     match pla_ui::selection::delete_cdp_selections_batch(&self.doc_key, &names) {
                                         Ok(n) => {
@@ -2423,22 +2517,15 @@ impl eframe::App for PlaApp {
                 let tip_slot = std::rc::Rc::new(std::cell::RefCell::new(None::<(String, String)>));
                 let (dsv, dodv, dmv, tsv) = (do_save.clone(), do_open_dir.clone(), do_manage.clone(), tip_slot.clone());
                 let icons: Box<dyn FnOnce(&mut egui::Ui)> = Box::new(move |ui| {
-                    let icon_btn = |ui: &mut egui::Ui, glyph: &str, tip: &str, hit: &std::cell::Cell<bool>, ts: &std::cell::RefCell<Option<(String, String)>>| {
-                        let resp = ui.add(
-                            egui::Button::new(egui::RichText::new(glyph).size(13.0).color(egui::Color32::WHITE))
-                                .frame(false)
-                                .rounding(egui::Rounding::same(4.0)),
-                        );
-                        if resp.hovered() {
-                            *ts.borrow_mut() = Some((format!("{glyph} {tip}"), String::new()));
-                        }
+                    let vbtn = |ui: &mut egui::Ui, kind: IconKind, tip: &str, hit: &std::cell::Cell<bool>, ts: &std::cell::RefCell<Option<(String, String)>>| {
+                        let resp = vector_icon_button(ui, kind, tip, ts);
                         if resp.clicked() {
                             hit.set(true);
                         }
                     };
-                    icon_btn(ui, "🗑", "批量删除", &dmv, &tsv);
-                    icon_btn(ui, "📂", "打开视口状态文件夹", &dodv, &tsv);
-                    icon_btn(ui, "💾", "保存当前视口状态(VS 自动命名 + 截图)", &dsv, &tsv);
+                    vbtn(ui, IconKind::Trash, "批量删除", &dmv, &tsv);
+                    vbtn(ui, IconKind::Folder, "打开视口状态文件夹", &dodv, &tsv);
+                    vbtn(ui, IconKind::Save, "保存当前视口状态(VS 自动命名 + 截图)", &dsv, &tsv);
                 });
                 header_extra_and_show(
                     ctx,
@@ -2466,7 +2553,7 @@ impl eframe::App for PlaApp {
                         let (fav_list, other_list): (Vec<_>, Vec<_>) =
                             self.vp_states.iter().cloned().partition(|m| m.fav);
                         if self.vp_states.is_empty() {
-                            ui.label(egui::RichText::new("(空 — 点 💾 保存当前视口)").small().color(COL_MUTED));
+                            ui.label(egui::RichText::new("(空 — 点右上软盘图标保存当前视口)").small().color(COL_MUTED));
                         }
                         let mut delete_ask: Option<String> = None;
                         let mut apply_now: Option<String> = None;
@@ -2532,7 +2619,7 @@ impl eframe::App for PlaApp {
                                                 }
                                                 _ => ui.add_sized(
                                                     egui::vec2(w, img_h),
-                                                    egui::Label::new(egui::RichText::new("🎥").size(20.0)).sense(egui::Sense::click()),
+                                                    egui::Label::new(egui::RichText::new("无截图").small().color(COL_MUTED)).sense(egui::Sense::click()),
                                                 ),
                                             };
                                             if img_resp.hovered() {
@@ -2614,13 +2701,15 @@ impl eframe::App for PlaApp {
                                     }
                                 }
                             });
-                        // 删除确认
+                        // 删除确认(R8b: 弹层)
                         if let Some(name) = self.vp_delete_confirm.clone() {
-                            ui.separator();
-                            ui.horizontal(|ui| {
-                                ui.label(egui::RichText::new(format!("删除「{name}」? 不可恢复")).small().color(COL_RED));
-                                if ui.small_button("确认删除").clicked() {
-                                    match pla_ui::vpstate::delete_vpstates(&self.doc_key, &[name.clone()]) {
+                            let text = format!("删除「{name}」? 不可恢复");
+                            match confirm_popup(ui.ctx(), "vp-del", &text) {
+                                Some(true) => {
+                                    match pla_ui::vpstate::delete_vpstates(
+                                        &self.doc_key,
+                                        &[name.clone()],
+                                    ) {
                                         Ok(_) => {
                                             self.vp_states_loaded = false;
                                             self.vp_pngs.remove(&name);
@@ -2630,10 +2719,9 @@ impl eframe::App for PlaApp {
                                     }
                                     self.vp_delete_confirm = None;
                                 }
-                                if ui.small_button("取消").clicked() {
-                                    self.vp_delete_confirm = None;
-                                }
-                            });
+                                Some(false) => self.vp_delete_confirm = None,
+                                None => {}
+                            }
                         }
                         if let Some(n) = delete_ask {
                             self.vp_delete_confirm = Some(n);
@@ -2801,7 +2889,7 @@ impl eframe::App for PlaApp {
                                     }
                                 }
                             }
-                            if ui.button("💾 保存关联").clicked() {
+                            if ui.button("保存关联").clicked() {
                                 let Some(name) = self.dim_sets.get(self.dim_set_sel).cloned() else {
                                     self.set_notice((true, "没有关联的选择集".into()));
                                     return;
