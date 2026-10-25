@@ -940,11 +940,13 @@ fn apply_sel_js(entries: &[ApplyEntry]) -> anyhow::Result<String> {
   var c=document.querySelector('plasticity-viewport canvas');
   if(!c) return JSON.stringify({ok:0,fail:0,errs:['no-canvas']});
   var cs = ed.changeSelection;
-  if(cs && cs.onHover && !window.__PLA_SPY5B__){
+  if(cs && cs.onHover && window.__PLA_SPY_VER__ !== 2){
     var orig = cs.onHover;
     var wrapped = function(hits){
       try{
-        var vp=null; ed.viewports.forEach(function(v){if(!vp)vp=v});
+        var edDyn = window.__PLA_HOOK__ ? window.__PLA_HOOK__.findEditor() : null;
+        if(!edDyn) edDyn = ed;
+        var vp=null; edDyn.viewports.forEach(function(v){if(!vp)vp=v});
         var pe = vp && vp.lastPointerEvent;
         var px = pe && typeof pe.clientX==='number' ? pe.clientX : null;
         var py = pe && typeof pe.clientY==='number' ? pe.clientY : null;
@@ -964,6 +966,7 @@ fn apply_sel_js(entries: &[ApplyEntry]) -> anyhow::Result<String> {
     try{ Object.defineProperty(wrapped,'name',{value:'__plaSpy5b'}) }catch(e4){}
     cs.onHover = wrapped;
     window.__PLA_SPY5B__ = true;
+    window.__PLA_SPY_VER__ = 2;
   }
   window.__PLA_MAP__ = {};
   var r=c.getBoundingClientRect();
