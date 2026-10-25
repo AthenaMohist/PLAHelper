@@ -637,6 +637,19 @@ async fn session_loop(
                     });
                     if !cam_saved.is_empty() {
                         for occ_id in &occluded_ids {
+                            // v6.1: 若该成员自带保存相机, 先直达该视角(比
+                            // navigateToSelection 的单面取景更忠实于保存环境)
+                            if let Some(mc) = entries
+                                .iter()
+                                .find(|e| e.id == *occ_id)
+                                .and_then(|e| e.camera.clone())
+                            {
+                                let enter_js = format!(
+                                    "(function(){{try{{var o={mc};var ed=window.__PLA_EDITOR__;if(!ed){{var f=window.__PLA_HOOK__;if(f)ed=f.findEditor();}}if(!ed)return 'no-ed';var vp=null;ed.viewports.forEach(function(v){{if(!vp)vp=v}});var cam=vp.camera;cam.position.set(o.px,o.py,o.pz);cam.quaternion.set(o.qx,o.qy,o.qz,o.qw);try{{vp.setNeedsRender()}}catch(e2){{}}return 'ok'}}catch(e){{return 'EXC'}}}})()"
+                                );
+                                let _ = eval_roundtrip(ws, &mut mid, &enter_js).await;
+                                tokio::time::sleep(Duration::from_millis(350)).await;
+                            }
                             // 1) addById 临时选中该面(navigateToSelection 只读选择,
                             //    不需要点击管线的活跃实体上下文)
                             let select_js = format!(
