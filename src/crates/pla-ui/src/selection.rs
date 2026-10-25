@@ -114,6 +114,52 @@ pub struct CdpMember {
     /// 快照采集的原始 id 元素 JSON(对象形 {id,versionId,...}); None = 纯数值 id。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
+    /// v6(R7-31l): 保存时刻的相机(整集共享, 存在每个成员上冗余但兼容);
+    /// None = 旧版选择集无相机。内容为 CAM_SNAPSHOT_JS 的 JSON 字符串。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub camera: Option<String>,
+}
+
+/// v6: 带相机保存 — members 同上, camera 为 CAM_SNAPSHOT_JS 输出(None=不存)。
+pub fn save_cdp_selection_with_camera(
+    doc_key: &str,
+    name: &str,
+    members: &[(String, String, String, Option<String>)],
+    camera: Option<&str>,
+) -> Result<String, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("选择集名称为空 — 请先在名称框输入".into());
+    }
+    if members.is_empty() {
+        return Err("实时选择勾选为空".into());
+    }
+    let exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let dir = exe.join("selections-cdp").join(sanitize(doc_key));
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建目录失败: {e}"))?;
+    let items: Vec<CdpMember> = members
+        .iter()
+        .map(|(k, i, n, key)| CdpMember {
+            kind: k.clone(),
+            id: i.clone(),
+            name: n.clone(),
+            key: key.clone(),
+            camera: camera.map(|c| c.to_string()),
+        })
+        .collect();
+    let json = serde_json::json!({
+        "doc_key": doc_key,
+        "name": name,
+        "fav": false,
+        "members": items,
+    });
+    let path = dir.join(format!("{}.json", sanitize(name)));
+    std::fs::write(&path, serde_json::to_string_pretty(&json).map_err(|e| e.to_string())?)
+        .map_err(|e| format!("写文件失败: {e}"))?;
+    Ok(path.display().to_string())
 }
 
 /// 保存 CDP 选择集(R7-14): exe 同级 `selections-cdp/<doc_key>/<名称>.json`。
@@ -143,6 +189,7 @@ pub fn save_cdp_selection(
             id: i.clone(),
             name: n.clone(),
             key: key.clone(),
+            camera: None,
         })
         .collect();
     let json = serde_json::json!({
@@ -277,6 +324,7 @@ pub fn load_cdp_selection(doc_key: &str, name: &str) -> Option<Vec<CdpMember>> {
                         id: m["id"].as_str().unwrap_or("").to_string(),
                         name: m["name"].as_str().unwrap_or("").to_string(),
                         key: m.get("key").and_then(|k| k.as_str()).map(String::from),
+                        camera: m.get("camera").and_then(|c| c.as_str()).map(String::from),
                     })
                     .collect()
             })

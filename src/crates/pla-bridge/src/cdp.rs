@@ -57,6 +57,10 @@ pub struct ApplyEntry {
     pub id: String,
     /// 保存时采集的原始 id 元素 JSON(对象形); None = 纯数值 id。
     pub key: Option<String>,
+    /// v6(R7-31l): 保存时刻的相机 JSON({px,py,pz,qx,qy,qz,qw})。
+    /// Some 时应用流程 = 还原保存视角 → 点击 → 恢复用户视角(按图索骥,
+    /// 保存视角下目标面必然正对可见)。None = 旧选择集, 走当前视角扫描。
+    pub camera: Option<String>,
 }
 
 /// CDP 线程 → UI 事件。
@@ -98,6 +102,9 @@ pub struct SelectionSnapshot {
     pub geo_ver: i64,
     /// R7-27: Plasticity 侧最近一次命令报错(原文 + 堆栈), 供 UI 显示。
     pub error: Option<(String, String)>,
+    /// v6(R7-31l): 当前相机 JSON 字符串({px..qw}); UI 保存选择集时随集存储,
+    /// 应用时还原(按图索骥)。None = 读取失败。
+    pub camera: Option<String>,
 }
 
 /// 实体树节点（平铺, indent 表层级）。
@@ -164,10 +171,15 @@ const SEL_SNAPSHOT_JS: &str = r#"(function(){
   var undo=-1, geoVer=-1;
   try{ undo = ed.history._undoStack.length }catch(e){}
   try{ geoVer = ed.geo._version!==undefined? ed.geo._version : ed.geo.version }catch(e){}
+  var cam=null;
+  try{ var vp2=null; ed.viewports.forEach(function(v){if(!vp2)vp2=v});
+    if(vp2&&vp2.camera){ var c2=vp2.camera;
+      cam={px:c2.position.x,py:c2.position.y,pz:c2.position.z,
+           qx:c2.quaternion.x,qy:c2.quaternion.y,qz:c2.quaternion.z,qw:c2.quaternion.w}; } }catch(e){}
   var lastErr = null;
   try{ var le = window.__PLA_LAST_ERROR__; if(le && le.msg) lastErr = { msg: String(le.msg).slice(0,200), stack: String(le.stack||'').slice(0,600), ts: le.ts }; }catch(e){}
   return JSON.stringify({ st:'ok', size: (typeof s.size==='number')? s.size : -1,
-    undo: undo, geoVer: geoVer, err: lastErr,
+    undo: undo, geoVer: geoVer, err: lastErr, cam: cam,
     ids: idset('ids'),
     solidIds: idset('solidIds'), sheetIds: idset('sheetIds'),
     faceIds: idset('faceIds'), edgeIds: idset('edgeIds'),
@@ -402,6 +414,32 @@ async fn session_loop(
                 if entries.is_empty() {
                     let _ = ev_tx.send(CdpEvent::Status("选择集应用: 成员为空".into()));
                     continue;
+                }
+                // v6(R7-31l) Phase 0: 还原保存视角(按图索骥)。
+                // 保存相机随集存储; 有则先快照用户相机 → 切到保存相机,
+                // 结束时(无论成败)恢复。旧集无相机 → 跳过(走当前视角)。
+                let saved_cam: Option<String> = entries
+                    .iter()
+                    .find_map(|e| e.camera.clone())
+                    .filter(|c| !c.is_empty());
+                let mut user_cam: Option<String> = None;
+                if let Some(cam_json) = saved_cam.as_ref() {
+                    match eval_roundtrip(ws, &mut mid, CAM_SNAPSHOT_JS).await {
+                        Ok(s) if !s.is_empty() => user_cam = Some(s),
+                        Ok(_) => eprintln!("[pla-cdp] v6: 用户相机快照为空(仍继续)"),
+                        Err(e) => eprintln!("[pla-cdp] v6: 用户相机快照失败(仍继续): {e:#}"),
+                    }
+                    let enter_js = format!(
+                        "(function(){{try{{var o={cam_json};var ed=window.__PLA_EDITOR__;if(!ed){{var f=window.__PLA_HOOK__;if(f)ed=f.findEditor();}}if(!ed)return 'no-ed';var vp=null;ed.viewports.forEach(function(v){{if(!vp)vp=v}});if(!vp||!vp.camera)return 'no-cam';var cam=vp.camera;cam.position.set(o.px,o.py,o.pz);cam.quaternion.set(o.qx,o.qy,o.qz,o.qw);try{{vp.setNeedsRender()}}catch(e2){{}}return 'ok'}}catch(e){{return 'EXC'}}}})()"
+                    );
+                    match eval_roundtrip(ws, &mut mid, &enter_js).await {
+                        Ok(r) if r.contains("ok") => {
+                            eprintln!("[pla-cdp] v6: 已切换到保存视角");
+                        }
+                        other => eprintln!("[pla-cdp] v6: 保存视角切换异常: {other:?}"),
+                    }
+                    // 相机切换后渲染/命中管线需要一拍稳定
+                    tokio::time::sleep(Duration::from_millis(350)).await;
                 }
                 let js = match apply_sel_js(&entries) {
                     Ok(j) => j,
@@ -707,6 +745,15 @@ async fn session_loop(
                 } else {
                     format!("选择集已应用: {ok} 项成功(真实点击管线)")
                 };
+                // v6: 恢复用户相机(保存视角仅用于点击, 用完即还)
+                if let Some(uc) = user_cam.as_ref() {
+                    let restore_js = format!(
+                        "(function(){{try{{var o={uc};var ed=window.__PLA_EDITOR__;if(!ed){{var f=window.__PLA_HOOK__;if(f)ed=f.findEditor();}}if(!ed)return 'no-ed';var vp=null;ed.viewports.forEach(function(v){{if(!vp)vp=v}});var cam=vp.camera;cam.position.set(o.px,o.py,o.pz);cam.quaternion.set(o.qx,o.qy,o.qz,o.qw);try{{vp.setNeedsRender()}}catch(e2){{}}return 'ok'}}catch(e){{return 'EXC'}}}})()"
+                    );
+                    if let Err(e) = eval_roundtrip(ws, &mut mid, &restore_js).await {
+                        eprintln!("[pla-cdp] v6: 用户相机恢复失败: {e:#}");
+                    }
+                }
                 let _ = ev_tx.send(CdpEvent::Status(msg));
             }
             // R7-28: 先「重新武装」再恢复 — 见 CdpCmd::ApplySelRearm 注释。
@@ -888,6 +935,7 @@ async fn session_loop(
                                 v["err"]["stack"].as_str().unwrap_or("").to_string(),
                             )
                         }),
+                        camera: v["cam"].as_object().map(|c| Value::Object(c.clone()).to_string()),
                     }));
                 } else {
                     let _ = ev_tx.send(CdpEvent::Selection(SelectionSnapshot {
@@ -898,6 +946,7 @@ async fn session_loop(
                         undo_len: -1,
                         geo_ver: -1,
                         error: None,
+                        camera: None,
                     }));
                 }
             }
@@ -1437,9 +1486,9 @@ mod tests {
     #[test]
     fn dump_apply_sel_js() {
         let entries = vec![
-            ApplyEntry { kind: "face".into(), id: "14f2025".into(), key: None },
-            ApplyEntry { kind: "edge".into(), id: "14e1984".into(), key: None },
-            ApplyEntry { kind: "solid".into(), id: "7".into(), key: None },
+            ApplyEntry { kind: "face".into(), id: "14f2025".into(), key: None, camera: None },
+            ApplyEntry { kind: "edge".into(), id: "14e1984".into(), key: None, camera: None },
+            ApplyEntry { kind: "solid".into(), id: "7".into(), key: None, camera: None },
         ];
         let js = apply_sel_js(&entries).unwrap();
         eprintln!("===GENERATED-JS-BEGIN===");

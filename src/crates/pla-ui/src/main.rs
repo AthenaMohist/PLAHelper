@@ -144,6 +144,8 @@ struct PlaApp {
     cdp_tree: Vec<(String, String, i64, bool)>,
     /// CDP 选择集勾选成员 (kind, id, name, key=原始 id 元素 JSON)。
     sel_cdp_members: Vec<(String, String, String, Option<String>)>,
+    /// v6: 最新实时相机(来自选择快照流), 保存选择集时随集存储。
+    sel_camera: Option<String>,
     /// R7-20: 已保存 CDP 选择集(收藏优先); 打开面板/变更后置 sel_saved_loaded=false 重载。
     sel_saved: Vec<pla_ui::selection::CdpSelMeta>,
     sel_saved_loaded: bool,
@@ -628,6 +630,7 @@ impl PlaApp {
             sel_rearm: false,
             cdp_tree: Vec::new(),
             sel_cdp_members: Vec::new(),
+            sel_camera: None,
             sel_saved: Vec::new(),
             sel_saved_loaded: false,
             sel_rename: None,
@@ -694,6 +697,10 @@ impl PlaApp {
                 pla_bridge::cdp::CdpEvent::Selection(snap) => {
                     if snap.undo_len >= 0 {
                         self.cdp_undo = snap.undo_len;
+                    }
+                    // v6(R7-31l): 持续跟踪最新相机(保存选择集时随集存储)。
+                    if snap.camera.is_some() {
+                        self.sel_camera = snap.camera.clone();
                     }
                     // R7-27: Plasticity 侧命令报错(例如 G 移动的 "reading 'active'")
                     // 直接显示在助手面板, 不用只盯着 Plasticity 的弹窗。
@@ -1712,10 +1719,11 @@ impl eframe::App for PlaApp {
                                 } else if self.sel_cdp_members.is_empty() {
                                     self.set_notice((true, "实时选择勾选为空".into()));
                                 } else {
-                                    match pla_ui::selection::save_cdp_selection(
+                                    match pla_ui::selection::save_cdp_selection_with_camera(
                                         &self.doc_key,
                                         &name,
                                         &self.sel_cdp_members.clone(),
+                                        self.sel_camera.as_deref(),
                                     ) {
                                         Ok(path) => {
                                             // R7-21: 保存成功立即刷新 SAVED SELECTIONS 墙。
@@ -1749,6 +1757,7 @@ impl eframe::App for PlaApp {
                                         kind: k.clone(),
                                         id: i.clone(),
                                         key: key.clone(),
+                                        camera: None,
                                     })
                                     .collect();
                                 if entries.is_empty() {
@@ -1925,6 +1934,7 @@ impl eframe::App for PlaApp {
                                                                         kind: m.kind.clone(),
                                                                         id: m.id.clone(),
                                                                         key: m.key.clone(),
+                                                                        camera: m.camera.clone(),
                                                                     })
                                                                     .collect();
                                                                 if entries.is_empty() {
@@ -2033,6 +2043,7 @@ impl eframe::App for PlaApp {
                                                 kind: m.kind.clone(),
                                                 id: m.id.clone(),
                                                 key: m.key.clone(),
+                                                camera: m.camera.clone(),
                                             })
                                             .collect();
                                         if entries.is_empty() {
