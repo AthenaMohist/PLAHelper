@@ -137,7 +137,62 @@ pub fn take_manual_snapshot(doc_key: &str, plasticity_hwnd: Option<isize>) -> Re
 
 /// 当前文档对应的快照目录(不创建)。
 pub fn snapshot_dir_of(doc_key: &str) -> PathBuf {
-    snapshot_dir_for(find_latest_doc(doc_key).as_ref())
+    snapshot_dir_for(latest_doc_cached(doc_key).as_ref())
+}
+
+// ---------------- R9: 文档跟随型存档(选择集/视口状态) ----------------
+/// 文档定位结果缓存(`find_latest_doc` 要扫 Recent 的 .lnk 并逐个解析
+/// IShellLinkW, 单帧会被调用十几次 → 不缓存会拖慢 UI)。TTL 2s: 文档切换后
+/// 最多延迟 2s 生效, 不影响正确性(目录只用于读写存档)。
+static DOC_CACHE: std::sync::Mutex<Option<(String, PathBuf, std::time::Instant)>> =
+    std::sync::Mutex::new(None);
+const DOC_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// 带缓存的「当前文档路径」。
+pub fn latest_doc_cached(doc_key: &str) -> Option<PathBuf> {
+    let now = std::time::Instant::now();
+    if let Ok(g) = DOC_CACHE.lock() {
+        if let Some((k, p, t)) = &*g {
+            if k == doc_key && now.duration_since(*t) < DOC_CACHE_TTL {
+                return Some(p.clone());
+            }
+        }
+    }
+    let p = find_latest_doc(doc_key)?;
+    if let Ok(mut g) = DOC_CACHE.lock() {
+        *g = Some((doc_key.to_string(), p.clone(), now));
+    }
+    Some(p)
+}
+
+/// R9: 文档同级存档目录 —— `<文档目录>/.pla/<sub>/<doc_key>`。
+/// 快照走 `<文档目录>/snapshot/`, 选择集/视口状态走 `.pla/selections`、
+/// `.pla/viewstates`(隐藏目录, 不污染文档文件夹)。定位不到文档 → None,
+/// 由调用方退回 exe 同级的旧位置。
+pub fn doc_side_dir(doc_key: &str, sub: &str) -> Option<PathBuf> {
+    let doc = latest_doc_cached(doc_key)?;
+    let parent = doc.parent()?;
+    Some(parent.join(".pla").join(sub).join(sanitize_filename(doc_key)))
+}
+
+/// R9: 旧存档(exe 同级)首次使用时迁到文档同级 — 只复制不删旧文件,
+/// 换机/换文档都不会丢历史选择集。失败静默(下次再试)。
+pub fn migrate_dir(legacy: &std::path::Path, new: &std::path::Path) {
+    if legacy == new || !legacy.is_dir() || new.exists() {
+        return;
+    }
+    if std::fs::create_dir_all(new).is_err() {
+        return;
+    }
+    let Ok(rd) = std::fs::read_dir(legacy) else { return };
+    let mut any = false;
+    for e in rd.flatten() {
+        let name = e.file_name();
+        if std::fs::copy(e.path(), new.join(&name)).is_ok() {
+            any = true;
+        }
+    }
+    let _ = any;
 }
 
 // ---------------- 收藏/改名/删除/元数据(R7-6, R7-10) ----------------
@@ -679,7 +734,7 @@ mod tests {
 
 /// 当前文档路径(R7-15 自动快照用: mtime 判断"是否有新保存内容")。
 pub fn latest_doc_path(doc_key: &str) -> Option<PathBuf> {
-    find_latest_doc(doc_key)
+    latest_doc_cached(doc_key)
 }
 
 /// 清理策略(R7-15): 按数量上限 + 按时间。返回删除个数。

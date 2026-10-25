@@ -385,6 +385,12 @@ thread_local! {
     /// 面板关闭后由主循环清除(重开回默认)。
     static PANEL_USER_POS: std::cell::RefCell<std::collections::HashMap<&'static str, egui::Pos2>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
+    /// R9-2: 面板id → 剩余等待帧数(降级 OS 拖动时, 等窗口真的被挪走后把落点
+    /// 补记为"用户位置", 否则它还会跟着工具栏跑)。
+    static PANEL_PENDING_USER: std::cell::RefCell<std::collections::HashMap<&'static str, u8>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+    /// R9-2: 主工具栏正在拖动(一级面板拖动中不要判定"用户挪了二级面板")。
+    static PRIMARY_DRAGGING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// R9: 面板拖动会话状态(自管拖动: SetCapture + 指针 delta)。
@@ -829,7 +835,13 @@ fn confirm_popup(
     result
 }
 
-fn panel_header(ui: &mut egui::Ui, title: &str, open: &mut bool, icons: Option<Box<dyn FnOnce(&mut egui::Ui)>>) {
+fn panel_header(
+    ui: &mut egui::Ui,
+    title: &str,
+    id: &'static str,
+    open: &mut bool,
+    icons: Option<Box<dyn FnOnce(&mut egui::Ui)>>,
+) {
     // R8e: 标题整行 = OS 级拖动区。先画行内容拿到行矩形, 再铺 interact drag 层
     // (egui 后注册者 z 序在上; 按钮先画在下层 — drag 层会挡住按钮点击?
     // 不会: egui 命中测试按"后注册优先", drag 层后注册会拦截按钮…
@@ -842,8 +854,16 @@ fn panel_header(ui: &mut egui::Ui, title: &str, open: &mut bool, icons: Option<B
     ui.horizontal(|ui| {
         ui.set_min_height(row_h);
         // 拖动视觉提示(2列x3点, 矢量)
-        let (hr, hresp) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
-        let col = if hresp.hovered() { COL_TEXT } else { COL_MUTED };
+        // R9-2: 双击手柄 = 归位(清掉用户位置, 重新跟随工具栏下方默认位)。
+        let (hr, hresp) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::click());
+        let pinned = PANEL_USER_POS.with(|u| u.borrow().contains_key(id));
+        let col = if hresp.hovered() {
+            COL_TEXT
+        } else if pinned {
+            COL_ACCENT
+        } else {
+            COL_MUTED
+        };
         for cx in [hr.left() + 4.0, hr.left() + 9.0] {
             for cy in [hr.top() + 3.5, hr.center().y, hr.bottom() - 3.5] {
                 ui.painter().circle_filled(egui::pos2(cx, cy), 1.3, col);
@@ -851,6 +871,14 @@ fn panel_header(ui: &mut egui::Ui, title: &str, open: &mut bool, icons: Option<B
         }
         if hresp.hovered() {
             PANEL_DRAG_HINT.with(|d| *d.borrow_mut() = true);
+        }
+        if hresp.double_clicked() {
+            PANEL_USER_POS.with(|u| {
+                u.borrow_mut().remove(id);
+            });
+            PANEL_LAST_CMD.with(|u| {
+                u.borrow_mut().remove(id);
+            });
         }
         ui.label(egui::RichText::new(title).size(13.0).strong().color(COL_TEXT));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1559,7 +1587,7 @@ fn header_extra_and_show(
                     egui::CentralPanel::default()
                         .frame(panel_frame())
                         .show(ctx, |ui| {
-                            panel_header(ui, title, &mut flag, icons.take());
+                            panel_header(ui, title, id, &mut flag, icons.take());
                             contents(ui);
                         });
                     // ---- R9: 面板拖动(自管 SetCapture + delta) + 跟随 ----
@@ -1597,6 +1625,11 @@ fn header_extra_and_show(
                             _ => {
                                 ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
                                 st = None;
+                                // 降级: OS 拖完会把窗口挪走, 之后若干帧内把它补
+                                // 记为"用户位置"(否则还会跟着工具栏跑)。
+                                PANEL_PENDING_USER.with(|u| {
+                                    u.borrow_mut().insert(id, 90);
+                                });
                             }
                         }
                     }
@@ -1618,33 +1651,55 @@ fn header_extra_and_show(
                             PANEL_DRAG.with(|m| m.borrow_mut().insert(id, s));
                         }
                     }
-                    // 跟随: 用户拖过 → 钉在落点; 否则跟随工具栏下方的默认位。
-                    let target = PANEL_USER_POS
-                        .with(|u| u.borrow().get(id).copied())
-                        .unwrap_or(desired);
-                    if let Some(r) = ctx.input(|i| i.viewport().outer_rect) {
-                        let off = (r.left() - target.x).abs().max((r.top() - target.y).abs());
+                    // 跟随: **用户拖过 → 彻底不跟随**(R9-2)。
+                    // 之前"拖过之后仍每帧按落点钉一次"与"默认位跟随"是两个写入者,
+                    // 拖动一级面板时表现为每帧闪回默认位再刷回拖动位(用户实拍)。
+                    // 规则改为: 有用户位置 = 完全冻结(只由用户拖动决定位置),
+                    // 无用户位置 = 跟随工具栏下方默认位。双击标题手柄可归位。
+                    let user_pos = PANEL_USER_POS.with(|u| u.borrow().get(id).copied());
+                    if user_pos.is_some() {
+                        // 冻结 — 本帧不发任何定位命令。
+                    } else if let Some(r) = ctx.input(|i| i.viewport().outer_rect) {
+                        // 降级路径补记: OS 拖动把窗口挪离默认位 → 记为用户位置。
+                        let pending = PANEL_PENDING_USER.with(|u| u.borrow().get(id).copied());
+                        if let Some(p) = pending {
+                            if p == 0 {
+                                PANEL_PENDING_USER.with(|u| u.borrow_mut().remove(id));
+                            } else if !PRIMARY_DRAGGING.get()
+                                && (r.left() - desired.x).abs().max((r.top() - desired.y).abs())
+                                    > 8.0
+                            {
+                                PANEL_USER_POS.with(|u| {
+                                    u.borrow_mut().insert(id, r.min);
+                                });
+                                PANEL_PENDING_USER.with(|u| u.borrow_mut().remove(id));
+                            } else {
+                                PANEL_PENDING_USER.with(|u| u.borrow_mut().insert(id, p - 1));
+                            }
+                        }
+                        let off =
+                            (r.left() - desired.x).abs().max((r.top() - desired.y).abs());
                         // 目标变了才发; 目标没变但偏得离谱(>8pt, 别人挪的)也纠正。
                         // 这样既跟得紧(0.5pt 阈值 ≈ 亚像素), 又不会因 DPI 取整
-                        // 每帧重复 SetWindowPos(= 面板疯狂瞬移的根因)。
+                        // 每帧重复 SetWindowPos(= 面板抖动/瞬移的根因)。
                         if off > 0.5 {
                             let changed = PANEL_LAST_CMD.with(|m| {
                                 let mut m = m.borrow_mut();
                                 match m.get(id) {
                                     Some(l)
-                                        if (l.x - target.x).abs() <= 0.25
-                                            && (l.y - target.y).abs() <= 0.25 =>
+                                        if (l.x - desired.x).abs() <= 0.25
+                                            && (l.y - desired.y).abs() <= 0.25 =>
                                     {
                                         false
                                     }
                                     _ => {
-                                        m.insert(id, target);
+                                        m.insert(id, desired);
                                         true
                                     }
                                 }
                             });
                             if changed || off > 8.0 {
-                                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(target));
+                                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(desired));
                             }
                         }
                     }
@@ -1659,6 +1714,8 @@ impl eframe::App for PlaApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_bridge();
         self.update_snap(ctx);
+        // R9-2: 一级面板拖动中(二级面板别据此误判"用户挪了我")。
+        PRIMARY_DRAGGING.set(self.toolbar_dragging);
         // 圆角裁剪: egui 画的圆角在 Windows glow 后端透明不可靠(R5 实测只有
         // 左上角圆), 由 SetWindowRgn 兜底; 子视口懒创建, 定时枚举补套。
         // R9: 拖动会话期间不枚举窗口/套 Rgn(避免与自管移动抢 SetWindowPos)。
@@ -1880,6 +1937,9 @@ impl eframe::App for PlaApp {
                 u.borrow_mut().retain(|k, _| open.contains(k));
             });
             PANEL_DRAG.with(|u| {
+                u.borrow_mut().retain(|k, _| open.contains(k));
+            });
+            PANEL_PENDING_USER.with(|u| {
                 u.borrow_mut().retain(|k, _| open.contains(k));
             });
         }

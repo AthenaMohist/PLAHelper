@@ -6,17 +6,24 @@
 
 use std::path::PathBuf;
 
-fn base_dir() -> PathBuf {
+/// 旧存档位置(exe 同级 viewstates/<doc_key>) — R9 起仅作迁移来源/兜底。
+fn legacy_vpstate_dir(doc_key: &str) -> PathBuf {
     let exe = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
         .unwrap_or_else(|| PathBuf::from("."));
-    exe.join("viewstates")
+    exe.join("viewstates").join(super::snapshot::sanitize_filename(doc_key))
 }
 
-/// 某文档的视口状态目录(不创建)。
+/// 某文档的视口状态目录 —— **跟随文档**: `<文档目录>/.pla/viewstates/<doc_key>`
+/// (R9, 与选择集同策略; 定位不到文档退回 exe 同级旧位置并迁移)。
 pub fn vpstate_dir(doc_key: &str) -> PathBuf {
-    base_dir().join(super::snapshot::sanitize_filename(doc_key))
+    let legacy = legacy_vpstate_dir(doc_key);
+    let dir = super::snapshot::doc_side_dir(doc_key, "viewstates").unwrap_or_else(|| legacy.clone());
+    if dir != legacy {
+        super::snapshot::migrate_dir(&legacy, &dir);
+    }
+    dir
 }
 
 /// 下一个序号名 VS001/VS002…
