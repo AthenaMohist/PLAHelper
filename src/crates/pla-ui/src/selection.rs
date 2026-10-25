@@ -124,7 +124,7 @@ pub struct CdpMember {
 pub fn save_cdp_selection_with_camera(
     doc_key: &str,
     name: &str,
-    members: &[(String, String, String, Option<String>)],
+    members: &[(String, String, String, Option<String>, Option<String>)],
     camera: Option<&str>,
 ) -> Result<String, String> {
     let name = name.trim();
@@ -142,12 +142,13 @@ pub fn save_cdp_selection_with_camera(
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建目录失败: {e}"))?;
     let items: Vec<CdpMember> = members
         .iter()
-        .map(|(k, i, n, key)| CdpMember {
+        .map(|(k, i, n, key, member_cam)| CdpMember {
             kind: k.clone(),
             id: i.clone(),
             name: n.clone(),
             key: key.clone(),
-            camera: camera.map(|c| c.to_string()),
+            // 每成员相机优先(多视角分组); 缺失回落整集相机(v6 首版行为)。
+            camera: member_cam.clone().or_else(|| camera.map(|c| c.to_string())),
         })
         .collect();
     let json = serde_json::json!({
@@ -347,22 +348,22 @@ pub fn member_key(kind: &str, id: &str) -> String {
 ///   "载入已存选择集待编辑"的中间态, 不该被清掉。
 /// - 保留顺序(勾选顺序), 只做过滤。
 pub fn prune_members_to_live(
-    members: &mut Vec<(String, String, String, Option<String>)>,
+    members: &mut Vec<(String, String, String, Option<String>, Option<String>)>,
     live_keys: &[String],
 ) {
     if live_keys.is_empty() {
         return;
     }
     let live: std::collections::HashSet<String> = live_keys.iter().cloned().collect();
-    members.retain(|(k, i, _, _)| live.contains(&member_key(k, i)));
+    members.retain(|(k, i, _, _, _)| live.contains(&member_key(k, i)));
 }
 
 #[cfg(test)]
 mod r726_tests {
     use super::*;
 
-    fn m(kind: &str, id: &str) -> (String, String, String, Option<String>) {
-        (kind.into(), id.into(), String::new(), None)
+    fn m(kind: &str, id: &str) -> (String, String, String, Option<String>, Option<String>) {
+        (kind.into(), id.into(), String::new(), None, None)
     }
 
     #[test]

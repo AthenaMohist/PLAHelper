@@ -143,7 +143,7 @@ struct PlaApp {
     /// CDP 实体树平铺 (name, ctor, indent, selected)。
     cdp_tree: Vec<(String, String, i64, bool)>,
     /// CDP 选择集勾选成员 (kind, id, name, key=原始 id 元素 JSON)。
-    sel_cdp_members: Vec<(String, String, String, Option<String>)>,
+    sel_cdp_members: Vec<(String, String, String, Option<String>, Option<String>)>,
     /// v6: 最新实时相机(来自选择快照流), 保存选择集时随集存储。
     sel_camera: Option<String>,
     /// R7-20: 已保存 CDP 选择集(收藏优先); 打开面板/变更后置 sel_saved_loaded=false 重载。
@@ -1651,13 +1651,14 @@ impl eframe::App for PlaApp {
                                         if !self
                                             .sel_cdp_members
                                             .iter()
-                                            .any(|(k, i, _, _)| format!("{k}:{i}") == key)
+                                            .any(|(k, i, _, _, _)| format!("{k}:{i}") == key)
                                         {
                                             self.sel_cdp_members.push((
                                                 it.kind.to_string(),
                                                 it.id.clone(),
                                                 it.name.clone(),
                                                 it.key.clone(),
+                                                self.sel_camera.clone(),
                                             ));
                                         }
                                     }
@@ -1674,7 +1675,7 @@ impl eframe::App for PlaApp {
                                         let mut on = self
                                             .sel_cdp_members
                                             .iter()
-                                            .any(|(k, i, _, _)| format!("{k}:{i}") == key);
+                                            .any(|(k, i, _, _, _)| format!("{k}:{i}") == key);
                                         let label = if it.name.is_empty() {
                                             format!("{} ({})", it.ctor, it.kind)
                                         } else {
@@ -1687,10 +1688,11 @@ impl eframe::App for PlaApp {
                                                     it.id.clone(),
                                                     it.name.clone(),
                                                     it.key.clone(),
+                                                    self.sel_camera.clone(),
                                                 ));
                                             } else {
                                                 self.sel_cdp_members
-                                                    .retain(|(k, i, _, _)| format!("{k}:{i}") != key);
+                                                    .retain(|(k, i, _, _, _)| format!("{k}:{i}") != key);
                                             }
                                         }
                                     }
@@ -1753,7 +1755,7 @@ impl eframe::App for PlaApp {
                                 let entries: Vec<pla_bridge::cdp::ApplyEntry> = self
                                     .sel_cdp_members
                                     .iter()
-                                    .map(|(k, i, _, key)| pla_bridge::cdp::ApplyEntry {
+                                    .map(|(k, i, _, key, _)| pla_bridge::cdp::ApplyEntry {
                                         kind: k.clone(),
                                         id: i.clone(),
                                         key: key.clone(),
@@ -1873,7 +1875,7 @@ impl eframe::App for PlaApp {
                                                         let n = members.len();
                                                         self.sel_cdp_members = members
                                                             .into_iter()
-                                                            .map(|m| (m.kind, m.id, m.name, m.key))
+                                                            .map(|m| (m.kind, m.id, m.name, m.key, m.camera))
                                                             .collect();
                                                         self.sel_name = meta.name.clone();
                                                         self.set_notice((

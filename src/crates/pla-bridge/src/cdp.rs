@@ -640,7 +640,7 @@ async fn session_loop(
                             // 1) addById 临时选中该面(navigateToSelection 只读选择,
                             //    不需要点击管线的活跃实体上下文)
                             let select_js = format!(
-                                "(function(){{try{{var ed=window.__PLA_EDITOR__;if(!ed||!ed.selection){{var f=window.__PLA_HOOK__;if(f)ed=f.findEditor();}}if(!ed)return 'no-ed';ed.click.clear();ed.click.addById('2:{}');return 'ok'}}catch(e){{return 'EXC'}}}})()",
+                                "(function(){{try{{var ed=window.__PLA_EDITOR__;if(!ed||!ed.selection){{var f=window.__PLA_HOOK__;if(f)ed=f.findEditor();}}if(!ed)return 'no-ed';ed.click.addById('2:{}');return 'ok'}}catch(e){{return 'EXC'}}}})()",
                                 occ_id
                             );
                             if let Err(e) = eval_roundtrip(ws, &mut mid, &select_js).await {
