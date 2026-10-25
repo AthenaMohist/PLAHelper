@@ -719,16 +719,27 @@ impl PlaApp {
                             .collect();
                         new_keys.sort();
                         if new_keys != self.live_sel_keys {
+                            // v7 + v6.1 多视角语义: 新成员绑定"选中时刻"相机
+                            // (本快照同拍); 已在镜像中的成员**保留其原相机**
+                            // (A 面视角1选中 → 转视角选 B → A 仍是视角1,
+                            //  应用时按各自视角分组点击)。
+                            let old = std::mem::take(&mut self.sel_cdp_members);
                             self.sel_cdp_members = snap
                                 .items
                                 .iter()
                                 .map(|it| {
+                                    let key = pla_ui::selection::member_key(it.kind, &it.id);
+                                    let kept_cam = old.iter().find_map(|(k, i, _, _, c)| {
+                                        (pla_ui::selection::member_key(k, i) == key)
+                                            .then(|| c.clone())
+                                            .flatten()
+                                    });
                                     (
                                         it.kind.to_string(),
                                         it.id.clone(),
                                         it.name.clone(),
                                         it.key.clone(),
-                                        snap.camera.clone(),
+                                        kept_cam.or_else(|| snap.camera.clone()),
                                     )
                                 })
                                 .collect();
