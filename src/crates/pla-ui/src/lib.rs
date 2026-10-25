@@ -4,5 +4,6 @@ pub mod round_corners;
 pub mod selection;
 pub mod snapshot;
 pub mod titlebar_probe;
+pub mod vpstate;
 pub mod wincap;
 pub mod window_finder;

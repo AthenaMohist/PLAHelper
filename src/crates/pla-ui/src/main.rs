@@ -31,11 +31,9 @@ const COL_RED: egui::Color32 = egui::Color32::from_rgb(0xd0, 0x50, 0x45);
 const COL_GRAY_DOT: egui::Color32 = egui::Color32::from_rgb(0x77, 0x77, 0x77);
 
 // ---------------- 工具栏形态/吸附参数(可调) ----------------
-/// 工具栏固定逻辑尺寸(横向一行按钮): 圆点+分隔线+5 按钮+分隔线+关闭键。
-/// 宽 246 = 276(6 按钮旧值) - 30(手动快照按钮 24 + 间距 6 移入快照墙, R7-5);
-/// 高 30: 垂直边距 3+3 + 按钮 24 = 30, 按钮行恰在窗口中心(吸附按中心对齐)。
-/// 窗口 = 面板本体, 极简细描边(R7-19: 光晕被用户否决移除)。
-const TOOLBAR_SIZE: [f32; 2] = [216.0, 30.0];
+/// 工具栏固定逻辑尺寸: 圆点+分隔线+6 按钮+分隔线+关闭键。
+/// 宽 246(R8-1: +30 视口状态按钮); 高 30。
+const TOOLBAR_SIZE: [f32; 2] = [246.0, 30.0];
 /// 面板整体右移微调(逻辑 px, 按 ppp 缩放; R6-2e 用户要求再偏右 10)。
 const SNAP_RIGHT_SHIFT: f32 = 10.0;
 /// 吸附垂直微调(逻辑 pt, 按 ppp 缩放; 仅作用于探测命中分支)。
@@ -60,6 +58,8 @@ const SNAP_POLL_MS: u64 = 300;
 const PROBE_POLL_MS: u64 = 1000;
 /// 位置漂移小于该值(物理像素)不重发定位命令, 避免抖动。
 const SNAP_EPS: f32 = 2.0;
+/// R8-3: 拖回吸附范围 — 拖动位置距默认锚点不超过该值(逻辑 pt)时恢复自动吸附。
+const SNAP_REENTER_PX: f32 = 40.0;
 /// 提示浮窗自动关闭时长。
 const NOTICE_TTL: Duration = Duration::from_secs(6);
 /// Win32 SetWindowRgn 圆角轮询间隔(子视口懒创建, 需定时补套)。
@@ -70,14 +70,17 @@ const ROUNDING: f32 = 10.0;
 
 /// 工具栏按钮列(横向排列, 顺序即产品顺序)。
 /// R7-5: 手动快照移入快照墙头部(图标钮); R7-11: 刷新实体移入选择集窗口头部 —
-/// 一级工具栏只留面板开关类按钮。
-/// 宽度 216 = 246 - (按钮24 + 间距6)。
-const TOOLBAR_ACTIONS: [Action; 4] = [
+/// 一级工具栏只留面板开关类按钮。R8-1: 加视口状态。
+const TOOLBAR_ACTIONS: [Action; 5] = [
     Action::ToggleSnapshots,
     Action::ToggleEntities,
+    Action::ToggleVpState,
     Action::ToggleDim,
     Action::ToggleSettings,
 ];
+
+/// R8-1: 视口状态面板尺寸(同快照墙)。
+const PANEL_VPSTATE: [f32; 2] = [232.0, 480.0];
 
 /// 面板逻辑尺寸 (宽, 高) — 子视口 OS 窗口大小。
 /// R7-6: 快照墙改窄加高(232x480) — 一行一个快照, 缩略图撑满内容宽。
@@ -124,6 +127,11 @@ struct PlaApp {
     show_entities: bool,
     show_dim: bool,
     show_settings: bool,
+    /// R8-1: 视口状态面板。
+    show_vpstate: bool,
+    /// R8-3: 工具栏拖动位置(None=自动吸附; Some=用户拖到的位置, 逻辑 pt)。
+    toolbar_drag_pos: Option<egui::Pos2>,
+    toolbar_dragging: bool,
     sel_name: String,
     sel_members: Vec<String>,
     /// CDP 会话句柄(R7-14): 实时选择/实体树通道(Plasticity 需 PLA-CDP 补丁版启动)。
@@ -190,6 +198,25 @@ struct PlaApp {
     snap_manage: bool,
     /// 管理模式勾选集合。
     snap_selected: std::collections::HashSet<String>,
+    /// R8-2: 快照单项删除确认中。
+    snap_delete_confirm: Option<String>,
+    /// R8-1: 选择集单项删除确认中。
+    sel_delete_confirm: Option<String>,
+    /// R8-1: 视口状态面板数据。
+    vp_states: Vec<pla_ui::vpstate::VpStateMeta>,
+    vp_states_loaded: bool,
+    vp_pending_state: Option<String>,
+    vp_rename: Option<String>,
+    vp_rename_buf: String,
+    vp_delete_confirm: Option<String>,
+    vp_pngs: std::collections::HashMap<String, std::sync::Arc<[u8]>>,
+    vp_shot_path: Option<String>,
+    /// R8-1: 选择集截图缓存 + 管理模式 + pending 保存流程。
+    sel_pngs: std::collections::HashMap<String, std::sync::Arc<[u8]>>,
+    sel_manage: bool,
+    sel_selected: std::collections::HashSet<String>,
+    sel_save_pending: Option<(String, Vec<(String, String, String, Option<String>, Option<String>)>, Option<String>)>,
+    sel_shot_path: Option<String>,
     /// 正在改名的快照名 + 编辑缓冲。
     rename_edit: Option<String>,
     rename_buf: String,
@@ -346,6 +373,8 @@ struct SnapItemActions {
     rename_start: bool,
     rename_commit: bool,
     rename_cancel: bool,
+    /// R8-2: 删除按钮被点(单删, 带确认)。
+    delete: bool,
 }
 
 /// PNG 尺寸解析(只读 IHDR 头, 不解码): 签名 8B + len 4B + "IHDR" 4B + W 4B + H 4B。
@@ -568,6 +597,21 @@ fn snap_item(
                 if pencil_button(ui).on_hover_text("改名").clicked() {
                     a.rename_start = true;
                 }
+                // R8-2: 单项删除(🗑 画出来的垃圾桶, 点击后调用方弹确认)。
+                let (drect, dresp) =
+                    ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::click());
+                let dcol = if dresp.hovered() { COL_RED } else { COL_MUTED };
+                let p = |x: f32, y: f32| egui::pos2(drect.left() + x, drect.top() + y);
+                ui.painter().line_segment([p(3.0, 4.0), p(11.0, 4.0)], egui::Stroke::new(1.2, dcol));
+                ui.painter().line_segment([p(5.5, 4.0), p(5.5, 2.5)], egui::Stroke::new(1.2, dcol));
+                ui.painter().line_segment([p(8.5, 4.0), p(8.5, 2.5)], egui::Stroke::new(1.2, dcol));
+                ui.painter().line_segment([p(6.2, 2.5), p(7.8, 2.5)], egui::Stroke::new(1.2, dcol));
+                ui.painter().line_segment([p(4.0, 4.0), p(5.0, 12.0)], egui::Stroke::new(1.2, dcol));
+                ui.painter().line_segment([p(10.0, 4.0), p(9.0, 12.0)], egui::Stroke::new(1.2, dcol));
+                ui.painter().line_segment([p(5.0, 12.0), p(9.0, 12.0)], egui::Stroke::new(1.2, dcol));
+                if dresp.on_hover_text("删除(需确认)").clicked() {
+                    a.delete = true;
+                }
             });
         },
     );
@@ -617,6 +661,9 @@ impl PlaApp {
             show_entities: false,
             show_dim: false,
             show_settings: false,
+            show_vpstate: false,
+            toolbar_drag_pos: None,
+            toolbar_dragging: false,
             sel_name: String::new(),
             sel_members: Vec::new(),
             cdp: pla_bridge::cdp::CdpHandle::spawn(9333),
@@ -658,6 +705,21 @@ impl PlaApp {
             snap_infos: std::collections::HashMap::new(),
             snap_manage: false,
             snap_selected: std::collections::HashSet::new(),
+            snap_delete_confirm: None,
+            sel_delete_confirm: None,
+            vp_states: Vec::new(),
+            vp_states_loaded: false,
+            vp_pending_state: None,
+            vp_rename: None,
+            vp_rename_buf: String::new(),
+            vp_delete_confirm: None,
+            vp_pngs: std::collections::HashMap::new(),
+            vp_shot_path: None,
+            sel_pngs: std::collections::HashMap::new(),
+            sel_manage: false,
+            sel_selected: std::collections::HashSet::new(),
+            sel_save_pending: None,
+            sel_shot_path: None,
             rename_edit: None,
             rename_buf: String::new(),
             round_state: round_corners::RoundState::new(),
@@ -754,6 +816,70 @@ impl PlaApp {
                 }
                 pla_bridge::cdp::CdpEvent::EvalResult(s) => {
                     self.set_notice((false, format!("CDP: {}", s)));
+                }
+                // R8-1: 视口状态采集回包 → 暂存, 等截图回包一起落盘。
+                pla_bridge::cdp::CdpEvent::VpStateResult(state) => {
+                    self.vp_pending_state = Some(state);
+                }
+                // R8-1: 视口截图回包 → 读盘, 完成 pending 存档。
+                pla_bridge::cdp::CdpEvent::ViewportPng(_len) => {
+                    let png_bytes = self
+                        .vp_shot_path
+                        .clone()
+                        .and_then(|p| std::fs::read(p).ok());
+                    // 视口状态存档
+                    if let (Some(state), Some(png)) =
+                        (self.vp_pending_state.take(), png_bytes.as_deref())
+                    {
+                        match pla_ui::vpstate::save_vpstate(
+                            &self.doc_key,
+                            &state,
+                            Some(png),
+                        ) {
+                            Ok(stem) => {
+                                self.vp_states_loaded = false;
+                                self.vp_pngs.clear();
+                                self.set_notice((false, format!("视口状态已保存: {stem}")));
+                            }
+                            Err(e) => self.set_notice((true, e)),
+                        }
+                    } else if let Some(state) = self.vp_pending_state.take() {
+                        // 截图失败: 仍然保存(无图)
+                        match pla_ui::vpstate::save_vpstate(&self.doc_key, &state, None) {
+                            Ok(stem) => {
+                                self.vp_states_loaded = false;
+                                self.set_notice((
+                                    false,
+                                    format!("视口状态已保存: {stem}(截图失败, 无缩略图)"),
+                                ));
+                            }
+                            Err(e) => self.set_notice((true, e)),
+                        }
+                    }
+                    // 选择集存档(pending = (SG名, members, camera))
+                    if let Some((name, members, cam)) = self.sel_save_pending.take() {
+                        let png2 = self
+                            .sel_shot_path
+                            .clone()
+                            .and_then(|p| std::fs::read(p).ok());
+                        match pla_ui::selection::save_cdp_selection_with_camera(
+                            &self.doc_key,
+                            &name,
+                            &members,
+                            cam.as_deref(),
+                            png2.as_deref(),
+                        ) {
+                            Ok(_) => {
+                                self.sel_saved_loaded = false;
+                                self.sel_pngs.clear();
+                                self.set_notice((
+                                    false,
+                                    format!("已保存 {} ({} 项, 含截图)", name, members.len()),
+                                ));
+                            }
+                            Err(e) => self.set_notice((true, e)),
+                        }
+                    }
                 }
                 pla_bridge::cdp::CdpEvent::RequestFocus => self.focus_plasticity(),
                 pla_bridge::cdp::CdpEvent::Tree(nodes) => {
@@ -860,13 +986,31 @@ impl PlaApp {
             Action::ToggleSnapshots => {
                 self.show_snapshots = !self.show_snapshots;
                 if self.show_snapshots {
+                    // R8-3: 二级面板互斥(快照墙/选择集/视口状态不共存)。
+                    self.show_entities = false;
+                    self.show_vpstate = false;
                     // 每次开墙刷新: 快照可能被外部增删(含 Plasticity 侧)
                     self.snapshots = pla_ui::snapshot::list_snapshots(&self.doc_key);
                     self.snap_favs = pla_ui::snapshot::load_favs(&self.doc_key);
                     self.snap_infos = pla_ui::snapshot::load_meta_infos(&self.doc_key);
                 }
             }
-            Action::ToggleEntities => self.show_entities = !self.show_entities,
+            Action::ToggleEntities => {
+                self.show_entities = !self.show_entities;
+                if self.show_entities {
+                    self.show_snapshots = false;
+                    self.show_vpstate = false;
+                    self.sel_saved_loaded = false;
+                }
+            }
+            Action::ToggleVpState => {
+                self.show_vpstate = !self.show_vpstate;
+                if self.show_vpstate {
+                    self.show_snapshots = false;
+                    self.show_entities = false;
+                    self.vp_states_loaded = false;
+                }
+            }
             Action::ToggleDim => self.show_dim = !self.show_dim,
             Action::ToggleSettings => self.show_settings = !self.show_settings,
         }
@@ -937,6 +1081,39 @@ impl PlaApp {
             return;
         }
         self.last_snap_poll = Instant::now();
+        // R8-3: 用户拖动后停在拖动位置; 拖回默认锚点附近(SNAP_REENTER_PX)才恢复吸附。
+        if self.toolbar_drag_pos.is_some() {
+            if let Some(target) = window_finder::acquire_target(&self.doc_key).clone() {
+                let ppp = ctx.pixels_per_point();
+                let anchor = self.default_anchor(&target, ctx, ppp);
+                if let (Some(dp), Some(da)) = (self.toolbar_drag_pos, anchor) {
+                    if (dp.x - da.x).abs() <= SNAP_REENTER_PX
+                        && (dp.y - da.y).abs() <= SNAP_REENTER_PX
+                    {
+                        // 拖回吸附区: 退出拖动模式, 走正常吸附流程
+                        self.toolbar_drag_pos = None;
+                        self.last_snap_anchor = None;
+                    } else {
+                        // 保持拖动位置: 只更新绑定/探测, 不发 OuterPosition
+                        self.snap_target = Some(target.clone());
+                        if self.last_probe_poll.elapsed()
+                            >= Duration::from_millis(PROBE_POLL_MS)
+                            || self
+                                .probed_edge
+                                .as_ref()
+                                .map_or(true, |(h, _)| *h != target.hwnd)
+                        {
+                            let edge = pla_ui::titlebar_probe::probe_filename_right_edge(
+                                &target, ppp,
+                            );
+                            self.probed_edge = edge.map(|e| (target.hwnd, e));
+                            self.last_probe_poll = Instant::now();
+                        }
+                        return;
+                    }
+                }
+            }
+        }
         let new_target = window_finder::acquire_target(&self.doc_key);
         self.snap_target = new_target;
         // R7-17: doc_key 跟随绑定窗口标题("model1.plasticity - Plasticity" →
@@ -978,26 +1155,8 @@ impl PlaApp {
         // 两者都按 ppp 缩放: probe/GetWindowRect 在 DPI-aware 进程里是物理像素,
         // 固定常量是逻辑 px, 不缩放在高 DPI 下会缩水遮文件名(R6 实测 4K/3x)。
         let ppp = ctx.pixels_per_point();
-        let (x_phys, y_phys) = match &self.probed_edge {
-            Some((h, hit)) if *h == target.hwnd => {
-                let x = hit.right as f32 + (SNAP_FILENAME_GAP + SNAP_RIGHT_SHIFT) * ppp;
-                // 实际内窗高(egui 上报): 请求 30pt 但 winit 隐形边框撑到 34pt,
-                // 按实际值取中心, 否则恒偏 2pt(R6-2m)。
-                let h_pt = ctx.input(|i| {
-                    i.viewport()
-                        .inner_rect
-                        .map(|r| r.height())
-                        .unwrap_or(TOOLBAR_SIZE[1])
-                });
-                let y = target.top as f32
-                    + (hit.cy as f32 + SNAP_Y_NUDGE_PT * ppp)
-                    - h_pt * 0.5 * ppp;
-                (x, y)
-            }
-            _ => (
-                target.left as f32 + (SNAP_LEFT_OFFSET + SNAP_RIGHT_SHIFT) * ppp,
-                target.top as f32 + SNAP_TOP_GAP as f32,
-            ),
+        let Some((x_phys, y_phys)) = self.default_anchor_phys(&target, ctx, ppp) else {
+            return;
         };
         let new_anchor = Some((target.left, target.top, x_phys as i32, y_phys as i32));
         let anchor_changed = match (new_anchor, self.last_snap_anchor) {
@@ -1018,6 +1177,45 @@ impl PlaApp {
             x_phys / ppp,
             y_phys / ppp,
         )));
+    }
+
+    /// R8-3: 默认吸附锚点(逻辑 pt) — 拖回判定用。
+    fn default_anchor(
+        &self,
+        target: &window_finder::TargetWindow,
+        ctx: &egui::Context,
+        ppp: f32,
+    ) -> Option<egui::Pos2> {
+        let (x, y) = self.default_anchor_phys(target, ctx, ppp)?;
+        Some(egui::pos2(x / ppp, y / ppp))
+    }
+
+    /// R8-3: 默认吸附锚点(物理 px)。探测命中 → 文件名右缘; 否则固定偏移。
+    fn default_anchor_phys(
+        &self,
+        target: &window_finder::TargetWindow,
+        ctx: &egui::Context,
+        ppp: f32,
+    ) -> Option<(f32, f32)> {
+        Some(match &self.probed_edge {
+            Some((h, hit)) if *h == target.hwnd => {
+                let x = hit.right as f32 + (SNAP_FILENAME_GAP + SNAP_RIGHT_SHIFT) * ppp;
+                let h_pt = ctx.input(|i| {
+                    i.viewport()
+                        .inner_rect
+                        .map(|r| r.height())
+                        .unwrap_or(TOOLBAR_SIZE[1])
+                });
+                let y = target.top as f32
+                    + (hit.cy as f32 + SNAP_Y_NUDGE_PT * ppp)
+                    - h_pt * 0.5 * ppp;
+                (x, y)
+            }
+            _ => (
+                target.left as f32 + (SNAP_LEFT_OFFSET + SNAP_RIGHT_SHIFT) * ppp,
+                target.top as f32 + SNAP_TOP_GAP as f32,
+            ),
+        })
     }
 }
 
@@ -1190,6 +1388,7 @@ impl eframe::App for PlaApp {
                         let active = match a {
                             Action::ToggleSnapshots => self.show_snapshots,
                             Action::ToggleEntities => self.show_entities,
+                            Action::ToggleVpState => self.show_vpstate,
                             Action::ToggleDim => self.show_dim,
                             Action::ToggleSettings => self.show_settings,
                             _ => false,
@@ -1244,8 +1443,35 @@ impl eframe::App for PlaApp {
                     }
                 });
                 }); // allocate_new_ui(居中行矩形)
+                // R8-3: 工具栏拖动 — 按住空白处拖动即脱离吸附;
+                // 拖回默认锚点附近恢复吸附(由 update_snap 判定)。
+                let bar_resp = ui.response();
+                if bar_resp.dragged_by(egui::PointerButton::Primary) {
+                    self.toolbar_dragging = true;
+                    if let Some(rect) = ctx.input(|i| i.viewport().outer_rect) {
+                        self.toolbar_drag_pos = Some(rect.min);
+                    }
+                } else if self.toolbar_dragging {
+                    self.toolbar_dragging = false;
+                    if let Some(rect) = ctx.input(|i| i.viewport().outer_rect) {
+                        self.toolbar_drag_pos = Some(rect.min);
+                    }
+                }
             });
         self.hovered_hint = hovered;
+
+        // R8-3: 拖动模式下每帧把窗口钉在拖动结束位置(吸附轮询被短路)。
+        if let Some(dp) = self.toolbar_drag_pos {
+            if !self.toolbar_dragging {
+                if let Some(rect) = ctx.input(|i| i.viewport().outer_rect) {
+                    if (rect.min.x - dp.x).abs() > SNAP_EPS
+                        || (rect.min.y - dp.y).abs() > SNAP_EPS
+                    {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(dp));
+                    }
+                }
+            }
+        }
 
         // ---- 工具栏外框基准位置(功能面板锚正下方, HUD 锚右侧) ----
         let toolbar_rect = ctx
@@ -1396,6 +1622,7 @@ impl eframe::App for PlaApp {
                         let mut rename_commit = false;
                         let mut rename_cancel = false;
                         let mut refresh = false;
+                        let mut delete_ask: Option<String> = None;
 
                         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                             // R7-10: 宽度必须在 ScrollArea 内部测 — 竖向滚动条出现后
@@ -1487,6 +1714,9 @@ impl eframe::App for PlaApp {
                                         }
                                         rename_commit |= act.rename_commit;
                                         rename_cancel |= act.rename_cancel;
+                                        if act.delete {
+                                            delete_ask = Some(s.clone());
+                                        }
                                     }
                                 }
                                 ui.separator();
@@ -1526,11 +1756,55 @@ impl eframe::App for PlaApp {
                                 }
                                 rename_commit |= act.rename_commit;
                                 rename_cancel |= act.rename_cancel;
+                                if act.delete {
+                                    delete_ask = Some(s.clone());
+                                }
                             }
                         });
                         // 悬浮缩略图时的元数据 → HUD(工具栏右侧文本框)
                         if let Some(t) = tip_slot.into_inner() {
                             self.hovered_hint = Some(t);
+                        }
+                        // R8-2: 单删确认(行内, 不遮内容)
+                        if let Some(name) = self.snap_delete_confirm.clone() {
+                            ui.separator();
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "删除「{}」? 含截图, 不可恢复",
+                                        name.trim_end_matches(".plasticity")
+                                    ))
+                                    .small()
+                                    .color(COL_RED),
+                                );
+                                if ui.small_button("确认删除").clicked() {
+                                    match pla_ui::snapshot::delete_snapshots(
+                                        &self.doc_key,
+                                        &[name.clone()],
+                                    ) {
+                                        Ok(_) => {
+                                            self.snapshots = pla_ui::snapshot::list_snapshots(
+                                                &self.doc_key,
+                                            );
+                                            self.snap_infos = pla_ui::snapshot::load_meta_infos(
+                                                &self.doc_key,
+                                            );
+                                            self.snap_pngs.remove(&name);
+                                            self.snap_favs.remove(&name);
+                                            self.snap_selected.remove(&name);
+                                            self.set_notice((false, format!("已删除「{name}」")));
+                                        }
+                                        Err(e) => self.set_notice((true, e)),
+                                    }
+                                    self.snap_delete_confirm = None;
+                                }
+                                if ui.small_button("取消").clicked() {
+                                    self.snap_delete_confirm = None;
+                                }
+                            });
+                        }
+                        if let Some(n) = delete_ask {
+                            self.snap_delete_confirm = Some(n);
                         }
 
                         // ---- 统一执行采集到的动作(此时列表借用已结束) ----
@@ -1624,30 +1898,264 @@ impl eframe::App for PlaApp {
             let desired = next_pos(&mut stack_y, PANEL_ENTITIES[1]);
             if let Some(desired) = desired {
                 let mut flag = self.show_entities;
+                // R8-1: 头部三图标按钮: 保存(SG 自动命名)/打开文件夹/批量删除
+                let do_save = std::rc::Rc::new(std::cell::Cell::new(false));
+                let do_open_dir = std::rc::Rc::new(std::cell::Cell::new(false));
+                let do_manage = std::rc::Rc::new(std::cell::Cell::new(false));
+                let tip_slot = std::rc::Rc::new(std::cell::RefCell::new(None::<(String, String)>));
+                let (dsv, dodv, dmv, tsv) = (do_save.clone(), do_open_dir.clone(), do_manage.clone(), tip_slot.clone());
+                let icons: Box<dyn FnOnce(&mut egui::Ui)> = Box::new(move |ui| {
+                    let icon_btn = |ui: &mut egui::Ui, glyph: &str, tip: &str, hit: &std::cell::Cell<bool>, ts: &std::cell::RefCell<Option<(String, String)>>| {
+                        let resp = ui.add(
+                            egui::Button::new(egui::RichText::new(glyph).size(13.0).color(egui::Color32::WHITE))
+                                .frame(false)
+                                .rounding(egui::Rounding::same(4.0)),
+                        );
+                        if resp.hovered() {
+                            *ts.borrow_mut() = Some((format!("{glyph} {tip}"), String::new()));
+                        }
+                        if resp.clicked() {
+                            hit.set(true);
+                        }
+                    };
+                    icon_btn(ui, "🗑", "批量删除", &dmv, &tsv);
+                    icon_btn(ui, "📂", "打开选择集文件夹", &dodv, &tsv);
+                    icon_btn(ui, "💾", "保存当前选择(SG 自动命名 + 截图)", &dsv, &tsv);
+                });
                 header_extra_and_show(
                     ctx,
                     "panel-entities",
-                    "实体树 / 选择集",
+                    "选择集",
                     desired,
                     egui::vec2(PANEL_ENTITIES[0], PANEL_ENTITIES[1]),
                     &mut flag,
                     true,
                     |ui| {
+                        let mut open_err: Option<String> = None;
+                        let inner_tip = std::cell::RefCell::new(None::<(String, String)>);
+
+                        // ============ SAVED SELECTIONS(置顶, 参照快照墙) ============
+                        section_header(ui, "SAVED SELECTIONS");
+                        if !self.sel_saved_loaded {
+                            self.sel_saved = pla_ui::selection::list_cdp_selections_meta(&self.doc_key);
+                            self.sel_saved_loaded = true;
+                        }
+                        // 截图缓存填充
+                        let sel_dir = pla_ui::selection::cdp_selections_dir(&self.doc_key);
+                        for meta in self.sel_saved.clone() {
+                            if !self.sel_pngs.contains_key(&meta.name) {
+                                if let Ok(b) = std::fs::read(sel_dir.join(format!("{}.png", meta.name))) {
+                                    self.sel_pngs.insert(meta.name.clone(), std::sync::Arc::from(b));
+                                }
+                            }
+                        }
+                        // 收藏区(一行3个) + 全部区
+                        let (fav_list, other_list): (Vec<_>, Vec<_>) =
+                            self.sel_saved.iter().cloned().partition(|m| m.fav);
+                        if self.sel_saved.is_empty() {
+                            ui.label(egui::RichText::new("(空 — 视口选中后点 💾 保存)").small().color(COL_MUTED));
+                        }
+                        let mut delete_ask: Option<String> = None;
+                        let mut apply_now: Option<String> = None;
+                        let mut fav_toggle: Option<(String, bool)> = None;
+                        let mut rename_start: Option<String> = None;
+                        let mut rename_commit = false;
+                        let mut rename_cancel = false;
+                        // 动态高度: 内容少 = 内容高; 多 = 屏高 1/3 上限 + 滚动。
+                        // 实现手段: ScrollArea max_height(预估值) — egui 无法先量后限,
+                        // 用"行数×行高"估算内容高, 上限 = 屏高/3。
+                        let screen_h = ctx.screen_rect().height();
+                        let row_h = 66.0;
+                        let content_rows = fav_list.len() / 3 + other_list.len() + 1;
+                        let content_h = (content_rows as f32 * row_h + 30.0).min(screen_h / 3.0).max(72.0);
+                        egui::ScrollArea::vertical()
+                            .id_salt("sel-saved-wall")
+                            .max_height(content_h)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                let avail_w = ui.available_width();
+                                let sp = ui.spacing().item_spacing.x;
+                                let cell_w = ((avail_w - sp * 2.0) / 3.0).max(40.0);
+                                // 单个已存选择项(小卡: 截图 + 名称行[★/改/删])
+                                let mut item = |ui: &mut egui::Ui, meta: &pla_ui::selection::CdpSelMeta, w: f32, img_h: f32| {
+                                    let mut del = false;
+                                    let mut fav = false;
+                                    let mut rn = false;
+                                    ui.allocate_ui_with_layout(
+                                        egui::vec2(w, img_h + 20.0),
+                                        egui::Layout::top_down(egui::Align::LEFT),
+                                        |ui| {
+                                            // 截图(点击 = 应用; 悬浮 = 信息入 tip 槽)
+                                            let png = self.sel_pngs.get(&meta.name);
+                                            let dims = png.and_then(|b| png_dims(b));
+                                            let img_resp = match (png, dims) {
+                                                (Some(bytes), Some((pw, ph))) => {
+                                                    let iw = (img_h * pw / ph).min(w);
+                                                    ui.allocate_ui_with_layout(
+                                                        egui::vec2(w, img_h),
+                                                        egui::Layout::top_down(egui::Align::Center),
+                                                        |ui| ui.add(
+                                                            egui::Image::from_bytes(
+                                                                format!("bytes://sel-{}", meta.name),
+                                                                bytes.clone(),
+                                                            )
+                                                            .fit_to_exact_size(egui::vec2(iw, img_h))
+                                                            .sense(egui::Sense::click()),
+                                                        ),
+                                                    ).inner
+                                                }
+                                                _ => ui.add_sized(
+                                                    egui::vec2(w, img_h),
+                                                    egui::Label::new(egui::RichText::new("🎯").size(20.0)).sense(egui::Sense::click()),
+                                                ),
+                                            };
+                                            if img_resp.hovered() {
+                                                *inner_tip.borrow_mut() = Some((
+                                                    format!("{} — {} 项", meta.name, meta.n_members),
+                                                    format!("保存于 {} · 点击应用回 Plasticity", if meta.created.is_empty() { "-" } else { &meta.created }),
+                                                ));
+                                            }
+                                            if img_resp.clicked() {
+                                                apply_now = Some(meta.name.clone());
+                                            }
+                                            // 名称行: [管理勾选] 名称 ★ ✎ 🗑
+                                            ui.horizontal(|ui| {
+                                                if self.sel_manage {
+                                                    let mut on = self.sel_selected.contains(&meta.name);
+                                                    if ui.checkbox(&mut on, "").changed() {
+                                                        if on { self.sel_selected.insert(meta.name.clone()); } else { self.sel_selected.remove(&meta.name); }
+                                                    }
+                                                }
+                                                if self.sel_rename.as_deref() == Some(meta.name.as_str()) {
+                                                    ui.add_sized(egui::vec2((w - 60.0).max(30.0), 16.0), egui::TextEdit::singleline(&mut self.sel_rename_buf)).request_focus();
+                                                    let (enter, esc) = ui.input(|i| (i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Escape)));
+                                                    if enter { rename_commit = true; }
+                                                    if esc { rename_cancel = true; }
+                                                } else {
+                                                    let name_w = (w - (14.0 + sp) * 3.0 - if self.sel_manage { 16.0 + sp } else { 0.0 }).max(30.0);
+                                                    let nr = ui.allocate_ui_with_layout(
+                                                        egui::vec2(name_w, 14.0),
+                                                        egui::Layout::left_to_right(egui::Align::Center),
+                                                        |ui| ui.add(egui::Label::new(egui::RichText::new(&meta.name).small().color(COL_TEXT)).sense(egui::Sense::click()).truncate()),
+                                                    ).inner;
+                                                    if nr.clicked() {
+                                                        apply_now = Some(meta.name.clone());
+                                                    }
+                                                }
+                                                // ★
+                                                let (srect, sresp) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::click());
+                                                ui.painter().text(srect.center(), egui::Align2::CENTER_CENTER, if meta.fav { "★" } else { "☆" }, egui::FontId::proportional(13.0), if meta.fav { egui::Color32::from_rgb(255,200,60) } else { COL_MUTED });
+                                                if sresp.on_hover_text(if meta.fav { "取消收藏" } else { "收藏(置顶)" }).clicked() { fav = true; }
+                                                // ✎
+                                                if pencil_button(ui).on_hover_text("改名").clicked() { rn = true; }
+                                                // 🗑
+                                                let (drect, dresp) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::click());
+                                                let dcol = if dresp.hovered() { COL_RED } else { COL_MUTED };
+                                                let p = |x: f32, y: f32| egui::pos2(drect.left() + x, drect.top() + y);
+                                                ui.painter().line_segment([p(3.0,4.0), p(11.0,4.0)], egui::Stroke::new(1.2, dcol));
+                                                ui.painter().line_segment([p(5.5,4.0), p(5.5,2.5)], egui::Stroke::new(1.2, dcol));
+                                                ui.painter().line_segment([p(8.5,4.0), p(8.5,2.5)], egui::Stroke::new(1.2, dcol));
+                                                ui.painter().line_segment([p(6.2,2.5), p(7.8,2.5)], egui::Stroke::new(1.2, dcol));
+                                                ui.painter().line_segment([p(4.0,4.0), p(5.0,12.0)], egui::Stroke::new(1.2, dcol));
+                                                ui.painter().line_segment([p(10.0,4.0), p(9.0,12.0)], egui::Stroke::new(1.2, dcol));
+                                                ui.painter().line_segment([p(5.0,12.0), p(9.0,12.0)], egui::Stroke::new(1.2, dcol));
+                                                if dresp.on_hover_text("删除(需确认)").clicked() { del = true; }
+                                            });
+                                        },
+                                    );
+                                    (del, fav, rn)
+                                };
+                                // 收藏行(3列, 定位同快照墙)
+                                if !fav_list.is_empty() {
+                                    ui.label(egui::RichText::new("★ 收藏").small().strong().color(COL_MUTED));
+                                    let fav_img_h = 56.0;
+                                    let fav_row_h = fav_img_h + 20.0;
+                                    for trio in fav_list.chunks(3) {
+                                        let row_rect = ui.allocate_exact_size(egui::vec2(avail_w, fav_row_h), egui::Sense::hover()).0;
+                                        for (ci, meta) in trio.iter().enumerate() {
+                                            let cell = egui::Rect::from_min_size(
+                                                egui::pos2(row_rect.left() + ci as f32 * (cell_w + sp), row_rect.top()),
+                                                egui::vec2(cell_w, fav_row_h),
+                                            );
+                                            let (del, fav, rn) = ui.allocate_new_ui(egui::UiBuilder::new().max_rect(cell), |ui| item(ui, meta, cell_w, fav_img_h)).inner;
+                                            if del { delete_ask = Some(meta.name.clone()); }
+                                            if fav { fav_toggle = Some((meta.name.clone(), !meta.fav)); }
+                                            if rn { rename_start = Some(meta.name.clone()); }
+                                        }
+                                    }
+                                    ui.separator();
+                                }
+                                // 全部区(一行一个, 大图)
+                                if !other_list.is_empty() || fav_list.is_empty() {
+                                    if !other_list.is_empty() {
+                                        ui.label(egui::RichText::new("全部").small().strong().color(COL_MUTED));
+                                    }
+                                    for meta in &other_list {
+                                        let (del, fav, rn) = item(ui, meta, avail_w, 96.0);
+                                        ui.add_space(4.0);
+                                        if del { delete_ask = Some(meta.name.clone()); }
+                                        if fav { fav_toggle = Some((meta.name.clone(), !meta.fav)); }
+                                        if rn { rename_start = Some(meta.name.clone()); }
+                                    }
+                                }
+                            });
+                        // 删除确认
+                        if let Some(name) = self.sel_delete_confirm.clone() {
+                            ui.separator();
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new(format!("删除「{name}」? 含截图, 不可恢复")).small().color(COL_RED));
+                                if ui.small_button("确认删除").clicked() {
+                                    match pla_ui::selection::delete_cdp_selections_batch(&self.doc_key, &[name.clone()]) {
+                                        Ok(_) => {
+                                            self.sel_saved_loaded = false;
+                                            self.sel_pngs.remove(&name);
+                                            self.sel_selected.remove(&name);
+                                            self.set_notice((false, format!("已删除「{name}」")));
+                                        }
+                                        Err(e) => self.set_notice((true, e)),
+                                    }
+                                    self.sel_delete_confirm = None;
+                                }
+                                if ui.small_button("取消").clicked() {
+                                    self.sel_delete_confirm = None;
+                                }
+                            });
+                        }
+                        if let Some(n) = delete_ask {
+                            self.sel_delete_confirm = Some(n);
+                        }
+                        // 管理模式操作条
+                        if self.sel_manage {
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new(format!("已选 {}", self.sel_selected.len())).small().color(COL_MUTED));
+                                if ui.small_button("🗑 删除所选").clicked() && !self.sel_selected.is_empty() {
+                                    let names: Vec<String> = self.sel_selected.iter().cloned().collect();
+                                    match pla_ui::selection::delete_cdp_selections_batch(&self.doc_key, &names) {
+                                        Ok(n) => {
+                                            self.sel_saved_loaded = false;
+                                            for nm in &names { self.sel_pngs.remove(nm); }
+                                            self.sel_selected.clear();
+                                            self.set_notice((false, format!("已删除 {n} 个选择集")));
+                                        }
+                                        Err(e) => self.set_notice((true, e)),
+                                    }
+                                }
+                                if ui.small_button("完成").clicked() {
+                                    self.sel_manage = false;
+                                    self.sel_selected.clear();
+                                }
+                            });
+                            ui.separator();
+                        }
+
+                        // ============ ENTITIES(实时选择镜像, 保留) ============
+                        ui.separator();
                         section_header(ui, "ENTITIES");
                         ui.label(
-                            egui::RichText::new(format!("doc: {} — 视口选择镜像", self.doc_key))
+                            egui::RichText::new(format!("实时选择({} 项): {}", self.sel_cdp_members.len(), self.cdp_status))
                                 .small()
                                 .color(COL_MUTED),
                         );
-                        // ---- R7-14: 实时选择(CDP) — 视口里选什么这里实时显示什么 ----
-                        // v7(R7-32): 只读镜像, 无勾选交互(勾选框/全选/清空已移除)。
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new(format!("实时选择: {}", self.cdp_status))
-                                    .small()
-                                    .color(COL_MUTED),
-                            );
-                        });
                         if !self.live_sel.is_empty() {
                             egui::ScrollArea::vertical()
                                 .id_salt("live-sel")
@@ -1660,283 +2168,428 @@ impl eframe::App for PlaApp {
                                             format!("{} ({})", it.name, it.kind)
                                         };
                                         ui.label(
-                                            egui::RichText::new(format!("● {}", label)).color(
-                                                if it.kind == "face" {
-                                                    COL_YELLOW
-                                                } else {
-                                                    COL_TEXT
-                                                },
+                                            egui::RichText::new(format!("● {label}")).color(
+                                                if it.kind == "face" { COL_YELLOW } else { COL_TEXT },
                                             ),
                                         );
                                     }
                                 });
                         } else {
-                            ui.label(
-                                egui::RichText::new("(空 — 在 Plasticity 视口/树里选择实体)")
-                                    .small()
-                                    .color(COL_MUTED),
-                            );
+                            ui.label(egui::RichText::new("(空 — 在 Plasticity 视口/树里选择实体)").small().color(COL_MUTED));
                         }
-                        ui.separator();
-                        // ---- R7-21: 旧"刷新实体"按钮与旧实体列表已删(用户不使用;
-                        //      旧实体树(bridge LIST_VISIBLE)UI 随之移除) ----
-                        section_header(ui, "SELECTION");
-                        ui.horizontal(|ui| {
-                            ui.label("名称:");
-                            ui.text_edit_singleline(&mut self.sel_name);
-                        });
-                        // ---- R7-14: CDP 选择集 —— 保存勾选的实时选择 + 一键应用回 Plasticity ----
-                        ui.horizontal(|ui| {
-                            if ui.button("保存实时选择").clicked() {
-                                let name = self.sel_name.trim().to_string();
-                                if name.is_empty() {
-                                    self.set_notice((true, "请先在名称框输入选择集名称".into()));
-                                } else if self.sel_cdp_members.is_empty() {
-                                    self.set_notice((true, "实时选择为空 — 请先在视口里选中目标".into()));
-                                } else {
-                                    match pla_ui::selection::save_cdp_selection_with_camera(
-                                        &self.doc_key,
-                                        &name,
-                                        &self.sel_cdp_members.clone(),
-                                        self.sel_camera.as_deref(),
-                                    ) {
-                                        Ok(path) => {
-                                            // R7-21: 保存成功立即刷新 SAVED SELECTIONS 墙。
-                                            self.sel_saved_loaded = false;
-                                            self.set_notice((
-                                                false,
-                                                format!(
-                                                    "已保存 {} ({} 项) → {}",
-                                                    name,
-                                                    self.sel_cdp_members.len(),
-                                                    path
+                        // R8-1(需求7): 报错信息溢出修复 — 包 ScrollArea + 换行
+                        if let Some(err) = self.cdp_err_msg.clone() {
+                            ui.separator();
+                            egui::ScrollArea::vertical()
+                                .id_salt("sel-err")
+                                .max_height(60.0)
+                                .show(ui, |ui| {
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(format!("⚠ {err}"))
+                                                .small()
+                                                .color(COL_RED),
+                                        )
+                                        .wrap(),
+                                    );
+                                });
+                        }
+
+                        // ---- 统一执行动作(借用结束) ----
+                        if let Some((name, fav)) = fav_toggle {
+                            let _ = pla_ui::selection::set_cdp_selection_fav(&self.doc_key, &name, fav);
+                            self.sel_saved_loaded = false;
+                        }
+                        if rename_cancel {
+                            self.sel_rename = None;
+                        }
+                        if let Some(old) = rename_start {
+                            self.sel_rename_buf = old.clone();
+                            self.sel_rename = Some(old);
+                        }
+                        if rename_commit {
+                            if let Some(old) = self.sel_rename.clone() {
+                                match pla_ui::selection::rename_cdp_selection(&self.doc_key, &old, &self.sel_rename_buf) {
+                                    Ok(_) => {
+                                        self.sel_saved_loaded = false;
+                                        self.sel_pngs.remove(&old);
+                                        self.set_notice((false, format!("已改名: {old} → {}", self.sel_rename_buf.trim())));
+                                    }
+                                    Err(e) => self.set_notice((true, e)),
+                                }
+                            }
+                            self.sel_rename = None;
+                        }
+                        if let Some(name) = apply_now {
+                            match pla_ui::selection::load_cdp_selection(&self.doc_key, &name) {
+                                Some(members) => {
+                                    let entries: Vec<pla_bridge::cdp::ApplyEntry> = members
+                                        .iter()
+                                        .map(|m| pla_bridge::cdp::ApplyEntry {
+                                            kind: m.kind.clone(),
+                                            id: m.id.clone(),
+                                            key: m.key.clone(),
+                                            camera: m.camera.clone(),
+                                        })
+                                        .collect();
+                                    if entries.is_empty() {
+                                        self.set_notice((true, "该选择集没有成员".into()));
+                                    } else {
+                                        let n = entries.len();
+                                        self.send_apply(entries);
+                                        self.pending_focus = true;
+                                        self.set_notice((false, format!("正在应用「{name}」{n} 项…")));
+                                    }
+                                }
+                                None => self.set_notice((true, "读取失败".into())),
+                            }
+                        }
+                        if let Some(e) = open_err {
+                            self.set_notice((true, e));
+                        }
+                        if let Some(t) = inner_tip.into_inner() {
+                            self.hovered_hint = Some(t);
+                        }
+                    },
+                    Some(icons),
+                );
+                // 图标 hover → HUD
+                if let Some(t) = tip_slot.borrow_mut().take() {
+                    self.hovered_hint = Some(t);
+                }
+                // 💾 保存: SG 自动命名 + 截图 → (pending 流程: 截图回包后落盘)
+                if do_save.get() {
+                    if self.sel_cdp_members.is_empty() {
+                        self.set_notice((true, "实时选择为空 — 请先在视口里选中目标".into()));
+                    } else {
+                        let name = pla_ui::selection::next_sg_name(&self.doc_key);
+                        let members = self.sel_cdp_members.clone();
+                        let cam = self.sel_camera.clone();
+                        // 截图临时路径(exe 同级 temp)
+                        let tmp = pla_ui::selection::cdp_selections_dir(&self.doc_key)
+                            .join(format!("__shot_tmp.png"));
+                        let tmp_str = tmp.display().to_string();
+                        self.sel_shot_path = Some(tmp_str.clone());
+                        self.sel_save_pending = Some((name.clone(), members, cam));
+                        self.cdp.send(pla_bridge::cdp::CdpCmd::CaptureViewport(tmp_str));
+                        self.set_notice((false, format!("正在保存选择集 {name}(截图中)…")));
+                    }
+                }
+                if do_open_dir.get() {
+                    if let Err(e) = pla_ui::selection::open_cdp_selections_dir(&self.doc_key) {
+                        self.set_notice((true, e));
+                    }
+                }
+                if do_manage.get() {
+                    self.sel_manage = !self.sel_manage;
+                    self.sel_selected.clear();
+                    self.sel_rename = None;
+                }
+                self.show_entities = flag;
+            }
+        }
+
+        // ============ R8-1: 视口状态面板(布局与快照墙一致) ============
+        if self.show_vpstate {
+            let desired = next_pos(&mut stack_y, PANEL_VPSTATE[1]);
+            if let Some(desired) = desired {
+                let mut flag = self.show_vpstate;
+                let do_save = std::rc::Rc::new(std::cell::Cell::new(false));
+                let do_open_dir = std::rc::Rc::new(std::cell::Cell::new(false));
+                let do_manage = std::rc::Rc::new(std::cell::Cell::new(false));
+                let tip_slot = std::rc::Rc::new(std::cell::RefCell::new(None::<(String, String)>));
+                let (dsv, dodv, dmv, tsv) = (do_save.clone(), do_open_dir.clone(), do_manage.clone(), tip_slot.clone());
+                let icons: Box<dyn FnOnce(&mut egui::Ui)> = Box::new(move |ui| {
+                    let icon_btn = |ui: &mut egui::Ui, glyph: &str, tip: &str, hit: &std::cell::Cell<bool>, ts: &std::cell::RefCell<Option<(String, String)>>| {
+                        let resp = ui.add(
+                            egui::Button::new(egui::RichText::new(glyph).size(13.0).color(egui::Color32::WHITE))
+                                .frame(false)
+                                .rounding(egui::Rounding::same(4.0)),
+                        );
+                        if resp.hovered() {
+                            *ts.borrow_mut() = Some((format!("{glyph} {tip}"), String::new()));
+                        }
+                        if resp.clicked() {
+                            hit.set(true);
+                        }
+                    };
+                    icon_btn(ui, "🗑", "批量删除", &dmv, &tsv);
+                    icon_btn(ui, "📂", "打开视口状态文件夹", &dodv, &tsv);
+                    icon_btn(ui, "💾", "保存当前视口状态(VS 自动命名 + 截图)", &dsv, &tsv);
+                });
+                header_extra_and_show(
+                    ctx,
+                    "panel-vpstate",
+                    "视口状态",
+                    desired,
+                    egui::vec2(PANEL_VPSTATE[0], PANEL_VPSTATE[1]),
+                    &mut flag,
+                    true,
+                    |ui| {
+                        let inner_tip = std::cell::RefCell::new(None::<(String, String)>);
+                        if !self.vp_states_loaded {
+                            self.vp_states = pla_ui::vpstate::list_vpstates(&self.doc_key);
+                            self.vp_states_loaded = true;
+                        }
+                        // PNG 缓存
+                        let vdir = pla_ui::vpstate::vpstate_dir(&self.doc_key);
+                        for m in self.vp_states.clone() {
+                            if !self.vp_pngs.contains_key(&m.name) {
+                                if let Ok(b) = std::fs::read(vdir.join(format!("{}.png", m.name))) {
+                                    self.vp_pngs.insert(m.name.clone(), std::sync::Arc::from(b));
+                                }
+                            }
+                        }
+                        let (fav_list, other_list): (Vec<_>, Vec<_>) =
+                            self.vp_states.iter().cloned().partition(|m| m.fav);
+                        if self.vp_states.is_empty() {
+                            ui.label(egui::RichText::new("(空 — 点 💾 保存当前视口)").small().color(COL_MUTED));
+                        }
+                        let mut delete_ask: Option<String> = None;
+                        let mut apply_now: Option<String> = None;
+                        let mut fav_toggle: Option<(String, bool)> = None;
+                        let mut rename_start: Option<String> = None;
+                        let mut rename_commit = false;
+                        let mut rename_cancel = false;
+                        // 悬浮信息: 从 JSON 里提取相机/显示模式摘要
+                        let state_brief = |name: &str| -> String {
+                            match pla_ui::vpstate::load_vpstate(&self.doc_key, name) {
+                                Some(s) => {
+                                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
+                                        let mode = v["shading"]["mode"].as_str().unwrap_or("-");
+                                        let sec = v["shading"]["section"].as_str().unwrap_or("none");
+                                        let nsec = v["sections"].as_array().map(|a| a.len()).unwrap_or(0);
+                                        let zoom = v["orbit"]["zoom"].as_f64();
+                                        let fov = v["cam"]["fov"].as_f64();
+                                        format!(
+                                            "显示: {mode} / 剖面模式: {sec}({nsec}) / {} / zoom {}",
+                                            if fov == Some(0.0) { "正交" } else { "透视" },
+                                            zoom.map(|z| format!("{z:.1}")).unwrap_or("-".into()),
+                                        )
+                                    } else {
+                                        "状态数据无法解析".into()
+                                    }
+                                }
+                                None => "状态数据缺失".into(),
+                            }
+                        };
+                        let screen_h = ctx.screen_rect().height();
+                        let row_h = 66.0;
+                        let content_rows = fav_list.len() / 3 + other_list.len() + 1;
+                        let content_h = (content_rows as f32 * row_h + 30.0).min(screen_h / 3.0).max(72.0);
+                        egui::ScrollArea::vertical()
+                            .id_salt("vp-wall")
+                            .max_height(content_h)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                let avail_w = ui.available_width();
+                                let sp = ui.spacing().item_spacing.x;
+                                let cell_w = ((avail_w - sp * 2.0) / 3.0).max(40.0);
+                                let mut item = |ui: &mut egui::Ui, meta: &pla_ui::vpstate::VpStateMeta, w: f32, img_h: f32| {
+                                    let mut del = false; let mut fav = false; let mut rn = false;
+                                    ui.allocate_ui_with_layout(
+                                        egui::vec2(w, img_h + 20.0),
+                                        egui::Layout::top_down(egui::Align::LEFT),
+                                        |ui| {
+                                            let png = self.vp_pngs.get(&meta.name);
+                                            let brief = state_brief(&meta.name);
+                                            let dims = png.and_then(|b| png_dims(b));
+                                            let img_resp = match (png, dims) {
+                                                (Some(bytes), Some((pw, ph))) => {
+                                                    let iw = (img_h * pw / ph).min(w);
+                                                    ui.allocate_ui_with_layout(
+                                                        egui::vec2(w, img_h),
+                                                        egui::Layout::top_down(egui::Align::Center),
+                                                        |ui| ui.add(
+                                                            egui::Image::from_bytes(format!("bytes://vp-{}", meta.name), bytes.clone())
+                                                                .fit_to_exact_size(egui::vec2(iw, img_h))
+                                                                .sense(egui::Sense::click()),
+                                                        ),
+                                                    ).inner
+                                                }
+                                                _ => ui.add_sized(
+                                                    egui::vec2(w, img_h),
+                                                    egui::Label::new(egui::RichText::new("🎥").size(20.0)).sense(egui::Sense::click()),
                                                 ),
-                                            ));
+                                            };
+                                            if img_resp.hovered() {
+                                                *inner_tip.borrow_mut() = Some((
+                                                    format!("{} — 视口状态", meta.name),
+                                                    format!("{brief} · 保存于 {} · 点击恢复", if meta.created.is_empty() { "-" } else { &meta.created }),
+                                                ));
+                                            }
+                                            if img_resp.clicked() {
+                                                apply_now = Some(meta.name.clone());
+                                            }
+                                            ui.horizontal(|ui| {
+                                                if self.sel_manage {
+                                                    // 视口状态面板复用 sel_manage 勾选集? 不, 用独立 vp 管理标记 = sel_manage 同一按钮
+                                                }
+                                                if self.vp_rename.as_deref() == Some(meta.name.as_str()) {
+                                                    ui.add_sized(egui::vec2((w - 60.0).max(30.0), 16.0), egui::TextEdit::singleline(&mut self.vp_rename_buf)).request_focus();
+                                                    let (enter, esc) = ui.input(|i| (i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Escape)));
+                                                    if enter { rename_commit = true; }
+                                                    if esc { rename_cancel = true; }
+                                                } else {
+                                                    let name_w = (w - (14.0 + sp) * 3.0).max(30.0);
+                                                    let nr = ui.allocate_ui_with_layout(
+                                                        egui::vec2(name_w, 14.0),
+                                                        egui::Layout::left_to_right(egui::Align::Center),
+                                                        |ui| ui.add(egui::Label::new(egui::RichText::new(&meta.name).small().color(COL_TEXT)).sense(egui::Sense::click()).truncate()),
+                                                    ).inner;
+                                                    if nr.clicked() {
+                                                        apply_now = Some(meta.name.clone());
+                                                    }
+                                                }
+                                                let (srect, sresp) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::click());
+                                                ui.painter().text(srect.center(), egui::Align2::CENTER_CENTER, if meta.fav { "★" } else { "☆" }, egui::FontId::proportional(13.0), if meta.fav { egui::Color32::from_rgb(255,200,60) } else { COL_MUTED });
+                                                if sresp.on_hover_text(if meta.fav { "取消收藏" } else { "收藏(置顶)" }).clicked() { fav = true; }
+                                                if pencil_button(ui).on_hover_text("改名").clicked() { rn = true; }
+                                                let (drect, dresp) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::click());
+                                                let dcol = if dresp.hovered() { COL_RED } else { COL_MUTED };
+                                                let p = |x: f32, y: f32| egui::pos2(drect.left() + x, drect.top() + y);
+                                                ui.painter().line_segment([p(3.0,4.0), p(11.0,4.0)], egui::Stroke::new(1.2, dcol));
+                                                ui.painter().line_segment([p(5.5,4.0), p(5.5,2.5)], egui::Stroke::new(1.2, dcol));
+                                                ui.painter().line_segment([p(8.5,4.0), p(8.5,2.5)], egui::Stroke::new(1.2, dcol));
+                                                ui.painter().line_segment([p(6.2,2.5), p(7.8,2.5)], egui::Stroke::new(1.2, dcol));
+                                                ui.painter().line_segment([p(4.0,4.0), p(5.0,12.0)], egui::Stroke::new(1.2, dcol));
+                                                ui.painter().line_segment([p(10.0,4.0), p(9.0,12.0)], egui::Stroke::new(1.2, dcol));
+                                                ui.painter().line_segment([p(5.0,12.0), p(9.0,12.0)], egui::Stroke::new(1.2, dcol));
+                                                if dresp.on_hover_text("删除(需确认)").clicked() { del = true; }
+                                            });
+                                        },
+                                    );
+                                    (del, fav, rn)
+                                };
+                                if !fav_list.is_empty() {
+                                    ui.label(egui::RichText::new("★ 收藏").small().strong().color(COL_MUTED));
+                                    let fav_img_h = 56.0;
+                                    let fav_row_h = fav_img_h + 20.0;
+                                    for trio in fav_list.chunks(3) {
+                                        let row_rect = ui.allocate_exact_size(egui::vec2(avail_w, fav_row_h), egui::Sense::hover()).0;
+                                        for (ci, meta) in trio.iter().enumerate() {
+                                            let cell = egui::Rect::from_min_size(
+                                                egui::pos2(row_rect.left() + ci as f32 * (cell_w + sp), row_rect.top()),
+                                                egui::vec2(cell_w, fav_row_h),
+                                            );
+                                            let (del, fav, rn) = ui.allocate_new_ui(egui::UiBuilder::new().max_rect(cell), |ui| item(ui, meta, cell_w, fav_img_h)).inner;
+                                            if del { delete_ask = Some(meta.name.clone()); }
+                                            if fav { fav_toggle = Some((meta.name.clone(), !meta.fav)); }
+                                            if rn { rename_start = Some(meta.name.clone()); }
+                                        }
+                                    }
+                                    ui.separator();
+                                }
+                                if !other_list.is_empty() {
+                                    ui.label(egui::RichText::new("全部").small().strong().color(COL_MUTED));
+                                    for meta in &other_list {
+                                        let (del, fav, rn) = item(ui, meta, avail_w, 96.0);
+                                        ui.add_space(4.0);
+                                        if del { delete_ask = Some(meta.name.clone()); }
+                                        if fav { fav_toggle = Some((meta.name.clone(), !meta.fav)); }
+                                        if rn { rename_start = Some(meta.name.clone()); }
+                                    }
+                                }
+                            });
+                        // 删除确认
+                        if let Some(name) = self.vp_delete_confirm.clone() {
+                            ui.separator();
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new(format!("删除「{name}」? 不可恢复")).small().color(COL_RED));
+                                if ui.small_button("确认删除").clicked() {
+                                    match pla_ui::vpstate::delete_vpstates(&self.doc_key, &[name.clone()]) {
+                                        Ok(_) => {
+                                            self.vp_states_loaded = false;
+                                            self.vp_pngs.remove(&name);
+                                            self.set_notice((false, format!("已删除「{name}」")));
                                         }
                                         Err(e) => self.set_notice((true, e)),
                                     }
+                                    self.vp_delete_confirm = None;
                                 }
-                            }
-                            // R7-28: 旧「重新武装」开关已随 v7 镜像模式移除(方案已否决)。
-                            if ui.button("应用到 Plasticity").clicked() {
-                                // R7-21: 按成员类型回放 — solid/sheet=addById(数值);
-                                // face/edge 等对象形走 add<Kind>({id,versionId,...}) 原样回放。
-                                let entries: Vec<pla_bridge::cdp::ApplyEntry> = self
-                                    .sel_cdp_members
-                                    .iter()
-                                    .map(|(k, i, _, key, _)| pla_bridge::cdp::ApplyEntry {
-                                        kind: k.clone(),
-                                        id: i.clone(),
-                                        key: key.clone(),
-                                        camera: None,
-                                    })
-                                    .collect();
-                                if entries.is_empty() {
-                                    self.set_notice((true, "勾选项为空".into()));
-                                } else {
-                                    let n = entries.len();
-                                    self.send_apply(entries);
-                                    // R7-26: 应用完成后把焦点还给 Plasticity。
-                                    self.pending_focus = true;
-                                    self.set_notice((
-                                        false,
-                                        format!("正在应用 {n} 项选择到 Plasticity…"),
-                                    ));
-                                }
-                            }
-                        });
-                        // ---- R7-20: 已保存选择集墙(参考快照墙: 收藏/改名/删除, 无截图) ----
-                        ui.separator();
-                        section_header(ui, "SAVED SELECTIONS");
-                        if !self.sel_saved_loaded {
-                            self.sel_saved =
-                                pla_ui::selection::list_cdp_selections_meta(&self.doc_key);
-                            self.sel_saved_loaded = true;
-                        }
-                        if self.sel_saved.is_empty() {
-                            ui.label(
-                                egui::RichText::new("(空 — 选中实时选择后保存)")
-                                    .small()
-                                    .color(COL_MUTED),
-                            );
-                        }
-                        egui::ScrollArea::vertical()
-                            .id_salt("sel-saved")
-                            .max_height(96.0)
-                            .show(ui, |ui| {
-                                for meta in self.sel_saved.clone() {
-                                    ui.horizontal(|ui| {
-                                        if self.sel_rename.as_deref()
-                                            == Some(meta.name.as_str())
-                                        {
-                                            // 改名行: 编辑框 + √/× (回车确认 / Esc 取消)
-                                            ui.add_sized(
-                                                egui::vec2(110.0, 18.0),
-                                                egui::TextEdit::singleline(
-                                                    &mut self.sel_rename_buf,
-                                                ),
-                                            )
-                                            .request_focus();
-                                            let (enter, esc) = ui.input(|i| {
-                                                (
-                                                    i.key_pressed(egui::Key::Enter),
-                                                    i.key_pressed(egui::Key::Escape),
-                                                )
-                                            });
-                                            if ui.small_button("√").clicked() || enter {
-                                                let old = meta.name.clone();
-                                                let new = self.sel_rename_buf.clone();
-                                                match pla_ui::selection::rename_cdp_selection(
-                                                    &self.doc_key, &old, &new,
-                                                ) {
-                                                    Ok(_) => {
-                                                        self.sel_rename = None;
-                                                        self.sel_saved_loaded = false;
-                                                        self.set_notice((
-                                                            false,
-                                                            format!(
-                                                                "已改名: {old} → {}",
-                                                                new.trim()
-                                                            ),
-                                                        ));
-                                                    }
-                                                    Err(e) => self.set_notice((true, e)),
-                                                }
-                                            }
-                                            if ui.small_button("×").clicked() || esc {
-                                                self.sel_rename = None;
-                                            }
-                                        } else {
-                                            // 收藏星(收藏优先由列表排序保证)
-                                            let star = if meta.fav { "★" } else { "☆" };
-                                            let star_btn = egui::Button::new(
-                                                egui::RichText::new(star).color(if meta.fav {
-                                                    COL_YELLOW
-                                                } else {
-                                                    COL_MUTED
-                                                }),
-                                            )
-                                            .frame(false);
-                                            if ui.add(star_btn).clicked() {
-                                                match pla_ui::selection::set_cdp_selection_fav(
-                                                    &self.doc_key,
-                                                    &meta.name,
-                                                    !meta.fav,
-                                                ) {
-                                                    Ok(_) => self.sel_saved_loaded = false,
-                                                    Err(e) => self.set_notice((true, e)),
-                                                }
-                                            }
-                                            // 名称: 点击 = 载入勾选区(可编辑后重存)
-                                            // v7(R7-32): 镜像模式下点击名称 = 只填入名称框。
-                                            // 编辑流程: 「应用」→ 视口里调整选择 → 同名保存(覆盖)。
-                                            if ui
-                                                .selectable_label(
-                                                    false,
-                                                    egui::RichText::new(&meta.name)
-                                                        .color(COL_TEXT),
-                                                )
-                                                .clicked()
-                                            {
-                                                self.sel_name = meta.name.clone();
-                                                self.set_notice((
-                                                    false,
-                                                    format!(
-                                                        "已填入名称「{}」— 应用后可在视口调整, 再点「保存实时选择」覆盖",
-                                                        meta.name
-                                                    ),
-                                                ));
-                                            }
-                                            ui.label(
-                                                egui::RichText::new(format!(
-                                                    "({})",
-                                                    meta.n_members
-                                                ))
-                                                .small()
-                                                .color(COL_MUTED),
-                                            );
-                                            ui.with_layout(
-                                                egui::Layout::right_to_left(egui::Align::Center),
-                                                |ui| {
-                                                    if ui.small_button("删").clicked() {
-                                                        match pla_ui::selection::
-                                                            delete_cdp_selection(
-                                                                &self.doc_key, &meta.name,
-                                                            ) {
-                                                            Ok(_) => {
-                                                                self.sel_saved_loaded = false;
-                                                                self.set_notice((
-                                                                    false,
-                                                                    format!(
-                                                                        "已删除「{}」",
-                                                                        meta.name
-                                                                    ),
-                                                                ));
-                                                            }
-                                                            Err(e) => self.set_notice((true, e)),
-                                                        }
-                                                    }
-                                                    if ui.small_button("改").clicked() {
-                                                        self.sel_rename = Some(meta.name.clone());
-                                                        self.sel_rename_buf = meta.name.clone();
-                                                    }
-                                                    // 直接应用: 不经勾选区, 一键复原到 Plasticity
-                                                    if ui.small_button("应用").clicked() {
-                                                        match pla_ui::selection::load_cdp_selection(
-                                                            &self.doc_key, &meta.name,
-                                                        ) {
-                                                            Some(members) => {
-                                                                let entries: Vec<pla_bridge::cdp::ApplyEntry> = members
-                                                                    .iter()
-                                                                    .map(|m| pla_bridge::cdp::ApplyEntry {
-                                                                        kind: m.kind.clone(),
-                                                                        id: m.id.clone(),
-                                                                        key: m.key.clone(),
-                                                                        camera: m.camera.clone(),
-                                                                    })
-                                                                    .collect();
-                                                                if entries.is_empty() {
-                                                                    self.set_notice((
-                                                                        true,
-                                                                        "该选择集没有成员".into(),
-                                                                    ));
-                                                                } else {
-                                                                    let n = entries.len();
-                                                                    self.send_apply(entries);
-                                                                    // R7-26: 应用完成后把焦点还给 Plasticity。
-                                                                    self.pending_focus = true;
-                                                                    self.set_notice((
-                                                                        false,
-                                                                        format!(
-                                                                            "正在应用「{}」{n} 项到 Plasticity…",
-                                                                            meta.name
-                                                                        ),
-                                                                    ));
-                                                                }
-                                                            }
-                                                            None => {
-                                                                self.set_notice((true, "读取失败".into()))
-                                                            }
-                                                        }
-                                                    }
-                                                },
-                                            );
-                                        }
-                                    });
+                                if ui.small_button("取消").clicked() {
+                                    self.vp_delete_confirm = None;
                                 }
                             });
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "当前选择 {} 项(视口实时镜像)",
-                                self.sel_cdp_members.len()
-                            ))
-                            .small()
-                            .color(COL_MUTED),
-                        );
+                        }
+                        if let Some(n) = delete_ask {
+                            self.vp_delete_confirm = Some(n);
+                        }
+                        // 管理条
+                        if self.sel_manage && self.show_vpstate {
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new("批量删除: 勾选要删的项").small().color(COL_MUTED));
+                                if ui.small_button("完成").clicked() {
+                                    self.sel_manage = false;
+                                    self.sel_selected.clear();
+                                }
+                            });
+                            ui.separator();
+                        }
+                        // 动作执行
+                        if let Some((name, fav)) = fav_toggle {
+                            let _ = pla_ui::vpstate::set_fav(&self.doc_key, &name, fav);
+                            self.vp_states_loaded = false;
+                        }
+                        if rename_cancel {
+                            self.vp_rename = None;
+                        }
+                        if let Some(old) = rename_start {
+                            self.vp_rename_buf = old.clone();
+                            self.vp_rename = Some(old);
+                        }
+                        if rename_commit {
+                            if let Some(old) = self.vp_rename.clone() {
+                                match pla_ui::vpstate::rename_vpstate(&self.doc_key, &old, &self.vp_rename_buf) {
+                                    Ok(_) => {
+                                        self.vp_states_loaded = false;
+                                        self.vp_pngs.remove(&old);
+                                        self.set_notice((false, format!("已改名: {old} → {}", self.vp_rename_buf.trim())));
+                                    }
+                                    Err(e) => self.set_notice((true, e)),
+                                }
+                            }
+                            self.vp_rename = None;
+                        }
+                        if let Some(name) = apply_now {
+                            match pla_ui::vpstate::load_vpstate(&self.doc_key, &name) {
+                                Some(state) => {
+                                    self.cdp.send(pla_bridge::cdp::CdpCmd::VpStateApply(state));
+                                    self.pending_focus = true;
+                                    self.set_notice((false, format!("正在恢复视口状态「{name}」…")));
+                                }
+                                None => self.set_notice((true, "状态数据缺失".into())),
+                            }
+                        }
+                        if let Some(t) = inner_tip.into_inner() {
+                            self.hovered_hint = Some(t);
+                        }
                     },
-                    None,
+                    Some(icons),
                 );
-                self.show_entities = flag;
+                if let Some(t) = tip_slot.borrow_mut().take() {
+                    self.hovered_hint = Some(t);
+                }
+                // 💾: 采集 + 截图 → pending 落盘
+                if do_save.get() {
+                    self.cdp.send(pla_bridge::cdp::CdpCmd::VpStateSave);
+                    let tmp = pla_ui::vpstate::vpstate_dir(&self.doc_key).join("__shot_tmp.png");
+                    let _ = std::fs::create_dir_all(&tmp.parent().unwrap_or(std::path::Path::new(".")));
+                    let tmp_str = tmp.display().to_string();
+                    self.vp_shot_path = Some(tmp_str.clone());
+                    self.cdp.send(pla_bridge::cdp::CdpCmd::CaptureViewport(tmp_str));
+                    self.set_notice((false, "正在采集视口状态 + 截图…".into()));
+                }
+                if do_open_dir.get() {
+                    if let Err(e) = pla_ui::vpstate::open_dir(&self.doc_key) {
+                        self.set_notice((true, e));
+                    }
+                }
+                if do_manage.get() {
+                    self.sel_manage = !self.sel_manage;
+                    self.sel_selected.clear();
+                }
+                self.show_vpstate = flag;
             }
         }
 

@@ -22,6 +22,13 @@ use serde_json::Value;
 pub enum CdpCmd {
     /// 应用选择集: 按成员类型回放(solid/sheet=addById(数值); 其余=add<Kind>({id,versionId,...}))。
     ApplySel(Vec<ApplyEntry>),
+    /// R8-1: 采集视口状态(相机/缩放/剖面/参考面/显示模式) → VpStateResult。
+    VpStateSave,
+    /// R8-1: 恢复视口状态(state = VpStateSave 采集的 JSON)。
+    VpStateApply(String),
+    /// R8-1: 视口裁剪截图(Page.captureScreenshot clip=视口 rect)。
+    /// 参数 = 输出 PNG 路径; 结果经 Status 上报。
+    CaptureViewport(String),
     /// R7-28: 派发一个按键(经 CDP Input.dispatchKeyEvent)。
     /// 注意: CDP 输入要求 Plasticity 窗口持有 OS 焦点, 否则事件被丢弃。
     Key(KeySpec),
@@ -69,6 +76,10 @@ pub enum CdpEvent {
     Tree(Vec<TreeNode>),
     /// Eval 回包。
     EvalResult(String),
+    /// R8-1: 视口状态采集回包(JSON 字符串; err 字段非空表示失败)。
+    VpStateResult(String),
+    /// R8-1: 视口截图回包(PNG 字节数)。
+    ViewportPng(usize),
     /// R7-28: 请 UI 把前台焦点交还 Plasticity(武装按键丢失时重试前置)。
     RequestFocus,
 }
@@ -410,33 +421,65 @@ async fn session_loop(
                     let _ = ev_tx.send(CdpEvent::Status("选择集应用: 成员为空".into()));
                     continue;
                 }
-                // v6(R7-31l) Phase 0: 还原保存视角(按图索骥)。
-                // 保存相机随集存储; 有则先快照用户相机 → 切到保存相机,
-                // 结束时(无论成败)恢复。旧集无相机 → 跳过(走当前视角)。
-                let saved_cam: Option<String> = entries
-                    .iter()
-                    .find_map(|e| e.camera.clone())
-                    .filter(|c| !c.is_empty());
-                let mut user_cam: Option<String> = None;
-                if let Some(cam_json) = saved_cam.as_ref() {
-                    match eval_roundtrip(ws, &mut mid, CAM_SNAPSHOT_JS).await {
-                        Ok(s) if !s.is_empty() => user_cam = Some(s),
-                        Ok(_) => eprintln!("[pla-cdp] v6: 用户相机快照为空(仍继续)"),
-                        Err(e) => eprintln!("[pla-cdp] v6: 用户相机快照失败(仍继续): {e:#}"),
+                // R8(成功率): 按成员相机分组应用 — 多视角选择集(A 面视角1选中、
+                // B 面视角2选中)每组切到自己的保存视角再扫描点击, 避免单一视角
+                // 下大量面被遮挡/漏扫。分组键 = camera JSON 字符串(None 归一组,
+                // 走当前视角)。组顺序 = 首次出现顺序(稳定)。
+                let mut cam_groups: Vec<(Option<String>, Vec<ApplyEntry>)> = Vec::new();
+                for e in entries {
+                    let key = e.camera.clone().filter(|c| !c.is_empty());
+                    match cam_groups.iter_mut().find(|(k, _)| *k == key) {
+                        Some((_, v)) => v.push(e.clone()),
+                        None => cam_groups.push((key, vec![e.clone()])),
                     }
-                    let enter_js = format!(
-                        "(function(){{try{{var o={cam_json};var ed=window.__PLA_EDITOR__;if(!ed){{var f=window.__PLA_HOOK__;if(f)ed=f.findEditor();}}if(!ed)return 'no-ed';var vp=null;ed.viewports.forEach(function(v){{if(!vp)vp=v}});if(!vp||!vp.camera)return 'no-cam';var cam=vp.camera;cam.position.set(o.px,o.py,o.pz);cam.quaternion.set(o.qx,o.qy,o.qz,o.qw);try{{vp.setNeedsRender()}}catch(e2){{}}return 'ok'}}catch(e){{return 'EXC'}}}})()"
-                    );
-                    match eval_roundtrip(ws, &mut mid, &enter_js).await {
-                        Ok(r) if r.contains("ok") => {
-                            eprintln!("[pla-cdp] v6: 已切换到保存视角");
-                        }
-                        other => eprintln!("[pla-cdp] v6: 保存视角切换异常: {other:?}"),
-                    }
-                    // 相机切换后渲染/命中管线需要一拍稳定
-                    tokio::time::sleep(Duration::from_millis(350)).await;
                 }
-                let js = match apply_sel_js(&entries) {
+                let n_groups = cam_groups.len();
+                eprintln!(
+                    "[pla-cdp] R8: {n_groups} 个相机组, 成员分布 {:?}",
+                    cam_groups
+                        .iter()
+                        .map(|(_, v)| v.len())
+                        .collect::<Vec<_>>()
+                );
+                // 全流程汇总
+                let mut total_ok = 0usize;
+                let mut total_fail = 0usize;
+                let mut fail_parts: Vec<String> = Vec::new();
+                let mut total_rescued = 0usize;
+                // 用户相机只快照一次, 全部组结束后恢复
+                let mut user_cam: Option<String> = None;
+                let mut user_cam_taken = false;
+                'groups: for (gi, (group_cam, group_entries)) in
+                    cam_groups.into_iter().enumerate()
+                {
+                    let entries = group_entries;
+                    // v6(R7-31l) Phase 0: 还原该组保存视角(按图索骥)。
+                    if let Some(cam_json) = group_cam.as_ref() {
+                        if !user_cam_taken {
+                            user_cam_taken = true;
+                            match eval_roundtrip(ws, &mut mid, CAM_SNAPSHOT_JS).await {
+                                Ok(s) if !s.is_empty() => user_cam = Some(s),
+                                Ok(_) => eprintln!("[pla-cdp] v6: 用户相机快照为空(仍继续)"),
+                                Err(e) => {
+                                    eprintln!("[pla-cdp] v6: 用户相机快照失败(仍继续): {e:#}")
+                                }
+                            }
+                        }
+                        let enter_js = format!(
+                            "(function(){{try{{var o={cam_json};var ed=window.__PLA_EDITOR__;if(!ed){{var f=window.__PLA_HOOK__;if(f)ed=f.findEditor();}}if(!ed)return 'no-ed';var vp=null;ed.viewports.forEach(function(v){{if(!vp)vp=v}});if(!vp||!vp.camera)return 'no-cam';var cam=vp.camera;cam.position.set(o.px,o.py,o.pz);cam.quaternion.set(o.qx,o.qy,o.qz,o.qw);try{{vp.setNeedsRender()}}catch(e2){{}}return 'ok'}}catch(e){{return 'EXC'}}}})()"
+                        );
+                        match eval_roundtrip(ws, &mut mid, &enter_js).await {
+                            Ok(r) if r.contains("ok") => {
+                                eprintln!("[pla-cdp] R8: 组 {gi} 已切换到保存视角");
+                            }
+                            other => {
+                                eprintln!("[pla-cdp] R8: 组 {gi} 视角切换异常: {other:?}")
+                            }
+                        }
+                        // 相机切换后渲染/命中管线需要一拍稳定
+                        tokio::time::sleep(Duration::from_millis(350)).await;
+                    }
+                let js = match apply_sel_js(&entries, gi > 0) {
                     Ok(j) => j,
                     Err(e) => {
                         let _ = ev_tx.send(CdpEvent::Status(format!("选择集应用失败: {e}")));
@@ -451,7 +494,7 @@ async fn session_loop(
                         let _ = ev_tx.send(CdpEvent::Status(format!(
                             "选择集应用失败(准备阶段): {e}"
                         )));
-                        continue;
+                        continue 'groups;
                     }
                 };
                 let rect: (i64, i64, i64, i64) = match serde_json::from_str::<(i64,i64,i64,i64)>(&prep) {
@@ -459,10 +502,9 @@ async fn session_loop(
                     Err(_) => {
                         // prep 是错误 JSON {err:...}
                         let (ok, fail, errs) = parse_apply_result(&prep);
-                        let _ = ev_tx.send(CdpEvent::Status(format!(
-                            "选择集应用: {ok} 项成功, {fail} 项失败 {errs}"
-                        )));
-                        continue;
+                        total_fail += fail as usize;
+                        fail_parts.push(errs);
+                        continue 'groups;
                     }
                 };
                 // Phase B(v5): 快速网格扫描 — spy 在页面侧自读坐标并累积进
@@ -535,11 +577,14 @@ async fn session_loop(
                     }
                 }
                 if located.is_empty() {
-                    let _ = ev_tx.send(CdpEvent::Status(format!(
-                        "选择集应用失败: 当前视角扫描未命中目标面({} 个; 可旋转视角后重试)",
+                    // R8: 相机绑定语义下"未扫到"= 该面在保存视角下不可见(极小面/
+                    // 边), 提示如实但不引导"旋转视角"(用户旋转会破坏组视角)。
+                    fail_parts.push(format!(
+                        "{} 项未扫到(保存视角下不可见)",
                         misses.len()
-                    )));
-                    continue;
+                    ));
+                    total_fail += misses.len();
+                    continue 'groups;
                 }
                 let click_points = plan_clicks(&located);
                 eprintln!(
@@ -552,7 +597,9 @@ async fn session_loop(
                 let mut clicked: Vec<(String, i64, i64)> = Vec::new();
                 let mut click_failed: Vec<String> = Vec::new();
                 for (i, (px, py)) in click_points.iter().enumerate() {
-                    let shift = i > 0;
+                    // R8: 首组第一击=普通点击(替换语义); 其余一律 shift 追加
+                    // (组内第 2+ 击 + 多相机组的全部后续组)。
+                    let shift = i > 0 || gi > 0;
                     let sent = dispatch_mouse_click(ws, &mut mid, *px, *py, shift).await;
                     let group = click_group(&located, *px, *py);
                     match sent {
@@ -594,6 +641,7 @@ async fn session_loop(
                 let face_ids = match faces_opt {
                     Some(f) => f,
                     None => {
+                        total_ok += clicked.len();
                         let _ = ev_tx.send(CdpEvent::Status(format!(
                             "选择集应用: {} 项已点击, 但校验读取失败(可查看选择状态确认)",
                             clicked.len()
@@ -606,7 +654,7 @@ async fn session_loop(
                         )
                         .await;
                         let _ = eval_roundtrip(ws, &mut mid, CLEAR_MAP_JS).await;
-                        continue;
+                        continue 'groups;
                     }
                 };
                 let mut tally = tally_occlusion(&clicked, &face_ids);
@@ -735,7 +783,11 @@ async fn session_loop(
                 // 唤醒 hover 后清累积表: 点击完成后的正常 hover 又会写入新命中,
                 // 留着既无用途也会无限增长(甚至干扰下次应用), 统一在收尾清零。
                 let _ = eval_roundtrip(ws, &mut mid, CLEAR_MAP_JS).await;
-                let msg = if fail > 0 {
+                // R8: 组结果并入汇总(不再逐组发 Status, 统一收尾一条)
+                total_ok += ok;
+                total_fail += fail;
+                total_rescued += rescued;
+                if fail > 0 {
                     let mut parts: Vec<String> = Vec::new();
                     if tally.occluded > 0 {
                         parts.push(format!("{} 项被遮挡", tally.occluded));
@@ -746,14 +798,10 @@ async fn session_loop(
                     if !click_failed.is_empty() {
                         parts.push(format!("{} 项点击发送失败", click_failed.len()));
                     }
-                    let detail = parts.join(", ");
-                    format!("选择集应用: {ok} 项成功, {fail} 项失败({detail}, 请旋转视角后重试)")
-                } else if rescued > 0 {
-                    format!("选择集已应用: {ok} 项成功({rescued} 项经加密扫描)")
-                } else {
-                    format!("选择集已应用: {ok} 项成功(真实点击管线)")
-                };
-                // v6: 恢复用户相机(保存视角仅用于点击, 用完即还)
+                    fail_parts.push(parts.join(", "));
+                }
+                } // ---- 'groups 循环结束 ----
+                // 全部组完成: 恢复用户相机 + 统一上报
                 if let Some(uc) = user_cam.as_ref() {
                     let restore_js = format!(
                         "(function(){{try{{var o={uc};var ed=window.__PLA_EDITOR__;if(!ed){{var f=window.__PLA_HOOK__;if(f)ed=f.findEditor();}}if(!ed)return 'no-ed';var vp=null;ed.viewports.forEach(function(v){{if(!vp)vp=v}});var cam=vp.camera;cam.position.set(o.px,o.py,o.pz);cam.quaternion.set(o.qx,o.qy,o.qz,o.qw);try{{vp.setNeedsRender()}}catch(e2){{}}return 'ok'}}catch(e){{return 'EXC'}}}})()"
@@ -762,7 +810,146 @@ async fn session_loop(
                         eprintln!("[pla-cdp] v6: 用户相机恢复失败: {e:#}");
                     }
                 }
+                let group_note = if n_groups > 1 {
+                    format!("({n_groups} 个视角组)")
+                } else {
+                    String::new()
+                };
+                let msg = if total_fail > 0 {
+                    let detail = fail_parts.join("; ");
+                    format!(
+                        "选择集应用: {total_ok} 项成功, {total_fail} 项失败({detail}){group_note}"
+                    )
+                } else if total_rescued > 0 {
+                    format!(
+                        "选择集已应用: {total_ok} 项成功({total_rescued} 项经加密扫描){group_note}"
+                    )
+                } else {
+                    format!("选择集已应用: {total_ok} 项成功(真实点击管线){group_note}")
+                };
                 let _ = ev_tx.send(CdpEvent::Status(msg));
+            }
+            // ---- R8-1: 视口状态采集/恢复 + 视口裁剪截图 ----
+            Ok(CdpCmd::VpStateSave) => {
+                let r = eval_roundtrip(ws, &mut mid, VPSTATE_SNAPSHOT_JS).await;
+                match r {
+                    Ok(s) => {
+                        let _ = ev_tx.send(CdpEvent::VpStateResult(s));
+                    }
+                    Err(e) => {
+                        let _ = ev_tx.send(CdpEvent::VpStateResult(format!(
+                            "{{\"err\":\"{e}\"}}"
+                        )));
+                    }
+                }
+            }
+            Ok(CdpCmd::VpStateApply(state)) => {
+                let js = VPSTATE_RESTORE_JS_TMPL.replace("__STATE__", &state);
+                match eval_roundtrip(ws, &mut mid, &js).await {
+                    Ok(r) => {
+                        let _ = ev_tx.send(CdpEvent::Status(format!("视口状态已恢复: {r}")));
+                    }
+                    Err(e) => {
+                        let _ = ev_tx
+                            .send(CdpEvent::Status(format!("视口状态恢复失败: {e}")));
+                    }
+                }
+            }
+            Ok(CdpCmd::CaptureViewport(out_path)) => {
+                // 视口 DOM rect(CSS px) → clip(逻辑 px); captureScreenshot
+                // 的 clip 以 CSS 像素为单位(与 viewport 缩放无关, 按 dpr 放大输出)。
+                let rect_js = r#"(function(){
+  var ed=window.__PLA_EDITOR__;
+  if(!ed||!ed.selection){ var f=window.__PLA_HOOK__; if(f) ed=f.findEditor(); if(ed) window.__PLA_EDITOR__=ed; }
+  if(!ed) return '';
+  var vps=[]; ed.viewports.forEach(function(v){vps.push(v)});
+  if(!vps.length) return '';
+  try{ var r=vps[0].container.getBoundingClientRect();
+    return JSON.stringify({x:r.x,y:r.y,w:r.width,h:r.height,scale:1}) }catch(e){ return '' }})()"#;
+                let rect_raw = match eval_roundtrip(ws, &mut mid, rect_js).await {
+                    Ok(s) if !s.is_empty() => s,
+                    _ => {
+                        let _ = ev_tx.send(CdpEvent::Status(
+                            "视口截图失败: 读不到视口区域".into(),
+                        ));
+                        continue;
+                    }
+                };
+                let clip: Value = match serde_json::from_str(&rect_raw) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let _ = ev_tx.send(CdpEvent::Status(format!(
+                            "视口截图失败: rect 解析 {e}"
+                        )));
+                        continue;
+                    }
+                };
+                // 先强制渲染一帧(按需渲染模式下 canvas 可能是旧帧)
+                let force = r#"(function(){
+  var ed=window.__PLA_EDITOR__;
+  if(!ed){ var f=window.__PLA_HOOK__; if(f) ed=f.findEditor(); }
+  if(!ed) return 'no-ed';
+  var vps=[]; ed.viewports.forEach(function(v){vps.push(v)});
+  if(!vps.length) return 'no-vp';
+  try{ vps[0].setNeedsRender() }catch(e){}
+  return 'ok'})()"#;
+                let _ = eval_roundtrip(ws, &mut mid, force).await;
+                tokio::time::sleep(Duration::from_millis(120)).await;
+                let shot = serde_json::json!({
+                    "id": mid,
+                    "method": "Page.captureScreenshot",
+                    "params": {
+                        "format": "png",
+                        "clip": clip,
+                        "captureBeyondViewport": false
+                    }
+                });
+                mid += 1;
+                if let Err(e) = ws_send(ws, shot).await {
+                    let _ = ev_tx.send(CdpEvent::Status(format!("视口截图失败: {e}")));
+                    continue;
+                }
+                // 等回包(带 data 字段的 base64)
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                let mut png_len = 0usize;
+                'shot: loop {
+                    let msg = match tokio::time::timeout_at(deadline, ws.next()).await {
+                        Ok(Some(Ok(m))) => m,
+                        _ => break 'shot,
+                    };
+                    if let tokio_tungstenite::tungstenite::Message::Text(t) = msg {
+                        if let Ok(v) = serde_json::from_str::<Value>(&t) {
+                            if v.get("id").is_some() && v.get("result").map(|r| r.get("data").is_some()).unwrap_or(false) {
+                                if let Some(b64) = v["result"]["data"].as_str() {
+                                    match base64_decode(b64) {
+                                        Ok(bytes) => {
+                                            png_len = bytes.len();
+                                            if let Err(e) = std::fs::write(&out_path, bytes) {
+                                                let _ = ev_tx.send(CdpEvent::Status(format!(
+                                                    "视口截图写盘失败: {e}"
+                                                )));
+                                                continue;
+                                            }
+                                        }
+                                        Err(e) => {
+                                            let _ = ev_tx.send(CdpEvent::Status(format!(
+                                                "视口截图解码失败: {e}"
+                                            )));
+                                            continue;
+                                        }
+                                    }
+                                }
+                                break 'shot;
+                            }
+                        }
+                    }
+                }
+                if png_len > 0 {
+                    let _ = ev_tx.send(CdpEvent::ViewportPng(png_len));
+                } else {
+                    let _ = ev_tx
+                        .send(CdpEvent::Status("视口截图失败: 未收到截图数据".into()));
+                }
             }
             // (R7-28「重新武装」ApplySelRearm 已于 R7-32 移除 — 方案被用户否决;
             //  v4+ 真实点击管线自身建立活跃实体上下文, 无需武装。)
@@ -917,15 +1104,18 @@ fn json_eval(mid: u64, expr: &str) -> Value {
 ///
 /// 数据源铁律: 本管线只信 spy 累积表; ed.selection.hits.hits 是 stale 点击
 /// 会话(合成 onClick 也会写它), 绝不可作扫描数据源(v4 的教训)。
-fn apply_sel_js(entries: &[ApplyEntry]) -> anyhow::Result<String> {
+fn apply_sel_js(entries: &[ApplyEntry], keep_sel: bool) -> anyhow::Result<String> {
     // Phase A 只需 entries 用于去重校验(空校验在 Rust 侧), 这里生成准备脚本。
+    // R8: keep_sel=true(多相机组的第 2+ 组)跳过 click.clear — 保住前面组
+    // 已点好的选择; 首组 keep_sel=false 维持"替换语义"。
     let _ = entries;
-    Ok(r#"(function(){
+    let clear_js = if keep_sel { "" } else { "try{ ed.click.clear() }catch(e){}" };
+    let js = r#"(function(){
   var ed=window.__PLA_EDITOR__;
   if(!ed||!ed.selection){ var f=window.__PLA_HOOK__; if(f) ed=f.findEditor(); if(ed) window.__PLA_EDITOR__=ed; }
   if(!ed||!ed.selection) return JSON.stringify({ok:0,fail:0,errs:['no-editor']});
   try{ ed.executor.cancelActiveCommand() }catch(e){}
-  try{ ed.click.clear() }catch(e){}
+  __CLEAR_SEL__
   document.body.removeAttribute('gizmo');
   document.body.removeAttribute('command');
   var c=document.querySelector('plasticity-viewport canvas');
@@ -962,8 +1152,8 @@ fn apply_sel_js(entries: &[ApplyEntry]) -> anyhow::Result<String> {
   window.__PLA_MAP__ = {};
   var r=c.getBoundingClientRect();
   return JSON.stringify([Math.round(r.x),Math.round(r.y),Math.round(r.width),Math.round(r.height)]);
-})()"#
-    .to_string())
+})()"#;
+    Ok(js.replace("__CLEAR_SEL__", clear_js))
 }
 
 /// v5: 收尾清累积表 — 点击完成后的正常 hover 又会写入新命中, 表留着既无用
@@ -1010,6 +1200,163 @@ const NAV_TO_SELECTION_JS: &str = r#"(function(){
   var vp=null; ed.viewports.forEach(function(v){if(!vp)vp=v});
   if(!vp||typeof vp.navigateToSelection!=='function') return 'no-nav';
   try{ vp.navigateToSelection(); return 'ok' }catch(e){ return 'EXC' }})()"#;
+
+/// R8-1: 视口状态采集 — 相机全参数(position/quaternion/zoom/fov) + orbitControls
+/// (target/focalOffset/radius) + shading(mode.tag/_sectionMode.tag) + 剖面数组
+/// (ed.sections.sections: enabled/p/n/x/y) + 参考面(vp._constructionPlane: p/n/x/y)
+/// + renderer/ao/grid 设置。返回 JSON; err 字段非空 = 失败。
+const VPSTATE_SNAPSHOT_JS: &str = r#"(function(){
+  var ed=window.__PLA_EDITOR__;
+  if(!ed||!ed.selection){ var f=window.__PLA_HOOK__; if(f) ed=f.findEditor(); if(ed) window.__PLA_EDITOR__=ed; }
+  if(!ed||!ed.selection) return JSON.stringify({err:'no-editor'});
+  var vps=[]; ed.viewports.forEach(function(v){vps.push(v)});
+  if(!vps.length) return JSON.stringify({err:'no-viewport'});
+  var vp=vps[0];
+  var out={};
+  function v3(v){ return v&&v.x!==undefined ? [v.x,v.y,v.z] : null }
+  try{
+    var c=vp.camera;
+    out.cam={px:c.position.x,py:c.position.y,pz:c.position.z,
+      qx:c.quaternion.x,qy:c.quaternion.y,qz:c.quaternion.z,qw:c.quaternion.w,
+      fov:(typeof c.fov==='number')?c.fov:null, zoom:(typeof c.zoom==='number')?c.zoom:null,
+      near:(typeof c.near==='number')?c.near:null, far:(typeof c.far==='number')?c.far:null};
+  }catch(e){}
+  try{
+    var oc=vp.orbitControls;
+    out.orbit={target:v3(oc.target), focal:v3(oc.focalOffset),
+      radius:(typeof oc.radius==='number')?oc.radius:null, zoom:(typeof oc.zoom==='number')?oc.zoom:null};
+  }catch(e){}
+  try{ out.shading={mode: ed.shading.mode?ed.shading.mode.tag:null,
+    section: ed.shading._sectionMode?ed.shading._sectionMode.tag:null} }catch(e){}
+  try{
+    var arr=[];
+    ed.sections.sections.forEach(function(s){
+      arr.push({enabled:!!s.enabled, p:v3(s.p), n:v3(s.n), x:v3(s.x), y:v3(s.y)});
+    });
+    out.sections=arr;
+  }catch(e){}
+  try{
+    var cp=vp._constructionPlane;
+    if(cp) out.cplane={p:v3(cp.p), n:v3(cp.n), x:v3(cp.x), y:v3(cp.y)};
+  }catch(e){}
+  try{
+    var r=vp.settings.Viewport.renderer;
+    out.renderer={antiAlias:!!r.antiAlias, toneMapping:String(r.toneMapping||''),
+      toneMappingExposure:(typeof r.toneMappingExposure==='number')?r.toneMappingExposure:null};
+  }catch(e){}
+  try{
+    var ao=vp.settings.Viewport.ao;
+    var av={};
+    Object.keys(ao).forEach(function(k){ var v=ao[k]; if(typeof v==='number'||typeof v==='boolean') av[k]=v });
+    out.ao=av;
+  }catch(e){}
+  try{
+    var g=vp.settings.Grid;
+    out.grid={every:(typeof g.every==='number')?g.every:null, size:(typeof g.size==='number')?g.size:null};
+  }catch(e){}
+  // 视口 DOM rect(CSS 像素) + dpr — 截图裁剪用
+  try{
+    var r2=vp.container.getBoundingClientRect();
+    out.vpRect=[r2.x,r2.y,r2.width,r2.height];
+    out.dpr=window.devicePixelRatio||1;
+  }catch(e){}
+  out.err='';
+  return JSON.stringify(out);})()"#;
+
+/// R8-1: 视口状态恢复 — 与 VPSTATE_SNAPSHOT_JS 对称。相机直写(正交模式禁碰
+/// 投影矩阵, v6 经验); shading 切换链 = 写 mode.tag + 构造合法 prev + dispatch
+/// shadingChanged(mode) + setNeedsRender(实测, R8-1 探测验证); 剖面/参考面数值
+/// 直写 + setNeedsRender。返回 'ok' 或错误描述。
+const VPSTATE_RESTORE_JS_TMPL: &str = r#"(function(){
+  var S=__STATE__;
+  var ed=window.__PLA_EDITOR__;
+  if(!ed||!ed.selection){ var f=window.__PLA_HOOK__; if(f) ed=f.findEditor(); if(ed) window.__PLA_EDITOR__=ed; }
+  if(!ed||!ed.selection) return 'no-editor';
+  var vps=[]; ed.viewports.forEach(function(v){vps.push(v)});
+  if(!vps.length) return 'no-viewport';
+  var vp=vps[0];
+  var applied=[];
+  function setV3(dst,src){ if(dst&&dst.set&&src){ try{ dst.set(src[0],src[1],src[2]); return true }catch(e){} } return false }
+  try{
+    if(S.cam){
+      var c=vp.camera;
+      c.position.set(S.cam.px,S.cam.py,S.cam.pz);
+      c.quaternion.set(S.cam.qx,S.cam.qy,S.cam.qz,S.cam.qw);
+      applied.push('cam');
+    }
+  }catch(e){}
+  try{
+    if(S.orbit){
+      var oc=vp.orbitControls;
+      setV3(oc.target,S.orbit.target);
+      setV3(oc.focalOffset,S.orbit.focal);
+      if(typeof S.orbit.radius==='number') oc.radius=S.orbit.radius;
+      if(typeof S.orbit.zoom==='number') oc.zoom=S.orbit.zoom;
+      try{ if(typeof oc.update==='function') oc.update() }catch(e2){}
+      applied.push('orbit');
+    }
+  }catch(e){}
+  try{
+    if(S.shading&&S.shading.mode){
+      var m=ed.shading.mode;
+      if(m&&m.tag!==S.shading.mode){
+        m.prev={tag:m.tag, materials:m.materials, isTinted:!!m.isTinted};
+        m.tag=S.shading.mode;
+        try{ ed.shading.signals.shadingChanged.dispatch(m) }catch(e2){}
+      }
+      if(S.shading.section&&ed.shading._sectionMode){
+        try{ ed.shading._sectionMode.tag=S.shading.section }catch(e2){}
+      }
+      applied.push('shading');
+    }
+  }catch(e){}
+  try{
+    if(S.sections){
+      var cur=ed.sections.sections;
+      // 数量对齐: 多余的禁用, 缺的无法凭空造(如实跳过)
+      for(var i=0;i<cur.length&&i<S.sections.length;i++){
+        var d=S.sections[i], s=cur[i];
+        try{ s.enabled=!!d.enabled }catch(e2){}
+        setV3(s.p,d.p); setV3(s.n,d.n); setV3(s.x,d.x); setV3(s.y,d.y);
+      }
+      for(var j=S.sections.length;j<cur.length;j++){ try{ cur[j].enabled=false }catch(e3){} }
+      applied.push('sections:'+Math.min(cur.length,S.sections.length));
+    }
+  }catch(e){}
+  try{
+    if(S.cplane){
+      var cp=vp._constructionPlane;
+      if(cp){ setV3(cp.p,S.cplane.p); setV3(cp.n,S.cplane.n); setV3(cp.x,S.cplane.x); setV3(cp.y,S.cplane.y);
+        applied.push('cplane'); }
+    }
+  }catch(e){}
+  try{
+    if(S.renderer){
+      var r=vp.settings.Viewport.renderer;
+      if(typeof S.renderer.antiAlias==='boolean') r.antiAlias=S.renderer.antiAlias;
+      if(S.renderer.toneMapping) r.toneMapping=S.renderer.toneMapping;
+      if(typeof S.renderer.toneMappingExposure==='number') r.toneMappingExposure=S.renderer.toneMappingExposure;
+      applied.push('renderer');
+    }
+  }catch(e){}
+  try{
+    if(S.ao){
+      var ao=vp.settings.Viewport.ao;
+      Object.keys(S.ao).forEach(function(k){ try{ ao[k]=S.ao[k] }catch(e2){} });
+      applied.push('ao');
+    }
+  }catch(e){}
+  try{
+    if(S.grid){
+      var g=vp.settings.Grid;
+      if(typeof S.grid.every==='number') g.every=S.grid.every;
+      if(typeof S.grid.size==='number') g.size=S.grid.size;
+      applied.push('grid');
+    }
+  }catch(e){}
+  try{ vp.setNeedsRender() }catch(e){}
+  return 'ok:'+applied.join(',');})()"#;
+
 
 /// v5.2: 取消活动命令 + 清 body 的 gizmo/command 属性(补选后收尾)。
 const CANCEL_CMD_JS: &str = r#"(function(){
@@ -1142,6 +1489,37 @@ async fn ws_send(ws: &mut WsStream, v: Value) -> anyhow::Result<()> {
     ws.send(tokio_tungstenite::tungstenite::Message::Text(v.to_string()))
         .await
         .map_err(|e| anyhow::anyhow!("ws send: {e}"))
+}
+
+/// R8-1: 标准 base64 解码(captureScreenshot 的 data 字段)。
+/// 非法字符跳过(容错), 输出字节流。
+fn base64_decode(s: &str) -> anyhow::Result<Vec<u8>> {
+    let mut lookup = [255u8; 256];
+    for (i, c) in b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+        .iter()
+        .enumerate()
+    {
+        lookup[*c as usize] = i as u8;
+    }
+    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    let mut buf = 0u32;
+    let mut bits = 0u32;
+    for &b in s.as_bytes() {
+        if b == b'=' {
+            break;
+        }
+        let v = lookup[b as usize];
+        if v == 255 {
+            continue; // 空白/非法字符跳过
+        }
+        buf = (buf << 6) | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+        }
+    }
+    Ok(out)
 }
 
 /// R7-28: 经 CDP Input 派发一次完整按键(修饰键先下后起)。
@@ -1408,7 +1786,7 @@ mod tests {
             ApplyEntry { kind: "edge".into(), id: "14e1984".into(), key: None, camera: None },
             ApplyEntry { kind: "solid".into(), id: "7".into(), key: None, camera: None },
         ];
-        let js = apply_sel_js(&entries).unwrap();
+        let js = apply_sel_js(&entries, false).unwrap();
         eprintln!("===GENERATED-JS-BEGIN===");
         eprintln!("{js}");
         eprintln!("===GENERATED-JS-END===");
@@ -1417,6 +1795,10 @@ mod tests {
         assert!(js.ends_with("})()"), "JS 未完整收尾");
         // v5: Phase A 关键步骤存在
         assert!(js.contains("cancelActiveCommand"), "缺少取消活动命令");
+        // R8: keep_sel 分支 — 首组有 clear, 后续组没有
+        let js_keep = apply_sel_js(&entries, true).unwrap();
+        assert!(!js_keep.contains("click.clear"), "keep_sel 组不应清选择");
+        assert!(js.contains("click.clear"), "首组应清选择");
         assert!(js.contains("getBoundingClientRect"), "缺少视口矩形获取");
         // v5: 累积式 hover spy 装配
         assert!(js.contains("__PLA_SPY5B__"), "缺少 spy 幂等标记");

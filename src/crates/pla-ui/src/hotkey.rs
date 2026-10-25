@@ -34,6 +34,7 @@ pub enum Action {
     ToggleEntities,   // 工具栏: 开/关实体树面板
     ToggleDim,        // 工具栏: 开/关尺寸驱动面板
     ToggleSettings,   // 工具栏: 开/关设置面板
+    ToggleVpState,    // R8-1: 开/关视口状态面板
 }
 
 impl Action {
@@ -49,6 +50,7 @@ impl Action {
             Action::ToggleEntities => "实体树面板",
             Action::ToggleDim => "尺寸驱动面板",
             Action::ToggleSettings => "设置面板",
+            Action::ToggleVpState => "视口状态面板",
         }
     }
     /// 图标 (emoji, 随 CJK 字体渲染)。
@@ -64,13 +66,14 @@ impl Action {
             Action::ToggleEntities => "🌳",
             Action::ToggleDim => "📐",
             Action::ToggleSettings => "⚙",
+            Action::ToggleVpState => "🎥",
         }
     }
-    pub const ALL: [Action; 10] = [
+    pub const ALL: [Action; 11] = [
         Action::SnapshotManual, Action::SnapshotRestore, Action::SelSave,
         Action::SelApply, Action::DimApply, Action::EntitiesRefresh,
         Action::ToggleSnapshots, Action::ToggleEntities, Action::ToggleDim,
-        Action::ToggleSettings,
+        Action::ToggleSettings, Action::ToggleVpState,
     ];
 }
 

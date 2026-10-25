@@ -121,11 +121,13 @@ pub struct CdpMember {
 }
 
 /// v6: 带相机保存 — members 同上, camera 为 CAM_SNAPSHOT_JS 输出(None=不存)。
+/// R8-1: 追加保存截图(视口裁剪 PNG 字节, 落盘 <名>.png)。旧集无截图照常。
 pub fn save_cdp_selection_with_camera(
     doc_key: &str,
     name: &str,
     members: &[(String, String, String, Option<String>, Option<String>)],
     camera: Option<&str>,
+    png: Option<&[u8]>,
 ) -> Result<String, String> {
     let name = name.trim();
     if name.is_empty() {
@@ -160,7 +162,93 @@ pub fn save_cdp_selection_with_camera(
     let path = dir.join(format!("{}.json", sanitize(name)));
     std::fs::write(&path, serde_json::to_string_pretty(&json).map_err(|e| e.to_string())?)
         .map_err(|e| format!("写文件失败: {e}"))?;
+    // R8-1: 截图覆盖保存(有则写, 无则删旧 — 保持与集内容一致)
+    let png_path = dir.join(format!("{}.png", sanitize(name)));
+    if let Some(bytes) = png {
+        let _ = std::fs::write(&png_path, bytes);
+    }
     Ok(path.display().to_string())
+}
+
+/// R8-1: 同上但不落截图(兼容旧调用)。
+pub fn save_cdp_selection_only(
+    doc_key: &str,
+    name: &str,
+    members: &[(String, String, String, Option<String>, Option<String>)],
+    camera: Option<&str>,
+) -> Result<String, String> {
+    save_cdp_selection_with_camera(doc_key, name, members, camera, None)
+}
+
+/// R8-1: 选择集下一个自动名 SG001/SG002…(点保存按钮时用)。
+pub fn next_sg_name(doc_key: &str) -> String {
+    let exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let dir = exe.join("selections-cdp").join(sanitize(doc_key));
+    let mut max = 0u32;
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for e in rd.flatten() {
+            let n = e.file_name().to_string_lossy().to_string();
+            let stem = n
+                .strip_suffix(".json")
+                .or_else(|| n.strip_suffix(".png"))
+                .unwrap_or("");
+            if let Some(num) = stem.strip_prefix("SG") {
+                if let Ok(v) = num.parse::<u32>() {
+                    max = max.max(v);
+                }
+            }
+        }
+    }
+    format!("SG{:03}", max + 1)
+}
+
+/// R8-1: 选择集存档目录(exe 同级 selections-cdp/<doc_key>)。
+pub fn cdp_selections_dir(doc_key: &str) -> PathBuf {
+    let exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let dir = exe.join("selections-cdp").join(sanitize(doc_key));
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+/// R8-1: 读选择集截图 PNG 字节。
+pub fn load_cdp_selection_png(doc_key: &str, name: &str) -> Option<Vec<u8>> {
+    std::fs::read(cdp_selections_dir(doc_key).join(format!("{}.png", sanitize(name)))).ok()
+}
+
+/// R8-1: 打开选择集目录。
+pub fn open_cdp_selections_dir(doc_key: &str) -> Result<(), String> {
+    let dir = cdp_selections_dir(doc_key);
+    std::process::Command::new("explorer")
+        .arg(dir.as_os_str())
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("打开失败: {e}"))
+}
+
+/// R8-1: 批量删除选择集(含截图)。返回删除数。
+pub fn delete_cdp_selections_batch(doc_key: &str, names: &[String]) -> Result<usize, String> {
+    let dir = cdp_selections_dir(doc_key);
+    let mut n = 0;
+    for name in names {
+        let mut ok = true;
+        for f in [format!("{}.json", sanitize(name)), format!("{}.png", sanitize(name))] {
+            if let Err(e) = std::fs::remove_file(dir.join(&f)) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    ok = false;
+                }
+            }
+        }
+        if ok {
+            n += 1;
+        }
+    }
+    Ok(n)
 }
 
 /// 保存 CDP 选择集(R7-14): exe 同级 `selections-cdp/<doc_key>/<名称>.json`。
@@ -211,6 +299,8 @@ pub struct CdpSelMeta {
     pub name: String,
     pub fav: bool,
     pub n_members: usize,
+    /// R8-1: 保存时间(存档 mtime, 悬浮信息用; 无 = "")。
+    pub created: String,
 }
 
 fn cdp_sel_path(doc_key: &str, name: &str) -> PathBuf {
@@ -225,12 +315,45 @@ fn cdp_sel_path(doc_key: &str, name: &str) -> PathBuf {
 
 /// 读取单个选择集元数据(无文件→None; fav 缺省 false, 旧文件兼容)。
 pub fn cdp_sel_meta(doc_key: &str, name: &str) -> Option<CdpSelMeta> {
-    let data = std::fs::read_to_string(cdp_sel_path(doc_key, name)).ok()?;
+    let path = cdp_sel_path(doc_key, name);
+    let data = std::fs::read_to_string(&path).ok()?;
     let v: serde_json::Value = serde_json::from_str(&data).ok()?;
+    // R8-1: mtime → 简单本地时间串(Windows 文件时间 → 秒, 手写换算避免引 chrono;
+    // 显示用途, 精度到分钟即可)
+    let created = std::fs::metadata(&path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .map(|t| {
+            let secs = t
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+                + 8 * 3600;
+            let days = (secs / 86400) as i64;
+            // Howard Hinnant civil_from_days(同 snapshot.rs, 简版)
+            let z = days + 719_468;
+            let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+            let doe = (z - era * 146_097) as u64;
+            let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+            let y = yoe as i64 + era * 400;
+            let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+            let mp = (5 * doy + 2) / 153;
+            let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+            let mth = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+            let yy = if mth <= 2 { y + 1 } else { y };
+            let rem = secs % 86400;
+            format!(
+                "{yy:04}-{mth:02}-{d:02} {:02}:{:02}",
+                rem / 3600,
+                (rem % 3600) / 60
+            )
+        })
+        .unwrap_or_default();
     Some(CdpSelMeta {
         name: name.to_string(),
         fav: v["fav"].as_bool().unwrap_or(false),
         n_members: v["members"].as_array().map(|a| a.len()).unwrap_or(0),
+        created,
     })
 }
 
@@ -271,7 +394,14 @@ pub fn rename_cdp_selection(doc_key: &str, old: &str, new: &str) -> Result<(), S
     v["name"] = serde_json::Value::String(new.to_string());
     std::fs::write(&new_path, serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?)
         .map_err(|e| format!("写文件失败: {e}"))?;
-    std::fs::remove_file(&old_path).map_err(|e| format!("移除旧文件失败: {e}"))
+    std::fs::remove_file(&old_path).map_err(|e| format!("移除旧文件失败: {e}"))?;
+    // R8-1: 截图跟随改名
+    let old_png = old_path.with_extension("png");
+    let new_png = new_path.with_extension("png");
+    if old_png.exists() {
+        let _ = std::fs::rename(&old_png, &new_png);
+    }
+    Ok(())
 }
 
 /// 列出已保存的 CDP 选择集(R7-16)。
