@@ -576,7 +576,98 @@ async fn session_loop(
                         continue;
                     }
                 };
-                let tally = tally_occlusion(&clicked, &face_ids);
+                let mut tally = tally_occlusion(&clicked, &face_ids);
+                let mut misses = misses;
+                // Phase E(v5.2): 遮挡自动补救 — 快照相机 → addById 临时选中
+                // 被遮挡面 → navigateToSelection() 转到该面正视 → 扫描定位 →
+                // shift+click 补选 → 处理完恢复用户原相机。用户全程无感知。
+                if tally.occluded > 0 {
+                    let mut rescued_occ: Vec<String> = Vec::new();
+                    let occluded_ids: Vec<String> = clicked
+                        .iter()
+                        .filter(|(id, _, _)| !face_ids.contains(id))
+                        .map(|(id, _, _)| id.clone())
+                        .collect();
+                    // 相机快照(position/quaternion 直写直读已验证; 不碰投影矩阵)
+                    let snap = eval_roundtrip(ws, &mut mid, CAM_SNAPSHOT_JS).await;
+                    let cam_saved = snap.unwrap_or_else(|e| {
+                        eprintln!("[pla-cdp] cam snapshot 失败(将跳过补救): {e:#}");
+                        String::new()
+                    });
+                    if !cam_saved.is_empty() {
+                        for occ_id in &occluded_ids {
+                            // 1) addById 临时选中该面(navigateToSelection 只读选择,
+                            //    不需要点击管线的活跃实体上下文)
+                            let select_js = format!(
+                                "(function(){{try{{var ed=window.__PLA_EDITOR__;if(!ed||!ed.selection){{var f=window.__PLA_HOOK__;if(f)ed=f.findEditor();}}if(!ed)return 'no-ed';ed.click.clear();ed.click.addById('2:{}');return 'ok'}}catch(e){{return 'EXC'}}}})()",
+                                occ_id
+                            );
+                            if let Err(e) = eval_roundtrip(ws, &mut mid, &select_js).await {
+                                eprintln!("[pla-cdp] 补救选择 {occ_id} 失败: {e:#}");
+                                continue;
+                            }
+                            // 2) 转到该面正视
+                            if let Err(e) = eval_roundtrip(ws, &mut mid, NAV_TO_SELECTION_JS).await {
+                                eprintln!("[pla-cdp] navigateToSelection 失败: {e:#}");
+                                continue;
+                            }
+                            // 导航是动画, 等待相机稳定
+                            tokio::time::sleep(Duration::from_millis(700)).await;
+                            // 3) 重扫定位该面(粗网格即可, 正视下必在前排)
+                            let mut occ_pos: Option<(i64, i64)> = None;
+                            'occ_scan: for gy in 0..SCAN_ROWS_COARSE {
+                                for gx in 0..SCAN_COLS_COARSE {
+                                    let x = rect.0 + (rect.2 as f64 * (gx as f64 + 0.5) / SCAN_COLS_COARSE as f64) as i64;
+                                    let y = rect.1 + (rect.3 as f64 * (gy as f64 + 0.5) / SCAN_ROWS_COARSE as f64) as i64;
+                                    let _ = dispatch_mouse_move(ws, &mut mid, x, y).await;
+                                    tokio::time::sleep(Duration::from_millis(25)).await;
+                                }
+                                if let Ok(s) = eval_roundtrip(ws, &mut mid, MAP_READ_JS).await {
+                                    let mut m2 = std::collections::HashMap::new();
+                                    absorb_map(&s, &mut m2);
+                                    if let Some(&(px, py)) = m2.get(occ_id) {
+                                        occ_pos = Some((px, py));
+                                        break 'occ_scan;
+                                    }
+                                }
+                            }
+                            // 4) shift+click 补选 + 取消可能的自动命令
+                            if let Some((px, py)) = occ_pos {
+                                let _ = eval_roundtrip(ws, &mut mid, CLEAR_MAP_JS).await;
+                                if dispatch_mouse_click(ws, &mut mid, px, py, true).await.is_ok() {
+                                    let _ = eval_roundtrip(ws, &mut mid, CANCEL_CMD_JS).await;
+                                    tokio::time::sleep(Duration::from_millis(250)).await;
+                                    // 复核: 进 faceIds 才算救回
+                                    if let Ok(v) = eval_roundtrip(ws, &mut mid, VERIFY_FACES_JS).await {
+                                        if let Some(fs) = extract_face_ids(&v) {
+                                            if fs.contains(occ_id) {
+                                                rescued_occ.push(occ_id.clone());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // 5) 恢复用户相机
+                        let restore_js = format!(
+                            "(function(){{try{{var o={cam_saved};var ed=window.__PLA_EDITOR__;if(!ed){{var f=window.__PLA_HOOK__;if(f)ed=f.findEditor();}}if(!ed)return 'no-ed';var vp=null;ed.viewports.forEach(function(v){{if(!vp)vp=v}});var cam=vp.camera;cam.position.set(o.px,o.py,o.pz);cam.quaternion.set(o.qx,o.qy,o.qz,o.qw);try{{vp.setNeedsRender()}}catch(e2){{}}return 'ok'}}catch(e){{return 'EXC'}}}})()"
+                        );
+                        if let Err(e) = eval_roundtrip(ws, &mut mid, &restore_js).await {
+                            eprintln!("[pla-cdp] 相机恢复失败: {e:#}");
+                        }
+                        let _ = dispatch_mouse_move(ws, &mut mid, rect.0 + rect.2 / 2, rect.1 + rect.3 / 2).await;
+                        // 重算 tally: 救回的从遮挡计数移入成功
+                        if !rescued_occ.is_empty() {
+                            tally.confirmed += rescued_occ.len();
+                            tally.occluded -= rescued_occ.len();
+                            let _ = ev_tx.send(CdpEvent::Status(format!(
+                                "遮挡自动补救: {}/{} 项经自动转视角补选",
+                                rescued_occ.len(),
+                                occluded_ids.len()
+                            )));
+                        }
+                    }
+                }
                 let ok = tally.confirmed;
                 let fail = misses.len() + tally.occluded + click_failed.len();
                 let _ = dispatch_mouse_move(ws, &mut mid, rect.0 + rect.2 / 2, rect.1 + rect.3 / 2).await;
@@ -902,6 +993,48 @@ const MAP_READ_JS: &str = r#"(function(){
     }
   }
   return JSON.stringify(o);})()"#;
+
+/// v5.2: 相机快照 — 返回 {px,py,pz,qx,qy,qz,qw}(JSON 字符串)。
+/// position/quaternion 直读; 绝不读/写投影参数(fov/near/zoom — 正交
+/// ProxyCamera 上 updateProjectionMatrix 有破坏性副作用, R7-31h 教训)。
+const CAM_SNAPSHOT_JS: &str = r#"(function(){
+  var ed=window.__PLA_EDITOR__;
+  if(!ed||!ed.selection){ var f=window.__PLA_HOOK__; if(f) ed=f.findEditor(); if(ed) window.__PLA_EDITOR__=ed; }
+  if(!ed||!ed.selection) return '';
+  var vp=null; ed.viewports.forEach(function(v){if(!vp)vp=v});
+  if(!vp||!vp.camera) return '';
+  var cam=vp.camera;
+  return JSON.stringify({px:cam.position.x,py:cam.position.y,pz:cam.position.z,
+    qx:cam.quaternion.x,qy:cam.quaternion.y,qz:cam.quaternion.z,qw:cam.quaternion.w});})()"#;
+
+/// v5.2: 转到当前选择正视(navigateToSelection, 实测相机立即响应;
+/// 动画驱动, 调用方需等待 ~700ms 让相机稳定)。
+const NAV_TO_SELECTION_JS: &str = r#"(function(){
+  var ed=window.__PLA_EDITOR__;
+  if(!ed||!ed.selection){ var f=window.__PLA_HOOK__; if(f) ed=f.findEditor(); if(ed) window.__PLA_EDITOR__=ed; }
+  if(!ed||!ed.selection) return 'no-ed';
+  var vp=null; ed.viewports.forEach(function(v){if(!vp)vp=v});
+  if(!vp||typeof vp.navigateToSelection!=='function') return 'no-nav';
+  try{ vp.navigateToSelection(); return 'ok' }catch(e){ return 'EXC' }})()"#;
+
+/// v5.2: 取消活动命令 + 清 body 的 gizmo/command 属性(补选后收尾)。
+const CANCEL_CMD_JS: &str = r#"(function(){
+  var ed=window.__PLA_EDITOR__;
+  if(!ed){ var f=window.__PLA_HOOK__; if(f) ed=f.findEditor(); }
+  if(!ed) return 'no-ed';
+  try{ ed.executor.cancelActiveCommand() }catch(e){}
+  document.body.removeAttribute('gizmo');
+  document.body.removeAttribute('command');
+  return 'ok'})()"#;
+
+/// v5.2: 复核当前 faceIds(补救后判定该面是否真的进了选择)。
+const VERIFY_FACES_JS: &str = r#"(function(){
+  var ed=window.__PLA_EDITOR__;
+  if(!ed||!ed.selection){ var f=window.__PLA_HOOK__; if(f) ed=f.findEditor(); if(ed) window.__PLA_EDITOR__=ed; }
+  if(!ed||!ed.selection) return JSON.stringify({selN:-1, faces:[]});
+  var s=ed.selection.selected;
+  return JSON.stringify({selN:(typeof s.size==='number')?s.size:-1,
+    faces:(function(){var a=[];try{s.faceIds.forEach(function(x){a.push(String(x&&x.versionId!==undefined?x.versionId:x))})}catch(e){}return a})()});})()"#;
 
 /// v5: 吸收 MAP_READ_JS 回包(JSON 对象字符串)进 pos_map。
 /// 回包异常时不吞错误 — 打日志供诊断, 已定位的不受影响。
