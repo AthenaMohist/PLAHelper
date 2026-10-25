@@ -865,13 +865,14 @@ async fn session_loop(
   var vps=[]; ed.viewports.forEach(function(v){vps.push(v)});
   if(!vps.length) return '';
   try{ var r=vps[0].container.getBoundingClientRect();
-    return JSON.stringify({x:r.x,y:r.y,w:r.width,h:r.height,scale:1}) }catch(e){ return '' }})()"#;
+    return JSON.stringify({x:r.x,y:r.y,width:r.width,height:r.height,scale:1}) }catch(e){ return '' }})()"#;
                 let rect_raw = match eval_roundtrip(ws, &mut mid, rect_js).await {
                     Ok(s) if !s.is_empty() => s,
                     _ => {
                         let _ = ev_tx.send(CdpEvent::Status(
-                            "视口截图失败: 读不到视口区域".into(),
+                            "视口截图失败: 读不到视口区域(仍将保存, 无缩略图)".into(),
                         ));
+                        let _ = ev_tx.send(CdpEvent::ViewportPng(0));
                         continue;
                     }
                 };
@@ -879,8 +880,9 @@ async fn session_loop(
                     Ok(v) => v,
                     Err(e) => {
                         let _ = ev_tx.send(CdpEvent::Status(format!(
-                            "视口截图失败: rect 解析 {e}"
+                            "视口截图失败: rect 解析 {e}(仍将保存, 无缩略图)"
                         )));
+                        let _ = ev_tx.send(CdpEvent::ViewportPng(0));
                         continue;
                     }
                 };
@@ -912,6 +914,7 @@ async fn session_loop(
                 // 等回包(带 data 字段的 base64)
                 let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
                 let mut png_len = 0usize;
+                let shot_id = mid - 1;
                 'shot: loop {
                     let msg = match tokio::time::timeout_at(deadline, ws.next()).await {
                         Ok(Some(Ok(m))) => m,
@@ -919,6 +922,16 @@ async fn session_loop(
                     };
                     if let tokio_tungstenite::tungstenite::Message::Text(t) = msg {
                         if let Ok(v) = serde_json::from_str::<Value>(&t) {
+                            // 错误回包(同 id)立即终止, 不空等超时
+                            if v.get("id").and_then(|i| i.as_u64()) == Some(shot_id)
+                                && v.get("error").is_some()
+                            {
+                                eprintln!(
+                                    "[pla-cdp] captureScreenshot 错误: {}",
+                                    v["error"]["message"].as_str().unwrap_or("?")
+                                );
+                                break 'shot;
+                            }
                             if v.get("id").is_some() && v.get("result").map(|r| r.get("data").is_some()).unwrap_or(false) {
                                 if let Some(b64) = v["result"]["data"].as_str() {
                                     match base64_decode(b64) {
@@ -947,8 +960,12 @@ async fn session_loop(
                 if png_len > 0 {
                     let _ = ev_tx.send(CdpEvent::ViewportPng(png_len));
                 } else {
-                    let _ = ev_tx
-                        .send(CdpEvent::Status("视口截图失败: 未收到截图数据".into()));
+                    let _ = ev_tx.send(CdpEvent::Status(
+                        "视口截图失败: 未收到截图数据(仍将保存, 无缩略图)".into(),
+                    ));
+                    // R8b: 失败也发 ViewportPng(0) — UI 的 pending 保存流程
+                    // (选择集/视口状态)靠该事件落盘, 不发会永远挂起无法保存。
+                    let _ = ev_tx.send(CdpEvent::ViewportPng(0));
                 }
             }
             // (R7-28「重新武装」ApplySelRearm 已于 R7-32 移除 — 方案被用户否决;

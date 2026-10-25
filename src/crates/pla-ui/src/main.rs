@@ -129,7 +129,7 @@ struct PlaApp {
     show_settings: bool,
     /// R8-1: 视口状态面板。
     show_vpstate: bool,
-    /// R8-3: 工具栏拖动位置(None=自动吸附; Some=用户拖到的位置, 逻辑 pt)。
+    /// R8b: 工具栏拖动位置(None=自动吸附; Some=用户拖到的位置, 逻辑 pt)。
     toolbar_drag_pos: Option<egui::Pos2>,
     toolbar_dragging: bool,
     sel_name: String,
@@ -363,6 +363,28 @@ fn panel_frame() -> egui::Frame {
         .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(150)))
 }
 
+/// R8b: 本帧面板拖动累计位移(header 手柄写入, 面板循环读)。
+thread_local! {
+    static PANEL_DRAG_DELTA: std::cell::RefCell<egui::Vec2> =
+        std::cell::RefCell::new(egui::Vec2::ZERO);
+    static PANEL_DRAG_HINT: std::cell::RefCell<bool> =
+        const { std::cell::RefCell::new(false) };
+    /// 面板id → 用户拖到的绝对位置(逻辑 pt)。主循环渲染时优先于默认跟随位;
+    /// 面板关闭后由主循环清除(重开回默认)。
+    static PANEL_USER_POS: std::cell::RefCell<std::collections::HashMap<&'static str, egui::Pos2>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// R8b: 二级面板标识(互斥用)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PanelId {
+    Snapshots,
+    Entities,
+    VpState,
+    Dim,
+    Settings,
+}
+
 /// 快照项交互结果(由 snap_item 采集, 调用方统一执行)。
 #[derive(Default)]
 struct SnapItemActions {
@@ -550,9 +572,11 @@ fn snap_item(
                 let name_resp = {
                     // R7-8: 名称行各元素全部定宽 — 之前 Button 自带 padding 使
                     // 单元格内容最小宽 > cell_w, 收藏第 3 列被挤出面板右缘。
+                    // R8b: 现在名称行有 3 个图标钮(★ ✎ 🗑)+管理勾选, 全部预留,
+                    // 否则垃圾桶被挤出可视区点不到。
                     let sp = ui.spacing().item_spacing.x;
                     let reserve = if manage { 16.0 + sp } else { 0.0 };
-                    let rem = (cell_w - (14.0 + sp) * 2.0 - reserve).max(24.0);
+                    let rem = (cell_w - (14.0 + sp) * 3.0 - reserve).max(24.0);
                     let nr = ui
                         .allocate_ui_with_layout(
                             egui::vec2(rem, 14.0),
@@ -621,6 +645,25 @@ fn snap_item(
 
 fn panel_header(ui: &mut egui::Ui, title: &str, open: &mut bool, icons: Option<Box<dyn FnOnce(&mut egui::Ui)>>) {
     ui.horizontal(|ui| {
+        // R8b: 拖动手柄(⋮⋮) — 拖动整个面板。位移经 header_drag 传出。
+        let (hr, hresp) = ui.allocate_exact_size(egui::vec2(16.0, 14.0), egui::Sense::drag());
+        ui.painter().text(
+            hr.center(),
+            egui::Align2::CENTER_CENTER,
+            "⋮⋮",
+            egui::FontId::proportional(9.0),
+            COL_MUTED,
+        );
+        if hresp.dragged() {
+            PANEL_DRAG_DELTA.with(|d| {
+                let mut d2 = d.borrow_mut();
+                let cur = hresp.drag_delta();
+                *d2 += cur;
+            });
+        }
+        if hresp.hovered() {
+            PANEL_DRAG_HINT.with(|d| *d.borrow_mut() = true);
+        }
         ui.label(egui::RichText::new(title).size(13.0).strong().color(COL_TEXT));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let close = egui::Button::new(
@@ -817,16 +860,23 @@ impl PlaApp {
                 pla_bridge::cdp::CdpEvent::EvalResult(s) => {
                     self.set_notice((false, format!("CDP: {}", s)));
                 }
-                // R8-1: 视口状态采集回包 → 暂存, 等截图回包一起落盘。
+                // R8-1: 视口状态采集回包 → 暂存并立即补发截图命令(串行化,
+                // 避免 VpStateSave/CaptureViewport 回包交错导致 pending 空)。
                 pla_bridge::cdp::CdpEvent::VpStateResult(state) => {
                     self.vp_pending_state = Some(state);
+                    if let Some(path) = self.vp_shot_path.clone() {
+                        self.cdp
+                            .send(pla_bridge::cdp::CdpCmd::CaptureViewport(path));
+                    }
                 }
                 // R8-1: 视口截图回包 → 读盘, 完成 pending 存档。
-                pla_bridge::cdp::CdpEvent::ViewportPng(_len) => {
-                    let png_bytes = self
-                        .vp_shot_path
-                        .clone()
-                        .and_then(|p| std::fs::read(p).ok());
+                // (len=0 = 截图失败 — 跳过读盘, pending 照常落盘为无图版本)
+                pla_bridge::cdp::CdpEvent::ViewportPng(png_len) => {
+                    let png_bytes = if png_len > 0 {
+                        self.vp_shot_path.clone().and_then(|p| std::fs::read(p).ok())
+                    } else {
+                        None
+                    };
                     // 视口状态存档
                     if let (Some(state), Some(png)) =
                         (self.vp_pending_state.take(), png_bytes.as_deref())
@@ -858,10 +908,11 @@ impl PlaApp {
                     }
                     // 选择集存档(pending = (SG名, members, camera))
                     if let Some((name, members, cam)) = self.sel_save_pending.take() {
-                        let png2 = self
-                            .sel_shot_path
-                            .clone()
-                            .and_then(|p| std::fs::read(p).ok());
+                        let png2 = if png_len > 0 {
+                            self.sel_shot_path.clone().and_then(|p| std::fs::read(p).ok())
+                        } else {
+                            None
+                        };
                         match pla_ui::selection::save_cdp_selection_with_camera(
                             &self.doc_key,
                             &name,
@@ -986,9 +1037,8 @@ impl PlaApp {
             Action::ToggleSnapshots => {
                 self.show_snapshots = !self.show_snapshots;
                 if self.show_snapshots {
-                    // R8-3: 二级面板互斥(快照墙/选择集/视口状态不共存)。
-                    self.show_entities = false;
-                    self.show_vpstate = false;
+                    // R8b: 互斥 = 全部二级面板(快照墙/选择集/视口状态/尺寸驱动/设置)。
+                    self.close_secondary_panels_except(PanelId::Snapshots);
                     // 每次开墙刷新: 快照可能被外部增删(含 Plasticity 侧)
                     self.snapshots = pla_ui::snapshot::list_snapshots(&self.doc_key);
                     self.snap_favs = pla_ui::snapshot::load_favs(&self.doc_key);
@@ -998,21 +1048,48 @@ impl PlaApp {
             Action::ToggleEntities => {
                 self.show_entities = !self.show_entities;
                 if self.show_entities {
-                    self.show_snapshots = false;
-                    self.show_vpstate = false;
+                    self.close_secondary_panels_except(PanelId::Entities);
                     self.sel_saved_loaded = false;
                 }
             }
             Action::ToggleVpState => {
                 self.show_vpstate = !self.show_vpstate;
                 if self.show_vpstate {
-                    self.show_snapshots = false;
-                    self.show_entities = false;
+                    self.close_secondary_panels_except(PanelId::VpState);
                     self.vp_states_loaded = false;
                 }
             }
-            Action::ToggleDim => self.show_dim = !self.show_dim,
-            Action::ToggleSettings => self.show_settings = !self.show_settings,
+            Action::ToggleDim => {
+                self.show_dim = !self.show_dim;
+                if self.show_dim {
+                    self.close_secondary_panels_except(PanelId::Dim);
+                }
+            }
+            Action::ToggleSettings => {
+                self.show_settings = !self.show_settings;
+                if self.show_settings {
+                    self.close_secondary_panels_except(PanelId::Settings);
+                }
+            }
+        }
+    }
+
+    /// R8b: 二级面板统一互斥 — 打开一个, 关掉其余全部。
+    fn close_secondary_panels_except(&mut self, keep: PanelId) {
+        if keep != PanelId::Snapshots {
+            self.show_snapshots = false;
+        }
+        if keep != PanelId::Entities {
+            self.show_entities = false;
+        }
+        if keep != PanelId::VpState {
+            self.show_vpstate = false;
+        }
+        if keep != PanelId::Dim {
+            self.show_dim = false;
+        }
+        if keep != PanelId::Settings {
+            self.show_settings = false;
         }
     }
 
@@ -1286,13 +1363,33 @@ fn header_extra_and_show(
                             panel_header(ui, title, &mut flag, icons.take());
                             contents(ui);
                         });
-                    // 跟随工具栏: 外框漂移超阈值即重定位。
+                    // R8b: 手柄拖动 → 面板自己的外框 + 位移 = 新绝对位置。
+                    // 存 PANEL_USER_POS(挪过后不再拉回默认位) + 即时移窗。
+                    let drag_delta = PANEL_DRAG_DELTA.with(|d| {
+                        let v = *d.borrow();
+                        *d.borrow_mut() = egui::Vec2::ZERO;
+                        v
+                    });
+                    let cur = ctx.input(|i| i.viewport().outer_rect);
+                    if drag_delta != egui::Vec2::ZERO {
+                        if let Some(r) = cur {
+                            let np =
+                                egui::pos2(r.left() + drag_delta.x, r.top() + drag_delta.y);
+                            PANEL_USER_POS.with(|u| {
+                                u.borrow_mut().insert(id, np);
+                            });
+                            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(np));
+                        }
+                    }
+                    // 跟随: 用户位置优先(挪过后不再跟随工具栏); 否则默认锚。
+                    let follow =
+                        PANEL_USER_POS.with(|u| u.borrow().get(id).copied()).unwrap_or(desired);
                     let cur = ctx.input(|i| i.viewport().outer_rect);
                     if let Some(r) = cur {
-                        if (r.left() - desired.x).abs() > SNAP_EPS
-                            || (r.top() - desired.y).abs() > SNAP_EPS
+                        if (r.left() - follow.x).abs() > SNAP_EPS
+                            || (r.top() - follow.y).abs() > SNAP_EPS
                         {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(desired));
+                            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(follow));
                         }
                     }
                 }
@@ -1443,15 +1540,17 @@ impl eframe::App for PlaApp {
                     }
                 });
                 }); // allocate_new_ui(居中行矩形)
-                // R8-3: 工具栏拖动 — 按住空白处拖动即脱离吸附;
-                // 拖回默认锚点附近恢复吸附(由 update_snap 判定)。
+                // R8b: 工具栏拖动 = OS 级整窗拖动(StartDrag)。任何空白处按下
+                // 即拖; 结束后记录位置脱离吸附; 拖回默认锚 40pt 内恢复吸附。
                 let bar_resp = ui.response();
-                if bar_resp.dragged_by(egui::PointerButton::Primary) {
+                if bar_resp.dragged_by(egui::PointerButton::Primary)
+                    && !self.toolbar_dragging
+                {
                     self.toolbar_dragging = true;
-                    if let Some(rect) = ctx.input(|i| i.viewport().outer_rect) {
-                        self.toolbar_drag_pos = Some(rect.min);
-                    }
-                } else if self.toolbar_dragging {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                } else if self.toolbar_dragging
+                    && !bar_resp.dragged_by(egui::PointerButton::Primary)
+                {
                     self.toolbar_dragging = false;
                     if let Some(rect) = ctx.input(|i| i.viewport().outer_rect) {
                         self.toolbar_drag_pos = Some(rect.min);
@@ -1460,7 +1559,31 @@ impl eframe::App for PlaApp {
             });
         self.hovered_hint = hovered;
 
-        // R8-3: 拖动模式下每帧把窗口钉在拖动结束位置(吸附轮询被短路)。
+        // R8b: 面板用户位置清理 — 关闭的面板移除记录(重开回默认跟随位)。
+        {
+            let mut open: std::collections::HashSet<&'static str> =
+                std::collections::HashSet::new();
+            if self.show_snapshots {
+                open.insert("panel-snapshots");
+            }
+            if self.show_entities {
+                open.insert("panel-entities");
+            }
+            if self.show_vpstate {
+                open.insert("panel-vpstate");
+            }
+            if self.show_dim {
+                open.insert("panel-dim");
+            }
+            if self.show_settings {
+                open.insert("panel-settings");
+            }
+            PANEL_USER_POS.with(|u| {
+                u.borrow_mut().retain(|k, _| open.contains(k));
+            });
+        }
+
+        // R8b: 拖动落位后每帧钉住位置(吸附轮询已短路, 防 egui/OS 抖动回弹)。
         if let Some(dp) = self.toolbar_drag_pos {
             if !self.toolbar_dragging {
                 if let Some(rect) = ctx.input(|i| i.viewport().outer_rect) {
@@ -2572,13 +2695,16 @@ impl eframe::App for PlaApp {
                 }
                 // 💾: 采集 + 截图 → pending 落盘
                 if do_save.get() {
+                    // 串行流程: 先采集状态 → 回包后再截图(VpStateResult 处理器触发)
+                    let tmp = pla_ui::vpstate::vpstate_dir(&self.doc_key)
+                        .join("__shot_tmp.png");
+                    let _ = std::fs::create_dir_all(
+                        &tmp.parent().unwrap_or(std::path::Path::new(".")),
+                    );
+                    self.vp_shot_path = Some(tmp.display().to_string());
+                    self.vp_pending_state = None;
                     self.cdp.send(pla_bridge::cdp::CdpCmd::VpStateSave);
-                    let tmp = pla_ui::vpstate::vpstate_dir(&self.doc_key).join("__shot_tmp.png");
-                    let _ = std::fs::create_dir_all(&tmp.parent().unwrap_or(std::path::Path::new(".")));
-                    let tmp_str = tmp.display().to_string();
-                    self.vp_shot_path = Some(tmp_str.clone());
-                    self.cdp.send(pla_bridge::cdp::CdpCmd::CaptureViewport(tmp_str));
-                    self.set_notice((false, "正在采集视口状态 + 截图…".into()));
+                    self.set_notice((false, "正在采集视口状态…".into()));
                 }
                 if do_open_dir.get() {
                     if let Err(e) = pla_ui::vpstate::open_dir(&self.doc_key) {
