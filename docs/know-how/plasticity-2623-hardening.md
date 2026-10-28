@@ -139,3 +139,44 @@ renderer 进程从未创建（无 `RENDER:` 日志、`ELECTRON_ENABLE_LOGGING` �
 - `tools/pla-cdp/pla-cdp-main-boot.js`：设想中的 v7 main 入口 bootstrap（CDP + 交接给原主包）。
   **目前被 §5 的校验挡住**，留着备用。
 - 若将来某版本只开了 Electron 完整性而没有自家校验，按 §4 改 sha256 即可复活整套 CDP 能力。
+
+## 9. ★★★ 突破（2026-10-29 06:40，推翻 §5/§6 的"无法注入"结论）
+
+**单字节 fuse 补丁 → node inspector → editor 全链路打通，读写均验证。**
+
+### 9.1 原理
+- §5 说"主/渲染进程都注入不进去"是对 asar 内容改动而言；但 exe 的 **fuse wire 本身没有被 Plasticity 自家校验**（工程师已实测改 exe 内 integrity 值可正常启动 → 壳不校验 exe 自身）。
+- fuse wire `000011011` 在 exe 文件偏移 **0xc824632**（sentinel `dL7pKGdnNz796PbbjQWNKmHXBZaB9tsX` + ver1 + len9 之后）。
+- Electron fuse 顺序：0=RunAsNode 1=CookieEncryption 2=NodeOptions 3=**NodeCliInspect** 4=EnableAsarIntegrity 5=OnlyLoadAppFromAsar ...
+- **把 idx3 '0'→'1'（偏移 0xc824635）→ `--inspect` 复活**。这是 Node 级 inspector，不经过 main 里 removeSwitch('remote-debugging-port') 的 Chromium 开关 → 堵不住。
+- 备份：`Plasticity.exe.pla-fuse-backup`（仅此一字节差异）。
+
+### 9.2 完整链路（全部实测）
+```
+Plasticity.exe --inspect=127.0.0.1:9334     (fuse idx3=1)
+  → node inspector (主进程, /json/list type=node)
+  → Runtime.evaluate + process.mainModule.require('electron')
+  → BrowserWindow.getAllWindows()[0].webContents.debugger.attach('1.3')   ← 内部 CDP, 无 removeSwitch
+  → renderer 全套 CDP: Runtime/Page/HeapProfiler
+```
+
+### 9.3 找 editor（26.2.3 renderer 无全局 ed，全在闭包）
+已证死路：全局扫描（`core`=lodash 污染, `__THREE__`=Three库）、require.cache（只有4个内建模块）、vm.Script wrapper（单包 webpack 闭包）、addEventListener handler 闭包链（[[Scopes]] 挖4层无命中）。
+**活路 = 堆快照交叉定位**：
+1. 同一 ws 会话内 `HeapProfiler.takeHeapSnapshot`（~62MB）收 chunk 落盘
+2. 离线解析：node_fields=[type,name,id,self_size,edge_count,detachedness]（k=6），edge_fields=[type,name_or_index,to_node]（w=3，to_node=**元素偏移**）
+3. 找**同时拥有 selection+shading+viewports 三条属性边**的源节点 → 唯一命中：name=**"Editor"**
+4. **同会话** `HeapProfiler.getObjectByHeapObjectId(id)` 还原活体（快照 id 跨会话作废！）
+5. `Runtime.callFunctionOn(oid, fn)` 读写
+
+### 9.4 实测结果
+- 读：`{sel:true, mode:Set, selSize:0, shading:true, vpCount:1}` ✅
+- 写：`signals.selectionModeChanged.dispatch(selection.mode)` → ok ✅
+- legacy：`window.__PLA_EDITOR__ = editor` 成功 → **老 PLAhelper JS 管线兼容**
+- app 干净退出 ✅
+
+### 9.5 产品化待办
+- pla-cdp 工具：fuse 字节补丁（幂等+备份）+ `--inspect=9334` 启动器
+- pla-bridge：连接层从 9333 CDP 改为 9334 inspector + attach + 堆快照找 editor（每次会话启动时跑一遍，~10s）
+- editor 探活：renderer reload 后 oid 变化 → 需重跑快照定位（或挂在 Page.loadEventFired 后自动重定位）
+- 26.1.3 老补丁路线整体作废（用户已拍板）
