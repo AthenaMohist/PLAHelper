@@ -465,12 +465,10 @@ async fn session_loop(
                                 }
                             }
                         }
-                        let enter_js = format!(
-                            "(function(){{try{{var o={cam_json};var ed=window.__PLA_EDITOR__;if(!ed){{var f=window.__PLA_HOOK__;if(f)ed=f.findEditor();}}if(!ed)return 'no-ed';var vp=null;ed.viewports.forEach(function(v){{if(!vp)vp=v}});if(!vp||!vp.camera)return 'no-cam';var cam=vp.camera;cam.position.set(o.px,o.py,o.pz);cam.quaternion.set(o.qx,o.qy,o.qz,o.qw);try{{vp.setNeedsRender()}}catch(e2){{}}return 'ok'}}catch(e){{return 'EXC'}}}})()"
-                        );
+                        let enter_js = PLA_VIEW_APPLY_JS_TMPL.replace("__VIEW__", cam_json);
                         match eval_roundtrip(ws, &mut mid, &enter_js).await {
-                            Ok(r) if r.contains("ok") => {
-                                eprintln!("[pla-cdp] R8: 组 {gi} 已切换到保存视角");
+                            Ok(r) if r.starts_with("ok") => {
+                                eprintln!("[pla-cdp] R8: 组 {gi} 已切换到保存视角: {r}");
                             }
                             other => {
                                 eprintln!("[pla-cdp] R8: 组 {gi} 视角切换异常: {other:?}")
@@ -478,6 +476,25 @@ async fn session_loop(
                         }
                         // 相机切换后渲染/命中管线需要一拍稳定
                         tokio::time::sleep(Duration::from_millis(350)).await;
+                        // R10: 回读校验 —— 只写 camera 而 orbitControls 仍在旧
+                        // target/radius 上时, 下一帧会把相机拉回原位。以前这是
+                        // 静默失败(表现为"未扫到"), 现在如实报警。
+                        if let Ok(now) = eval_roundtrip(ws, &mut mid, CAM_SNAPSHOT_JS).await {
+                            match view_delta(cam_json, &now) {
+                                Ok(d) if d > 1e-3 => {
+                                    eprintln!(
+                                        "[pla-cdp] R8: 组 {gi} 视角切换未生效(回读偏差 {d:.4})"
+                                    );
+                                    let _ = ev_tx.send(CdpEvent::Status(format!(
+                                        "警告: 视角组 {gi} 切视角未生效(偏差 {d:.4}) — 该组目标大概率扫不到"
+                                    )));
+                                }
+                                Ok(_) => {}
+                                Err(e) => {
+                                    eprintln!("[pla-cdp] R8: 组 {gi} 视角回读校验失败: {e}")
+                                }
+                            }
+                        }
                     }
                 let js = match apply_sel_js(&entries, gi > 0) {
                     Ok(j) => j,
@@ -687,9 +704,7 @@ async fn session_loop(
                                 .find(|e| e.id == *occ_id)
                                 .and_then(|e| e.camera.clone())
                             {
-                                let enter_js = format!(
-                                    "(function(){{try{{var o={mc};var ed=window.__PLA_EDITOR__;if(!ed){{var f=window.__PLA_HOOK__;if(f)ed=f.findEditor();}}if(!ed)return 'no-ed';var vp=null;ed.viewports.forEach(function(v){{if(!vp)vp=v}});var cam=vp.camera;cam.position.set(o.px,o.py,o.pz);cam.quaternion.set(o.qx,o.qy,o.qz,o.qw);try{{vp.setNeedsRender()}}catch(e2){{}}return 'ok'}}catch(e){{return 'EXC'}}}})()"
-                                );
+                                let enter_js = PLA_VIEW_APPLY_JS_TMPL.replace("__VIEW__", &mc);
                                 let _ = eval_roundtrip(ws, &mut mid, &enter_js).await;
                                 tokio::time::sleep(Duration::from_millis(350)).await;
                             }
@@ -746,9 +761,7 @@ async fn session_loop(
                             }
                         }
                         // 5) 恢复用户相机
-                        let restore_js = format!(
-                            "(function(){{try{{var o={cam_saved};var ed=window.__PLA_EDITOR__;if(!ed){{var f=window.__PLA_HOOK__;if(f)ed=f.findEditor();}}if(!ed)return 'no-ed';var vp=null;ed.viewports.forEach(function(v){{if(!vp)vp=v}});var cam=vp.camera;cam.position.set(o.px,o.py,o.pz);cam.quaternion.set(o.qx,o.qy,o.qz,o.qw);try{{vp.setNeedsRender()}}catch(e2){{}}return 'ok'}}catch(e){{return 'EXC'}}}})()"
-                        );
+                        let restore_js = PLA_VIEW_APPLY_JS_TMPL.replace("__VIEW__", &cam_saved);
                         if let Err(e) = eval_roundtrip(ws, &mut mid, &restore_js).await {
                             eprintln!("[pla-cdp] 相机恢复失败: {e:#}");
                         }
@@ -803,9 +816,7 @@ async fn session_loop(
                 } // ---- 'groups 循环结束 ----
                 // 全部组完成: 恢复用户相机 + 统一上报
                 if let Some(uc) = user_cam.as_ref() {
-                    let restore_js = format!(
-                        "(function(){{try{{var o={uc};var ed=window.__PLA_EDITOR__;if(!ed){{var f=window.__PLA_HOOK__;if(f)ed=f.findEditor();}}if(!ed)return 'no-ed';var vp=null;ed.viewports.forEach(function(v){{if(!vp)vp=v}});var cam=vp.camera;cam.position.set(o.px,o.py,o.pz);cam.quaternion.set(o.qx,o.qy,o.qz,o.qw);try{{vp.setNeedsRender()}}catch(e2){{}}return 'ok'}}catch(e){{return 'EXC'}}}})()"
-                    );
+                    let restore_js = PLA_VIEW_APPLY_JS_TMPL.replace("__VIEW__", uc);
                     if let Err(e) = eval_roundtrip(ws, &mut mid, &restore_js).await {
                         eprintln!("[pla-cdp] v6: 用户相机恢复失败: {e:#}");
                     }
@@ -847,7 +858,7 @@ async fn session_loop(
                 let js = VPSTATE_RESTORE_JS_TMPL.replace("__STATE__", &state);
                 match eval_roundtrip(ws, &mut mid, &js).await {
                     Ok(r) => {
-                        let _ = ev_tx.send(CdpEvent::Status(format!("视口状态已恢复: {r}")));
+                        let _ = ev_tx.send(CdpEvent::Status(fmt_vpstate_apply_result(&r)));
                     }
                     Err(e) => {
                         let _ = ev_tx
@@ -1198,6 +1209,12 @@ const MAP_READ_JS: &str = r#"(function(){
 /// v5.2: 相机快照 — 返回 {px,py,pz,qx,qy,qz,qw}(JSON 字符串)。
 /// position/quaternion 直读; 绝不读/写投影参数(fov/near/zoom — 正交
 /// ProxyCamera 上 updateProjectionMatrix 有破坏性副作用, R7-31h 教训)。
+///
+/// R10: 额外尽力附带 orbit(target/focal/radius/zoom) 与 zoom/fov。原因:
+/// Plasticity 的相机由 orbitControls 驱动, 只写 camera.position/quaternion
+/// 会在下一帧被 orbit.update() 覆盖 —— 这是「选择集多视角组还原失败」的头号
+/// 嫌疑(单组=当前视角不受影响, 多组必然失败)。老存档只有 7 个数字, 消费方
+/// 必须容忍 orbit/zoom 缺失(见 `PLA_VIEW_APPLY_JS_TMPL`)。
 const CAM_SNAPSHOT_JS: &str = r#"(function(){
   var ed=window.__PLA_EDITOR__;
   if(!ed||!ed.selection){ var f=window.__PLA_HOOK__; if(f) ed=f.findEditor(); if(ed) window.__PLA_EDITOR__=ed; }
@@ -1205,8 +1222,64 @@ const CAM_SNAPSHOT_JS: &str = r#"(function(){
   var vp=null; ed.viewports.forEach(function(v){if(!vp)vp=v});
   if(!vp||!vp.camera) return '';
   var cam=vp.camera;
-  return JSON.stringify({px:cam.position.x,py:cam.position.y,pz:cam.position.z,
-    qx:cam.quaternion.x,qy:cam.quaternion.y,qz:cam.quaternion.z,qw:cam.quaternion.w});})()"#;
+  var o={px:cam.position.x,py:cam.position.y,pz:cam.position.z,
+    qx:cam.quaternion.x,qy:cam.quaternion.y,qz:cam.quaternion.z,qw:cam.quaternion.w};
+  try{ if(typeof cam.zoom==='number') o.zoom=cam.zoom }catch(e){}
+  try{ if(typeof cam.fov==='number') o.fov=cam.fov }catch(e){}
+  try{
+    var oc=vp.orbitControls;
+    if(oc){
+      var orb={};
+      if(oc.target&&oc.target.x!==undefined) orb.target=[oc.target.x,oc.target.y,oc.target.z];
+      if(oc.focalOffset&&oc.focalOffset.x!==undefined) orb.focal=[oc.focalOffset.x,oc.focalOffset.y,oc.focalOffset.z];
+      if(typeof oc.radius==='number') orb.radius=oc.radius;
+      if(typeof oc.zoom==='number') orb.zoom=oc.zoom;
+      o.orbit=orb;
+    }
+  }catch(e2){}
+  return JSON.stringify(o);})()"#;
+
+/// R10: 统一的「切到某个已存视角」脚本(把原先复制三份的内联 JS 收口)。
+/// 入参 __VIEW__ = CAM_SNAPSHOT_JS 的 JSON(可缺 orbit/zoom/fov — 老存档兼容)。
+///
+/// 顺序要点: 先写 camera, 再写 orbitControls(否则下一帧 orbit.update() 用
+/// 旧 target/radius 把相机拉回去), 最后 setNeedsRender。投影参数只在**透视**
+/// 相机上写(正交 ProxyCamera 的 updateProjectionMatrix 有破坏性副作用)。
+/// 返回 'ok:cam' / 'ok:orbit' / 'no-ed' / 'no-cam' / 'EXC:<msg>'。
+const PLA_VIEW_APPLY_JS_TMPL: &str = r#"(function(){
+  try{
+    var o=__VIEW__;
+    var ed=window.__PLA_EDITOR__;
+    if(!ed||!ed.selection){ var f=window.__PLA_HOOK__; if(f) ed=f.findEditor(); if(ed) window.__PLA_EDITOR__=ed; }
+    if(!ed||!ed.selection) return 'no-ed';
+    var vp=null; ed.viewports.forEach(function(v){if(!vp)vp=v});
+    if(!vp||!vp.camera) return 'no-cam';
+    var cam=vp.camera;
+    cam.position.set(o.px,o.py,o.pz);
+    cam.quaternion.set(o.qx,o.qy,o.qz,o.qw);
+    var persp = (cam.isPerspectiveCamera===true);
+    var proj=false;
+    if(persp){
+      try{ if(typeof o.zoom==='number' && typeof cam.zoom==='number'){ cam.zoom=o.zoom; proj=true } }catch(e1){}
+      try{ if(typeof o.fov==='number' && typeof cam.fov==='number'){ cam.fov=o.fov; proj=true } }catch(e2){}
+    }
+    var orbit=false;
+    try{
+      var oc=vp.orbitControls;
+      if(o.orbit&&oc){
+        function sv(dst,src){ if(dst&&dst.set&&src&&src.length===3){ try{ dst.set(src[0],src[1],src[2]); return true }catch(e){} } return false }
+        sv(oc.target,o.orbit.target);
+        sv(oc.focalOffset,o.orbit.focal);
+        if(typeof o.orbit.radius==='number') oc.radius=o.orbit.radius;
+        if(typeof o.orbit.zoom==='number') oc.zoom=o.orbit.zoom;
+        orbit=true;
+      }
+    }catch(e3){}
+    if(persp&&proj){ try{ cam.updateProjectionMatrix() }catch(e4){} }
+    try{ var oc2=vp.orbitControls; if(oc2&&typeof oc2.update==='function') oc2.update() }catch(e5){}
+    try{ vp.setNeedsRender() }catch(e6){}
+    return 'ok'+(proj?':proj':'')+(orbit?':orbit':':cam');
+  }catch(e){ return 'EXC:'+(e&&e.message?e.message:String(e)) }})()"#;
 
 /// v5.2: 转到当前选择正视(navigateToSelection, 实测相机立即响应;
 /// 动画驱动, 调用方需等待 ~700ms 让相机稳定)。
@@ -1230,6 +1303,10 @@ const VPSTATE_SNAPSHOT_JS: &str = r#"(function(){
   if(!vps.length) return JSON.stringify({err:'no-viewport'});
   var vp=vps[0];
   var out={};
+  // R10: 逐段记录失败原因。以前每段一个空 catch, 26.x 里任何结构变化(如
+  // vp.settings 搬走、orbitControls 改名)都会让该段**静默消失**, 恢复时对应
+  // 项跳过且仍返回 ok —— 用户看到的就是"全都恢复不了"却没有任何线索。
+  out.failed=[];
   function v3(v){ return v&&v.x!==undefined ? [v.x,v.y,v.z] : null }
   try{
     var c=vp.camera;
@@ -1237,40 +1314,40 @@ const VPSTATE_SNAPSHOT_JS: &str = r#"(function(){
       qx:c.quaternion.x,qy:c.quaternion.y,qz:c.quaternion.z,qw:c.quaternion.w,
       fov:(typeof c.fov==='number')?c.fov:null, zoom:(typeof c.zoom==='number')?c.zoom:null,
       near:(typeof c.near==='number')?c.near:null, far:(typeof c.far==='number')?c.far:null};
-  }catch(e){}
+  }catch(e){ out.failed.push('cam:'+(e&&e.message?e.message:'EXC')) }
   try{
     var oc=vp.orbitControls;
     out.orbit={target:v3(oc.target), focal:v3(oc.focalOffset),
       radius:(typeof oc.radius==='number')?oc.radius:null, zoom:(typeof oc.zoom==='number')?oc.zoom:null};
-  }catch(e){}
+  }catch(e){ out.failed.push('orbit:'+(e&&e.message?e.message:'EXC')) }
   try{ out.shading={mode: ed.shading.mode?ed.shading.mode.tag:null,
-    section: ed.shading._sectionMode?ed.shading._sectionMode.tag:null} }catch(e){}
+    section: ed.shading._sectionMode?ed.shading._sectionMode.tag:null} }catch(e){ out.failed.push('shading:'+(e&&e.message?e.message:'EXC')) }
   try{
     var arr=[];
     ed.sections.sections.forEach(function(s){
       arr.push({enabled:!!s.enabled, p:v3(s.p), n:v3(s.n), x:v3(s.x), y:v3(s.y)});
     });
     out.sections=arr;
-  }catch(e){}
+  }catch(e){ out.failed.push('sections:'+(e&&e.message?e.message:'EXC')) }
   try{
     var cp=vp._constructionPlane;
     if(cp) out.cplane={p:v3(cp.p), n:v3(cp.n), x:v3(cp.x), y:v3(cp.y)};
-  }catch(e){}
+  }catch(e){ out.failed.push('cplane:'+(e&&e.message?e.message:'EXC')) }
   try{
     var r=vp.settings.Viewport.renderer;
     out.renderer={antiAlias:!!r.antiAlias, toneMapping:String(r.toneMapping||''),
       toneMappingExposure:(typeof r.toneMappingExposure==='number')?r.toneMappingExposure:null};
-  }catch(e){}
+  }catch(e){ out.failed.push('renderer:'+(e&&e.message?e.message:'EXC')) }
   try{
     var ao=vp.settings.Viewport.ao;
     var av={};
     Object.keys(ao).forEach(function(k){ var v=ao[k]; if(typeof v==='number'||typeof v==='boolean') av[k]=v });
     out.ao=av;
-  }catch(e){}
+  }catch(e){ out.failed.push('ao:'+(e&&e.message?e.message:'EXC')) }
   try{
     var g=vp.settings.Grid;
     out.grid={every:(typeof g.every==='number')?g.every:null, size:(typeof g.size==='number')?g.size:null};
-  }catch(e){}
+  }catch(e){ out.failed.push('grid:'+(e&&e.message?e.message:'EXC')) }
   // 视口 DOM rect(CSS 像素) + dpr — 截图裁剪用
   try{
     var r2=vp.container.getBoundingClientRect();
@@ -1293,15 +1370,33 @@ const VPSTATE_RESTORE_JS_TMPL: &str = r#"(function(){
   if(!vps.length) return 'no-viewport';
   var vp=vps[0];
   var applied=[];
+  // R10: 以前每段空 catch + 只回 applied 列表 —— 任何一段没生效就"无声跳过",
+  // 面板显示"已恢复"但界面/视角纹丝不动。现在分段记录 missing(存档里没有)
+  // 与 failed(写的时候抛了), 回包原样交回 Rust 侧如实显示。
+  var missing=[];
+  var failed=[];
+  function ex(e){ return e&&e.message?e.message:'EXC' }
   function setV3(dst,src){ if(dst&&dst.set&&src){ try{ dst.set(src[0],src[1],src[2]); return true }catch(e){} } return false }
   try{
     if(S.cam){
       var c=vp.camera;
       c.position.set(S.cam.px,S.cam.py,S.cam.pz);
       c.quaternion.set(S.cam.qx,S.cam.qy,S.cam.qz,S.cam.qw);
+      // R10: 缩放(fov/zoom)以前**根本没有恢复** —— 相机位姿对了但取景范围
+      // 不对, 用户看到的就是"视角恢复不了"。只在透视相机上写: 正交
+      // ProxyCamera 的 updateProjectionMatrix 有破坏性副作用(R7-31h)。
+      var persp = (c.isPerspectiveCamera===true);
+      var proj=false;
+      if(typeof S.cam.zoom==='number' && typeof c.zoom==='number'){
+        if(persp){ c.zoom=S.cam.zoom; proj=true } else { missing.push('zoom(正交未应用)') }
+      }
+      if(typeof S.cam.fov==='number' && typeof c.fov==='number'){
+        if(persp){ c.fov=S.cam.fov; proj=true } else { missing.push('fov(正交未应用)') }
+      }
+      if(proj){ try{ c.updateProjectionMatrix() }catch(e1){} applied.push('proj') }
       applied.push('cam');
-    }
-  }catch(e){}
+    } else { missing.push('cam') }
+  }catch(e){ failed.push('cam:'+ex(e)) }
   try{
     if(S.orbit){
       var oc=vp.orbitControls;
@@ -1311,22 +1406,22 @@ const VPSTATE_RESTORE_JS_TMPL: &str = r#"(function(){
       if(typeof S.orbit.zoom==='number') oc.zoom=S.orbit.zoom;
       try{ if(typeof oc.update==='function') oc.update() }catch(e2){}
       applied.push('orbit');
-    }
-  }catch(e){}
+    } else { missing.push('orbit') }
+  }catch(e){ failed.push('orbit:'+ex(e)) }
   try{
     if(S.shading&&S.shading.mode){
       var m=ed.shading.mode;
       if(m&&m.tag!==S.shading.mode){
         m.prev={tag:m.tag, materials:m.materials, isTinted:!!m.isTinted};
         m.tag=S.shading.mode;
-        try{ ed.shading.signals.shadingChanged.dispatch(m) }catch(e2){}
-      }
+        try{ ed.shading.signals.shadingChanged.dispatch(m) }catch(e2){ failed.push('shading:dispatch') }
+      } else if(!m){ failed.push('shading:no-mode') }
       if(S.shading.section&&ed.shading._sectionMode){
-        try{ ed.shading._sectionMode.tag=S.shading.section }catch(e2){}
+        try{ ed.shading._sectionMode.tag=S.shading.section }catch(e2){ failed.push('shading:section') }
       }
       applied.push('shading');
-    }
-  }catch(e){}
+    } else { missing.push('shading') }
+  }catch(e){ failed.push('shading:'+ex(e)) }
   try{
     if(S.sections){
       var cur=ed.sections.sections;
@@ -1338,15 +1433,15 @@ const VPSTATE_RESTORE_JS_TMPL: &str = r#"(function(){
       }
       for(var j=S.sections.length;j<cur.length;j++){ try{ cur[j].enabled=false }catch(e3){} }
       applied.push('sections:'+Math.min(cur.length,S.sections.length));
-    }
-  }catch(e){}
+    } else { missing.push('sections') }
+  }catch(e){ failed.push('sections:'+ex(e)) }
   try{
     if(S.cplane){
       var cp=vp._constructionPlane;
       if(cp){ setV3(cp.p,S.cplane.p); setV3(cp.n,S.cplane.n); setV3(cp.x,S.cplane.x); setV3(cp.y,S.cplane.y);
-        applied.push('cplane'); }
-    }
-  }catch(e){}
+        applied.push('cplane'); } else { failed.push('cplane:null') }
+    } else { missing.push('cplane') }
+  }catch(e){ failed.push('cplane:'+ex(e)) }
   try{
     if(S.renderer){
       var r=vp.settings.Viewport.renderer;
@@ -1354,25 +1449,25 @@ const VPSTATE_RESTORE_JS_TMPL: &str = r#"(function(){
       if(S.renderer.toneMapping) r.toneMapping=S.renderer.toneMapping;
       if(typeof S.renderer.toneMappingExposure==='number') r.toneMappingExposure=S.renderer.toneMappingExposure;
       applied.push('renderer');
-    }
-  }catch(e){}
+    } else { missing.push('renderer') }
+  }catch(e){ failed.push('renderer:'+ex(e)) }
   try{
     if(S.ao){
       var ao=vp.settings.Viewport.ao;
       Object.keys(S.ao).forEach(function(k){ try{ ao[k]=S.ao[k] }catch(e2){} });
       applied.push('ao');
-    }
-  }catch(e){}
+    } else { missing.push('ao') }
+  }catch(e){ failed.push('ao:'+ex(e)) }
   try{
     if(S.grid){
       var g=vp.settings.Grid;
       if(typeof S.grid.every==='number') g.every=S.grid.every;
       if(typeof S.grid.size==='number') g.size=S.grid.size;
       applied.push('grid');
-    }
-  }catch(e){}
+    } else { missing.push('grid') }
+  }catch(e){ failed.push('grid:'+ex(e)) }
   try{ vp.setNeedsRender() }catch(e){}
-  return 'ok:'+applied.join(',');})()"#;
+  return JSON.stringify({applied:applied, missing:missing, failed:failed});})()"#;
 
 
 /// v5.2: 取消活动命令 + 清 body 的 gizmo/command 属性(补选后收尾)。
@@ -1405,6 +1500,84 @@ fn absorb_map(raw: &str, pos_map: &mut std::collections::HashMap<String, (i64, i
         }
         Err(e) => eprintln!("[pla-cdp] map read 解析失败: {e} (raw: {raw})"),
     }
+}
+
+/// R10: 把 VPSTATE_RESTORE_JS_TMPL 的回包翻成人话。**不再谎报成功**: 只要
+/// failed 非空就明确说"部分失败", missing(存档里本来就没有)单独列出。
+///
+/// 回包形状: `{"applied":[..],"missing":[..],"failed":[..]}`;
+/// 老格式(`ok:cam,orbit`)或任何解析失败都原样透出, 保证不丢信息。
+///
+/// @param raw CDP 回包字符串
+/// @return 给面板显示的中文摘要
+fn fmt_vpstate_apply_result(raw: &str) -> String {
+    let Ok(v) = serde_json::from_str::<Value>(raw) else {
+        return format!("视口状态已恢复: {raw}");
+    };
+    /// 把 JSON 数组转成可读列表。
+    fn list(v: &Value, key: &str) -> Vec<String> {
+        v.get(key)
+            .and_then(|x| x.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .map(|x| x.as_str().unwrap_or_default().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    let applied = list(&v, "applied");
+    let missing = list(&v, "missing");
+    let failed = list(&v, "failed");
+
+    let mut msg = if applied.is_empty() && failed.is_empty() {
+        "视口状态恢复: 没有任何项被应用".to_string()
+    } else {
+        format!("视口状态已恢复: {}", applied.join("/"))
+    };
+    if !failed.is_empty() {
+        msg.push_str(&format!(" | 部分失败: {}", failed.join(", ")));
+    }
+    if !missing.is_empty() {
+        msg.push_str(&format!(" | 存档未含: {}", missing.join(", ")));
+    }
+    msg
+}
+
+/// R10: 比较两个 CAM_SNAPSHOT_JS 回包的差异(相对位移 + 四元数夹角, 无量纲)。
+///
+/// 用途: 「切到保存视角」之后回读一次相机, 确认真的切过去了。相机在 Plasticity
+/// 里由 orbitControls 驱动, 只写 camera.position/quaternion 会在下一帧被
+/// orbit.update() 拉回原位 —— 那种情况下扫描会在**错误的视角**里进行, 表现
+/// 只是「未扫到」, 真实故障被掩盖。这里给调用方一个可判定的是/否。
+///
+/// @param target_json 期望视角(CAM_SNAPSHOT_JS 输出)
+/// @param actual_json 实际回读(CAM_SNAPSHOT_JS 输出)
+/// @return 差值: 相对位移 + 2*acos(|dot(q,q')|); 解析失败时返回 Err(不撒谎说 0)。
+fn view_delta(target_json: &str, actual_json: &str) -> anyhow::Result<f64> {
+    /// 取一个数字字段; 缺失或类型不对时**报错**, 不静默当 0。
+    fn num(value: &Value, key: &str) -> anyhow::Result<f64> {
+        value
+            .get(key)
+            .and_then(|v| v.as_f64())
+            .ok_or_else(|| anyhow::anyhow!("视角回包缺少字段 {key}"))
+    }
+    let a: Value = serde_json::from_str(target_json)?;
+    let b: Value = serde_json::from_str(actual_json)?;
+    let dx = num(&a, "px")? - num(&b, "px")?;
+    let dy = num(&a, "py")? - num(&b, "py")?;
+    let dz = num(&a, "pz")? - num(&b, "pz")?;
+    let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+    let scale = ((num(&a, "px")?).powi(2) + (num(&a, "py")?).powi(2) + (num(&a, "pz")?).powi(2))
+        .sqrt()
+        .max(1.0);
+    let dot = (num(&a, "qx")? * num(&b, "qx")?
+        + num(&a, "qy")? * num(&b, "qy")?
+        + num(&a, "qz")? * num(&b, "qz")?
+        + num(&a, "qw")? * num(&b, "qw")?)
+    .abs()
+    .min(1.0);
+    Ok(dist / scale + 2.0 * dot.acos())
 }
 
 /// v5: 粗网格行×列(6x9=54 点, 实测 1.7s 内扫完)。
@@ -1970,5 +2143,53 @@ mod tests {
         assert_eq!(click_group(&located, 983, 193).len(), 2);
         assert_eq!(click_group(&located, 412, 507).len(), 1);
         assert_eq!(click_group(&located, 1, 1).len(), 0);
+    }
+
+    #[test]
+    fn view_delta_detects_identity_and_mismatch() {
+        let a = r#"{"px":10,"py":20,"pz":30,"qx":0,"qy":0,"qz":0,"qw":1}"#;
+        // 完全一致 → 0
+        assert!(view_delta(a, a).unwrap() < 1e-9);
+        // 四元数取反表示同一朝向, 仍应判为一致
+        let flipped = r#"{"px":10,"py":20,"pz":30,"qx":0,"qy":0,"qz":0,"qw":-1}"#;
+        assert!(view_delta(a, flipped).unwrap() < 1e-9);
+        // 位置平移 → 明显非 0(>1e-3 阈值)
+        let moved = r#"{"px":110,"py":20,"pz":30,"qx":0,"qy":0,"qz":0,"qw":1}"#;
+        assert!(view_delta(a, moved).unwrap() > 1e-3);
+        // 缺字段 → 报错, 不静默当 0(R10: 不撒谎)
+        assert!(view_delta(a, r#"{"px":1}"#).is_err());
+        assert!(view_delta("not-json", a).is_err());
+    }
+
+    #[test]
+    fn fmt_vpstate_apply_result_reports_failures() {
+        // 全部应用成功
+        let ok = r#"{"applied":["cam","orbit","shading"],"missing":[],"failed":[]}"#;
+        let s = fmt_vpstate_apply_result(ok);
+        assert!(s.contains("cam"), "{s}");
+        assert!(!s.contains("失败"), "{s}");
+        // 部分失败必须如实带出来(旧实现会谎报"已恢复")
+        let bad = r#"{"applied":["cam"],"missing":["grid"],"failed":["shading:cannot read"]}"#;
+        let s = fmt_vpstate_apply_result(bad);
+        assert!(s.contains("shading:cannot read"), "{s}");
+        assert!(s.contains("存档未含"), "{s}");
+        // 什么都没应用
+        let none = r#"{"applied":[],"missing":["cam"],"failed":[]}"#;
+        assert!(fmt_vpstate_apply_result(none).contains("没有任何项被应用"));
+        // 老格式 / 坏数据原样透出, 不丢信息
+        assert_eq!(fmt_vpstate_apply_result("ok:cam,orbit"), "视口状态已恢复: ok:cam,orbit");
+    }
+
+    #[test]
+    fn view_apply_template_is_well_formed() {
+        let js = PLA_VIEW_APPLY_JS_TMPL.replace(
+            "__VIEW__",
+            r#"{"px":1,"py":2,"pz":3,"qx":0,"qy":0,"qz":0,"qw":1}"#,
+        );
+        assert!(!js.contains("__VIEW__"), "占位符未替换");
+        assert!(!js.contains("//"), "JS 内含 // 注释会吞掉后续代码");
+        assert!(js.ends_with("})()"), "JS 未完整收尾");
+        assert!(js.contains("orbitControls"), "缺少 orbitControls 同步(会被下一帧拉回)");
+        assert!(js.contains("setNeedsRender"));
     }
 }

@@ -5,9 +5,30 @@
 | 文件 | 作用 |
 | --- | --- |
 | `pla-ui.exe` | PLAhelper 主程序（单文件，双击即用）。字体已内嵌，无外部依赖。 |
-| `patch-cdp.bat` | 给 Plasticity 打 CDP 补丁的批处理（自动找安装位置、自动备份）。 |
+| `patch-cdp.bat` | 给 Plasticity 打 CDP 补丁的批处理（自动找安装位置、自动备份）。**仅适用于 26.2.1 及更早**。 |
 | `pla-cdp-patch.js` | 补丁本体，`patch-cdp.bat` 要用它，两者必须放在同一目录。 |
+| `pla-cdp-v7.js` | **新的检测/打补丁/还原工具**（推荐）。先 `status` 看清楚能不能打，再 `patch`。 |
+| `pla-asar.js` | 零依赖 asar 读写库（`pla-cdp-v7.js` 与排查时用），`node pla-asar.js <asar> info`。 |
+| `pla-cdp-main-boot.js` | v7 主入口引导脚本（26.2.x 被官方校验挡住，暂不可用，留档备用）。 |
 | `README.md` | 本说明。 |
+
+## 〇、先看这条：Plasticity 26.2.3 及以上**打不了补丁**
+
+从 26.2.3 起 Plasticity 把主程序换成了加密包（`resources/plasticity.jsc.pack`，自定义容器
+`PLSEC001`），并且会校验 `app.asar` 里每个文件的内容 —— 只要改了任何文件，程序就在
+「App ready」之后几十毫秒自己退出（没有报错、界面都不出来）。所以 **26.2.3 上没有可用的
+CDP 端口**，PLAhelper 依赖 CDP 的功能（选择集、视口状态、实体树）在这些版本上不可用。
+
+判断方法（不用装任何东西）：
+
+```
+node pla-cdp-v7.js status
+```
+
+- `layout: legacy` + `patched: NO` → 可以打（见下节）。
+- `layout: hardened` → **打不了**，工具会明确说出来并且**不会动任何文件**。
+
+技术细节与证据：`repo/docs/know-how/plasticity-2623-hardening.md`。
 
 ## 一、使用步骤
 
