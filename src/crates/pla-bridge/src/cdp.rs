@@ -1231,9 +1231,13 @@ const CAM_SNAPSHOT_JS: &str = r#"(function(){
     if(oc){
       var orb={};
       if(oc.target&&oc.target.x!==undefined) orb.target=[oc.target.x,oc.target.y,oc.target.z];
+      if(oc.targetEnd&&oc.targetEnd.x!==undefined) orb.targetEnd=[oc.targetEnd.x,oc.targetEnd.y,oc.targetEnd.z];
       if(oc.focalOffset&&oc.focalOffset.x!==undefined) orb.focal=[oc.focalOffset.x,oc.focalOffset.y,oc.focalOffset.z];
+      if(oc.focalOffsetEnd&&oc.focalOffsetEnd.x!==undefined) orb.focalEnd=[oc.focalOffsetEnd.x,oc.focalOffsetEnd.y,oc.focalOffsetEnd.z];
       if(typeof oc.radius==='number') orb.radius=oc.radius;
+      if(typeof oc.radiusEnd==='number') orb.radiusEnd=oc.radiusEnd;
       if(typeof oc.zoom==='number') orb.zoom=oc.zoom;
+      if(typeof oc.zoomEnd==='number') orb.zoomEnd=oc.zoomEnd;
       o.orbit=orb;
     }
   }catch(e2){}
@@ -1269,9 +1273,21 @@ const PLA_VIEW_APPLY_JS_TMPL: &str = r#"(function(){
       if(o.orbit&&oc){
         function sv(dst,src){ if(dst&&dst.set&&src&&src.length===3){ try{ dst.set(src[0],src[1],src[2]); return true }catch(e){} } return false }
         sv(oc.target,o.orbit.target);
+        sv(oc.targetEnd,o.orbit.targetEnd||o.orbit.target);
         sv(oc.focalOffset,o.orbit.focal);
-        if(typeof o.orbit.radius==='number') oc.radius=o.orbit.radius;
-        if(typeof o.orbit.zoom==='number') oc.zoom=o.orbit.zoom;
+        sv(oc.focalOffsetEnd,o.orbit.focalEnd||o.orbit.focal);
+        if(typeof o.orbit.radius==='number'){
+          oc.radius=o.orbit.radius;
+          oc.radiusEnd=(o.orbit.radiusEnd!==undefined&&o.orbit.radiusEnd!==null)?o.orbit.radiusEnd:o.orbit.radius;
+        }
+        if(typeof o.orbit.zoom==='number'){
+          oc.zoom=o.orbit.zoom;
+          oc.zoomEnd=(o.orbit.zoomEnd!==undefined&&o.orbit.zoomEnd!==null)?o.orbit.zoomEnd:o.orbit.zoom;
+        }
+        if(oc.quaternion&&oc.quaternion.set){
+          try{ oc.quaternion.set(o.qx,o.qy,o.qz,o.qw) }catch(e7){}
+          try{ if(oc.quaternionEnd&&oc.quaternionEnd.set) oc.quaternionEnd.set(o.qx,o.qy,o.qz,o.qw) }catch(e8){}
+        }
         orbit=true;
       }
     }catch(e3){}
@@ -1317,8 +1333,15 @@ const VPSTATE_SNAPSHOT_JS: &str = r#"(function(){
   }catch(e){ out.failed.push('cam:'+(e&&e.message?e.message:'EXC')) }
   try{
     var oc=vp.orbitControls;
-    out.orbit={target:v3(oc.target), focal:v3(oc.focalOffset),
-      radius:(typeof oc.radius==='number')?oc.radius:null, zoom:(typeof oc.zoom==='number')?oc.zoom:null};
+    // R10(实测): orbitControls 是**阻尼**的 — 每个量都有 x / xEnd 两份, 每帧把
+    // x 往 xEnd 插值。只写 x 而 xEnd 还是旧值时, 相机会被动画拉回旧取景 ——
+    // 这就是"恢复后视角/缩放不对"的直接原因。两份都要存、都要写。
+    out.orbit={target:v3(oc.target), targetEnd:v3(oc.targetEnd),
+      focal:v3(oc.focalOffset), focalEnd:v3(oc.focalOffsetEnd),
+      radius:(typeof oc.radius==='number')?oc.radius:null,
+      radiusEnd:(typeof oc.radiusEnd==='number')?oc.radiusEnd:null,
+      zoom:(typeof oc.zoom==='number')?oc.zoom:null,
+      zoomEnd:(typeof oc.zoomEnd==='number')?oc.zoomEnd:null};
   }catch(e){ out.failed.push('orbit:'+(e&&e.message?e.message:'EXC')) }
   try{ out.shading={mode: ed.shading.mode?ed.shading.mode.tag:null,
     section: ed.shading._sectionMode?ed.shading._sectionMode.tag:null} }catch(e){ out.failed.push('shading:'+(e&&e.message?e.message:'EXC')) }
@@ -1400,10 +1423,25 @@ const VPSTATE_RESTORE_JS_TMPL: &str = r#"(function(){
   try{
     if(S.orbit){
       var oc=vp.orbitControls;
+      // R10(实测): x / xEnd 成对写 —— 只写当前值会被阻尼动画拉回旧取景。
+      function svEnd(dst,src){ if(dst&&dst.set&&src){ try{ dst.set(src[0],src[1],src[2]); return true }catch(e){} } return false }
       setV3(oc.target,S.orbit.target);
+      svEnd(oc.targetEnd,S.orbit.targetEnd||S.orbit.target);
       setV3(oc.focalOffset,S.orbit.focal);
-      if(typeof S.orbit.radius==='number') oc.radius=S.orbit.radius;
-      if(typeof S.orbit.zoom==='number') oc.zoom=S.orbit.zoom;
+      svEnd(oc.focalOffsetEnd,S.orbit.focalEnd||S.orbit.focal);
+      if(typeof S.orbit.radius==='number'){
+        oc.radius=S.orbit.radius;
+        if(S.orbit.radiusEnd!==undefined&&S.orbit.radiusEnd!==null) oc.radiusEnd=S.orbit.radiusEnd; else oc.radiusEnd=S.orbit.radius;
+      }
+      if(typeof S.orbit.zoom==='number'){
+        oc.zoom=S.orbit.zoom;
+        if(S.orbit.zoomEnd!==undefined&&S.orbit.zoomEnd!==null) oc.zoomEnd=S.orbit.zoomEnd; else oc.zoomEnd=S.orbit.zoom;
+      }
+      // 朝向也同步给 orbit(否则用户下一次拖动会从旧朝向"跳"回来)
+      if(S.cam&&oc.quaternion&&oc.quaternion.set){
+        try{ oc.quaternion.set(S.cam.qx,S.cam.qy,S.cam.qz,S.cam.qw) }catch(e2){}
+        try{ if(oc.quaternionEnd&&oc.quaternionEnd.set) oc.quaternionEnd.set(S.cam.qx,S.cam.qy,S.cam.qz,S.cam.qw) }catch(e3){}
+      }
       try{ if(typeof oc.update==='function') oc.update() }catch(e2){}
       applied.push('orbit');
     } else { missing.push('orbit') }
@@ -1423,16 +1461,17 @@ const VPSTATE_RESTORE_JS_TMPL: &str = r#"(function(){
     } else { missing.push('shading') }
   }catch(e){ failed.push('shading:'+ex(e)) }
   try{
-    if(S.sections){
+    if(S.sections&&Array.isArray(S.sections)){
       var cur=ed.sections.sections;
+      var curArr=Array.isArray(cur)?cur:(function(){var a=[];try{cur.forEach(function(x){a.push(x)})}catch(e9){}return a})();
       // 数量对齐: 多余的禁用, 缺的无法凭空造(如实跳过)
-      for(var i=0;i<cur.length&&i<S.sections.length;i++){
-        var d=S.sections[i], s=cur[i];
+      for(var i=0;i<curArr.length&&i<S.sections.length;i++){
+        var d=S.sections[i], s=curArr[i];
         try{ s.enabled=!!d.enabled }catch(e2){}
         setV3(s.p,d.p); setV3(s.n,d.n); setV3(s.x,d.x); setV3(s.y,d.y);
       }
-      for(var j=S.sections.length;j<cur.length;j++){ try{ cur[j].enabled=false }catch(e3){} }
-      applied.push('sections:'+Math.min(cur.length,S.sections.length));
+      for(var j=S.sections.length;j<curArr.length;j++){ try{ curArr[j].enabled=false }catch(e3){} }
+      applied.push('sections:'+Math.min(curArr.length,S.sections.length));
     } else { missing.push('sections') }
   }catch(e){ failed.push('sections:'+ex(e)) }
   try{
