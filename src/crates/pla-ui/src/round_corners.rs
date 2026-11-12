@@ -1,32 +1,48 @@
-//! Win32 `SetWindowRgn` 圆角裁剪 — 面板四角圆角的可靠路径(R5 修复)。
+//! 面板圆角: Windows 11 DWM 系统圆角(R13, 取代 R5 的 `SetWindowRgn`)。
 //!
-//! 背景: egui `Rounding::same(6.0)` 画的是四角一致圆角, 但 Windows glow 后端
-//! 的透明窗口未真正生效(R5 实测只有左上角圆, 其余三角露出不透明底色)。
-//! 本模块不赌透明修复, 直接用 Win32 区域裁剪把 OS 窗口四角切圆:
-//!   - 主工具栏窗口(固定尺寸)与全部子视口面板(快照墙/实体树/尺寸/设置/
-//!     提示浮窗, 尺寸动态)都是本进程的可见顶层窗口, 统一枚举处理。
-//!   - 已套过 Rgn 的 HWND 记录 (宽, 高); 尺寸未变不重复套(移动不影响 —
-//!     Rgn 相对窗口客户区原点)。子视口尺寸变化时按 GetWindowRect 实际
-//!     物理像素重建 Rgn。
-//!   - Rgn 一律用物理像素(GetWindowRect 语义), 与 DPI 无关地贴合窗口。
+//! 为什么换:
+//!   - `SetWindowRgn` 是 1 位掩码 → 圆角边缘锯齿;
+//!   - 窗口带区域后 DWM 不再合成非客户区, 激活切换(WM_NCACTIVATE)时
+//!     DefWindowProc 会把经典样式标题栏直接画到窗口上 = 切换二级面板闪出的
+//!     "Win98 标题栏";
+//!   - 子视口(二级面板)在 glow 后端下窗口透明不生效(R13 实测四角为不透明
+//!     #000000; 根视口工具栏透明正常), 所以不能只靠 egui 画圆角。
+//!
+//! DWM 圆角(`DWMWA_WINDOW_CORNER_PREFERENCE = DWMWCP_ROUND`)由系统合成器做
+//! 抗锯齿裁剪, 与窗口是否透明无关; 系统边框关掉(`DWMWA_BORDER_COLOR =
+//! DWMWA_COLOR_NONE`), 轮廓仍由 egui 绘制。系统圆角半径为 8 逻辑 px(随 DPI
+//! 缩放), egui 侧面板外圆角与之对齐(main.rs `PANEL_OUTER_ROUNDING`)。
+//! Windows 10 不支持该属性, 调用失败即保持方角, 不影响功能。
+//!
+//! 同一轮枚举顺带处理任务栏: 二级面板/提示浮窗设为工具栏窗口的**被拥有窗口**
+//! (`GWLP_HWNDPARENT`)。系统不会给被拥有窗口建任务栏按钮(R13 前每个面板都在
+//! 任务栏上显示一个"未知程序"图标)。不用 `WS_EX_TOOLWINDOW`: winit 每次窗口
+//! 标志变化(含显示/隐藏)都会整体重写 GWL_EXSTYLE, 会把它冲掉; owner 它不碰。
+//! 必须在面板首次显示前设置(面板先隐藏渲染, 见 main.rs viewport_reveal)。
 #![allow(clippy::upper_case_acronyms)]
 
 #[cfg(windows)]
 mod imp {
-    use std::collections::HashMap;
+    use std::collections::HashSet;
 
     use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
-    use windows::Win32::Graphics::Gdi::{
-        CreateRoundRectRgn, DeleteObject, SetWindowRgn, HRGN,
+    use windows::Win32::Graphics::Dwm::{
+        DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_WINDOW_CORNER_PREFERENCE,
+        DWMWCP_ROUND,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetWindowRect, GetWindowThreadProcessId, IsWindow, IsWindowVisible,
+        EnumWindows, GetWindowLongPtrW, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId,
+        IsWindow, SetWindowLongPtrW, GWLP_HWNDPARENT, GWL_EXSTYLE, WS_EX_APPWINDOW,
     };
 
-    /// 圆角裁剪状态: 已套 Rgn 的 HWND → 套用时窗口 (宽, 高) 物理像素。
+    /// `DWMWA_COLOR_NONE`: 不画系统边框。
+    const DWMWA_COLOR_NONE: u32 = 0xFFFF_FFFE;
+
+    /// 已处理过的 HWND(圆角 / 设 owner 分别记录)。
     #[derive(Default)]
     pub struct RoundState {
-        applied: HashMap<isize, (i32, i32)>,
+        applied: HashSet<isize>,
+        owned: HashSet<isize>,
     }
 
     impl RoundState {
@@ -35,67 +51,98 @@ mod imp {
         }
     }
 
-    /// EnumWindows 回调: 收集全部顶层 HWND。
     unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
         let list = &mut *(lparam.0 as *mut Vec<HWND>);
         list.push(hwnd);
         true.into()
     }
 
-    /// 轮询本进程全部可见顶层窗口, 为新出现或尺寸变化的窗口套圆角 Rgn。
-    /// 每帧调用太频(枚举开销), 调用方按 ~500ms 节流(main.rs ROUND_POLL_MS)。
-    /// ellipse_px: CreateRoundRectRgn 椭圆直径(物理像素) = egui ROUNDING×2×ppp,
-    /// 由调用方按当前 DPI 换算 — 写死会和 egui 画出的圆角在高 DPI 下错位露黑角。
-    pub fn poll_round_windows(state: &mut RoundState, ellipse_px: i32) {
+    unsafe fn window_title(hwnd: HWND) -> String {
+        let mut buf = [0u16; 128];
+        let n = GetWindowTextW(hwnd, &mut buf);
+        String::from_utf16_lossy(&buf[..n.max(0) as usize])
+    }
+
+    /// 给本进程全部顶层窗口(含尚未显示的新建面板)设置 DWM 圆角; 除根窗口(标题 =
+    /// `root_title`, 即工具栏)外的窗口设 owner = 根窗口(不占任务栏)。每个 HWND 各只设一次。
+    /// 开销 = 一次 EnumWindows; 调用方在面板隐藏阶段每帧调用, 平时低频轮询兜底。
+    pub fn apply_round_corners(state: &mut RoundState, root_title: &str) {
         let my_pid = std::process::id();
-        // 清理已销毁窗口的死条目(QA 返工备注): HWND 会被系统复用, 不清理
-        // 则 applied 表随子视口反复开合缓慢膨胀。残余极低危场景 — 复用后
-        // 尺寸恰好与旧条目相同会漏套一次 — 由下一次尺寸变化兜底重套。
-        state.applied.retain(|&hwnd_id, _| unsafe {
-            IsWindow(HWND(hwnd_id)).as_bool()
-        });
+        state
+            .applied
+            .retain(|&id| unsafe { IsWindow(HWND(id)).as_bool() });
+        state
+            .owned
+            .retain(|&id| unsafe { IsWindow(HWND(id)).as_bool() });
         let mut hwnds: Vec<HWND> = Vec::new();
         unsafe {
             let ptr = &mut hwnds as *mut Vec<HWND> as isize;
-            // 失败(极少)时返回已收集部分, 容忍即可。
             let _ = EnumWindows(Some(enum_proc), LPARAM(ptr));
         }
-        for hwnd in hwnds {
-            unsafe {
-                if !IsWindowVisible(hwnd).as_bool() {
-                    continue;
-                }
+        // 本进程的有效顶层窗口(跳过 IME/消息类辅助窗口: 0 尺寸或极小)。
+        let mine: Vec<HWND> = hwnds
+            .into_iter()
+            .filter(|&hwnd| unsafe {
                 let mut pid: u32 = 0;
                 GetWindowThreadProcessId(hwnd, Some(&mut pid));
                 if pid != my_pid {
-                    continue;
+                    return false;
                 }
                 let mut rect = RECT::default();
-                if GetWindowRect(hwnd, &mut rect).is_err() {
+                GetWindowRect(hwnd, &mut rect).is_ok()
+                    && rect.right - rect.left >= 40
+                    && rect.bottom - rect.top >= 20
+            })
+            .collect();
+        let root = mine
+            .iter()
+            .copied()
+            .find(|&h| unsafe { window_title(h) } == root_title);
+        if let Some(root) = root {
+            for &hwnd in &mine {
+                if hwnd == root {
                     continue;
                 }
-                let w = rect.right - rect.left;
-                let h = rect.bottom - rect.top;
-                // 最小化窗口 GetWindowRect 返回 (-32000,-32000) 一类离屏坐标,
-                // 尺寸无意义, 跳过(恢复后尺寸变化会重新套)。
-                if w <= 0 || h <= 0 || rect.left < -20000 || rect.top < -20000 {
-                    continue;
+                unsafe {
+                    if !state.owned.contains(&hwnd.0) {
+                        let _ = SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, root.0);
+                        state.owned.insert(hwnd.0);
+                    }
+                    // winit 给所有无 owner 窗口加 WS_EX_APPWINDOW(强制上任务栏, 对被拥有窗口
+                    // 同样生效), 且每次窗口标志变化都会重写。它在 ShowWindow **之后**才重写,
+                    // 所以隐藏阶段清掉即可: 系统在窗口首次显示时决定是否建任务栏按钮。
+                    // 轮询时再清一次, 保持样式一致。
+                    let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+                    let app = WS_EX_APPWINDOW.0 as isize;
+                    if ex & app != 0 {
+                        let _ = SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex & !app);
+                    }
                 }
-                // 已套过且尺寸未变: 不重复套(Rgn 相对窗口, 移动无需重套)。
-                if state.applied.get(&hwnd.0) == Some(&(w, h)) {
-                    continue;
-                }
-                // CreateRoundRectRgn 返回裸 HRGN(失败返回空句柄)。
-                let rgn: HRGN = CreateRoundRectRgn(0, 0, w + 1, h + 1, ellipse_px, ellipse_px);
-                if rgn.is_invalid() {
-                    continue;
-                }
-                // 成功后系统接管 Rgn 所有权, 不得 DeleteObject; 失败则手动释放。
-                if SetWindowRgn(hwnd, rgn, true) != 0 {
-                    state.applied.insert(hwnd.0, (w, h));
-                } else {
-                    let _ = DeleteObject(rgn);
-                }
+            }
+        }
+        for hwnd in mine {
+            if state.applied.contains(&hwnd.0) {
+                continue;
+            }
+            unsafe {
+                let pref = DWMWCP_ROUND;
+                let ok = DwmSetWindowAttribute(
+                    hwnd,
+                    DWMWA_WINDOW_CORNER_PREFERENCE,
+                    &pref as *const _ as *const core::ffi::c_void,
+                    std::mem::size_of_val(&pref) as u32,
+                )
+                .is_ok();
+                let none = DWMWA_COLOR_NONE;
+                let _ = DwmSetWindowAttribute(
+                    hwnd,
+                    DWMWA_BORDER_COLOR,
+                    &none as *const _ as *const core::ffi::c_void,
+                    std::mem::size_of_val(&none) as u32,
+                );
+                // 失败(如 Windows 10)也记为已处理, 不反复重试。
+                let _ = ok;
+                state.applied.insert(hwnd.0);
             }
         }
     }
@@ -103,7 +150,7 @@ mod imp {
 
 #[cfg(not(windows))]
 mod imp {
-    /// 非 Windows 平台占位: 无 Win32 区域裁剪, UI 仍是 egui 画的圆角。
+    /// 非 Windows 平台占位: 圆角完全由 egui 绘制。
     #[derive(Default)]
     pub struct RoundState;
 
@@ -113,7 +160,7 @@ mod imp {
         }
     }
 
-    pub fn poll_round_windows(_state: &mut RoundState) {}
+    pub fn apply_round_corners(_state: &mut RoundState, _root_title: &str) {}
 }
 
 pub use imp::*;

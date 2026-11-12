@@ -36,5 +36,7 @@ windows = { version = "0.52", features = [
     "Win32_System_Com",
     "Win32_Storage_FileSystem",
     "Win32_Graphics_Gdi",
+    # Graphics_Dwm: Win11 系统圆角 DWMWA_WINDOW_CORNER_PREFERENCE(R13, 取代 SetWindowRgn)。
+    "Win32_Graphics_Dwm",
     "Win32_Storage_Xps",
 ] }

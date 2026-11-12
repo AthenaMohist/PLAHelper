@@ -23,10 +23,13 @@ const COL_PANEL: egui::Color32 = egui::Color32::from_rgb(0x18, 0x18, 0x18);
 const COL_BTN: egui::Color32 = egui::Color32::from_rgb(0x33, 0x33, 0x33);
 const COL_BTN_HOVER: egui::Color32 = egui::Color32::from_rgb(0x3d, 0x3d, 0x3d);
 /// Plasticity 主题强调黄(取色自用户 Plasticity 26.2.3 激活态按钮实测像素 #ca8a1e)。
+/// 只用于"主题"类着色(激活按钮/选中/钉住手柄); **状态语义色不跟主题**, 见下方。
 const COL_ACCENT: egui::Color32 = egui::Color32::from_rgb(0xca, 0x8a, 0x1e);
 const COL_TEXT: egui::Color32 = egui::Color32::from_rgb(0xcc, 0xcc, 0xcc);
 const COL_MUTED: egui::Color32 = egui::Color32::from_rgb(0x8a, 0x8a, 0x8a);
+// ---- 状态语义色(固定, 与主题无关): 灰=未绑定 / 黄=连接中 / 绿=已连接·成功 / 红=失败 ----
 const COL_YELLOW: egui::Color32 = egui::Color32::from_rgb(0xd9, 0xa8, 0x2c);
+const COL_GREEN: egui::Color32 = egui::Color32::from_rgb(0x3e, 0xa3, 0x4d);
 const COL_RED: egui::Color32 = egui::Color32::from_rgb(0xd0, 0x50, 0x45);
 const COL_GRAY_DOT: egui::Color32 = egui::Color32::from_rgb(0x77, 0x77, 0x77);
 
@@ -62,7 +65,7 @@ const SNAP_REENTER_X_PT: f32 = 200.0;
 const SNAP_REENTER_Y_PT: f32 = 48.0;
 /// 提示浮窗自动关闭时长。
 const NOTICE_TTL: Duration = Duration::from_secs(6);
-/// Win32 SetWindowRgn 圆角轮询间隔(子视口懒创建, 需定时补套)。
+/// DWM 系统圆角兜底轮询间隔(新面板在隐藏阶段即已设置, 见 viewport_reveal)。
 const ROUND_POLL_MS: u64 = 500;
 
 /// 全局圆角(工具栏/面板/按钮一致)。
@@ -94,7 +97,7 @@ fn main() -> eframe::Result<()> {
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size(TOOLBAR_SIZE)
-            .with_title("PLA Toolbar")
+            .with_title(ROOT_TITLE)
             .with_resizable(false)
             .with_decorations(false)
             .with_transparent(true)
@@ -224,9 +227,7 @@ struct PlaApp {
     /// 正在改名的快照名 + 编辑缓冲。
     rename_edit: Option<String>,
     rename_buf: String,
-    /// Win32 窗口圆角裁剪状态(已套 Rgn 的 HWND + 尺寸)。
-    round_state: round_corners::RoundState,
-    /// 上次圆角轮询时刻。
+    /// 上次圆角轮询时刻(DWM 圆角状态在 thread_local ROUND_STATE)。
     last_round_poll: Instant,
 }
 
@@ -318,7 +319,7 @@ fn apply_plasticity_style(ctx: &egui::Context) {
         w.rounding = egui::Rounding::same(ROUNDING);
     }
     v.window_rounding = egui::Rounding::same(ROUNDING);
-    v.window_stroke = egui::Stroke::new(3.0, egui::Color32::from_gray(150));
+    v.window_stroke = egui::Stroke::new(PANEL_BORDER_STROKE_W, COL_PANEL_BORDER);
     v.window_shadow = egui::epaint::Shadow::NONE;
     v.popup_shadow = egui::epaint::Shadow::NONE;
     v.button_frame = true;
@@ -338,7 +339,7 @@ fn apply_plasticity_style(ctx: &egui::Context) {
 /// bridge 状态文本 → 圆点颜色。
 fn status_color(status: &str) -> egui::Color32 {
     if status.starts_with("已连接") {
-        COL_ACCENT
+        COL_GREEN
     } else if status.starts_with("连接中") {
         COL_YELLOW
     } else {
@@ -356,19 +357,22 @@ fn section_header(ui: &mut egui::Ui, text: &str) {
     );
 }
 
-/// 面板浅灰轮廓宽度(逻辑 pt)与颜色:
-/// epaint 0.29 的 RectShape 使用 StrokeKind::Outside(向 paint_rect 外侧扩展绘制),
-/// 若 outer_margin=0 则描边落入 [-3, -3]..[W+3, H+3] 被视口 clip_rect 完全裁掉。
-/// 通过 outer_margin 内缩 + 前景层补绘, 保证 3pt 浅灰轮廓完整落在窗口与圆角区域内。
-const PANEL_BORDER_INSET: f32 = 2.5;
-const PANEL_BORDER_STROKE_W: f32 = 3.0;
+/// 面板浅灰轮廓宽度(逻辑 pt)与颜色。
+/// R13: 1px(R7-19)看不清、3pt(R12)太粗 → 1.5pt(150% 缩放下约 2 物理像素)。
+/// epaint 0.29 的矩形描边以边线为中心向两侧各扩 w/2, 外侧再加约 0.5px 抗锯齿羽化;
+/// 内缩 = w/2 + 0.5 让整条描边(含羽化)完整落在窗口内, 不被窗口边缘切掉。
+const PANEL_BORDER_STROKE_W: f32 = 1.5;
+const PANEL_BORDER_INSET: f32 = PANEL_BORDER_STROKE_W / 2.0 + 0.5;
 const COL_PANEL_BORDER: egui::Color32 = egui::Color32::from_gray(180);
+/// 面板窗口外圆角(逻辑 pt) = Win11 DWM 系统圆角半径(8 逻辑 px, 随 DPI 缩放)。
+/// egui 轮廓内缩 PANEL_BORDER_INSET 后与系统裁剪弧同心, 圆角处不被切、不露黑角。
+const PANEL_OUTER_ROUNDING: f32 = 8.0;
 
 /// 工具栏/子视口共用的圆角深色面板 Frame。
 fn panel_frame() -> egui::Frame {
     egui::Frame::none()
         .fill(COL_PANEL)
-        .rounding(egui::Rounding::same((ROUNDING - PANEL_BORDER_INSET).max(2.0)))
+        .rounding(egui::Rounding::same((PANEL_OUTER_ROUNDING - PANEL_BORDER_INSET).max(2.0)))
         .outer_margin(egui::Margin::same(PANEL_BORDER_INSET))
         .inner_margin(egui::Margin {
             left: 6.0 - PANEL_BORDER_INSET,
@@ -377,6 +381,69 @@ fn panel_frame() -> egui::Frame {
             bottom: 3.0 - PANEL_BORDER_INSET,
         })
         .stroke(egui::Stroke::new(PANEL_BORDER_STROKE_W, COL_PANEL_BORDER))
+}
+
+thread_local! {
+    /// R13: DWM 圆角已处理窗口表(见 round_corners.rs)。
+    static ROUND_STATE: std::cell::RefCell<round_corners::RoundState> =
+        std::cell::RefCell::new(round_corners::RoundState::new());
+}
+
+/// 根视口(工具栏)窗口标题 — 二级面板以它为 owner(不占任务栏)。
+const ROOT_TITLE: &str = "PLA Toolbar";
+
+/// R13: 给本进程新出现的顶层窗口设置 DWM 系统圆角, 并把面板挂到工具栏名下(不占任务栏)。
+fn apply_round_corners_now() {
+    ROUND_STATE.with(|s| round_corners::apply_round_corners(&mut s.borrow_mut(), ROOT_TITLE));
+}
+
+thread_local! {
+    /// R13: 子视口"年龄" — key → (上次渲染所在的根帧号, 连续渲染帧数)。
+    /// 中间断档(面板关过)即归零, 无需显式清理。
+    static VIEWPORT_AGE: std::cell::RefCell<std::collections::HashMap<&'static str, (u64, u32)>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// R13: 新建子视口先隐藏渲染这么多帧(定位 + 首帧画好)再显示。
+/// 实测(屏幕连拍): 不隐藏时新窗口先以白底未绘制状态、在错误位置出现, 要等下一次
+/// 重绘才画出内容 — 无输入时可持续 1s 以上。
+const VIEWPORT_SHOW_AFTER_FRAMES: u32 = 2;
+
+/// 返回 key 对应子视口已连续渲染的帧数(本帧首次渲染 = 0)。
+fn viewport_age(ctx: &egui::Context, key: &'static str) -> u32 {
+    let nr = ctx.cumulative_pass_nr();
+    VIEWPORT_AGE.with(|m| {
+        let mut m = m.borrow_mut();
+        let e = m.entry(key).or_insert((nr, 0));
+        if e.0 + 1 == nr {
+            *e = (nr, e.1.saturating_add(1));
+        } else if e.0 != nr {
+            *e = (nr, 0);
+        }
+        e.1
+    })
+}
+
+/// 子视口显隐阶段: 返回 (builder 需强制隐藏, 本帧需在子视口内补发 Visible(true))。
+/// 未到显示帧时请求重绘, 保证无输入也能走完隐藏阶段。
+///
+/// 注意 egui 0.29 的坑: `ViewportBuilder::patch` 判断 visible 变化时误与
+/// `self.active` 比较(viewport.rs:731), with_active(true) 的窗口从隐藏改为可见时
+/// 永远不发 Visible(true)。所以显示一律在子视口内显式 send_viewport_cmd,
+/// 显示后 builder 不再带 with_visible(否则 active 窗口会被每帧重新隐藏)。
+fn viewport_reveal(ctx: &egui::Context, key: &'static str) -> (bool, bool) {
+    let age = viewport_age(ctx, key);
+    let hide = age < VIEWPORT_SHOW_AFTER_FRAMES;
+    if hide {
+        ctx.request_repaint();
+        // 窗口在 age 0 那帧创建(隐藏); 之后的隐藏帧里设好 DWM 圆角, 显示时即为圆角。
+        if age >= 1 {
+            apply_round_corners_now();
+        }
+    }
+    // 连发几帧(winit 对已可见窗口的 Visible(true) 是空操作), 防单帧命令丢失。
+    let reveal = (VIEWPORT_SHOW_AFTER_FRAMES..VIEWPORT_SHOW_AFTER_FRAMES + 3).contains(&age);
+    (hide, reveal)
 }
 
 /// 在视口前景层补绘浅灰圆角边框, 防止内部控件(如标题栏分割线/滚动区)压盖轮廓。
@@ -389,7 +456,7 @@ fn paint_panel_border(ctx: &egui::Context) {
         ));
         painter.add(egui::epaint::RectShape::stroke(
             rect,
-            egui::Rounding::same((ROUNDING - PANEL_BORDER_INSET).max(2.0)),
+            egui::Rounding::same((PANEL_OUTER_ROUNDING - PANEL_BORDER_INSET).max(2.0)),
             egui::Stroke::new(PANEL_BORDER_STROKE_W, COL_PANEL_BORDER),
         ));
     }
@@ -1020,7 +1087,6 @@ impl PlaApp {
             sel_shot_path: None,
             rename_edit: None,
             rename_buf: String::new(),
-            round_state: round_corners::RoundState::new(),
             last_round_poll: Instant::now() - Duration::from_millis(ROUND_POLL_MS),
         }
     }
@@ -1593,7 +1659,8 @@ fn header_extra_and_show(
     let mut flag = *open;
     let mut contents = Some(add_contents);
     let mut icons = header_icons;
-    let builder = egui::ViewportBuilder::default()
+    let (hide, reveal) = viewport_reveal(parent, id);
+    let mut builder = egui::ViewportBuilder::default()
         .with_title(title)
         .with_decorations(false)
         .with_resizable(false)
@@ -1602,11 +1669,17 @@ fn header_extra_and_show(
         .with_active(active)
         .with_position(desired)
         .with_inner_size(size);
+    if hide {
+        builder = builder.with_visible(false);
+    }
     parent.show_viewport_immediate(
         egui::ViewportId::from_hash_of(id),
         builder,
         // 非 move: flag 借用进闭包, ×/OS 关闭的结果能在调用后传回。
         |ctx, class| {
+            if reveal {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            }
             if ctx.input(|i| i.viewport().close_requested()) {
                 flag = false;
             }
@@ -1767,22 +1840,25 @@ fn header_extra_and_show(
 }
 
 impl eframe::App for PlaApp {
+    /// R13: 全透明清屏 — 圆角外的四角由窗口透明露出背后的 Plasticity。
+    /// (eframe 默认是 alpha≈0.7 的深灰, 去掉 SetWindowRgn 后会在四角露出暗角。)
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        [0.0, 0.0, 0.0, 0.0]
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_bridge();
         self.update_snap(ctx);
         // R9-2: 一级面板拖动中(二级面板别据此误判"用户挪了我")。
         PRIMARY_DRAGGING.set(self.toolbar_dragging);
-        // 圆角裁剪: egui 画的圆角在 Windows glow 后端透明不可靠(R5 实测只有
-        // 左上角圆), 由 SetWindowRgn 兜底; 子视口懒创建, 定时枚举补套。
-        // R9: 拖动会话期间不枚举窗口/套 Rgn(避免与自管移动抢 SetWindowPos)。
+        // R13: 圆角 = Win11 DWM 系统圆角(抗锯齿, 不依赖窗口透明), 取代 SetWindowRgn
+        // (锯齿 + 激活切换时闪经典标题栏)。新面板在隐藏阶段即设置(viewport_reveal),
+        // 这里低频轮询兜底(其他新建窗口, 如根视口)。拖动会话期间不枚举窗口。
         if !self.toolbar_dragging
             && self.last_round_poll.elapsed() >= Duration::from_millis(ROUND_POLL_MS)
         {
             self.last_round_poll = Instant::now();
-            round_corners::poll_round_windows(
-                &mut self.round_state,
-                (ROUNDING * 2.0 * ctx.pixels_per_point()).round() as i32,
-            );
+            apply_round_corners_now();
         }
 
         // ---- 快捷键触发(全局): 解本帧按键事件, 纯逻辑匹配 ----
@@ -2061,7 +2137,9 @@ impl eframe::App for PlaApp {
         let tb_origin = self
             .toolbar_drag_pos
             .or_else(|| toolbar_rect.map(|r| r.min));
-        let toolbar_bottom_left = tb_origin.map(|p| egui::pos2(p.x + 2.0, p.y + tb_h + 6.0));
+        // R13: 工具栏与面板外框内缩相同(PANEL_BORDER_INSET), 左缘不再额外 +2pt
+        // (旧值让面板比工具栏右偏约 3 物理像素, 用户截图实锤)。
+        let toolbar_bottom_left = tb_origin.map(|p| egui::pos2(p.x, p.y + tb_h + 6.0));
 
         // ---- HUD 视口实际渲染点已移到所有功能面板之后(R7-9) —
         // 面板内按钮(如快照墙头部图标)的 hover 在面板视口渲染时才写入
@@ -3395,7 +3473,8 @@ impl eframe::App for PlaApp {
                 let desired = egui::pos2(tr.x + TOOLBAR_SIZE[0] + 8.0, tr.y + 2.0);
                 let mut hud = Some((hint, notice));
                 let mut open_flag = true; // notice 的 × 关闭经它传出
-                let builder = egui::ViewportBuilder::default()
+                let (hud_hide, hud_reveal) = viewport_reveal(ctx, "hud-popup");
+                let mut builder = egui::ViewportBuilder::default()
                     .with_decorations(false)
                     .with_resizable(false)
                     .with_transparent(true)
@@ -3403,10 +3482,16 @@ impl eframe::App for PlaApp {
                     .with_active(false) // 不抢焦点
                     .with_position(desired)
                     .with_inner_size(size);
+                if hud_hide {
+                    builder = builder.with_visible(false);
+                }
                 ctx.show_viewport_immediate(
                     egui::ViewportId::from_hash_of("hud-popup"),
                     builder,
                     |hctx, class| {
+                        if hud_reveal {
+                            hctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                        }
                         let Some((hint, notice)) = hud.take() else { return };
                         if hctx.input(|i| i.viewport().close_requested()) {
                             open_flag = false;
@@ -3434,7 +3519,7 @@ impl eframe::App for PlaApp {
                                         egui::RichText::new(if *is_err { "! 提示" } else { "√ 完成" })
                                             .size(12.5)
                                             .strong()
-                                            .color(if *is_err { COL_RED } else { COL_ACCENT }),
+                                            .color(if *is_err { COL_RED } else { COL_GREEN }),
                                     );
                                     ui.with_layout(
                                         egui::Layout::right_to_left(egui::Align::Center),
@@ -3457,7 +3542,7 @@ impl eframe::App for PlaApp {
                                 });
                                 ui.label(
                                     egui::RichText::new(msg)
-                                        .color(if *is_err { COL_RED } else { COL_ACCENT }),
+                                        .color(if *is_err { COL_RED } else { COL_GREEN }),
                                 );
                             }
                         };

@@ -35,7 +35,9 @@ mod imp {
         DIB_RGB_COLORS, SRCCOPY,
     };
     use windows::Win32::Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS};
-    use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, PW_RENDERFULLCONTENT};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetClientRect, GetWindowRect, PW_RENDERFULLCONTENT,
+    };
 
     /// 探测目标窗口顶栏「文件名文字块」(物理像素)。
     /// `ppp` = egui pixels_per_point, 用于尺度相关阈值。
@@ -49,12 +51,14 @@ mod imp {
         ppp: f32,
     ) -> Option<ProbeHit> {
         let hwnd = HWND(target.hwnd);
-        // 与 wincap.rs 一致: 取客户区真实尺寸做全窗 PrintWindow, 再裁顶部条带。
-        // 原因:
-        //   1. Windows 10/11 下 GetWindowRect 含 ~8-10px 隐形缩放边框(最大化时 left/top 为 -8),
-        //      而 Electron 隐藏标题栏窗口的可视顶栏原点在 ClientToScreen(0,0);
-        //   2. DWM 的 PrintWindow(PW_RENDERFULLCONTENT) 对非完整窗口高度的兼容位图
-        //      可能按比例纵向压缩整窗或偏移, 全尺寸渲染再 BitBlt 顶部条带可确保 1:1 像素准确。
+        // 全窗 PrintWindow 再从「客户区原点」裁顶部条带。
+        //   1. Windows 10/11 的 GetWindowRect 含隐形缩放边框(150% 缩放最大化时 left/top = -11),
+        //      Electron 无边框窗口的可视顶栏原点在 ClientToScreen(0,0);
+        //   2. PrintWindow 的位图原点是**窗口矩形**左上角, 不是客户区 —
+        //      所以位图按窗口矩形尺寸分配, 条带从 (客户区原点 - 窗口原点) 处裁。
+        //      R13 修: R12 版位图按客户区尺寸、从 (0,0) 裁, 最大化时内容整体偏移 11px,
+        //      再叠加 cy 里的客户区偏移 = 双重补偿, 工具栏比顶栏中心低 11px、右偏 11px(实测)。
+        //   3. DWM 对非完整窗口尺寸的位图可能缩放, 全尺寸渲染再 BitBlt 保证 1:1。
         let mut rc = RECT::default();
         if GetClientRect(hwnd, &mut rc).is_err() {
             return None;
@@ -70,6 +74,15 @@ mod imp {
         } else {
             (target.left, target.top)
         };
+        let mut wr = RECT::default();
+        if GetWindowRect(hwnd, &mut wr).is_err() {
+            return None;
+        }
+        let full_w = (wr.right - wr.left).max(width);
+        let full_h = (wr.bottom - wr.top).max(height);
+        // 客户区在 PrintWindow 位图里的偏移(正常窗口顶部通常为 0, 左右为隐形边框宽)。
+        let off_x = (origin_x - wr.left).clamp(0, full_w - width);
+        let off_y = (origin_y - wr.top).clamp(0, full_h - height);
 
         let strip_h = ((88.0 * ppp).round() as i32).clamp(48, 160).min(height);
         let y0 = 2;
@@ -84,7 +97,7 @@ mod imp {
             if mem_full.is_invalid() {
                 return None;
             }
-            let bmp_full = CreateCompatibleBitmap(hdc_screen, width, height);
+            let bmp_full = CreateCompatibleBitmap(hdc_screen, full_w, full_h);
             if bmp_full.is_invalid() {
                 let _ = DeleteDC(mem_full);
                 return None;
@@ -100,7 +113,7 @@ mod imp {
                     if !bmp_strip.is_invalid() {
                         let old_strip = SelectObject(mem_strip, bmp_strip);
                         let blt_ok = BitBlt(
-                            mem_strip, 0, 0, width, strip_h, mem_full, 0, 0, SRCCOPY,
+                            mem_strip, 0, 0, width, strip_h, mem_full, off_x, off_y, SRCCOPY,
                         )
                         .is_ok();
                         if blt_ok {

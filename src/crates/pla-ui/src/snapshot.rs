@@ -428,11 +428,24 @@ pub fn list_snapshots(doc_key: &str) -> Vec<String> {
     names
 }
 
-/// 全量候选收集 → doc_key 精确/子串过滤 → 取最新。
-fn find_latest_doc(doc_key: &str) -> Option<PathBuf> {
-    let mut cands: Vec<(SystemTime, PathBuf)> = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    let mut push = |p: PathBuf| {
+/// R13: 目录深扫未命中的负缓存 (doc_key, 时刻)。深扫在冷缓存下可达十几秒,
+/// 面板每帧都会取文档目录 → 不缓存未命中会让 UI 线程每 2s 卡死一次
+/// (切换面板时旧面板滞留、新面板不出现, 实测)。
+static NEG_CACHE: std::sync::Mutex<Vec<(String, std::time::Instant)>> =
+    std::sync::Mutex::new(Vec::new());
+const NEG_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+/// 负缓存最多记几个 doc_key(切换文档/多窗口时互不覆盖)。
+const NEG_CACHE_CAP: usize = 16;
+
+/// 候选文档收集器(去重 + 排除快照)。
+#[derive(Default)]
+struct DocCandidates {
+    cands: Vec<(SystemTime, PathBuf)>,
+    seen: std::collections::HashSet<PathBuf>,
+}
+
+impl DocCandidates {
+    fn push(&mut self, p: PathBuf) {
         if !p.is_file() {
             return; // Recent / LevelDB 里可能有已删除/改名的旧目标, 只收现存文件
         }
@@ -454,33 +467,76 @@ fn find_latest_doc(doc_key: &str) -> Option<PathBuf> {
             return;
         }
         let canon = p.canonicalize().unwrap_or_else(|_| p.clone());
-        if !seen.insert(canon) {
+        if !self.seen.insert(canon) {
             return;
         }
         if let Ok(meta) = p.metadata() {
             let mt = meta.modified().unwrap_or(UNIX_EPOCH);
-            cands.push((mt, p));
+            self.cands.push((mt, p));
         }
-    };
+    }
+}
 
+/// 文档定位(R13 分阶段):
+/// ① Plasticity 自身最近文件(leveldb) + Windows Recent .lnk — 快, 命中即返回;
+/// ② 仅当 ① 未命中: 程序/工作目录祖先 + 已知文件夹深扫 — 慢, 未命中结果负缓存 60s。
+fn find_latest_doc(doc_key: &str) -> Option<PathBuf> {
+    let mut c = DocCandidates::default();
     // 1) Plasticity 自身 Local Storage (leveldb) 最近打开文件列表 —
     //    Plasticity 内部打开/保存的任何路径(含深层目录/任意盘符)均实时记录在此。
     for p in plasticity_leveldb_targets() {
-        push(p);
+        c.push(p);
     }
     // 2) Windows Recent .lnk 解析(资源管理器双击打开的文档)。
     for p in recent_plasticity_targets() {
-        push(p);
+        c.push(p);
+    }
+    if let Some(p) = match_doc(&mut c.cands, doc_key) {
+        return Some(cache_doc_hit(doc_key, p));
+    }
+    let neg_hit = NEG_CACHE.lock().ok().map_or(false, |g| {
+        g.iter()
+            .any(|(k, t)| k == doc_key && t.elapsed() < NEG_CACHE_TTL)
+    });
+    if neg_hit {
+        return None;
     }
     // 3) 当前程序/工作目录向上回溯 4 层(覆盖项目仓内 test-docs 等目录)。
     for root in exe_and_cwd_roots() {
-        scan_dir_recursive(&root, 3, &mut push);
+        scan_dir_recursive(&root, 3, &mut |p| c.push(p));
     }
     // 4) 已知文件夹(SHGetKnownFolderPath, 跟随系统重定向) 递归深度 5。
     for (root, depth) in known_roots() {
-        scan_dir_recursive(&root, depth, &mut push);
+        scan_dir_recursive(&root, depth, &mut |p| c.push(p));
     }
+    match match_doc(&mut c.cands, doc_key) {
+        Some(p) => Some(cache_doc_hit(doc_key, p)),
+        None => {
+            if let Ok(mut g) = NEG_CACHE.lock() {
+                g.retain(|(k, t)| k != doc_key && t.elapsed() < NEG_CACHE_TTL);
+                if g.len() >= NEG_CACHE_CAP {
+                    g.remove(0);
+                }
+                g.push((doc_key.to_string(), std::time::Instant::now()));
+            }
+            None
+        }
+    }
+}
 
+/// 命中写入正缓存并清掉该 doc_key 的负缓存。
+fn cache_doc_hit(doc_key: &str, p: PathBuf) -> PathBuf {
+    if let Ok(mut g) = DOC_CACHE.lock() {
+        *g = Some((doc_key.to_string(), p.clone(), std::time::Instant::now()));
+    }
+    if let Ok(mut g) = NEG_CACHE.lock() {
+        g.retain(|(k, _)| k != doc_key);
+    }
+    p
+}
+
+/// 候选 → doc_key 精确/子串过滤 → 取最新。
+fn match_doc(cands: &mut [(SystemTime, PathBuf)], doc_key: &str) -> Option<PathBuf> {
     if cands.is_empty() {
         return None;
     }
@@ -518,11 +574,6 @@ fn find_latest_doc(doc_key: &str) -> Option<PathBuf> {
         // 注意: 当 doc_key 为明确文档名(如 "model1")时, 若未找到匹配文档, 绝不回退 cands.first()!
         // 否则会把毫不相干的其它文档(如 testbed/testjig)当成当前文档拍快照或打开。
     };
-    if let Some(ref p) = matched {
-        if let Ok(mut g) = DOC_CACHE.lock() {
-            *g = Some((doc_key.to_string(), p.clone(), std::time::Instant::now()));
-        }
-    }
     matched
 }
 
@@ -861,6 +912,22 @@ mod tests {
 
         // 严格过滤: 不存在的文档名绝不静默回退到 testbed 等其它文档
         assert!(find_latest_doc("__nonexistent_doc_99999__").is_none());
+    }
+
+    /// R13: 未命中走一次深扫后进负缓存, 再查同名不再深扫(UI 线程不再周期性卡死)。
+    #[test]
+    fn doc_lookup_miss_is_negatively_cached() {
+        let key = "__nonexistent_doc_neg_cache__";
+        let t0 = std::time::Instant::now();
+        assert!(find_latest_doc(key).is_none());
+        let first = t0.elapsed();
+        let t1 = std::time::Instant::now();
+        assert!(find_latest_doc(key).is_none());
+        let second = t1.elapsed();
+        assert!(
+            second < first / 2 || second < std::time::Duration::from_millis(300),
+            "second lookup should skip the deep scan: first={first:?} second={second:?}"
+        );
     }
 
     /// 冒烟(本机手动跑: cargo test -p pla-ui --release -- --ignored --nocapture):
