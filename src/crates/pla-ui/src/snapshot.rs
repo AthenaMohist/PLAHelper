@@ -392,7 +392,10 @@ pub fn open_in_plasticity(snapshot_name: &str, doc_key: &str) -> Result<(), Stri
 
 /// 打开当前文档的快照文件夹(explorer); 目录不存在则先创建。
 pub fn open_snapshot_dir(doc_key: &str) -> Result<(), String> {
-    let dir = snapshot_dir_for(find_latest_doc(doc_key).as_ref());
+    let doc = find_latest_doc(doc_key).ok_or_else(|| {
+        format!("未找到当前文档 '{doc_key}.plasticity' 的保存位置，请先在 Plasticity 中 Ctrl+S 保存一次")
+    })?;
+    let dir = snapshot_dir_for(Some(&doc));
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建快照目录失败: {e}"))?;
     std::process::Command::new("explorer")
         .arg(dir.as_os_str())
@@ -403,7 +406,10 @@ pub fn open_snapshot_dir(doc_key: &str) -> Result<(), String> {
 
 /// 列出当前文档的现有快照(原 TODO G2-2): 文档同级 snapshot/*.plasticity, 文件名新→旧。
 pub fn list_snapshots(doc_key: &str) -> Vec<String> {
-    let dir = snapshot_dir_for(find_latest_doc(doc_key).as_ref());
+    let Some(doc) = find_latest_doc(doc_key) else {
+        return Vec::new();
+    };
+    let dir = snapshot_dir_for(Some(&doc));
     let mut names: Vec<String> = std::fs::read_dir(&dir)
         .map(|rd| {
             rd.flatten()
@@ -422,21 +428,19 @@ pub fn list_snapshots(doc_key: &str) -> Vec<String> {
     names
 }
 
-/// 全量候选收集 → doc_key 软过滤 → 取最新。
+/// 全量候选收集 → doc_key 精确/子串过滤 → 取最新。
 fn find_latest_doc(doc_key: &str) -> Option<PathBuf> {
     let mut cands: Vec<(SystemTime, PathBuf)> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     let mut push = |p: PathBuf| {
         if !p.is_file() {
-            return; // Recent 里可能有已删除/改名的旧目标, 只收现存文件
+            return; // Recent / LevelDB 里可能有已删除/改名的旧目标, 只收现存文件
         }
-        // R7-6: 排除我们自己的快照 — 快照墙开进 Plasticity 后会进 Recent,
-        // 文件名又含文档名, 不排除会劫持「当前文档」判定(23:10 实测)。
-        // R7-9: 快照的快照防护 — 路径任一层含 snapshot 目录的 .plasticity
-        // 一律不作候选(改名/挪动也逃不掉), 杜绝对快照再拍快照的循环嵌套。
+        // R7-6 & R7-9: 排除 snapshot 目录及历史 -snap-d 快照文件, 杜绝快照套快照。
         let in_snapshot_dir = p.components().any(|c| {
             c.as_os_str()
                 .to_str()
-                .map(|s| s.eq_ignore_ascii_case("snapshot"))
+                .map(|s| s.eq_ignore_ascii_case("snapshot") || s.eq_ignore_ascii_case("snapshots"))
                 .unwrap_or(false)
         });
         if in_snapshot_dir {
@@ -449,43 +453,179 @@ fn find_latest_doc(doc_key: &str) -> Option<PathBuf> {
         {
             return;
         }
+        let canon = p.canonicalize().unwrap_or_else(|_| p.clone());
+        if !seen.insert(canon) {
+            return;
+        }
         if let Ok(meta) = p.metadata() {
             let mt = meta.modified().unwrap_or(UNIX_EPOCH);
             cands.push((mt, p));
         }
     };
 
-    // 1) Recent .lnk 解析 — 本机实锤唯一能覆盖 D:\...\PLAhelper\test\model1.plasticity 的通道。
+    // 1) Plasticity 自身 Local Storage (leveldb) 最近打开文件列表 —
+    //    Plasticity 内部打开/保存的任何路径(含深层目录/任意盘符)均实时记录在此。
+    for p in plasticity_leveldb_targets() {
+        push(p);
+    }
+    // 2) Windows Recent .lnk 解析(资源管理器双击打开的文档)。
     for p in recent_plasticity_targets() {
         push(p);
     }
-    // 2) 已知文件夹(SHGetKnownFolderPath, 跟随系统重定向) 递归深度 2。
-    for root in known_roots() {
-        scan_dir_recursive(&root, 2, &mut push);
+    // 3) 当前程序/工作目录向上回溯 4 层(覆盖项目仓内 test-docs 等目录)。
+    for root in exe_and_cwd_roots() {
+        scan_dir_recursive(&root, 3, &mut push);
+    }
+    // 4) 已知文件夹(SHGetKnownFolderPath, 跟随系统重定向) 递归深度 5。
+    for (root, depth) in known_roots() {
+        scan_dir_recursive(&root, depth, &mut push);
     }
 
     if cands.is_empty() {
         return None;
     }
     cands.sort_by(|a, b| b.0.cmp(&a.0)); // 新→旧
-    let key = doc_key.trim().trim_end_matches(".plasticity");
-    if key.is_empty() {
-        return cands.first().map(|(_, p)| p.clone());
+    let key = doc_key.trim().trim_end_matches(".plasticity").trim();
+    let matched = if key.is_empty() || key.eq_ignore_ascii_case("untitled") {
+        cands.first().map(|(_, p)| p.clone())
+    } else {
+        let key_lower = key.to_lowercase();
+        // 优先 1: 文件名 stem 精确匹配(忽略大小写) — 例如 key="model1" 精确命中 model1.plasticity,
+        // 绝不会被同目录的 model1_prev1.plasticity 或其它目录的 testbed.plasticity 劫持。
+        cands
+            .iter()
+            .find(|(_, p)| {
+                p.file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.eq_ignore_ascii_case(key))
+                    .unwrap_or(false)
+            })
+            .or_else(|| {
+                // 优先 2: 文件名包含 key(排除 Plasticity 自动备份后缀 _prev/_hour/_day/_autosave)。
+                cands.iter().find(|(_, p)| {
+                    let Some(stem) = p.file_stem().and_then(|s| s.to_str()) else {
+                        return false;
+                    };
+                    let s_low = stem.to_lowercase();
+                    let is_auto_backup = s_low.contains("_prev")
+                        || s_low.contains("_hour")
+                        || s_low.contains("_day")
+                        || s_low.contains("_autosave");
+                    !is_auto_backup && s_low.contains(&key_lower)
+                })
+            })
+            .map(|(_, p)| p.clone())
+        // 注意: 当 doc_key 为明确文档名(如 "model1")时, 若未找到匹配文档, 绝不回退 cands.first()!
+        // 否则会把毫不相干的其它文档(如 testbed/testjig)当成当前文档拍快照或打开。
+    };
+    if let Some(ref p) = matched {
+        if let Ok(mut g) = DOC_CACHE.lock() {
+            *g = Some((doc_key.to_string(), p.clone(), std::time::Instant::now()));
+        }
     }
-    // 软过滤: 命中集合非空才用, 否则回退全局最新(全局都空时上面已返回 None)。
-    cands.iter()
-        .find(|(_, p)| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| n.contains(key))
+    matched
+}
+
+/// 解析 `%APPDATA%\Plasticity\Local Storage\leveldb\*.{log,ldb}` 中记录的 `.plasticity` 路径。
+/// Plasticity 将最近打开的文档列表以 JSON (`[{"path":"C:\\...\\model1.plasticity","lastOpened":...}]`)
+/// 写入 LevelDB(可能为 UTF-8 或偶/奇字节对齐的 UTF-16LE)。
+fn plasticity_leveldb_targets() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let appdata = std::env::var("APPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| dirs_home().join("AppData").join("Roaming"));
+    let leveldb_dir = appdata
+        .join("Plasticity")
+        .join("Local Storage")
+        .join("leveldb");
+    let Ok(rd) = std::fs::read_dir(&leveldb_dir) else {
+        return out;
+    };
+    let mut files: Vec<(SystemTime, PathBuf)> = rd
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.extension()
+                .and_then(|x| x.to_str())
+                .map(|ext| ext.eq_ignore_ascii_case("log") || ext.eq_ignore_ascii_case("ldb"))
                 .unwrap_or(false)
         })
-        .or_else(|| cands.first())
-        .map(|(_, p)| p.clone())
+        .map(|p| {
+            let mt = std::fs::metadata(&p)
+                .and_then(|m| m.modified())
+                .unwrap_or(UNIX_EPOCH);
+            (mt, p)
+        })
+        .collect();
+    files.sort_by(|a, b| b.0.cmp(&a.0)); // 新→旧
+
+    for (_, file_path) in files {
+        let Ok(bytes) = std::fs::read(&file_path) else {
+            continue;
+        };
+        // 视图 1: UTF-8
+        extract_plasticity_paths_from_text(&String::from_utf8_lossy(&bytes), &mut out);
+        // 视图 2: UTF-16LE (偶数偏移)
+        if bytes.len() >= 2 {
+            let u16s: Vec<u16> = bytes
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            extract_plasticity_paths_from_text(&String::from_utf16_lossy(&u16s), &mut out);
+        }
+        // 视图 3: UTF-16LE (奇数偏移 — LevelDB 变长键后常出现奇数起点)
+        if bytes.len() >= 3 {
+            let u16s: Vec<u16> = bytes[1..]
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            extract_plasticity_paths_from_text(&String::from_utf16_lossy(&u16s), &mut out);
+        }
+    }
+    out
+}
+
+/// 从解码后的文本中提取 `"path":"...*.plasticity"`。
+fn extract_plasticity_paths_from_text(text: &str, out: &mut Vec<PathBuf>) {
+    let needle = "\"path\":\"";
+    let mut rest = text;
+    while let Some(idx) = rest.find(needle) {
+        let after = &rest[idx + needle.len()..];
+        if let Some(end_q) = after.find('"') {
+            let raw = &after[..end_q];
+            let unescaped = raw.replace("\\\\", "\\").replace("\\/", "/");
+            if unescaped.to_lowercase().ends_with(".plasticity") {
+                out.push(PathBuf::from(unescaped));
+            }
+            rest = &after[end_q + 1..];
+        } else {
+            break;
+        }
+    }
+}
+
+/// 当前 exe 及工作目录的向上祖先目录(覆盖项目工作区内的测试文档)。
+fn exe_and_cwd_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    for base in [std::env::current_exe().ok(), std::env::current_dir().ok()].into_iter().flatten() {
+        let mut cur = if base.is_file() {
+            base.parent().map(|p| p.to_path_buf())
+        } else {
+            Some(base)
+        };
+        for _ in 0..5 {
+            let Some(p) = cur else { break };
+            roots.push(p.clone());
+            cur = p.parent().map(|parent| parent.to_path_buf());
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    roots.retain(|p| seen.insert(p.canonicalize().unwrap_or_else(|_| p.clone())));
+    roots
 }
 
 /// 已知文件夹扫描根: SHGetKnownFolderPath(跟随重定向) + USERPROFILE 兜底, 去重。
-fn known_roots() -> Vec<PathBuf> {
+fn known_roots() -> Vec<(PathBuf, u8)> {
     use known_folder::folder_id;
     let mut roots = Vec::new();
     for fid in [
@@ -494,16 +634,16 @@ fn known_roots() -> Vec<PathBuf> {
         folder_id::DOWNLOADS,
     ] {
         if let Some(p) = known_folder::path(fid) {
-            roots.push(p);
+            roots.push((p, 5));
         }
     }
     let home = dirs_home();
-    roots.push(home.join("Documents"));
-    roots.push(home.join("Desktop"));
-    roots.push(home.join("Downloads"));
-    roots.push(home.clone());
+    roots.push((home.join("Documents"), 5));
+    roots.push((home.join("Desktop"), 4));
+    roots.push((home.join("Downloads"), 4));
+    roots.push((home.clone(), 2));
     let mut seen = std::collections::HashSet::new();
-    roots.retain(|p| seen.insert(p.canonicalize().unwrap_or_else(|_| p.clone())));
+    roots.retain(|(p, _)| seen.insert(p.canonicalize().unwrap_or_else(|_| p.clone())));
     roots
 }
 
@@ -513,9 +653,22 @@ fn scan_dir_recursive(dir: &PathBuf, depth: u8, push: &mut impl FnMut(PathBuf)) 
     for entry in rd.flatten() {
         let p = entry.path();
         if p.is_dir() {
-            // 跳过明显的系统/缓存目录, 避免扫 home 全树时踩进 AppData
+            // 跳过明显的系统/构建/缓存/快照目录, 避免深扫时耗时或踩进快照目录
             let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if name.starts_with('.') || name == "AppData" {
+            if name.starts_with('.')
+                || matches!(
+                    name,
+                    "AppData"
+                        | "target"
+                        | "node_modules"
+                        | "snapshot"
+                        | "snapshots"
+                        | "Programs"
+                        | "Windows"
+                        | "Program Files"
+                        | "Program Files (x86)"
+                )
+            {
                 continue;
             }
             if depth > 0 {
@@ -695,6 +848,19 @@ mod tests {
         std::fs::write(&path, b"probe").expect("快照文件名无法落盘");
         assert!(path.exists());
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn extract_leveldb_paths_and_strict_doc_key_match() {
+        let mut out = Vec::new();
+        let sample = r#"[{"path":"C:\\Users\\frg\\Documents\\BaiduSyncdisk\\AIAgent\\PLAHelper\\test-docs\\model1.plasticity","lastOpened":1793848641814},{"path":"C:\\Users\\frg\\Documents\\testbed.plasticity","lastOpened":1793818174157}]"#;
+        extract_plasticity_paths_from_text(sample, &mut out);
+        assert_eq!(out.len(), 2);
+        assert!(out[0].ends_with("model1.plasticity"));
+        assert!(out[1].ends_with("testbed.plasticity"));
+
+        // 严格过滤: 不存在的文档名绝不静默回退到 testbed 等其它文档
+        assert!(find_latest_doc("__nonexistent_doc_99999__").is_none());
     }
 
     /// 冒烟(本机手动跑: cargo test -p pla-ui --release -- --ignored --nocapture):

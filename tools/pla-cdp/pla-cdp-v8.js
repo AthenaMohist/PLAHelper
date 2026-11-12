@@ -94,12 +94,33 @@ function flipFuse(exePath, index) {
   if (!fs.existsSync(backup)) {
     fs.copyFileSync(exePath, backup);
   }
-  const fh = fs.openSync(exePath, 'r+');
+  const b = Buffer.from('1');
   try {
-    const b = Buffer.from('1');
-    fs.writeSync(fh, b, 0, 1, fuse.offset + index);
-  } finally {
-    fs.closeSync(fh);
+    const fh = fs.openSync(exePath, 'r+');
+    try {
+      fs.writeSync(fh, b, 0, 1, fuse.offset + index);
+    } finally {
+      fs.closeSync(fh);
+    }
+  } catch (err) {
+    if (err && err.code === 'EBUSY') {
+      // On Windows, a running .exe cannot be opened for write ('r+'),
+      // but CAN be renamed while running so a patched copy takes its path.
+      const tmpPatched = exePath + '.pla-tmp-patched';
+      const oldRunning = exePath + '.pla-running-old';
+      fs.copyFileSync(backup, tmpPatched);
+      const fh = fs.openSync(tmpPatched, 'r+');
+      try {
+        fs.writeSync(fh, b, 0, 1, fuse.offset + index);
+      } finally {
+        fs.closeSync(fh);
+      }
+      try { if (fs.existsSync(oldRunning)) fs.unlinkSync(oldRunning); } catch (e) {}
+      fs.renameSync(exePath, oldRunning);
+      fs.renameSync(tmpPatched, exePath);
+    } else {
+      throw err;
+    }
   }
   const check = readFuse(exePath);
   return check.wire[index] === '1'
@@ -122,16 +143,74 @@ function restoreFuse(exePath) {
 }
 
 /**
- * Finds the newest hardened install.
+ * Checks whether a file is writable by the current user.
+ * @param {string} filePath
+ * @return {boolean}
+ */
+function isWritable(filePath) {
+  try {
+    fs.accessSync(filePath, fs.constants.R_OK | fs.constants.W_OK);
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+/**
+ * Finds the newest hardened install, preferring user-writable installs first.
  * @return {{dir:string, exe:string}|null}
  */
 function newestHardened() {
-  const dirs = installDirs().slice().sort().reverse(); // app-26.2.10 > app-26.2.3
-  for (const dir of dirs) {
+  const candidates = [];
+  for (const dir of installDirs()) {
     const exe = path.join(dir, 'Plasticity.exe');
     const asar = path.join(dir, 'resources', 'app.asar');
     if (fs.existsSync(exe) && fs.existsSync(asar)) {
-      return { dir, exe };
+      const writable = isWritable(exe);
+      const base = path.basename(dir); // e.g. app-26.2.3
+      candidates.push({ dir, exe, writable, base });
+    }
+  }
+  candidates.sort((a, b) => {
+    if (a.writable !== b.writable) return a.writable ? -1 : 1;
+    return b.base.localeCompare(a.base, undefined, { numeric: true });
+  });
+  return candidates.length ? { dir: candidates[0].dir, exe: candidates[0].exe } : null;
+}
+
+/**
+ * Parses a V8 heap snapshot JSON file in-process and returns the heap object ID
+ * of the Editor instance (the unique node with outgoing property edges
+ * 'selection', 'shading', and 'viewports').
+ * @param {string} heapPath
+ * @return {number|null}
+ */
+function findEditorInHeapFile(heapPath) {
+  const d = JSON.parse(fs.readFileSync(heapPath, 'utf8'));
+  const nodes = d.nodes;
+  const strings = d.strings;
+  const edges = d.edges;
+  const k = 6; // [type, name, id, self_size, edge_count, detachedness]
+  const w = 3; // [type, name_or_index, to_node]
+  const n = Math.floor(nodes.length / k);
+  let eoff = 0;
+  for (let i = 0; i < n; i++) {
+    const off = i * k;
+    const ecnt = nodes[off + 4];
+    let mask = 0;
+    for (let j = 0; j < ecnt; j++) {
+      const eo = eoff + j * w;
+      const nameidx = edges[eo + 1];
+      if (typeof nameidx === 'number' && nameidx >= 0 && nameidx < strings.length) {
+        const nm = strings[nameidx];
+        if (nm === 'selection') mask |= 1;
+        else if (nm === 'shading') mask |= 2;
+        else if (nm === 'viewports') mask |= 4;
+      }
+    }
+    eoff += ecnt * w;
+    if (mask === 7) {
+      return nodes[off + 2];
     }
   }
   return null;
@@ -307,10 +386,8 @@ class RendererBridge {
    * @return {Promise<string>} 'OK' on success.
    */
   async locateAndExposeEditor() {
-    const { execSync } = require('child_process');
     const os = require('os');
     const heapPath = path.join(os.tmpdir(), 'pla-heap.json');
-    const parser = path.join(__dirname, 'pla-heap-find-editor.py');
     const SEND = (method, params) => this.io.call('Runtime.evaluate', {
       expression: `__PLA_PROXY_SEND(${JSON.stringify(method)}, ${JSON.stringify(params || {})})`,
       returnByValue: true, awaitPromise: true,
@@ -348,10 +425,12 @@ class RendererBridge {
     if (!snapLen || !String(snapLen).startsWith('len=')) {
       throw new Error('snapshot failed: ' + JSON.stringify(snap).slice(0, 200));
     }
-    // 2) parse offline (python), get editor heap object id
-    const out = execSync(`python "${parser}" "${heapPath}"`, { encoding: 'utf8' }).trim();
-    if (!out.startsWith('FOUND:')) throw new Error('editor not found in heap: ' + out);
-    const edId = out.slice('FOUND:'.length);
+    // 2) parse in-process (pure JS, no external Python dependency), get editor heap object id
+    const foundId = findEditorInHeapFile(heapPath);
+    if (foundId === null || foundId === undefined) {
+      throw new Error('editor not found in heap (' + snapLen + ')');
+    }
+    const edId = String(foundId);
     // 3) revive + expose (same session)
     const REVIVE_JS = '(async () => {'
       + ' const r = await __PLA_PROXY_SEND("HeapProfiler.getObjectByHeapObjectId", { objectId: "' + edId + '" });'

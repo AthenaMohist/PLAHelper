@@ -50,6 +50,11 @@ function candidateRoots() {
   if (env) {
     roots.push(env);
   }
+  const home = os.homedir();
+  if (home) {
+    roots.push(path.join(home, 'Programs'));
+    roots.push(path.join(home, 'Programs', 'Plasticity'));
+  }
   roots.push(path.join(process.env.LOCALAPPDATA || '', 'Programs', 'Plasticity'));
   roots.push(path.join(process.env.PROGRAMFILES || 'C:\\Program Files', 'Plasticity'));
   roots.push(path.join(process.env['PROGRAMFILES(X86)'] || '', 'Plasticity'));

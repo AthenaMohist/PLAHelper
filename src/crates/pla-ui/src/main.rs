@@ -22,8 +22,8 @@ use pla_ui::window_finder;
 const COL_PANEL: egui::Color32 = egui::Color32::from_rgb(0x18, 0x18, 0x18);
 const COL_BTN: egui::Color32 = egui::Color32::from_rgb(0x33, 0x33, 0x33);
 const COL_BTN_HOVER: egui::Color32 = egui::Color32::from_rgb(0x3d, 0x3d, 0x3d);
-/// Plasticity 图标方块绿(强调色)。
-const COL_ACCENT: egui::Color32 = egui::Color32::from_rgb(0x3e, 0xa3, 0x4d);
+/// Plasticity 主题强调黄(取色自用户 Plasticity 26.2.3 激活态按钮实测像素 #ca8a1e)。
+const COL_ACCENT: egui::Color32 = egui::Color32::from_rgb(0xca, 0x8a, 0x1e);
 const COL_TEXT: egui::Color32 = egui::Color32::from_rgb(0xcc, 0xcc, 0xcc);
 const COL_MUTED: egui::Color32 = egui::Color32::from_rgb(0x8a, 0x8a, 0x8a);
 const COL_YELLOW: egui::Color32 = egui::Color32::from_rgb(0xd9, 0xa8, 0x2c);
@@ -37,9 +37,8 @@ const TOOLBAR_SIZE: [f32; 2] = [246.0, 30.0];
 /// 面板整体右移微调(逻辑 px, 按 ppp 缩放; R6-2e 用户要求再偏右 10)。
 const SNAP_RIGHT_SHIFT: f32 = 10.0;
 /// 吸附垂直微调(逻辑 pt, 按 ppp 缩放; 仅作用于探测命中分支)。
-/// R6-2l 曾设 -2.0 校准「窗口实际高=请求+4pt」造成的内容偏上, R6-2m 改为
-/// 按 egui 上报的实际内窗高取中心后已无需补偿, 归零留作微调旋钮。
-const SNAP_Y_NUDGE_PT: f32 = 0.0;
+/// 文件名 ".plasticity" 含下伸字母 p/y, 像素包围盒中心偏下 ~1.5pt, 微调使工具栏在 43px 顶栏内居中。
+const SNAP_Y_NUDGE_PT: f32 = -1.5;
 /// 注: 勿对 panel ui 用 min_rect 测尺寸做自适应 — CentralPanel 的 min_rect
 /// 含整个可用区, need=窗口+余量 每帧自增(R6-2b 已回退, 教训留档)。
 /// 方形图标按钮边长。
@@ -47,19 +46,20 @@ const BTN_SIZE: f32 = 24.0;
 /// 吸附定位(物理像素): 优先像素探测 Plasticity 顶栏「文件名文字块」右缘
 /// (titlebar_probe, PrintWindow 离屏渲染不受本工具栏遮挡), 工具栏停在其右侧;
 /// 探测失败(渲染失败/找不到文字块)降级为本固定偏移 — 预留足够距离越过文件名。
-const SNAP_LEFT_OFFSET: f32 = 500.0;
+const SNAP_LEFT_OFFSET: f32 = 310.0;
 /// 探测成功时, 文件名块右缘与工具栏左缘的间隙(物理像素)。
 const SNAP_FILENAME_GAP: f32 = pla_ui::titlebar_probe::FILENAME_GAP_PX;
 /// 吸附: 相对目标窗口顶边的下移(物理像素)。
-const SNAP_TOP_GAP: i32 = 2;
+const SNAP_TOP_GAP: i32 = 3;
 /// 吸附/绑定轮询间隔。
 const SNAP_POLL_MS: u64 = 300;
 /// 文件名探测间隔(PrintWindow 有渲染开销, 比吸附轮询慢一档)。
 const PROBE_POLL_MS: u64 = 1000;
 /// 位置漂移小于该值(物理像素)不重发定位命令, 避免抖动。
 const SNAP_EPS: f32 = 2.0;
-/// R8-3: 拖回吸附范围 — 拖动位置距默认锚点不超过该值(逻辑 pt)时恢复自动吸附。
-const SNAP_REENTER_PX: f32 = 40.0;
+/// R8-3: 拖回吸附范围 — 拖动位置进入顶栏吸附区(水平 ±200pt, 垂直 ±48pt)时恢复自动吸附。
+const SNAP_REENTER_X_PT: f32 = 200.0;
+const SNAP_REENTER_Y_PT: f32 = 48.0;
 /// 提示浮窗自动关闭时长。
 const NOTICE_TTL: Duration = Duration::from_secs(6);
 /// Win32 SetWindowRgn 圆角轮询间隔(子视口懒创建, 需定时补套)。
@@ -318,7 +318,7 @@ fn apply_plasticity_style(ctx: &egui::Context) {
         w.rounding = egui::Rounding::same(ROUNDING);
     }
     v.window_rounding = egui::Rounding::same(ROUNDING);
-    v.window_stroke = egui::Stroke::new(SW, egui::Color32::from_rgb(0x44, 0x44, 0x44));
+    v.window_stroke = egui::Stroke::new(3.0, egui::Color32::from_gray(150));
     v.window_shadow = egui::epaint::Shadow::NONE;
     v.popup_shadow = egui::epaint::Shadow::NONE;
     v.button_frame = true;
@@ -356,15 +356,43 @@ fn section_header(ui: &mut egui::Ui, text: &str) {
     );
 }
 
+/// 面板浅灰轮廓宽度(逻辑 pt)与颜色:
+/// epaint 0.29 的 RectShape 使用 StrokeKind::Outside(向 paint_rect 外侧扩展绘制),
+/// 若 outer_margin=0 则描边落入 [-3, -3]..[W+3, H+3] 被视口 clip_rect 完全裁掉。
+/// 通过 outer_margin 内缩 + 前景层补绘, 保证 3pt 浅灰轮廓完整落在窗口与圆角区域内。
+const PANEL_BORDER_INSET: f32 = 2.5;
+const PANEL_BORDER_STROKE_W: f32 = 3.0;
+const COL_PANEL_BORDER: egui::Color32 = egui::Color32::from_gray(180);
+
 /// 工具栏/子视口共用的圆角深色面板 Frame。
-/// R7-19: 面板边框 = 按钮悬停同款(egui 默认 hovered bg_stroke: 1px 灰150) —
-/// 用户实测否决内侧羽化光晕(奶白渐变太亮), 改极简细描边。
 fn panel_frame() -> egui::Frame {
     egui::Frame::none()
         .fill(COL_PANEL)
-        .rounding(egui::Rounding::same(ROUNDING))
-        .inner_margin(egui::Margin { left: 6.0, right: 6.0, top: 3.0, bottom: 3.0 })
-        .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(150)))
+        .rounding(egui::Rounding::same((ROUNDING - PANEL_BORDER_INSET).max(2.0)))
+        .outer_margin(egui::Margin::same(PANEL_BORDER_INSET))
+        .inner_margin(egui::Margin {
+            left: 6.0 - PANEL_BORDER_INSET,
+            right: 6.0 - PANEL_BORDER_INSET,
+            top: 3.0 - PANEL_BORDER_INSET,
+            bottom: 3.0 - PANEL_BORDER_INSET,
+        })
+        .stroke(egui::Stroke::new(PANEL_BORDER_STROKE_W, COL_PANEL_BORDER))
+}
+
+/// 在视口前景层补绘浅灰圆角边框, 防止内部控件(如标题栏分割线/滚动区)压盖轮廓。
+fn paint_panel_border(ctx: &egui::Context) {
+    let rect = ctx.screen_rect().shrink(PANEL_BORDER_INSET);
+    if rect.width() > 4.0 && rect.height() > 4.0 {
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("pla_panel_border"),
+        ));
+        painter.add(egui::epaint::RectShape::stroke(
+            rect,
+            egui::Rounding::same((ROUNDING - PANEL_BORDER_INSET).max(2.0)),
+            egui::Stroke::new(PANEL_BORDER_STROKE_W, COL_PANEL_BORDER),
+        ));
+    }
 }
 
 thread_local! {
@@ -850,11 +878,15 @@ fn panel_header(
     let row_rect = ui.available_rect_before_wrap();
     let row_h = 20.0;
     let drag_rect = egui::Rect::from_min_size(row_rect.min, egui::vec2(row_rect.width(), row_h));
-    let _drag_layer = ui.interact(drag_rect, egui::Id::new("panel-title-drag"), egui::Sense::drag());
+    let _drag_layer = ui.interact(
+        drag_rect,
+        egui::Id::new("panel-title-drag"),
+        egui::Sense::click_and_drag(),
+    );
     ui.horizontal(|ui| {
         ui.set_min_height(row_h);
         // 拖动视觉提示(2列x3点, 矢量)
-        // R9-2: 双击手柄 = 归位(清掉用户位置, 重新跟随工具栏下方默认位)。
+        // R9-2: 双击手柄或标题空白处 = 归位(清掉用户位置, 重新跟随工具栏下方默认位)。
         let (hr, hresp) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::click());
         let pinned = PANEL_USER_POS.with(|u| u.borrow().contains_key(id));
         let col = if hresp.hovered() {
@@ -872,7 +904,7 @@ fn panel_header(
         if hresp.hovered() {
             PANEL_DRAG_HINT.with(|d| *d.borrow_mut() = true);
         }
-        if hresp.double_clicked() {
+        if hresp.double_clicked() || _drag_layer.double_clicked() {
             PANEL_USER_POS.with(|u| {
                 u.borrow_mut().remove(id);
             });
@@ -1385,15 +1417,13 @@ impl PlaApp {
         if self.toolbar_dragging {
             return;
         }
-        // R8-3: 用户拖动后停在拖动位置; 拖回默认锚点附近(SNAP_REENTER_PX)才恢复吸附。
+        // R8-3: 用户拖动后停在拖动位置; 拖回默认锚点附近(SNAP_REENTER_X_PT/Y_PT)才恢复吸附。
         if self.toolbar_drag_pos.is_some() {
             if let Some(target) = window_finder::acquire_target(&self.doc_key).clone() {
                 let ppp = ctx.pixels_per_point();
                 let anchor = self.default_anchor(&target, ctx, ppp);
                 if let (Some(dp), Some(da)) = (self.toolbar_drag_pos, anchor) {
-                    if (dp.x - da.x).abs() <= SNAP_REENTER_PX
-                        && (dp.y - da.y).abs() <= SNAP_REENTER_PX
-                    {
+                    if Self::is_in_toolbar_snap_zone(dp, da) {
                         // 拖回吸附区: 退出拖动模式, 走正常吸附流程
                         self.toolbar_drag_pos = None;
                         self.last_snap_anchor = None;
@@ -1462,6 +1492,7 @@ impl PlaApp {
         let Some((x_phys, y_phys)) = self.default_anchor_phys(&target, ctx, ppp) else {
             return;
         };
+        let desired_pt = egui::pos2(x_phys / ppp, y_phys / ppp);
         let new_anchor = Some((target.left, target.top, x_phys as i32, y_phys as i32));
         let anchor_changed = match (new_anchor, self.last_snap_anchor) {
             (Some(n), Some(o)) => {
@@ -1472,15 +1503,22 @@ impl PlaApp {
             }
             _ => true,
         };
-        if !anchor_changed {
+        let rect_drifted = ctx
+            .input(|i| i.viewport().outer_rect)
+            .map_or(false, |r| {
+                (r.min.x - desired_pt.x).abs() > SNAP_EPS
+                    || (r.min.y - desired_pt.y).abs() > SNAP_EPS
+            });
+        if !anchor_changed && !rect_drifted {
             return;
         }
         self.last_snap_anchor = new_anchor;
         // 物理 → egui points: OuterPosition 用 points(见 egui 0.29 ViewportInfo)。
-        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
-            x_phys / ppp,
-            y_phys / ppp,
-        )));
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(desired_pt));
+    }
+
+    fn is_in_toolbar_snap_zone(dp: egui::Pos2, da: egui::Pos2) -> bool {
+        (dp.x - da.x).abs() <= SNAP_REENTER_X_PT && (dp.y - da.y).abs() <= SNAP_REENTER_Y_PT
     }
 
     /// R8-3: 默认吸附锚点(逻辑 pt) — 拖回判定用。
@@ -1590,6 +1628,7 @@ fn header_extra_and_show(
                             panel_header(ui, title, id, &mut flag, icons.take());
                             contents(ui);
                         });
+                    paint_panel_border(ctx);
                     // ---- R9: 面板拖动(自管 SetCapture + delta) + 跟随 ----
                     // 读一帧清一帧的拖动信号(标题行的 drag 层写入)。
                     let drag_signal = PANEL_DRAG_ACTIVE.with(|d| {
@@ -1636,9 +1675,26 @@ fn header_extra_and_show(
                     if let Some(mut s) = st {
                         if s.active {
                             if !down {
-                                // 松手: 会话收口(之后不再跟随, 保持落点)
+                                // 松手: 会话收口; 若拖回默认跟随位附近则自动归位吸附
                                 s.active = false;
                                 pla_ui::window_drag::release_capture();
+                                let snap_back = PANEL_USER_POS.with(|u| {
+                                    u.borrow().get(id).copied().map_or(false, |up| {
+                                        (up.x - desired.x).abs() <= 80.0
+                                            && (up.y - desired.y).abs() <= SNAP_REENTER_Y_PT
+                                    })
+                                });
+                                if snap_back {
+                                    PANEL_USER_POS.with(|u| {
+                                        u.borrow_mut().remove(id);
+                                    });
+                                    PANEL_LAST_CMD.with(|u| {
+                                        u.borrow_mut().remove(id);
+                                    });
+                                    ctx.send_viewport_cmd(
+                                        egui::ViewportCommand::OuterPosition(desired),
+                                    );
+                                }
                             } else if let Some(c) = cur {
                                 let ppp = ctx.pixels_per_point().max(0.01);
                                 let target = s.origin_win
@@ -1770,15 +1826,23 @@ impl eframe::App for PlaApp {
                     egui::pos2(avail.left(), avail.center().y - row_h * 0.5),
                     egui::pos2(avail.right(), avail.center().y + row_h * 0.5),
                 );
-                // R8e: 拖动层 = 整行矩形(Sense::drag; 面板背景 response 只有
+                // R8e: 拖动层 = 整行矩形(Sense::click_and_drag; 面板背景 response 只有
                 // click 没有 drag, 之前 dragged_by 永false = 拖不动的根因)。
-                // 先注册 → 按钮后画在上层 → 按钮点击不受影响, 空白处拖动。
-                let tb_drag = ui.interact(row_rect, egui::Id::new("tb-drag"), egui::Sense::drag());
+                // 先注册 → 按钮后画在上层 → 按钮点击不受影响, 空白处拖动, 双击归位。
+                let tb_drag = ui.interact(
+                    row_rect,
+                    egui::Id::new("tb-drag"),
+                    egui::Sense::click_and_drag(),
+                );
+                let mut reset_to_snap = tb_drag.double_clicked();
                 ui.allocate_new_ui(egui::UiBuilder::new().max_rect(row_rect), |ui| {
                 ui.horizontal(|ui| {
-                    // 状态圆点区: 未绑定=灰; 已绑定显示 bridge 状态色。
+                    // 状态圆点区: 未绑定=灰; 已绑定显示 bridge 状态色; 双击亦可归位。
                     let (dot_rect, dot_resp) =
-                        ui.allocate_exact_size(egui::vec2(12.0, BTN_SIZE), egui::Sense::hover());
+                        ui.allocate_exact_size(egui::vec2(12.0, BTN_SIZE), egui::Sense::click());
+                    if dot_resp.double_clicked() {
+                        reset_to_snap = true;
+                    }
                     let dot_color = if self.snap_target.is_none() {
                         COL_GRAY_DOT
                     } else {
@@ -1793,7 +1857,7 @@ impl eframe::App for PlaApp {
                         hovered = Some((
                             "PLA 助手".into(),
                             match &self.snap_target {
-                                Some(t) => format!("已绑定: {} / {}", t.title, self.bridge_status),
+                                Some(t) => format!("已绑定: {} / {} (双击归位)", t.title, self.bridge_status),
                                 None => "未绑定 — 等待 Plasticity 窗口…".into(),
                             },
                         ));
@@ -1898,6 +1962,19 @@ impl eframe::App for PlaApp {
                         pla_ui::window_drag::release_capture();
                         self.drag_origin_cursor = None;
                         self.drag_origin_win = None;
+                        if let (Some(dp), Some(target)) = (
+                            self.toolbar_drag_pos,
+                            self.snap_target
+                                .clone()
+                                .or_else(|| window_finder::acquire_target(&self.doc_key)),
+                        ) {
+                            let ppp = ctx.pixels_per_point();
+                            if let Some(da) = self.default_anchor(&target, ctx, ppp) {
+                                if Self::is_in_toolbar_snap_zone(dp, da) {
+                                    reset_to_snap = true;
+                                }
+                            }
+                        }
                     } else if let (Some(oc), Some(ow), Some(c)) =
                         (self.drag_origin_cursor, self.drag_origin_win, cur_now)
                     {
@@ -1908,7 +1985,22 @@ impl eframe::App for PlaApp {
                         ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(target));
                     }
                 }
+                if reset_to_snap {
+                    self.toolbar_drag_pos = None;
+                    self.last_snap_anchor = None;
+                    if let Some(target) = self
+                        .snap_target
+                        .clone()
+                        .or_else(|| window_finder::acquire_target(&self.doc_key))
+                    {
+                        let ppp = ctx.pixels_per_point();
+                        if let Some(da) = self.default_anchor(&target, ctx, ppp) {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(da));
+                        }
+                    }
+                }
             });
+        paint_panel_border(ctx);
         self.hovered_hint = hovered;
 
         // R8b: 面板用户位置清理 — 关闭的面板移除记录(重开回默认跟随位)。
@@ -3382,6 +3474,7 @@ impl eframe::App for PlaApp {
                                 egui::CentralPanel::default()
                                     .frame(panel_frame())
                                     .show(hctx, |ui| show_ui(ui, &mut open_flag));
+                                paint_panel_border(hctx);
                                 let cur = hctx.input(|i| i.viewport().outer_rect);
                                 if let Some(r) = cur {
                                     if (r.left() - desired.x).abs() > SNAP_EPS
