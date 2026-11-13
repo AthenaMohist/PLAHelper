@@ -97,6 +97,15 @@
         图标 PH（白色几何 P 同 Plasticity 风格 + H 琥珀横梁，深色圆角底）：`tools/icon/make-icon.ps1` 生成
         `assets/pla-helper.ico/.png`；`build.rs` 手写只含 .rsrc 的 COFF 目标文件嵌进 exe（本机 GNU 工具链无 windres/rc）；
         任务栏用 `with_icon` 设窗口图标。待用户验证。
+      - R29 快照墙/视口状态面板宽 280；缩略图高度由格宽推出（`fav_img_h_for`/`big_img_h_for`）。
+      - R30 笔记面板（记录 + 计算器）：工具栏 📝 按钮；独立浮窗（不互斥、不自动关、首次默认位置，
+        之后位置/大小记在 ui-prefs.json `notes_rect`；标题行 StartDrag 拖动，四边四角 BeginResize 调大小）。
+        跟文档走：`<文档目录>/.pla/notes/<doc>/notes.md`（普通 Markdown，0.6s 防抖保存，切文档/关闭/退出立即写）。
+        块编辑：只显示渲染效果，点行编辑原文；`- ` `1. ` `[] ` `# ` `---` 即时转换；待办打勾加删除线；拖动柄重排，
+        右键柄删除/复制/转换；Tab 缩进；`=` 开头的行即时计算。表格：Excel 公式（`formula.rs`：A1/范围/SUM/AVERAGE/IF/ROUND…
+        共 40+ 函数，循环引用 #CIRC!，^ 左结合同 Excel），右键行/列号插入删除。
+        模块：`notes.rs`（模型/解析/序列化）、`notes_ui.rs`（界面）、`formula.rs`（公式）。待用户验证。
+        已知限制：插入/删除行列不会自动改写公式里的引用；表格公式只能引用本表。
 - [x] **U6 提示浮窗标题为 "egui window"**：随 U8 一起解决（被拥有窗口不进任务栏，也不进 Alt+Tab）。
 - [x] **U7 连接指示灯跟随主题色变黄**（R13）：R12 把强调色改黄后，"已连接"也变黄，和"连接中"无法区分。
       状态语义色改为固定色、不跟主题：灰 = 未绑定 / 黄 = 连接中 / 绿 = 已连接、成功 / 红 = 失败。

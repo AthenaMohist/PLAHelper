@@ -53,7 +53,8 @@ const COL_GRAY_DOT: egui::Color32 = egui::Color32::from_rgb(0x77, 0x77, 0x77);
 // ---------------- 工具栏形态/吸附参数(可调) ----------------
 /// 工具栏固定逻辑尺寸: 圆点+分隔线+6 按钮+分隔线+关闭键。
 /// 宽 246(R8-1: +30 视口状态按钮); 高 30。
-const TOOLBAR_SIZE: [f32; 2] = [246.0, 30.0];
+/// R30: +30 笔记按钮 → 276。
+const TOOLBAR_SIZE: [f32; 2] = [276.0, 30.0];
 /// 面板整体右移微调(逻辑 px, 按 ppp 缩放; R6-2e 用户要求再偏右 10)。
 const SNAP_RIGHT_SHIFT: f32 = 10.0;
 /// 吸附垂直微调(逻辑 pt, 按 ppp 缩放; 仅作用于探测命中分支)。
@@ -91,11 +92,12 @@ const ROUNDING: f32 = 10.0;
 /// 工具栏按钮列(横向排列, 顺序即产品顺序)。
 /// R7-5: 手动快照移入快照墙头部(图标钮); R7-11: 刷新实体移入选择集窗口头部 —
 /// 一级工具栏只留面板开关类按钮。R8-1: 加视口状态。
-const TOOLBAR_ACTIONS: [Action; 5] = [
+const TOOLBAR_ACTIONS: [Action; 6] = [
     Action::ToggleSnapshots,
     Action::ToggleEntities,
     Action::ToggleVpState,
     Action::ToggleDim,
+    Action::ToggleNotes,
     Action::ToggleSettings,
 ];
 
@@ -167,6 +169,13 @@ struct PlaApp {
     show_settings: bool,
     /// F2: CDP 能力面板(点工具栏状态点开关)。
     show_caps: bool,
+    /// R30: 笔记面板(独立浮窗: 不互斥、不自动关、位置/大小记忆、可调大小)。
+    show_notes: bool,
+    notes: pla_ui::notes_ui::NotesPanel,
+    /// 本次打开时交给 ViewportBuilder 的外框(打开期间不变 → egui 不会每帧重发定位, 不和 OS 拖动打架)。
+    notes_open_rect: Option<[f32; 4]>,
+    /// 上次写进偏好文件的外框(变化且松手后再写)。
+    notes_saved_rect: Option<[f32; 4]>,
     /// R8-1: 视口状态面板。
     show_vpstate: bool,
     /// R8b: 工具栏拖动位置(None=自动吸附; Some=用户拖到的位置, 逻辑 pt)。
@@ -1876,6 +1885,10 @@ impl PlaApp {
             show_dim: false,
             show_settings: false,
             show_caps: false,
+            show_notes: false,
+            notes: pla_ui::notes_ui::NotesPanel::new(),
+            notes_open_rect: None,
+            notes_saved_rect: pla_ui::prefs::load_notes_rect(),
             step_loaded: false,
             step_bound: None,
             step_deg_buf: String::new(),
@@ -2286,6 +2299,16 @@ impl PlaApp {
                     self.close_secondary_panels_except(PanelId::Dim);
                 }
             }
+            Action::ToggleNotes => {
+                // R30: 不调用 close_secondary_panels_except — 笔记与其他面板并存。
+                self.show_notes = !self.show_notes;
+                if self.show_notes {
+                    self.notes.set_doc(&self.doc_key);
+                } else {
+                    self.notes.flush();
+                    self.notes_open_rect = None;
+                }
+            }
             Action::ToggleSettings => {
                 self.show_settings = !self.show_settings;
                 if self.show_settings {
@@ -2294,6 +2317,144 @@ impl PlaApp {
                     self.step_loaded = false;
                 }
             }
+        }
+    }
+
+    /// R30: 笔记浮窗。与二级面板不同: 不跟随工具栏、不互斥; 首次在默认位置(工具栏下方、二级面板右侧),
+    /// 之后用户拖到哪/拉多大就记住(ui-prefs.json `notes_rect`), 关掉重开仍在原处。
+    /// 拖动 = 标题行 OS StartDrag; 调大小 = 四边/四角 BeginResize(无边框窗口自己画热区)。
+    fn show_notes_window(&mut self, ctx: &egui::Context) {
+        const ID: &str = "panel-notes";
+        let open_rect = *self.notes_open_rect.get_or_insert_with(|| {
+            self.notes_saved_rect.unwrap_or_else(|| {
+                let root = ctx.input(|i| i.viewport().outer_rect).unwrap_or(egui::Rect::from_min_size(
+                    egui::pos2(200.0, 120.0),
+                    egui::vec2(TOOLBAR_SIZE[0], TOOLBAR_SIZE[1]),
+                ));
+                [root.left() + PANEL_SNAPSHOTS[0] + 12.0, root.bottom() + 8.0, 320.0, 440.0]
+            })
+        });
+        let (hide, reveal) = viewport_reveal(ctx, ID);
+        let mut builder = egui::ViewportBuilder::default()
+            .with_title(ID)
+            .with_decorations(false)
+            .with_resizable(true)
+            .with_transparent(true)
+            .with_window_level(egui::WindowLevel::AlwaysOnTop)
+            .with_position(egui::pos2(open_rect[0], open_rect[1]))
+            .with_inner_size(egui::vec2(open_rect[2], open_rect[3]))
+            .with_min_inner_size(egui::vec2(220.0, 160.0));
+        if hide {
+            builder = builder.with_visible(false);
+        }
+        let theme = pla_ui::notes_ui::Theme {
+            text: COL_TEXT,
+            muted: COL_MUTED,
+            accent: COL_ACCENT,
+            red: COL_RED,
+            green: COL_GREEN,
+            field: COL_FIELD,
+            card: COL_CARD,
+        };
+        let doc = self.doc_key.clone();
+        let mut open = true;
+        let mut live_rect: Option<[f32; 4]> = None;
+        let mut pointer_down = false;
+        let notes = &mut self.notes;
+        ctx.show_viewport_immediate(egui::ViewportId::from_hash_of(ID), builder, |ctx, _class| {
+            if reveal {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            }
+            if ctx.input(|i| i.viewport().close_requested()) {
+                open = false;
+            }
+            egui::CentralPanel::default().frame(panel_frame()).show(ctx, |ui| {
+                // ---- 标题行: 拖动柄 + 标题 + 文档名 + × ----
+                let (row, drag) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 22.0), egui::Sense::click_and_drag());
+                if drag.drag_started() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                }
+                let p = ui.painter();
+                for dy in [-4.0f32, 0.0, 4.0] {
+                    for dx in [-2.5f32, 2.5] {
+                        p.circle_filled(egui::pos2(row.left() + 7.0 + dx, row.center().y + dy), 1.2, COL_MUTED);
+                    }
+                }
+                let tr_ = paint_text(p, egui::pos2(row.left() + 18.0, row.center().y), egui::Align2::LEFT_CENTER, tr("笔记", "Notes"), 13.0, egui::Color32::WHITE, true);
+                p.text(
+                    egui::pos2(tr_.right() + 8.0, row.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    truncate_chars(&doc, 24),
+                    egui::FontId::proportional(11.0),
+                    COL_MUTED,
+                );
+                let xr = egui::Rect::from_center_size(egui::pos2(row.right() - 9.0, row.center().y), egui::vec2(18.0, 18.0));
+                let xresp = ui.interact(xr, egui::Id::new("notes-close"), egui::Sense::click());
+                ui.painter().text(xr.center(), egui::Align2::CENTER_CENTER, "×", egui::FontId::proportional(15.0), if xresp.hovered() { egui::Color32::WHITE } else { COL_MUTED });
+                if xresp.on_hover_text(tr("关闭(内容已自动保存)", "Close (content is saved automatically)")).clicked() {
+                    open = false;
+                }
+                notes.ui(ui, &theme);
+            });
+            paint_panel_border(ctx);
+            // ---- 调大小热区(四边 + 四角) ----
+            use egui::viewport::ResizeDirection as D;
+            let sr = ctx.screen_rect();
+            let e = 5.0;
+            let c = 12.0;
+            let zones = [
+                (egui::Rect::from_min_max(egui::pos2(sr.right() - c, sr.bottom() - c), sr.max), D::SouthEast, egui::CursorIcon::ResizeSouthEast),
+                (egui::Rect::from_min_max(egui::pos2(sr.left(), sr.bottom() - c), egui::pos2(sr.left() + c, sr.bottom())), D::SouthWest, egui::CursorIcon::ResizeSouthWest),
+                (egui::Rect::from_min_max(egui::pos2(sr.right() - c, sr.top()), egui::pos2(sr.right(), sr.top() + c)), D::NorthEast, egui::CursorIcon::ResizeNorthEast),
+                (egui::Rect::from_min_max(sr.min, egui::pos2(sr.left() + c, sr.top() + c)), D::NorthWest, egui::CursorIcon::ResizeNorthWest),
+                (egui::Rect::from_min_max(egui::pos2(sr.right() - e, sr.top() + c), egui::pos2(sr.right(), sr.bottom() - c)), D::East, egui::CursorIcon::ResizeEast),
+                (egui::Rect::from_min_max(egui::pos2(sr.left(), sr.top() + c), egui::pos2(sr.left() + e, sr.bottom() - c)), D::West, egui::CursorIcon::ResizeWest),
+                (egui::Rect::from_min_max(egui::pos2(sr.left() + c, sr.bottom() - e), egui::pos2(sr.right() - c, sr.bottom())), D::South, egui::CursorIcon::ResizeSouth),
+                (egui::Rect::from_min_max(egui::pos2(sr.left() + c, sr.top()), egui::pos2(sr.right() - c, sr.top() + e)), D::North, egui::CursorIcon::ResizeNorth),
+            ];
+            egui::Area::new(egui::Id::new("notes-resize"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(sr.min)
+                .show(ctx, |ui| {
+                    for (i, (r, dir, icon)) in zones.into_iter().enumerate() {
+                        let resp = ui.interact(r, egui::Id::new(("notes-rz", i)), egui::Sense::drag());
+                        if resp.hovered() || resp.dragged() {
+                            ctx.set_cursor_icon(icon);
+                        }
+                        if resp.drag_started() {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(dir));
+                        }
+                    }
+                    // 右下角斜纹提示
+                    let p = ui.painter();
+                    for k in 1..=3 {
+                        let o = k as f32 * 3.5;
+                        p.line_segment(
+                            [egui::pos2(sr.right() - 3.0 - o, sr.bottom() - 3.0), egui::pos2(sr.right() - 3.0, sr.bottom() - 3.0 - o)],
+                            egui::Stroke::new(1.0, COL_MUTED),
+                        );
+                    }
+                });
+            let vp = ctx.input(|i| (i.viewport().outer_rect, i.viewport().inner_rect));
+            if let (Some(o), Some(inner)) = vp {
+                live_rect = Some([o.left(), o.top(), inner.width(), inner.height()]);
+            }
+            pointer_down = ctx.input(|i| i.pointer.any_down());
+        });
+        // 位置/大小变了且已松手 → 写偏好(拖动/调整中不写, 免得每帧写盘)
+        if let Some(r) = live_rect {
+            let moved = self.notes_saved_rect.map_or(true, |s| s.iter().zip(r.iter()).any(|(a, b)| (a - b).abs() > 1.0));
+            if moved && !pointer_down {
+                if let Err(e) = pla_ui::prefs::save_notes_rect(r) {
+                    pla_ui::diag::log(&format!("save notes rect failed: {e}"));
+                }
+                self.notes_saved_rect = Some(r);
+            }
+        }
+        if !open {
+            self.show_notes = false;
+            self.notes.flush();
+            self.notes_open_rect = None;
         }
     }
 
@@ -2961,6 +3122,7 @@ impl eframe::App for PlaApp {
 
     /// R14 诊断: 正常退出留痕(区分"用户关闭"与"无声崩溃/被外部结束")。
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.notes.flush(); // R30: 退出前把未落盘的笔记写掉
         pla_ui::diag::log("on_exit (正常关闭)");
     }
 
@@ -3085,6 +3247,7 @@ impl eframe::App for PlaApp {
                             Action::ToggleVpState => self.show_vpstate,
                             Action::ToggleDim => self.show_dim,
                             Action::ToggleSettings => self.show_settings,
+                            Action::ToggleNotes => self.show_notes,
                             _ => false,
                         };
                         let hk = self
@@ -4934,6 +5097,13 @@ impl eframe::App for PlaApp {
                 }
                 self.show_caps = flag;
             }
+        }
+
+        // ---- R30: 笔记面板(独立浮窗, 与上面的二级面板并存) ----
+        self.notes.tick();
+        if self.show_notes {
+            self.notes.set_doc(&self.doc_key);
+            self.show_notes_window(ctx);
         }
 
         // ---- R15: 设置项悬停三级面板(面板本帧登记, 本帧渲染; 不悬停即关闭) ----
