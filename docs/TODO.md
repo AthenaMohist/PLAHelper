@@ -79,7 +79,7 @@
 
 先按「复现步骤 → 期望 → 实际」逐条登记到本节，再修。已知线索：
 
-- [~] **B1 选择集** —— R22 已整条替换为**按数据恢复**（待用户在界面上复测）：垫片 `sel.apply` 按 id 查对象，
+- [x] **B1 选择集** —— R22 已整条替换为**按数据恢复**（用户界面复测通过 2026-11-13）：垫片 `sel.apply` 按 id 查对象，
       在一个自建 `SelectionCommand` 子类里逐项 `changeSelection.onClick`（未选中则下钻一次），经 `editor.enqueue` 执行。
       真机：60 面 14 ms 全中、撤销 +1、下钻 10 次；完整链路（选中 → G / Shift+Delete 真的改几何 → Ctrl+Z）已验证。
       删除悬停扫描 / 真实点击 / 遮挡补救 / 下钻补点 / 相机分组整套（cdp.rs −805 行）与 `scan.*`、`sel.addFaceById`、`sel.faceIds`；
