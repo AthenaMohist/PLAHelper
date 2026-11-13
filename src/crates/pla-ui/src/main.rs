@@ -446,7 +446,12 @@ struct CapsView {
     age_s: Option<u64>,
     cdp_conn: pla_bridge::cdp::ConnState,
     proxy_status: String,
+    /// R27: 原设置面板 BRIDGE 卡的内容搬到这里(连接/通道信息集中在一个面板)。
     bridge_status: String,
+    bridge_color: egui::Color32,
+    bridge_url: String,
+    /// 本助手绑定的 Plasticity 窗口标题(CDP 与 Bridge 都跟随它)。
+    bound_title: Option<String>,
 }
 
 fn avail_style(a: &Availability) -> (&'static str, egui::Color32) {
@@ -523,10 +528,18 @@ fn caps_panel_ui(ui: &mut egui::Ui, v: &CapsView, reprobe: &mut bool) {
             ],
         )),
         |ui| {
+            let bound = v
+                .bound_title
+                .clone()
+                .unwrap_or_else(|| tr("未绑定(等待 Plasticity…)", "Unbound (waiting for Plasticity…)").into());
+            value_row(
+                ui,
+                tr("绑定窗口", "Bound window"),
+                &bound,
+                if v.bound_title.is_some() { COL_TEXT } else { COL_YELLOW },
+            );
             value_row(ui, tr("连接", "Connection"), &v.cdp_conn.text(), cdp_conn_color(&v.cdp_conn));
             value_row(ui, tr("代理", "Proxy"), &v.proxy_status, COL_TEXT);
-            // Bridge 是只读冗余通道(实体网格), 与 CDP 能力无关; 断开不影响本面板任何功能。
-            value_row(ui, tr("Bridge(只读)", "Bridge (read-only)"), &v.bridge_status, status_color(&v.bridge_status));
             match caps {
                 None => value_row(
                     ui,
@@ -569,6 +582,31 @@ fn caps_panel_ui(ui: &mut egui::Ui, v: &CapsView, reprobe: &mut bool) {
             if ui.add_enabled(caps.is_some(), btn).clicked() {
                 *reprobe = true;
             }
+        },
+    );
+    // ---- R27: 官方 Bridge(只读冗余通道, 原在设置面板) — 与 CDP 能力无关, 断开不影响上面任何功能 ----
+    settings_card(
+        ui,
+        "BRIDGE",
+        Some((
+            tr("官方 Bridge", "Official Bridge"),
+            vec![
+                info_text(tr(
+                    "Plasticity 自带的 WebSocket 服务(偏好设置 → Server, 端口 8980)。\
+                     pla-ui 用它读取实体网格; 只读, 不能修改模型。",
+                    "Plasticity's built-in WebSocket server (Preferences → Server, port 8980). \
+                     pla-ui reads entity meshes through it; read-only, cannot modify the model.",
+                )),
+                info_text(tr(
+                    "它是 CDP 之外的冗余通道: 断开只影响实体网格读取, 选择集/视口/快照等走 CDP 的功能照常。",
+                    "A backup channel besides CDP: if it's down only entity-mesh reading is affected; \
+                     selection sets, viewports, snapshots etc. go through CDP and keep working.",
+                )),
+            ],
+        )),
+        |ui| {
+            value_row(ui, tr("状态", "Status"), &v.bridge_status, v.bridge_color);
+            value_row(ui, tr("地址", "Address"), &v.bridge_url, COL_MUTED);
         },
     );
     // ---- 按组: 功能状态 + 所需能力明细 ----
@@ -641,7 +679,7 @@ fn select_all_invert_buttons(
 ) {
     let everything = !all.is_empty() && all.iter().all(|n| selected.contains(n));
     if ui
-        .small_button(if everything { tr("取消全选", "Select none") } else { tr("全选", "Select all") })
+        .small_button(if everything { tr("取消全选", "None") } else { tr("全选", "All") })
         .on_hover_text(tr("选中全部; 已全部选中时再按 = 全部取消", "Select all; press again when all selected = clear"))
         .clicked()
     {
@@ -805,16 +843,43 @@ const ROW_H: f32 = 28.0;
 const FIELD_FRAC: f32 = 0.5;
 
 /// 行标签(常态浅灰, 悬停变白加粗); 有说明时在标签后画一个小 "?" 圈。
-fn paint_row_label(ui: &egui::Ui, rect: egui::Rect, text: &str, hovered: bool, has_info: bool) {
+/// R27: 文本适配宽度 —— 先把字号从 `size` 缩到 `min_size`(英文通常比中文长), 仍放不下再省略号截断。
+/// 返回 (显示文本, 字号, 是否截断)。
+fn fit_text(ui: &egui::Ui, text: &str, max_w: f32, size: f32, min_size: f32) -> (String, f32, bool) {
+    let w = |s: &str, sz: f32| {
+        ui.fonts(|f| f.layout_no_wrap(s.into(), egui::FontId::proportional(sz), egui::Color32::WHITE).size().x)
+    };
+    let mut sz = size;
+    while sz > min_size && w(text, sz) > max_w {
+        sz -= 0.5;
+    }
+    if w(text, sz) <= max_w {
+        return (text.to_string(), sz, false);
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut n = chars.len();
+    while n > 1 && w(&format!("{}…", chars[..n].iter().collect::<String>()), sz) > max_w {
+        n -= 1;
+    }
+    (format!("{}…", chars[..n].iter().collect::<String>()), sz, true)
+}
+
+/// 行标签: 限定在 `max_w` 内(缩字号/省略号, 截断时悬停显示全文)。
+fn paint_row_label(ui: &egui::Ui, rect: egui::Rect, text: &str, hovered: bool, has_info: bool, max_w: f32) {
+    let max_w = (max_w - if has_info { 18.0 } else { 0.0 }).max(20.0);
+    let (shown, size, cut) = fit_text(ui, text, max_w, 12.5, 10.5);
     let r = paint_text(
         ui.painter(),
         egui::pos2(rect.left(), rect.center().y),
         egui::Align2::LEFT_CENTER,
-        text,
-        12.5,
+        &shown,
+        size,
         if hovered { egui::Color32::WHITE } else { COL_TEXT },
         hovered,
     );
+    if cut && hovered {
+        egui::show_tooltip_text(ui.ctx(), ui.layer_id(), ui.id().with(("row-label", text)), text);
+    }
     if has_info {
         let c = egui::pos2(r.right() + 9.0, rect.center().y);
         let col = if hovered { egui::Color32::WHITE } else { COL_MUTED };
@@ -874,7 +939,7 @@ fn toggle_row(
         resp.mark_changed();
     }
     let hovered = resp.hovered();
-    paint_row_label(ui, rect, label, hovered, info.is_some());
+    paint_row_label(ui, rect, label, hovered, info.is_some(), rect.width() - 34.0 - 10.0);
     let t = ui.ctx().animate_bool(resp.id, *on);
     let track = egui::Rect::from_center_size(
         egui::pos2(rect.right() - 17.0, rect.center().y),
@@ -894,19 +959,11 @@ fn toggle_row(
 fn value_row(ui: &mut egui::Ui, label: &str, value: &str, color: egui::Color32) {
     let (rect, resp) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 22.0), egui::Sense::hover());
-    paint_row_label(ui, rect, label, false, false);
-    let max_w = rect.width() * 0.68;
-    let font = egui::FontId::proportional(12.0);
-    let mut shown = value.to_string();
-    let width = |s: &str| ui.fonts(|f| f.layout_no_wrap(s.into(), font.clone(), color).size().x);
-    if width(&shown) > max_w {
-        let chars: Vec<char> = value.chars().collect();
-        let mut n = chars.len();
-        while n > 1 && width(&format!("{}…", chars[..n].iter().collect::<String>())) > max_w {
-            n -= 1;
-        }
-        shown = format!("{}…", chars[..n].iter().collect::<String>());
-    }
+    // R27: 标签与值分宽 — 值最多占 68%, 标签用剩下的(英文标签/值都可能变长, 不再互相压字)。
+    let (shown, vsize, _) = fit_text(ui, value, rect.width() * 0.68, 12.0, 10.5);
+    let font = egui::FontId::proportional(vsize);
+    let vw = ui.fonts(|f| f.layout_no_wrap(shown.clone(), font.clone(), color).size().x);
+    paint_row_label(ui, rect, label, resp.hovered(), false, rect.width() - vw - 10.0);
     ui.painter().text(
         egui::pos2(rect.right(), rect.center().y),
         egui::Align2::RIGHT_CENTER,
@@ -938,8 +995,8 @@ fn stepper_row(
 ) -> (bool, i32) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), ROW_H), egui::Sense::hover());
     let hovered = ui.rect_contains_pointer(rect);
-    paint_row_label(ui, rect, label, hovered, info.is_some());
     let field = field_rect(rect);
+    paint_row_label(ui, rect, label, hovered, info.is_some(), field.left() - rect.left() - 6.0);
     ui.painter().rect_filled(field, egui::Rounding::same(6.0), COL_FIELD);
     let bw = 24.0;
     let minus = egui::Rect::from_min_size(field.min, egui::vec2(bw, field.height()));
@@ -992,8 +1049,8 @@ fn drag_row<T: egui::emath::Numeric>(
 ) -> bool {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), ROW_H), egui::Sense::hover());
     let hovered = ui.rect_contains_pointer(rect);
-    paint_row_label(ui, rect, label, hovered, info.is_some());
     let field = field_rect(rect);
+    paint_row_label(ui, rect, label, hovered, info.is_some(), field.left() - rect.left() - 6.0);
     let changed = ui
         .allocate_new_ui(egui::UiBuilder::new().max_rect(field), |ui| {
             let v = ui.visuals_mut();
@@ -3254,7 +3311,7 @@ impl eframe::App for PlaApp {
 
                         // ---- 管理模式操作条(删除立即执行, 列表随后按新数据渲染) ----
                         if self.snap_manage {
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.label(
                                     egui::RichText::new(t!("已选 {}", "{} selected", self.snap_selected.len()))
                                         .small()
@@ -3264,7 +3321,7 @@ impl eframe::App for PlaApp {
                                 select_all_invert_buttons(ui, &all, &mut self.snap_selected);
                                 let del = ui.add(
                                     egui::Button::new(
-                                        egui::RichText::new(tr("删除所选", "Delete selected"))
+                                        egui::RichText::new(tr("删除所选", "Delete"))
                                             .small()
                                             .color(egui::Color32::WHITE),
                                     )
@@ -3905,11 +3962,11 @@ impl eframe::App for PlaApp {
                         }
                         // 管理模式操作条
                         if self.sel_manage {
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.label(egui::RichText::new(t!("已选 {}", "{} selected", self.sel_selected.len())).small().color(COL_MUTED));
                                 let all: Vec<String> = self.sel_saved.iter().map(|m| m.name.clone()).collect();
                                 select_all_invert_buttons(ui, &all, &mut self.sel_selected);
-                                if ui.small_button(tr("删除所选", "Delete selected")).clicked() && !self.sel_selected.is_empty() {
+                                if ui.small_button(tr("删除所选", "Delete")).clicked() && !self.sel_selected.is_empty() {
                                     let names: Vec<String> = self.sel_selected.iter().cloned().collect();
                                     match pla_ui::selection::delete_cdp_selections_batch(&self.doc_key, &names) {
                                         Ok(n) => {
@@ -4268,11 +4325,11 @@ impl eframe::App for PlaApp {
                         }
                         // 管理条
                         if self.sel_manage && self.show_vpstate {
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.label(egui::RichText::new(t!("已选 {}", "{} selected", self.sel_selected.len())).small().color(COL_MUTED));
                                 let all: Vec<String> = self.vp_states.iter().map(|m| m.name.clone()).collect();
                                 select_all_invert_buttons(ui, &all, &mut self.sel_selected);
-                                if ui.small_button(tr("删除所选", "Delete selected")).clicked() && !self.sel_selected.is_empty() {
+                                if ui.small_button(tr("删除所选", "Delete")).clicked() && !self.sel_selected.is_empty() {
                                     let names: Vec<String> = self.sel_selected.iter().cloned().collect();
                                     match pla_ui::vpstate::delete_vpstates(&self.doc_key, &names) {
                                         Ok(n) => {
@@ -4381,7 +4438,7 @@ impl eframe::App for PlaApp {
                                 pla_ui::selection::list_cdp_selections(&self.doc_key);
                             self.dim_loaded = true;
                         }
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.label(tr("关联选择集:", "Linked set:"));
                             let cur = self
                                 .dim_sets
@@ -4400,7 +4457,7 @@ impl eframe::App for PlaApp {
                                     pla_ui::selection::list_cdp_selections(&self.doc_key);
                             }
                         });
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.label(tr("方向:", "Axis:"));
                             for (i, ax) in ["X", "Y", "Z"].iter().enumerate() {
                                 ui.selectable_value(&mut self.dim_axis, i, *ax);
@@ -4408,8 +4465,8 @@ impl eframe::App for PlaApp {
                             ui.label(tr("数值(毫米):", "Value (mm):"));
                             ui.add(egui::DragValue::new(&mut self.dim_value).speed(0.1));
                         });
-                        ui.horizontal(|ui| {
-                            if ui.button(tr("① 选中关联实体", "① Select linked entities")).clicked() {
+                        ui.horizontal_wrapped(|ui| {
+                            if ui.button(tr("① 选中关联实体", "① Select linked")).clicked() {
                                 let Some(name) = self.dim_sets.get(self.dim_set_sel).cloned() else {
                                     self.set_notice((
                                         true,
@@ -4534,28 +4591,7 @@ impl eframe::App for PlaApp {
                                 }
                             });
                         });
-                        settings_card(
-                            ui,
-                            "BRIDGE",
-                            Some((
-                                tr("官方 Bridge", "Official Bridge"),
-                                vec![info_text(tr(
-                                    "Plasticity 自带的 WebSocket 服务(偏好设置 → Server, 端口 8980)。\
-                                     pla-ui 用它读取实体网格; 只读, 不能修改模型。",
-                                    "Plasticity's built-in WebSocket server (Preferences → Server, port 8980). \
-                                     pla-ui reads entity meshes through it; read-only, cannot modify the model.",
-                                ))],
-                            )),
-                            |ui| {
-                                value_row(ui, tr("地址", "Address"), &self.bridge.url, COL_TEXT);
-                                let bind_text = match &self.snap_target {
-                                    Some(t) => t.title.clone(),
-                                    None => tr("未绑定(等待 Plasticity…)", "Unbound (waiting for Plasticity…)").into(),
-                                };
-                                value_row(ui, tr("绑定窗口", "Bound window"), &bind_text, COL_TEXT);
-                                value_row(ui, tr("状态", "Status"), &self.bridge_status_text(), status_color(&self.bridge_status));
-                            },
-                        );
+                        // R27: BRIDGE 卡已移到 CDP 能力面板(点工具栏状态点打开)。
                         // ---- F7: Plasticity 默认以 CDP 模式运行(pla-ui 托管代理) ----
                         settings_card(
                             ui,
@@ -4783,7 +4819,7 @@ impl eframe::App for PlaApp {
                             |ui| {
                             for a in Action::ALL {
                                 let key = format!("{a:?}");
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     ui.label(a.icon());
                                     ui.label(a.label());
                                     let cur = self
@@ -4831,6 +4867,9 @@ impl eframe::App for PlaApp {
                     cdp_conn: self.cdp_conn.clone(),
                     proxy_status: self.proxy.status.clone(),
                     bridge_status: self.bridge_status_text(),
+                    bridge_color: status_color(&self.bridge_status),
+                    bridge_url: self.bridge.url.clone(),
+                    bound_title: self.snap_target.as_ref().map(|t| t.title.clone()),
                 };
                 let mut reprobe = false;
                 show_child_window(
