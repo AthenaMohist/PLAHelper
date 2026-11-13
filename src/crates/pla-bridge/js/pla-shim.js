@@ -20,7 +20,8 @@
   // =====================================================================
   // 1. 内部结构表（唯一来源）。Plasticity 升级改名时，在对应行追加备选路径即可。
   //    键 -> [根, 备选路径...]
-  //    根：ed = Editor；sel = 当前 Selection；vp = 视口（见 viewport()）；oc = 视口的轨道控制器。
+  //    根：ed = Editor；sel = 当前 Selection；vp = 视口（见 viewport()）；oc = 视口的轨道控制器；
+  //        reg = 命令注册表(CommandRegistry)。
   // =====================================================================
   var LOC = {
     'ed.selection':            ['ed', 'selection'],
@@ -33,8 +34,9 @@
     'ed.undoStack':            ['ed', 'history._undoStack', 'history.undoStack'],
     'ed.geoVersion':           ['ed', 'geo._version', 'geo.version'],
     'ed.errorSignal':          ['ed', 'signals.environmentChanged'],
-    'ed.registry.add':         ['ed', 'registry.add'],
-    'ed.registry.listeners':   ['ed', 'registry.inlineListenersByCommandName'],
+    'ed.registry':             ['ed', 'registry'],
+    'reg.add':                 ['reg', 'add'],
+    'reg.listeners':           ['reg', 'inlineListenersByCommandName'],
     'ed.keymaps.add':          ['ed', 'keymaps.add'],
     'ed.keymaps.bindings':     ['ed', 'keymaps.keyBindings'],
     'ed.keyboard.update':      ['ed', 'keyboard.updateKeymap'],
@@ -111,11 +113,12 @@
     'cam.write': { needs: ['vp.camera', 'vp.orbit', 'oc.quaternionEnd', 'oc.targetEnd', 'oc.radiusEnd', 'vp.render'] },
     'cam.nav':   { needs: ['vp.navigate'] },
     'cam.step':  { needs: ['oc.step'], optional: ['ed.settings.orbit'] },
-    'cam.roll':  { needs: ['ed.registry.add', 'ed.registry.listeners', 'oc.quaternionEnd', 'oc.step'] },
+    'cam.roll':  { needs: ['reg.add', 'reg.listeners', 'oc.quaternionEnd', 'oc.step'] },
     'scan':      { needs: ['ed.hover', 'vp.pointer', 'ed.cancelCommand', 'ed.click.clear'] },
     'vp.state':  { needs: ['vp.camera', 'vp.orbit', 'ed.shading.mode', 'ed.shading.changed', 'ed.sections'],
                    optional: ['ed.shading.section', 'vp.cplane', 'vp.settings.renderer', 'vp.settings.ao', 'vp.settings.grid', 'vp.container'] },
     'keymap':    { needs: ['ed.keymaps.add', 'ed.keymaps.bindings'], optional: ['ed.keyboard.update'] },
+    'cmd.dispatch': { needs: ['reg.add', 'reg.listeners'] },
     'err.hook':  { needs: ['ed.errorSignal'] },
     'tree':      { needs: [], dom: true },
     'mat.set':     { todo: 'N1' },
@@ -128,7 +131,7 @@
   // 3. 解析器
   // =====================================================================
   var MISS = {};
-  var state = { ed: null, finder: null, gen: 0, hooks: {}, lastError: null, hits: {} };
+  var state = { ed: null, finder: null, gen: 0, hooks: {}, lastError: null, hits: {}, pings: 0 };
 
   function errMsg(e) { return e && e.message ? String(e.message) : String(e); }
 
@@ -155,6 +158,7 @@
       case 'sel': return get('sel.selected');
       case 'vp': return viewport();
       case 'oc': return get('vp.orbit');
+      case 'reg': return get('ed.registry');
     }
     return undefined;
   }
@@ -184,6 +188,25 @@
     var r = resolve(key, base);
     if (!r.ok) throw new CapError(key, [key]);
     return r.v;
+  }
+
+  // 写入表键对应的属性(按实际命中的那条路径写); 返回是否写成。
+  function put(key, val, base) {
+    var spec = LOC[key];
+    var r = resolve(key, base);
+    if (!r.ok) return false;
+    var root = base !== undefined ? base : rootOf(spec[0]);
+    var parts = r.path.split('.');
+    var last = parts.pop();
+    var parent = parts.length ? walk(root, parts.join('.')) : root;
+    if (parent === MISS || parent === null || parent === undefined) return false;
+    try { parent[last] = val; return true; } catch (e) { return false; }
+  }
+
+  // 向量类(three.js Vector3 / Quaternion)按分量写: 有 set 用 set。
+  function setVec(obj, arr) {
+    if (!obj || !arr || typeof obj.set !== 'function') return false;
+    try { obj.set.apply(obj, arr); return true; } catch (e) { return false; }
   }
 
   function call0(obj, key) {
@@ -399,6 +422,86 @@
       o.orbit = orb;
     }
     return o;
+  });
+
+  // 切到给定视角(参数 = cam.get 的输出; 老存档可缺 orbit/zoom/fov)。
+  // 顺序: 先写相机, 再写轨道控制器(当前值 + *End 两份, 否则阻尼插值会拉回), 最后 update + 重绘。
+  // 投影参数只在透视相机上写(正交 ProxyCamera 的 updateProjectionMatrix 有破坏性副作用, R7-31h)。
+  def('cam.set', 'cam.write', function (o) {
+    var cam = need('vp.camera');
+    cam.position.set(o.px, o.py, o.pz);
+    cam.quaternion.set(o.qx, o.qy, o.qz, o.qw);
+    var persp = cam.isPerspectiveCamera === true;
+    var proj = false;
+    if (persp) {
+      if (typeof o.zoom === 'number' && typeof cam.zoom === 'number') { cam.zoom = o.zoom; proj = true; }
+      if (typeof o.fov === 'number' && typeof cam.fov === 'number') { cam.fov = o.fov; proj = true; }
+    }
+    var oc = get('vp.orbit');
+    var orbit = false;
+    if (o.orbit && oc) {
+      ORBIT_FIELDS.forEach(function (f) {
+        var cur = o.orbit[f[0]];
+        var end = o.orbit[f[0] + 'End'];
+        if (end === undefined || end === null) end = cur;
+        if (cur === undefined || cur === null) return;
+        if (f[3] === 'v3') {
+          setVec(get('oc.' + f[0], oc), cur);
+          setVec(get('oc.' + f[0] + 'End', oc), end);
+        } else {
+          put('oc.' + f[0], cur, oc);
+          put('oc.' + f[0] + 'End', end, oc);
+        }
+      });
+      // 朝向也同步给轨道控制器(否则下一次拖动会从旧朝向跳回来)。
+      setVec(get('oc.quaternion', oc), [o.qx, o.qy, o.qz, o.qw]);
+      setVec(get('oc.quaternionEnd', oc), [o.qx, o.qy, o.qz, o.qw]);
+      orbit = true;
+    }
+    if (persp && proj) { try { cam.updateProjectionMatrix(); } catch (e) {} }
+    call0(oc, 'oc.update');
+    call0(viewport(), 'vp.render');
+    return { proj: proj, orbit: orbit };
+  });
+
+  // ---- 命令派发: 对视口元素派发 CustomEvent(Plasticity CommandRegistry 的执行方式) ----
+  function viewportElement() {
+    try { return document.querySelector(CFG.viewportSelector); } catch (e) { return null; }
+  }
+
+  function hasListener(name, el) {
+    var m = need('reg.listeners');
+    var w = m && (typeof m.get === 'function' ? m.get(name) : m[name]);
+    return !!(w && typeof w.has === 'function' && w.has(el));
+  }
+
+  function dispatchOn(el, name) {
+    el.dispatchEvent(new CustomEvent(name, { bubbles: true }));
+  }
+
+  def('cmd.dispatch', 'cmd.dispatch', function (a) {
+    var el = viewportElement();
+    if (!el) throw new Error('no viewport element (' + CFG.viewportSelector + ')');
+    if (!a || typeof a.name !== 'string') throw new Error('cmd.dispatch needs {name}');
+    dispatchOn(el, a.name);
+    return true;
+  });
+
+  // 自检用: 在视口元素上注册一个空命令(幂等), 派发它, 确认回调真的执行了。
+  // 覆盖"注册(对象形式 add)→ 派发 → 回调"整条链(滚转、命令派发层都依赖它)。
+  def('cmd.ping', 'cmd.dispatch', function () {
+    var el = viewportElement();
+    if (!el) throw new Error('no viewport element (' + CFG.viewportSelector + ')');
+    var name = CFG.pingCommand;
+    if (!hasListener(name, el)) {
+      var map = {};
+      map[name] = function () { state.pings++; };
+      // CommandRegistry.add 只有对象形式 add(target, {名: 回调})(pitfalls #21)。
+      need('reg.add').call(need('ed.registry'), el, map);
+    }
+    var before = state.pings;
+    dispatchOn(el, name);
+    return { registered: hasListener(name, el), fired: state.pings > before };
   });
 
   def('err.last', 'err.hook', function () { return state.lastError; });

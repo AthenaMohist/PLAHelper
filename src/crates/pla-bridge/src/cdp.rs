@@ -288,13 +288,13 @@ fn cdp_thread_main(
     });
 }
 
-type WsStream = tokio_tungstenite::WebSocketStream<
+pub(crate) type WsStream = tokio_tungstenite::WebSocketStream<
     tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
 >;
 
 /// R19: 从 /json/list 里选目标。`want` = 绑定窗口 HWND(0 = 任意)。
 /// 代理(R19 起)给每个 Plasticity 窗口列一个 page, 带 `hwnd` 字段; 旧代理没有该字段 → 退回第一个。
-fn pick_page(list: &Value, want: isize) -> anyhow::Result<&Value> {
+pub(crate) fn pick_page(list: &Value, want: isize) -> anyhow::Result<&Value> {
     let pages: Vec<&Value> = list
         .as_array()
         .map(|a| a.iter().filter(|t| t["type"] == "page").collect())
@@ -319,7 +319,7 @@ fn pick_page(list: &Value, want: isize) -> anyhow::Result<&Value> {
 }
 
 /// 连 page target(`want` = 绑定窗口 HWND, 0 = 任意)。
-async fn connect_page(port: u16, want: isize) -> anyhow::Result<WsStream> {
+pub(crate) async fn connect_page(port: u16, want: isize) -> anyhow::Result<WsStream> {
     let body = http_get(port, "/json/list").await?;
     let v: Value = serde_json::from_str(&body)?;
     let page = pick_page(&v, want)?;
@@ -459,7 +459,7 @@ async fn session_loop(
                     if let Some(cam_json) = group_cam.as_ref() {
                         if !user_cam_taken {
                             user_cam_taken = true;
-                            match eval_roundtrip(ws, &mut mid, CAM_SNAPSHOT_JS).await {
+                            match cam_get(ws, &mut mid).await {
                                 Ok(s) if !s.is_empty() => user_cam = Some(s),
                                 Ok(_) => eprintln!("[pla-cdp] v6: 用户相机快照为空(仍继续)"),
                                 Err(e) => {
@@ -467,9 +467,8 @@ async fn session_loop(
                                 }
                             }
                         }
-                        let enter_js = PLA_VIEW_APPLY_JS_TMPL.replace("__VIEW__", cam_json);
-                        match eval_roundtrip(ws, &mut mid, &enter_js).await {
-                            Ok(r) if r.starts_with("ok") => {
+                        match cam_set(ws, &mut mid, cam_json).await {
+                            Ok(r) => {
                                 eprintln!("[pla-cdp] R8: 组 {gi} 已切换到保存视角: {r}");
                             }
                             other => {
@@ -481,7 +480,7 @@ async fn session_loop(
                         // R10: 回读校验 —— 只写 camera 而 orbitControls 仍在旧
                         // target/radius 上时, 下一帧会把相机拉回原位。以前这是
                         // 静默失败(表现为"未扫到"), 现在如实报警。
-                        if let Ok(now) = eval_roundtrip(ws, &mut mid, CAM_SNAPSHOT_JS).await {
+                        if let Ok(now) = cam_get(ws, &mut mid).await {
                             match view_delta(cam_json, &now) {
                                 Ok(d) if d > 1e-3 => {
                                     eprintln!(
@@ -692,7 +691,7 @@ async fn session_loop(
                         .collect();
                     occluded_ids.extend(misses.iter().cloned());
                     // 相机快照(position/quaternion 直写直读已验证; 不碰投影矩阵)
-                    let snap = eval_roundtrip(ws, &mut mid, CAM_SNAPSHOT_JS).await;
+                    let snap = cam_get(ws, &mut mid).await;
                     let cam_saved = snap.unwrap_or_else(|e| {
                         eprintln!("[pla-cdp] cam snapshot 失败(将跳过补救): {e:#}");
                         String::new()
@@ -706,8 +705,7 @@ async fn session_loop(
                                 .find(|e| e.id == *occ_id)
                                 .and_then(|e| e.camera.clone())
                             {
-                                let enter_js = PLA_VIEW_APPLY_JS_TMPL.replace("__VIEW__", &mc);
-                                let _ = eval_roundtrip(ws, &mut mid, &enter_js).await;
+                                let _ = cam_set(ws, &mut mid, &mc).await;
                                 tokio::time::sleep(Duration::from_millis(350)).await;
                             }
                             // 1) addById 临时选中该面(navigateToSelection 只读选择,
@@ -763,8 +761,7 @@ async fn session_loop(
                             }
                         }
                         // 5) 恢复用户相机
-                        let restore_js = PLA_VIEW_APPLY_JS_TMPL.replace("__VIEW__", &cam_saved);
-                        if let Err(e) = eval_roundtrip(ws, &mut mid, &restore_js).await {
+                        if let Err(e) = cam_set(ws, &mut mid, &cam_saved).await {
                             eprintln!("[pla-cdp] 相机恢复失败: {e:#}");
                         }
                         let _ = dispatch_mouse_move(ws, &mut mid, rect.0 + rect.2 / 2, rect.1 + rect.3 / 2).await;
@@ -818,8 +815,7 @@ async fn session_loop(
                 } // ---- 'groups 循环结束 ----
                 // 全部组完成: 恢复用户相机 + 统一上报
                 if let Some(uc) = user_cam.as_ref() {
-                    let restore_js = PLA_VIEW_APPLY_JS_TMPL.replace("__VIEW__", uc);
-                    if let Err(e) = eval_roundtrip(ws, &mut mid, &restore_js).await {
+                    if let Err(e) = cam_set(ws, &mut mid, uc).await {
                         eprintln!("[pla-cdp] v6: 用户相机恢复失败: {e:#}");
                     }
                 }
@@ -1062,6 +1058,20 @@ async fn install_shim(ws: &mut WsStream, mid: &mut u64) -> Option<shim::CapsRepo
     probe_caps(ws, mid).await
 }
 
+/// 读当前视角(垫片 `cam.get`), 返回 JSON 字符串 {px..qw, zoom?, fov?, orbit?}。
+async fn cam_get(ws: &mut WsStream, mid: &mut u64) -> anyhow::Result<String> {
+    let raw = eval_roundtrip(ws, mid, &shim::call_expr(shim::api::CAM_GET, &Value::Null)).await?;
+    Ok(shim::parse_reply(&raw)?.to_string())
+}
+
+/// 切到给定视角(垫片 `cam.set`; 参数 = `cam_get` 的 JSON, 老存档可缺 orbit/zoom/fov)。
+async fn cam_set(ws: &mut WsStream, mid: &mut u64, view_json: &str) -> anyhow::Result<String> {
+    let view: Value = serde_json::from_str(view_json)
+        .map_err(|e| anyhow::anyhow!("视角 JSON 无法解析: {e}"))?;
+    let raw = eval_roundtrip(ws, mid, &shim::call_expr(shim::api::CAM_SET, &view)).await?;
+    Ok(shim::parse_reply(&raw)?.to_string())
+}
+
 /// F2: 能力探测(只读)。
 async fn probe_caps(ws: &mut WsStream, mid: &mut u64) -> Option<shim::CapsReport> {
     let raw = match eval_roundtrip(ws, mid, &shim::call_expr(shim::api::CORE_PROBE, &Value::Null)).await {
@@ -1274,96 +1284,6 @@ const MAP_READ_JS: &str = r#"(function(){
   }
   return JSON.stringify(o);})()"#;
 
-/// v5.2: 相机快照 — 返回 {px,py,pz,qx,qy,qz,qw}(JSON 字符串)。
-/// position/quaternion 直读; 绝不读/写投影参数(fov/near/zoom — 正交
-/// ProxyCamera 上 updateProjectionMatrix 有破坏性副作用, R7-31h 教训)。
-///
-/// R10: 额外尽力附带 orbit(target/focal/radius/zoom) 与 zoom/fov。原因:
-/// Plasticity 的相机由 orbitControls 驱动, 只写 camera.position/quaternion
-/// 会在下一帧被 orbit.update() 覆盖 —— 这是「选择集多视角组还原失败」的头号
-/// 嫌疑(单组=当前视角不受影响, 多组必然失败)。老存档只有 7 个数字, 消费方
-/// 必须容忍 orbit/zoom 缺失(见 `PLA_VIEW_APPLY_JS_TMPL`)。
-const CAM_SNAPSHOT_JS: &str = r#"(function(){
-  var ed=window.__PLA_EDITOR__;
-  if(!ed||!ed.selection){ var f=window.__PLA_HOOK__; if(f) ed=f.findEditor(); if(ed) window.__PLA_EDITOR__=ed; }
-  if(!ed||!ed.selection) return '';
-  var vp=null; ed.viewports.forEach(function(v){if(!vp)vp=v});
-  if(!vp||!vp.camera) return '';
-  var cam=vp.camera;
-  var o={px:cam.position.x,py:cam.position.y,pz:cam.position.z,
-    qx:cam.quaternion.x,qy:cam.quaternion.y,qz:cam.quaternion.z,qw:cam.quaternion.w};
-  try{ if(typeof cam.zoom==='number') o.zoom=cam.zoom }catch(e){}
-  try{ if(typeof cam.fov==='number') o.fov=cam.fov }catch(e){}
-  try{
-    var oc=vp.orbitControls;
-    if(oc){
-      var orb={};
-      if(oc.target&&oc.target.x!==undefined) orb.target=[oc.target.x,oc.target.y,oc.target.z];
-      if(oc.targetEnd&&oc.targetEnd.x!==undefined) orb.targetEnd=[oc.targetEnd.x,oc.targetEnd.y,oc.targetEnd.z];
-      if(oc.focalOffset&&oc.focalOffset.x!==undefined) orb.focal=[oc.focalOffset.x,oc.focalOffset.y,oc.focalOffset.z];
-      if(oc.focalOffsetEnd&&oc.focalOffsetEnd.x!==undefined) orb.focalEnd=[oc.focalOffsetEnd.x,oc.focalOffsetEnd.y,oc.focalOffsetEnd.z];
-      if(typeof oc.radius==='number') orb.radius=oc.radius;
-      if(typeof oc.radiusEnd==='number') orb.radiusEnd=oc.radiusEnd;
-      if(typeof oc.zoom==='number') orb.zoom=oc.zoom;
-      if(typeof oc.zoomEnd==='number') orb.zoomEnd=oc.zoomEnd;
-      o.orbit=orb;
-    }
-  }catch(e2){}
-  return JSON.stringify(o);})()"#;
-
-/// R10: 统一的「切到某个已存视角」脚本(把原先复制三份的内联 JS 收口)。
-/// 入参 __VIEW__ = CAM_SNAPSHOT_JS 的 JSON(可缺 orbit/zoom/fov — 老存档兼容)。
-///
-/// 顺序要点: 先写 camera, 再写 orbitControls(否则下一帧 orbit.update() 用
-/// 旧 target/radius 把相机拉回去), 最后 setNeedsRender。投影参数只在**透视**
-/// 相机上写(正交 ProxyCamera 的 updateProjectionMatrix 有破坏性副作用)。
-/// 返回 'ok:cam' / 'ok:orbit' / 'no-ed' / 'no-cam' / 'EXC:<msg>'。
-const PLA_VIEW_APPLY_JS_TMPL: &str = r#"(function(){
-  try{
-    var o=__VIEW__;
-    var ed=window.__PLA_EDITOR__;
-    if(!ed||!ed.selection){ var f=window.__PLA_HOOK__; if(f) ed=f.findEditor(); if(ed) window.__PLA_EDITOR__=ed; }
-    if(!ed||!ed.selection) return 'no-ed';
-    var vp=null; ed.viewports.forEach(function(v){if(!vp)vp=v});
-    if(!vp||!vp.camera) return 'no-cam';
-    var cam=vp.camera;
-    cam.position.set(o.px,o.py,o.pz);
-    cam.quaternion.set(o.qx,o.qy,o.qz,o.qw);
-    var persp = (cam.isPerspectiveCamera===true);
-    var proj=false;
-    if(persp){
-      try{ if(typeof o.zoom==='number' && typeof cam.zoom==='number'){ cam.zoom=o.zoom; proj=true } }catch(e1){}
-      try{ if(typeof o.fov==='number' && typeof cam.fov==='number'){ cam.fov=o.fov; proj=true } }catch(e2){}
-    }
-    var orbit=false;
-    try{
-      var oc=vp.orbitControls;
-      if(o.orbit&&oc){
-        function sv(dst,src){ if(dst&&dst.set&&src&&src.length===3){ try{ dst.set(src[0],src[1],src[2]); return true }catch(e){} } return false }
-        sv(oc.target,o.orbit.target);
-        sv(oc.targetEnd,o.orbit.targetEnd||o.orbit.target);
-        sv(oc.focalOffset,o.orbit.focal);
-        sv(oc.focalOffsetEnd,o.orbit.focalEnd||o.orbit.focal);
-        if(typeof o.orbit.radius==='number'){
-          oc.radius=o.orbit.radius;
-          oc.radiusEnd=(o.orbit.radiusEnd!==undefined&&o.orbit.radiusEnd!==null)?o.orbit.radiusEnd:o.orbit.radius;
-        }
-        if(typeof o.orbit.zoom==='number'){
-          oc.zoom=o.orbit.zoom;
-          oc.zoomEnd=(o.orbit.zoomEnd!==undefined&&o.orbit.zoomEnd!==null)?o.orbit.zoomEnd:o.orbit.zoom;
-        }
-        if(oc.quaternion&&oc.quaternion.set){
-          try{ oc.quaternion.set(o.qx,o.qy,o.qz,o.qw) }catch(e7){}
-          try{ if(oc.quaternionEnd&&oc.quaternionEnd.set) oc.quaternionEnd.set(o.qx,o.qy,o.qz,o.qw) }catch(e8){}
-        }
-        orbit=true;
-      }
-    }catch(e3){}
-    if(persp&&proj){ try{ cam.updateProjectionMatrix() }catch(e4){} }
-    try{ var oc2=vp.orbitControls; if(oc2&&typeof oc2.update==='function') oc2.update() }catch(e5){}
-    try{ vp.setNeedsRender() }catch(e6){}
-    return 'ok'+(proj?':proj':'')+(orbit?':orbit':':cam');
-  }catch(e){ return 'EXC:'+(e&&e.message?e.message:String(e)) }})()"#;
 
 /// v5.2: 转到当前选择正视(navigateToSelection, 实测相机立即响应;
 /// 动画驱动, 调用方需等待 ~700ms 让相机稳定)。
@@ -1661,7 +1581,7 @@ fn fmt_vpstate_apply_result(raw: &str) -> String {
 /// @param target_json 期望视角(CAM_SNAPSHOT_JS 输出)
 /// @param actual_json 实际回读(CAM_SNAPSHOT_JS 输出)
 /// @return 差值: 相对位移 + 2*acos(|dot(q,q')|); 解析失败时返回 Err(不撒谎说 0)。
-fn view_delta(target_json: &str, actual_json: &str) -> anyhow::Result<f64> {
+pub(crate) fn view_delta(target_json: &str, actual_json: &str) -> anyhow::Result<f64> {
     /// 取一个数字字段; 缺失或类型不对时**报错**, 不静默当 0。
     fn num(value: &Value, key: &str) -> anyhow::Result<f64> {
         value
@@ -1945,7 +1865,7 @@ async fn dispatch_mouse_move(
 }
 
 /// 发 evaluate 并收对应 id 的回包(跳过事件帧)。
-async fn eval_roundtrip(
+pub(crate) async fn eval_roundtrip(
     ws: &mut WsStream,
     mid: &mut u64,
     expr: &str,
@@ -1978,7 +1898,7 @@ async fn eval_roundtrip(
     }
 }
 
-async fn http_get(port: u16, path: &str) -> anyhow::Result<String> {
+pub(crate) async fn http_get(port: u16, path: &str) -> anyhow::Result<String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port)).await?;
     s.write_all(
@@ -2330,16 +2250,4 @@ mod tests {
         assert_eq!(fmt_vpstate_apply_result("ok:cam,orbit"), "视口状态已恢复: ok:cam,orbit");
     }
 
-    #[test]
-    fn view_apply_template_is_well_formed() {
-        let js = PLA_VIEW_APPLY_JS_TMPL.replace(
-            "__VIEW__",
-            r#"{"px":1,"py":2,"pz":3,"qx":0,"qy":0,"qz":0,"qw":1}"#,
-        );
-        assert!(!js.contains("__VIEW__"), "占位符未替换");
-        assert!(!js.contains("//"), "JS 内含 // 注释会吞掉后续代码");
-        assert!(js.ends_with("})()"), "JS 未完整收尾");
-        assert!(js.contains("orbitControls"), "缺少 orbitControls 同步(会被下一帧拉回)");
-        assert!(js.contains("setNeedsRender"));
-    }
 }

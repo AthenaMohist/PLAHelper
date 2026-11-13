@@ -25,6 +25,9 @@ pub const EDITOR_SIGNATURE: &[&str] = &["selection", "shading", "viewports"];
 /// 视口自定义元素（`orbit:rotate:*` / `viewport:*` 命令的监听器挂在它上面；keymap 也用它做选择器）。
 pub const VIEWPORT_SELECTOR: &str = "plasticity-viewport";
 
+/// 自检用空命令名（`cmd.ping` 注册并派发它，验证"注册 → 派发 → 回调"整条链）。
+pub const PING_COMMAND: &str = "pla:shim:ping";
+
 /// 接口名（与 `pla-shim.js` 的 `def()` 一一对应；新增接口两边同时加，契约测试会检查）。
 pub mod api {
     pub const CORE_PROBE: &str = "core.probe";
@@ -33,12 +36,16 @@ pub mod api {
     pub const SEL_SNAPSHOT: &str = "sel.snapshot";
     pub const HIST_STATE: &str = "hist.state";
     pub const CAM_GET: &str = "cam.get";
+    pub const CAM_SET: &str = "cam.set";
+    pub const CMD_DISPATCH: &str = "cmd.dispatch";
+    pub const CMD_PING: &str = "cmd.ping";
     pub const ERR_LAST: &str = "err.last";
     pub const TREE_LIST: &str = "tree.list";
 
     /// 全部接口名（契约测试用）。
     pub const ALL: &[&str] = &[
-        CORE_PROBE, CORE_HEALTH, CORE_APIS, SEL_SNAPSHOT, HIST_STATE, CAM_GET, ERR_LAST, TREE_LIST,
+        CORE_PROBE, CORE_HEALTH, CORE_APIS, SEL_SNAPSHOT, HIST_STATE, CAM_GET, CAM_SET, CMD_DISPATCH,
+        CMD_PING, ERR_LAST, TREE_LIST,
     ];
 }
 
@@ -56,6 +63,7 @@ pub mod cap {
     pub const SCAN: &str = "scan";
     pub const VP_STATE: &str = "vp.state";
     pub const KEYMAP: &str = "keymap";
+    pub const CMD_DISPATCH: &str = "cmd.dispatch";
     pub const ERR_HOOK: &str = "err.hook";
     pub const TREE: &str = "tree";
     pub const MAT_SET: &str = "mat.set";
@@ -66,7 +74,7 @@ pub mod cap {
     /// 全部能力名（契约测试用）。
     pub const ALL: &[&str] = &[
         EDITOR, SEL_READ, SEL_WRITE, HIST_READ, CAM_READ, CAM_WRITE, CAM_NAV, CAM_STEP, CAM_ROLL, SCAN,
-        VP_STATE, KEYMAP, ERR_HOOK, TREE, MAT_SET, CMD_EXEC, BOOL_RUN, ASSET_PLACE,
+        VP_STATE, KEYMAP, CMD_DISPATCH, ERR_HOOK, TREE, MAT_SET, CMD_EXEC, BOOL_RUN, ASSET_PLACE,
     ];
 }
 
@@ -202,6 +210,7 @@ pub fn config_json() -> Value {
         "editorGlobal": EDITOR_GLOBAL,
         "editorSignature": EDITOR_SIGNATURE,
         "viewportSelector": VIEWPORT_SELECTOR,
+        "pingCommand": PING_COMMAND,
     })
 }
 

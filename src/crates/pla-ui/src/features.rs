@@ -48,6 +48,7 @@ pub fn cap_label(c: &str) -> &'static str {
         cap::SCAN => "悬停扫描定位",
         cap::VP_STATE => "视口显示状态(着色/剖面/构造面…)",
         cap::KEYMAP => "改按键绑定(运行时)",
+        cap::CMD_DISPATCH => "注册 / 派发命令",
         cap::ERR_HOOK => "捕获命令报错",
         cap::TREE => "读取实体树(Outliner)",
         cap::MAT_SET => "材质方案",

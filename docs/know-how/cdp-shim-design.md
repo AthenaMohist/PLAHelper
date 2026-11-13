@@ -51,9 +51,11 @@
 | tree | `tree.list` | tree | ✓ F1a |
 | sel | `sel.faceIds` `sel.clear` `sel.addById` `sel.cancelCommand` | sel.write | F1b |
 | scan | `scan.begin` `scan.read` `scan.clear` `scan.end`（还原 onHover） | scan | F1b |
-| cam | `cam.set` `cam.navigateToSelection` `cam.roll` `cam.setOrbitStep` `cam.vpRect` `cam.render` | cam.write / cam.nav / cam.step / cam.roll | F1b |
+| cam | `cam.set` | cam.write | ✓ R20（cdp.rs 相机读写已全部改走垫片） |
+| cmd | `cmd.dispatch` `cmd.ping`（自检: 注册→派发→回调） | cmd.dispatch | ✓ R20 |
+| cam | `cam.navigateToSelection` `cam.roll` `cam.setOrbitStep` `cam.vpRect` `cam.render` | cam.nav / cam.step / cam.roll | F1b |
 | vp | `vp.save` `vp.restore` | vp.state | F1b |
-| cmd | `cmd.dispatch` `cmd.setArrowBindings` | cmd.dispatch / keymap | F1b |
+| cmd | `cmd.setArrowBindings` | keymap | F1b |
 | 预留 | `mat.set`(N1) `cmd.exec`(N2) `bool.run`(N4) `asset.place`(N5) | 探测显示 todo | N 节 |
 
 ## 4b. 能力 → 功能 → 界面（F2）

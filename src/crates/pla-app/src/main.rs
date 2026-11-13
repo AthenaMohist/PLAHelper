@@ -245,6 +245,7 @@ fn main() {
         println!("  entities <doc_key>                            列出 bridge 实体(id/kind/name)");
         println!("  cdp-eval <js>                                 经 CDP(9333) 在 Plasticity renderer 执行 JS");
         println!("  cdp-probe                                     注入垫片 __PLA__ 并打印能力探测 + 只读接口回读");
+        println!("  cdp-selftest [--hwnd N] [--json 文件]          CDP 契约自检(不改动文档); 退出码 0 通过/1 有失败/2 连不上");
         println!("  doc-list / ping");
         return;
     }
@@ -303,6 +304,46 @@ fn main() {
                 }
                 Err(e) => { eprintln!("CDP ERROR: {e}"); std::process::exit(1); }
             }
+        },
+        "cdp-selftest" => {
+            // F3: 契约自检(传输/垫片/能力/只读/回环/守护), 绝不改动文档。
+            let mut hwnd: Option<isize> = None;
+            let mut json_out: Option<String> = None;
+            let mut it = a.iter();
+            while let Some(x) = it.next() {
+                match x.as_str() {
+                    "--hwnd" => hwnd = it.next().and_then(|v| v.parse().ok()),
+                    "--json" => json_out = it.next().cloned(),
+                    other => { eprintln!("未知参数: {other}(可用 --hwnd <N> --json <文件>)"); std::process::exit(2); }
+                }
+            }
+            let rep = rt.block_on(pla_bridge::selftest::run(9333, 9334, hwnd));
+            use pla_bridge::selftest::Level;
+            println!("PLAhelper CDP 自检 — 目标: {}", rep.target.as_deref().unwrap_or("(未确定)"));
+            let mut stage = "";
+            for c in &rep.checks {
+                if c.stage != stage {
+                    stage = c.stage;
+                    println!("\n[{stage}]");
+                }
+                if c.detail.is_empty() {
+                    println!("  {:<4}  {}", c.level.tag(), c.name);
+                } else {
+                    println!("  {:<4}  {:<28} {}", c.level.tag(), c.name, c.detail);
+                }
+            }
+            println!(
+                "\n汇总: {} PASS · {} WARN · {} FAIL · {} SKIP{}",
+                rep.count(Level::Pass), rep.count(Level::Warn), rep.count(Level::Fail), rep.count(Level::Skip),
+                if rep.aborted { "(传输层失败, 后续未执行)" } else { "" }
+            );
+            if let Some(p) = json_out {
+                match std::fs::write(&p, serde_json::to_string_pretty(&rep.to_json()).unwrap()) {
+                    Ok(()) => println!("报告已写入 {p}"),
+                    Err(e) => eprintln!("报告写入失败: {e}"),
+                }
+            }
+            std::process::exit(rep.exit_code());
         },
         "doc-list" => println!("{}", serde_json::to_string_pretty(&state.cmd_doc_list()).unwrap()),
         "snapshot-create" => { need(3);
