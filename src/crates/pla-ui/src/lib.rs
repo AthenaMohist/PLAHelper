@@ -4,6 +4,7 @@ pub mod diag;
 pub mod features;
 pub mod hotkey;
 pub mod plasticity_config;
+pub mod prefs;
 pub mod round_corners;
 pub mod sel_labels;
 pub mod selection;

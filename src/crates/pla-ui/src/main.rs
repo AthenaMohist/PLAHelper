@@ -115,6 +115,8 @@ const PANEL_CAPS: [f32; 2] = [320.0, 600.0];
 fn main() -> eframe::Result<()> {
     pla_ui::diag::install_panic_hook();
     pla_ui::diag::log("start");
+    // R25: 界面语言(偏好文件; 默认简体中文)。
+    pla_bridge::i18n::set(pla_ui::prefs::load_lang());
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size(TOOLBAR_SIZE)
@@ -168,7 +170,8 @@ struct PlaApp {
     sel_members: Vec<String>,
     /// CDP 会话句柄(R7-14): 实时选择/实体树通道(Plasticity 需 PLA-CDP 补丁版启动)。
     cdp: pla_bridge::cdp::CdpHandle,
-    cdp_status: String,
+    /// R25: CDP 连接状态(结构化; 文本按当前语言生成, 颜色按变体, 不再字符串匹配)。
+    cdp_conn: pla_bridge::cdp::ConnState,
     /// F2: 最近一次能力探测(None = CDP 未连接/未探测)。功能可用性一律经 `features` 表判定。
     cdp_caps: Option<pla_bridge::shim::CapsReport>,
     /// 最近一次收到能力探测的时刻。
@@ -438,7 +441,7 @@ fn hud_size(
 struct CapsView {
     caps: Option<pla_bridge::shim::CapsReport>,
     age_s: Option<u64>,
-    cdp_status: String,
+    cdp_conn: pla_bridge::cdp::ConnState,
     proxy_status: String,
     bridge_status: String,
 }
@@ -503,7 +506,7 @@ fn caps_panel_ui(ui: &mut egui::Ui, v: &CapsView, reprobe: &mut bool) {
             ],
         )),
         |ui| {
-            value_row(ui, "连接", &v.cdp_status, cdp_status_color(&v.cdp_status));
+            value_row(ui, "连接", &v.cdp_conn.text(), cdp_conn_color(&v.cdp_conn));
             value_row(ui, "代理", &v.proxy_status, COL_TEXT);
             // Bridge 是只读冗余通道(实体网格), 与 CDP 能力无关; 断开不影响本面板任何功能。
             value_row(ui, "Bridge(只读)", &v.bridge_status, status_color(&v.bridge_status));
@@ -646,14 +649,13 @@ mod select_all_tests {
     }
 }
 
-/// CDP 状态文本(pla-bridge `CdpEvent::Status`)→ 圆点颜色(U7 语义: 黄 连接中 / 绿 已连接 / 红 未连上)。
-fn cdp_status_color(status: &str) -> egui::Color32 {
-    if status.contains("已连接") {
-        COL_GREEN
-    } else if status.contains("连接中") || status.contains("重试中") {
-        COL_YELLOW
-    } else {
-        COL_RED
+/// CDP 连接状态 → 圆点颜色(U7 语义: 黄 连接中 / 绿 已连接 / 红 未连上)。按变体判定, 与界面语言无关。
+fn cdp_conn_color(c: &pla_bridge::cdp::ConnState) -> egui::Color32 {
+    use pla_bridge::cdp::ConnState;
+    match c {
+        ConnState::Connected => COL_GREEN,
+        ConnState::Connecting | ConnState::Timeout => COL_YELLOW,
+        _ => COL_RED,
     }
 }
 
@@ -1729,7 +1731,7 @@ impl PlaApp {
             sel_name: String::new(),
             sel_members: Vec::new(),
             cdp: pla_bridge::cdp::CdpHandle::spawn(9333),
-            cdp_status: "CDP 连接中…".into(),
+            cdp_conn: pla_bridge::cdp::ConnState::Connecting,
             cdp_caps: None,
             cdp_caps_at: None,
             root_hwnd: None,
@@ -1807,8 +1809,12 @@ impl PlaApp {
         // CDP 事件: 实时选择/实体树/状态(R7-14)。
         while let Some(ev) = self.cdp.poll() {
             match ev {
-                pla_bridge::cdp::CdpEvent::Status(s) => {
-                    self.cdp_status = s;
+                pla_bridge::cdp::CdpEvent::Conn(c) => {
+                    self.cdp_conn = c;
+                }
+                // R25: 操作结果走通知(成功绿 / 失败红), 不再覆盖连接状态。
+                pla_bridge::cdp::CdpEvent::Report { ok, msg } => {
+                    self.set_notice((!ok, msg));
                     // R7-26: 「应用」回包后把焦点交还 Plasticity ——
                     // 工具栏是独立窗口, 焦点留在它上面时 Plasticity 收不到键盘
                     // 事件, 主程序"任何操作都不生效"(用户实测)。
@@ -1978,7 +1984,7 @@ impl PlaApp {
 
     /// 自动快照(R7-15, PRD P0-1): 定时 + 定步数 + mtime 防重 + 清理策略。
     fn auto_snapshot_tick(&mut self) {
-        if !self.auto_snap_enabled || !self.cdp_status.contains("已连接") {
+        if !self.auto_snap_enabled || !self.cdp_conn.is_connected() {
             return;
         }
         // 定时
@@ -2412,7 +2418,7 @@ impl PlaApp {
 
     /// CDP 通道是否已连上 Plasticity。
     fn cdp_connected(&self) -> bool {
-        self.cdp_status.contains("已连接")
+        self.cdp_conn.is_connected()
     }
 
     /// F2: 功能不可用的原因(None = 可用, 降级也算可用)。判定一律走 `features` 表。
@@ -2800,7 +2806,7 @@ impl eframe::App for PlaApp {
                     let dot_color = if self.snap_target.is_none() {
                         COL_GRAY_DOT
                     } else {
-                        cdp_status_color(&self.cdp_status)
+                        cdp_conn_color(&self.cdp_conn)
                     };
                     ui.painter().circle_filled(dot_rect.center(), 4.0, dot_color);
                     // F2: 外环只在能力受损时出现(黄 部分可用 / 红 未找到编辑器); 全部可用或未连接不画。
@@ -3484,7 +3490,7 @@ impl eframe::App for PlaApp {
                             .show_inside(ui, |ui| {
                         section_header(ui, "ENTITIES");
                         ui.label(
-                            egui::RichText::new(format!("实时选择({} 项): {}", self.sel_cdp_members.len(), self.cdp_status))
+                            egui::RichText::new(format!("实时选择({} 项): {}", self.sel_cdp_members.len(), self.cdp_conn.text()))
                                 .small()
                                 .color(COL_MUTED),
                         );
@@ -4308,6 +4314,30 @@ impl eframe::App for PlaApp {
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
                         ui.spacing_mut().item_spacing.y = 6.0;
+                        // ---- R25: 界面语言(一键切换, 立即生效, 记入 ui-prefs.json) ----
+                        // 选项用各自语言的名字显示(简体中文 / English), 无论当前是哪种语言都认得出来。
+                        settings_card(ui, "LANGUAGE", None, |ui| {
+                            let cur = pla_bridge::i18n::get();
+                            let w = ((ui.available_width() - 8.0) / 2.0).max(60.0);
+                            ui.horizontal(|ui| {
+                                for lang in pla_bridge::i18n::Lang::ALL {
+                                    let on = cur == lang;
+                                    let btn = egui::Button::new(
+                                        egui::RichText::new(lang.native_name())
+                                            .color(if on { egui::Color32::BLACK } else { COL_TEXT }),
+                                    )
+                                    .fill(if on { COL_ACCENT } else { COL_BTN })
+                                    .rounding(egui::Rounding::same(6.0))
+                                    .min_size(egui::vec2(w, 24.0));
+                                    if ui.add(btn).clicked() && !on {
+                                        pla_bridge::i18n::set(lang);
+                                        if let Err(e) = pla_ui::prefs::save_lang(lang) {
+                                            self.set_notice((true, e));
+                                        }
+                                    }
+                                }
+                            });
+                        });
                         settings_card(
                             ui,
                             "BRIDGE",
@@ -4344,7 +4374,7 @@ impl eframe::App for PlaApp {
                             )),
                             |ui| {
                                 let cdp_col = if self.cdp_connected() { COL_GREEN } else { COL_MUTED };
-                                value_row(ui, "CDP", &self.cdp_status, cdp_col);
+                                value_row(ui, "CDP", &self.cdp_conn.text(), cdp_col);
                                 value_row(ui, "代理", &self.proxy.status, COL_TEXT);
                         let mut cdp_on = self.cdp_startup.unwrap_or(false);
                         if toggle_row(
@@ -4555,7 +4585,7 @@ impl eframe::App for PlaApp {
                 let view = CapsView {
                     caps: self.cdp_caps.clone(),
                     age_s: self.cdp_caps_at.map(|t| t.elapsed().as_secs()),
-                    cdp_status: self.cdp_status.clone(),
+                    cdp_conn: self.cdp_conn.clone(),
                     proxy_status: self.proxy.status.clone(),
                     bridge_status: self.bridge_status_text(),
                 };

@@ -73,8 +73,11 @@ pub struct ApplyEntry {
 /// CDP 线程 → UI 事件。
 #[derive(Debug, Clone)]
 pub enum CdpEvent {
-    /// 连接状态。
-    Status(String),
+    /// R25: 连接状态(结构化; 界面按变体显示文本与颜色, 不再字符串匹配)。
+    Conn(ConnState),
+    /// R25: 一次操作的结果(选择集应用、视口恢复、截图失败…); ok 决定界面用绿色还是红色。
+    /// 以前和连接状态共用一个 Status(String), 结果文本把"已连接"冲掉、连接指示变红。
+    Report { ok: bool, msg: String },
     /// 实时选择快照（st=ok 时有意义）。
     Selection(SelectionSnapshot),
     /// 实体树（OutlinerSection 平铺, 含 curves/instances）。
@@ -89,6 +92,45 @@ pub enum CdpEvent {
     RequestFocus,
     /// F2: 能力探测结果(变化时才发)。None = CDP 断开, 能力未知。
     Caps(Option<shim::CapsReport>),
+}
+
+/// R25: CDP 连接状态。
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConnState {
+    /// 启动后尚未有结果。
+    Connecting,
+    Connected,
+    /// 连不上, 等待重试。refused = 9333 无人监听(Plasticity 未以 CDP 模式运行 / 代理没起)。
+    Waiting { detail: String, refused: bool },
+    /// 连接尝试超时(典型: Plasticity 刚启动, renderer 未就绪)。
+    Timeout,
+    /// 会话中途断开(原因)。
+    Disconnected(String),
+    /// CDP 线程起不来。
+    Failed(String),
+}
+
+impl ConnState {
+    pub fn is_connected(&self) -> bool {
+        matches!(self, ConnState::Connected)
+    }
+
+    /// 当前界面语言下的文本。
+    pub fn text(&self) -> String {
+        use crate::i18n::tr;
+        match self {
+            ConnState::Connecting => tr("CDP 连接中…", "CDP connecting…").into(),
+            ConnState::Connected => tr("CDP 已连接", "CDP connected").into(),
+            ConnState::Waiting { detail, refused: true } => crate::t!(
+                "CDP 等待中: 9333 无监听 — Plasticity 未以 CDP 模式运行, 或代理未启动({detail})",
+                "CDP waiting: nothing on 9333 — Plasticity not in CDP mode, or proxy not running ({detail})"
+            ),
+            ConnState::Waiting { detail, .. } => crate::t!("CDP 等待中({detail})", "CDP waiting ({detail})"),
+            ConnState::Timeout => tr("CDP 连接超时, 重试中…", "CDP connection timed out, retrying…").into(),
+            ConnState::Disconnected(e) => crate::t!("CDP 断开: {e}", "CDP disconnected: {e}"),
+            ConnState::Failed(e) => crate::t!("CDP 线程启动失败: {e}", "CDP thread failed to start: {e}"),
+        }
+    }
 }
 
 /// 一个选中条目。
@@ -186,7 +228,7 @@ fn cdp_thread_main(
     let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
         Ok(rt) => rt,
         Err(e) => {
-            let _ = ev_tx.send(CdpEvent::Status(format!("CDP 线程启动失败: {e}")));
+            let _ = ev_tx.send(CdpEvent::Conn(ConnState::Failed(e.to_string())));
             return;
         }
     };
@@ -200,10 +242,10 @@ fn cdp_thread_main(
             let want = target.load(Ordering::Relaxed);
             match tokio::time::timeout(Duration::from_secs(5), connect_page(port, want)).await {
                 Ok(Ok(mut ws)) => {
-                    let _ = ev_tx.send(CdpEvent::Status("CDP 已连接".into()));
+                    let _ = ev_tx.send(CdpEvent::Conn(ConnState::Connected));
                     if let Err(e) = session_loop(&mut ws, &cmd_rx, &ev_tx, &target, want).await {
                         eprintln!("[pla-cdp] session err: {e:#}");
-                        let _ = ev_tx.send(CdpEvent::Status(format!("CDP 断开: {e}")));
+                        let _ = ev_tx.send(CdpEvent::Conn(ConnState::Disconnected(e.to_string())));
                     }
                     // F2: 断开后能力未知(面板回到"未连接", 不保留过期的能力表)。
                     let _ = ev_tx.send(CdpEvent::Caps(None));
@@ -214,19 +256,15 @@ fn cdp_thread_main(
                     // appendSwitch 9333, 拒连只可能是: Plasticity 未启动, 或运行中的
                     // 实例是补丁部署前启动的旧实例(index.js 是启动时加载的)。
                     // 给出可执行指引, 不再让用户对着「积极拒绝」猜。
-                    let msg = format!("{e}");
-                    let hint = if msg.contains("10061") {
-                        " — 9333 无监听: Plasticity 未启动, 或是补丁部署前启动的旧实例。保存文件并重启 Plasticity 即可(补丁已装, 普通启动即生效)"
-                    } else {
-                        ""
-                    };
-                    let _ = ev_tx.send(CdpEvent::Status(format!("CDP 等待中({e}){hint}")));
+                    let detail = format!("{e}");
+                    let refused = detail.contains("10061");
+                    let _ = ev_tx.send(CdpEvent::Conn(ConnState::Waiting { detail, refused }));
                 }
                 Err(_) => {
                     eprintln!("[pla-cdp] connect timeout(5s)");
                     // 5s 超时: 连接挂起(典型为 Plasticity 启动初期 renderer 未就绪),
                     // 丢弃重试 — 状态照常上报, UI 不会永远停在「连接中」。
-                    let _ = ev_tx.send(CdpEvent::Status("CDP 连接超时, 重试中…".into()));
+                    let _ = ev_tx.send(CdpEvent::Conn(ConnState::Timeout));
                 }
             }
             // 断开冷却 + 处理积压命令
@@ -360,7 +398,7 @@ async fn session_loop(
                 // 取代 R7-R21 的悬停扫网格 + 真实点击 + 遮挡补救 + 下钻补点(漏面、受遮挡/视角/后台节流影响)。
                 // 见 docs/know-how/selection-by-command.md。
                 if entries.is_empty() {
-                    let _ = ev_tx.send(CdpEvent::Status("选择集应用: 成员为空".into()));
+                    let _ = ev_tx.send(CdpEvent::Report { ok: false, msg: crate::i18n::tr("选择集应用: 成员为空", "Apply selection set: no members").into() });
                     continue;
                 }
                 let items: Vec<Value> = entries
@@ -368,11 +406,11 @@ async fn session_loop(
                     .map(|e| serde_json::json!({ "kind": e.kind, "id": e.id }))
                     .collect();
                 let args = serde_json::json!({ "items": items, "replace": true });
-                let msg = match shim_call(ws, &mut mid, shim::api::SEL_APPLY, args).await {
+                let (ok, msg) = match shim_call(ws, &mut mid, shim::api::SEL_APPLY, args).await {
                     Ok(v) => sel_apply_message(entries.len(), &v),
-                    Err(e) => format!("选择集应用失败: {e}"),
+                    Err(e) => (false, crate::t!("选择集应用失败: {e}", "Apply selection set failed: {e}")),
                 };
-                let _ = ev_tx.send(CdpEvent::Status(msg));
+                let _ = ev_tx.send(CdpEvent::Report { ok, msg });
             }
             // ---- R8-1: 视口状态采集/恢复 + 视口裁剪截图 ----
             Ok(CdpCmd::VpStateSave) => {
@@ -384,14 +422,14 @@ async fn session_loop(
                 let _ = ev_tx.send(CdpEvent::VpStateResult(s));
             }
             Ok(CdpCmd::VpStateApply(state)) => {
-                let msg = match serde_json::from_str::<Value>(&state) {
-                    Err(e) => format!("视口状态恢复失败: 存档无法解析({e})"),
+                let (ok, msg) = match serde_json::from_str::<Value>(&state) {
+                    Err(e) => (false, crate::t!("视口状态恢复失败: 存档无法解析({e})", "Restore viewport state failed: unreadable save ({e})")),
                     Ok(s) => match shim_call(ws, &mut mid, shim::api::VP_RESTORE, s).await {
                         Ok(r) => fmt_vpstate_apply_result(&r.to_string()),
-                        Err(e) => format!("视口状态恢复失败: {e}"),
+                        Err(e) => (false, crate::t!("视口状态恢复失败: {e}", "Restore viewport state failed: {e}")),
                     },
                 };
-                let _ = ev_tx.send(CdpEvent::Status(msg));
+                let _ = ev_tx.send(CdpEvent::Report { ok, msg });
             }
             Ok(CdpCmd::CaptureViewport(out_path)) => {
                 // 视口 DOM rect(CSS px) → clip(逻辑 px); captureScreenshot
@@ -399,9 +437,7 @@ async fn session_loop(
                 let clip: Value = match shim_call(ws, &mut mid, shim::api::CAM_VP_RECT, Value::Null).await {
                     Ok(v) => v,
                     Err(e) => {
-                        let _ = ev_tx.send(CdpEvent::Status(format!(
-                            "视口截图失败: 读不到视口区域({e}), 仍将保存, 无缩略图"
-                        )));
+                        let _ = ev_tx.send(CdpEvent::Report { ok: false, msg: crate::t!("视口截图失败: 读不到视口区域({e}), 仍将保存, 无缩略图", "Viewport screenshot failed: cannot read viewport area ({e}); saving without thumbnail") });
                         let _ = ev_tx.send(CdpEvent::ViewportPng(0));
                         continue;
                     }
@@ -420,7 +456,7 @@ async fn session_loop(
                 });
                 mid += 1;
                 if let Err(e) = ws_send(ws, shot).await {
-                    let _ = ev_tx.send(CdpEvent::Status(format!("视口截图失败: {e}")));
+                    let _ = ev_tx.send(CdpEvent::Report { ok: false, msg: crate::t!("视口截图失败: {e}", "Viewport screenshot failed: {e}") });
                     continue;
                 }
                 // 等回包(带 data 字段的 base64)
@@ -450,16 +486,12 @@ async fn session_loop(
                                         Ok(bytes) => {
                                             png_len = bytes.len();
                                             if let Err(e) = std::fs::write(&out_path, bytes) {
-                                                let _ = ev_tx.send(CdpEvent::Status(format!(
-                                                    "视口截图写盘失败: {e}"
-                                                )));
+                                                let _ = ev_tx.send(CdpEvent::Report { ok: false, msg: crate::t!("视口截图写盘失败: {e}", "Writing viewport screenshot failed: {e}") });
                                                 continue;
                                             }
                                         }
                                         Err(e) => {
-                                            let _ = ev_tx.send(CdpEvent::Status(format!(
-                                                "视口截图解码失败: {e}"
-                                            )));
+                                            let _ = ev_tx.send(CdpEvent::Report { ok: false, msg: crate::t!("视口截图解码失败: {e}", "Decoding viewport screenshot failed: {e}") });
                                             continue;
                                         }
                                     }
@@ -472,9 +504,7 @@ async fn session_loop(
                 if png_len > 0 {
                     let _ = ev_tx.send(CdpEvent::ViewportPng(png_len));
                 } else {
-                    let _ = ev_tx.send(CdpEvent::Status(
-                        "视口截图失败: 未收到截图数据(仍将保存, 无缩略图)".into(),
-                    ));
+                    let _ = ev_tx.send(CdpEvent::Report { ok: false, msg: crate::i18n::tr("视口截图失败: 未收到截图数据(仍将保存, 无缩略图)", "Viewport screenshot failed: no image data received (saving without thumbnail)").into() });
                     // R8b: 失败也发 ViewportPng(0) — UI 的 pending 保存流程
                     // (选择集/视口状态)靠该事件落盘, 不发会永远挂起无法保存。
                     let _ = ev_tx.send(CdpEvent::ViewportPng(0));
@@ -484,7 +514,7 @@ async fn session_loop(
             //  v4+ 真实点击管线自身建立活跃实体上下文, 无需武装。)
             Ok(CdpCmd::Key(spec)) => {
                 if let Err(e) = dispatch_key(ws, &mut mid, &spec).await {
-                    let _ = ev_tx.send(CdpEvent::Status(format!("按键派发失败: {e}")));
+                    let _ = ev_tx.send(CdpEvent::Report { ok: false, msg: crate::t!("按键派发失败: {e}", "Key dispatch failed: {e}") });
                 }
             }
             Err(TryRecvError::Disconnected) => return Err(anyhow::anyhow!("ui gone")),
@@ -564,7 +594,8 @@ pub(crate) async fn shim_call(ws: &mut WsStream, mid: &mut u64, name: &str, args
 }
 
 /// `sel.apply` 回包 → 状态栏文字(如实列出没选上 / 不支持的成员)。
-fn sel_apply_message(total: usize, v: &Value) -> String {
+/// 返回 (是否完全成功, 文本)。
+fn sel_apply_message(total: usize, v: &Value) -> (bool, String) {
     let list = |k: &str| -> Vec<String> {
         v[k].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default()
     };
@@ -573,20 +604,25 @@ fn sel_apply_message(total: usize, v: &Value) -> String {
     let extra = list("extra");
     let ok = total.saturating_sub(missing.len() + unsupported.len());
     if missing.is_empty() && unsupported.is_empty() && extra.is_empty() {
-        return format!("选择集已应用: {ok} 项全部选中");
+        return (true, crate::t!("选择集已应用: {ok} 项全部选中", "Selection set applied: all {ok} items selected"));
     }
     let mut parts = Vec::new();
     if !missing.is_empty() {
         let head: Vec<&str> = missing.iter().take(3).map(String::as_str).collect();
-        parts.push(format!("{} 项找不到或没选上({}{})", missing.len(), head.join(", "), if missing.len() > 3 { "…" } else { "" }));
+        let more = if missing.len() > 3 { "…" } else { "" };
+        let (n, h) = (missing.len(), head.join(", "));
+        parts.push(crate::t!("{n} 项找不到或没选上({h}{more})", "{n} not found or not selected ({h}{more})"));
     }
     if !unsupported.is_empty() {
-        parts.push(format!("{} 项类型暂不支持", unsupported.len()));
+        let n = unsupported.len();
+        parts.push(crate::t!("{n} 项类型暂不支持", "{n} of an unsupported type"));
     }
     if !extra.is_empty() {
-        parts.push(format!("多选了 {} 项", extra.len()));
+        let n = extra.len();
+        parts.push(crate::t!("多选了 {n} 项", "{n} extra selected"));
     }
-    format!("选择集应用: {ok}/{total} 项选中; {}", parts.join("; "))
+    let detail = parts.join("; ");
+    (false, crate::t!("选择集应用: {ok}/{total} 项选中; {detail}", "Selection set: {ok}/{total} selected; {detail}"))
 }
 
 /// 不关心结果的垫片调用(收尾/唤醒类): 失败只记日志。
@@ -730,9 +766,10 @@ fn selection_from_batch(raw: &str) -> SelectionSnapshot {
 ///
 /// @param raw CDP 回包字符串
 /// @return 给面板显示的中文摘要
-fn fmt_vpstate_apply_result(raw: &str) -> String {
+/// 返回 (是否完全成功, 文本)。
+fn fmt_vpstate_apply_result(raw: &str) -> (bool, String) {
     let Ok(v) = serde_json::from_str::<Value>(raw) else {
-        return format!("视口状态已恢复: {raw}");
+        return (true, crate::t!("视口状态已恢复: {raw}", "Viewport state restored: {raw}"));
     };
     /// 把 JSON 数组转成可读列表。
     fn list(v: &Value, key: &str) -> Vec<String> {
@@ -750,18 +787,22 @@ fn fmt_vpstate_apply_result(raw: &str) -> String {
     let missing = list(&v, "missing");
     let failed = list(&v, "failed");
 
-    let mut msg = if applied.is_empty() && failed.is_empty() {
-        "视口状态恢复: 没有任何项被应用".to_string()
+    let nothing = applied.is_empty() && failed.is_empty();
+    let mut msg = if nothing {
+        crate::i18n::tr("视口状态恢复: 没有任何项被应用", "Restore viewport state: nothing was applied").to_string()
     } else {
-        format!("视口状态已恢复: {}", applied.join("/"))
+        let a = applied.join("/");
+        crate::t!("视口状态已恢复: {a}", "Viewport state restored: {a}")
     };
     if !failed.is_empty() {
-        msg.push_str(&format!(" | 部分失败: {}", failed.join(", ")));
+        let f = failed.join(", ");
+        msg.push_str(&crate::t!(" | 部分失败: {f}", " | partly failed: {f}"));
     }
     if !missing.is_empty() {
-        msg.push_str(&format!(" | 存档未含: {}", missing.join(", ")));
+        let m = missing.join(", ");
+        msg.push_str(&crate::t!(" | 存档未含: {m}", " | not in save: {m}"));
     }
-    msg
+    (!nothing && failed.is_empty(), msg)
 }
 
 /// R10: 比较两个 CAM_SNAPSHOT_JS 回包的差异(相对位移 + 四元数夹角, 无量纲)。
@@ -1095,19 +1136,22 @@ mod tests {
     fn fmt_vpstate_apply_result_reports_failures() {
         // 全部应用成功
         let ok = r#"{"applied":["cam","orbit","shading"],"missing":[],"failed":[]}"#;
-        let s = fmt_vpstate_apply_result(ok);
+        let (good, s) = fmt_vpstate_apply_result(ok);
+        assert!(good, "全部应用 = 成功");
         assert!(s.contains("cam"), "{s}");
         assert!(!s.contains("失败"), "{s}");
         // 部分失败必须如实带出来(旧实现会谎报"已恢复")
         let bad = r#"{"applied":["cam"],"missing":["grid"],"failed":["shading:cannot read"]}"#;
-        let s = fmt_vpstate_apply_result(bad);
+        let (good, s) = fmt_vpstate_apply_result(bad);
+        assert!(!good, "部分失败 = 不算成功(界面显示红色)");
         assert!(s.contains("shading:cannot read"), "{s}");
         assert!(s.contains("存档未含"), "{s}");
         // 什么都没应用
         let none = r#"{"applied":[],"missing":["cam"],"failed":[]}"#;
-        assert!(fmt_vpstate_apply_result(none).contains("没有任何项被应用"));
+        assert!(fmt_vpstate_apply_result(none).1.contains("没有任何项被应用"));
+        assert!(!fmt_vpstate_apply_result(none).0);
         // 老格式 / 坏数据原样透出, 不丢信息
-        assert_eq!(fmt_vpstate_apply_result("ok:cam,orbit"), "视口状态已恢复: ok:cam,orbit");
+        assert_eq!(fmt_vpstate_apply_result("ok:cam,orbit").1, "视口状态已恢复: ok:cam,orbit");
     }
 
 }
