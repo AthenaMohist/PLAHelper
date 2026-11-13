@@ -17,6 +17,15 @@
 | 13 | 新面板先白底、错位闪现 ~1s | immediate 子视口建好就显示, 下一次重绘前是未绘制白底 | 先 `with_visible(false)` 渲染 2 帧(定位+圆角)再显示。**egui 0.29 坑**: `ViewportBuilder::patch` 判断 visible 变化时误与 `self.active` 比较, `with_active(true)` 的窗口永远收不到 Visible(true) → 必须在子视口内显式 `send_viewport_cmd(Visible(true))`, 且显示后 builder 不再带 with_visible |
 | 15 | 最大化时工具栏不在顶栏垂直居中(偏低 11px) | `PrintWindow` 位图原点是**窗口矩形**(最大化时为 -11,-11), 不是客户区; R12 从位图 (0,0) 裁条带又加了客户区偏移 = 双重补偿 | 位图按窗口矩形尺寸分配, 条带从 (客户区原点 - 窗口原点) 处裁(R13) |
 | 16 | 每个二级面板在任务栏都有一个"未知程序"按钮 | winit 给所有无 owner 窗口加 `WS_EX_APPWINDOW`(强制上任务栏, 被拥有窗口也一样), 且每次窗口标志变化都整体重写 GWL_EXSTYLE(`WS_EX_TOOLWINDOW` 会被冲掉); `with_taskbar(false)` 只在创建时 DeleteTab, 隐藏创建后再显示会失效 | 隐藏阶段设 owner(`GWLP_HWNDPARENT` = 工具栏) + 清 `WS_EX_APPWINDOW`; winit 先 ShowWindow 后重写样式, 系统在首次显示时决定建不建按钮(R13) |
+| 17 | keymap 加的方向键绑定完全无效 | 写在 `'orbit-controls'` 选择器下: 它是轨道控制器自己按名字读的**虚拟选择器**(鼠标手势用), 页面里没有这个元素, 键盘匹配永远落空 | 键盘绑定必须用真实 DOM 选择器: `plasticity-viewport`(`orbit:rotate:*` 监听器挂在这里; 键盘管理器把按键目标设为最后指针所在的 CANVAS)(R14) |
+| 18 | 改 settings.json 的 rotateDiscreteIncrement 不生效 | Plasticity 不重载 settings.json; 值被缓存在各视口 `orbitControls.rotateDiscreteIncrement`, 改 `ed.settings`/调 `onSettingsChanged` 都无效 | CDP 直接改各视口 `orbitControls.rotateDiscreteIncrement`(并同步 `ed.settings`, 防 Plasticity 写回旧值)(R14) |
+| 19 | 自动化测试里方向键送不到 Plasticity | 为抢前台点了一下 Alt: Electron 窗口进入菜单模式, 后续方向键被菜单吃掉 | 抢前台用 Shift 等不触发菜单的键; 或不注入按键, 直接对 `<plasticity-viewport>` 派发命令事件 |
+| 20 | CDP 期间 Plasticity 崩溃 | `pla-cdp-v8.js` 的"已暴露 editor"快路径判断 `pre === true` 永不成立(返回的是 CDP 结果对象) → **每个新会话都拍一次 ~160MB 堆快照**; 并发会话还会写坏同一快照文件; 每个会话还 detach/attach 共享调试器, 把其他会话踢掉 | 快路径改判 `pre.result.value`; 定位单飞(串行); 调试器只 attach 一次(R14) |
+| 21 | 经 CDP 注册的自定义命令不生效 | Plasticity 的 `CommandRegistry.add` 只有对象形式 `add(target, {命令名: 回调})`(arity 2), Atom 的三参 `add(target, name, fn)` 静默无效 | 用对象形式; 幂等判断查 `inlineListenersByCommandName[名].has(el)`, 不靠自设标记(R14) |
+| 22 | 关掉 `pla-cdp-v8.js launch` 的终端, Plasticity 跟着被杀(未保存的工作丢失) | Node(libuv)把非 detached 子进程放进"父进程退出即杀"的作业对象 | launch 改 `detached: true`; 默认改为快捷方式直接带参数启动 Plasticity, 代理是独立进程, 挂了不影响 Plasticity(R14) |
+| 23 | 停用"CDP 模式启动"会删掉 .plasticity 的用户级关联 | Plasticity 安装器本身就在 HKCU 写了 `plasticity_auto_file\shell\open\command`, 不是我们新建的 | 启用时把原命令备份到 `PlaHelperPrevCommand`, 停用时写回; 只有整键是我们新建(`PlaHelperCreated`)才整键删除(R14) |
+| 24 | 二级面板输入框白底、文字悬停变黑、很多字看不清 | egui 0.29 `set_style` 只改"当前主题", 主题默认跟随系统; 系统浅色时子面板用浅色主题控件, 贴在我们手绘的深色面板上 | `set_theme(Dark)` + `set_style_of(Dark/Light, 同一样式)`(R15) |
+| 25 | 悬停说明浮窗右侧文字被截断 | 横排(`ui.horizontal`)里的 Label 默认不换行, 超宽会撑大内容区, 连带后续换行文字都越过右边框 | 说明文字一律 `Label::new(..).wrap()`(R15) |
 | 14 | 切换面板时旧面板滞留、新面板不出现、点击丢失 | R12 加深的文档定位(`find_latest_doc`)每次未命中都全盘深扫(热缓存 ~2s, 冷缓存 ~19s), 面板每帧取文档目录, 2s TTL 一过就在 UI 线程重扫 | 分阶段: leveldb + Recent 命中即返回; 深扫未命中负缓存 60s(R13) |
 
 ## 假按钮教训

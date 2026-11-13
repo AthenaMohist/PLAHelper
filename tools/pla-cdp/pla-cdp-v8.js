@@ -34,6 +34,9 @@ const path = require('path');
 const http = require('http');
 const { spawn } = require('child_process');
 
+/** R14: the one editor-locate (heap snapshot) chain shared by all sessions. */
+let locateInFlight = null;
+
 const INSPECTOR_PORT = 9334;
 const PROXY_PORT = 9333;
 const FUSE_SENTINEL = Buffer.from('dL7pKGdnNz796PbbjQWNKmHXBZaB9tsX');
@@ -355,8 +358,10 @@ class RendererBridge {
       if (!wins.length) return 'NO_WINDOW';
       const wc = wins[0].webContents;
       const dbg = wc.debugger;
-      try { dbg.detach(); } catch (e) {}
-      dbg.attach('1.3');
+      // R14: attach only once. The debugger is shared by all proxy sessions;
+      // detach+attach per session broke every other live session (pla-ui saw
+      // "Connection reset without closing handshake" whenever another client connected).
+      if (!dbg.isAttached()) dbg.attach('1.3');
       globalThis.__PLA_PROXY_SEND = (m, p) => dbg.sendCommand(m, p);
       globalThis.__PLA_PROXY_EMIT = null;
       return 'OK';
@@ -366,9 +371,17 @@ class RendererBridge {
     if (v !== 'OK') throw new Error('attach failed: ' + JSON.stringify(r).slice(0, 200));
 
     const br = new RendererBridge(io);
-    br.locateAndExposeEditor().catch((e) => {
-      process.stderr.write('editor locate failed: ' + e.message + '\n');
-    });
+    // R14: single-flight — concurrent sessions must never take heap snapshots in
+    // parallel (each is ~160 MB; parallel ones corrupted pla-heap.json and a burst of
+    // them crashed Plasticity). Later sessions wait for the running locate, then hit
+    // the fast path.
+    const run = () => br.locateAndExposeEditor();
+    locateInFlight = (locateInFlight || Promise.resolve())
+      .catch(() => {})
+      .then(run)
+      .catch((e) => {
+        process.stderr.write('editor locate failed: ' + e.message + '\n');
+      });
     return br;
   }
   constructor(io) {
@@ -397,11 +410,15 @@ class RendererBridge {
       return v;
     });
     // 0) fast path: already exposed?
+    //    R14 fix: SEND returns the inner CDP reply ({ result: { type, value } }),
+    //    never a bare `true` — the old `pre === true` check never matched, so EVERY
+    //    new session took a fresh ~160 MB heap snapshot.
     try {
       const pre = await SEND('Runtime.evaluate', {
         expression: '!!window.__PLA_EDITOR__', returnByValue: true,
       });
-      if (pre === true) return 'OK: already';
+      const exposed = pre === true || (pre && pre.result && pre.result.value === true);
+      if (exposed) return 'OK: already';
     } catch (e) { /* fall through to full locate */ }
     // 1) take heap snapshot, collect chunks in the renderer-side main world
     const SNAP_JS = '(async () => {'
@@ -561,8 +578,10 @@ function main() {
       return 2;
     }
     console.log(`launching ${hardened.exe} --inspect=127.0.0.1:${INSPECTOR_PORT}`);
+    // R14: detached — non-detached children live in libuv's kill-on-close job object,
+    // so Plasticity would die (unsaved work lost) whenever this launcher/proxy exits.
     const child = spawn(hardened.exe, [`--inspect=127.0.0.1:${INSPECTOR_PORT}`], {
-      detached: false, stdio: 'ignore', cwd: path.dirname(hardened.exe),
+      detached: true, stdio: 'ignore', cwd: path.dirname(hardened.exe),
     });
     child.unref();
     waitForInspector(60).then(() => runProxy()).catch((e) => {

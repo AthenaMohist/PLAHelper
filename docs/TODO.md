@@ -16,9 +16,29 @@
 
 ## Q — 快速见效
 
-- [ ] **Q1 方向键步进旋转**：`keymap.json` 绑定方向键 → `orbit:rotate:{up,down,left,right}`（先在 Plasticity 快捷键编辑器里核对 26.2.3 命令 id）；
-      PLAhelper 面板一键切换步进角 15/30/45/90°（写 `settings.json` 的 `OrbitControls.rotateDiscreteIncrement`，**单位弧度**）。
-      合并写入、写前备份；验证改文件后 Plasticity 是否热重载。
+- [x] **Q1 方向键步进旋转**（R14 完成，CDP 实测 + 用户手按确认 2026-11-13）
+      - 设置面板 ORBIT STEP：勾选框 = 在 `keymap.json` 的 `'plasticity-viewport'` 块加/删 4 条
+        方向键 → `orbit:rotate:{left,right,up,down}`；输入框 = 每按一下转动的角度（°），
+        写 `settings.json` 的 `OrbitControls.rotateDiscreteIncrement`（**单位弧度**）。
+      - 最小文本改动（不重排用户文件），首次写前备份 `*.json.pla-bak`；`plasticity_config.rs` 11 项单测。
+      - 生效方式（26.2.3 实测）：keymap.json 由 Plasticity 自动重载；settings.json **不重载**，
+        步进角缓存在各视口 `orbitControls.rotateDiscreteIncrement` → CDP 已连接时 pla-ui 直接改它
+        （30/15° 实测立即生效），未连接时重启 Plasticity 生效。
+      - 首版失败原因：绑定写在 `'orbit-controls'` —— 那是鼠标手势用的虚拟选择器，页面上没有这个元素。
+- [~] **Q1b 方向对调 + Alt 滚转**（R14，CDP 实测，待用户手按确认）：←/→、↑/↓ 与原生方向对调；
+      Alt+←/→ = 绕屏幕轴按步进角滚转（`pla:roll:*`，pla-bridge `ROLL_HOOK_JS` 经 CDP 注册，
+      改轨道控制器 `quaternionEnd`；Plasticity 自带 `viewport:roll:*` 固定 90°）。未连 CDP 时 Alt+←/→ 无效。
+- [x] **F7 Plasticity 默认以 CDP 模式运行**（R14，pla-ui 托管；2026-11-13 实测：任务栏快捷方式启动 →
+      3s 调试端口就绪 → pla-ui 2s 内自动拉起代理 → 单次堆快照定位 editor → 方向键/滚转/角度全部可用；
+      代理在 pla-ui 重启后存活且不重复拉起）
+      - 设置面板 CDP MODE 勾选：用户级快捷方式（任务栏固定、用户开始菜单、用户桌面）指向已打 fuse 的 exe
+        并带 `--inspect=127.0.0.1:9334`；`.plasticity` 双击 = HKCU 覆盖 open 命令（原值备份为
+        `PlaHelperPrevCommand`，取消勾选写回）。公用桌面/全体开始菜单需管理员，只报告不改。
+      - 代理托管：9334 在听且 9333 无人监听 → 自动 `node tools/pla-cdp/pla-cdp-v8.js proxy`
+        （无窗口，日志 `%TEMP%\pla-cdp-proxy.log`），代理独立于 pla-ui 存活。
+      - 后续：代理用 Rust 重写进 pla-bridge（去掉 node 依赖）；Plasticity 升级后提示重新打 fuse。
+- [ ] **Q2 视口立方体右键旋转按钮跟随步进角**（可选）：按钮命令是 `viewport:rotate:*`/`viewport:roll:*`，
+      固定 90°，不读 rotateDiscreteIncrement。要改只能在 CDP 连接时替换这组命令的监听器，待用户决定。
 
 ## U — UI 硬伤
 
@@ -32,8 +52,14 @@
       **最大化时工具栏偏低 11px、偏右 11px**：标题栏探测把 PrintWindow 位图当成从客户区原点开始
       （实际从窗口矩形原点开始，最大化时差 11px），再叠加客户区偏移 = 双重补偿。已修，最大化实测上下各留 3px；
       窗口化与最大化均经用户确认（2026-11-13）。
-- [~] **U4 面板边框**（R13）：1.5pt 灰180（150% 缩放约 2 物理像素），待用户确认观感。
-- [ ] **U5 切换面板的淡入淡出**：DWM 系统动画（旧面板淡出约 0.1s、新面板淡入）。如不喜欢可用 `DWMWA_TRANSITIONS_FORCEDISABLED` 关掉。
+- [x] **U4 面板边框**（R13）：1.5pt 灰180（150% 缩放约 2 物理像素），用户确认（2026-11-13）。
+- [x] **U5 切换面板的淡入淡出**：DWM 系统动画（旧面板淡出约 0.1s、新面板淡入），用户确认保留。
+      如需关掉：`DWMWA_TRANSITIONS_FORCEDISABLED`。
+- [~] **U9 设置面板原生风格**（R15，待用户确认观感）：圆角分组卡片 + 大写粗体标题；左标签右控件；
+      胶囊开关（开 = 强调黄）；圆角数值框（白字居中）；步进角 −/+ 步进器（±5°）；行标签悬停变白加粗；
+      说明文字移入悬停三级面板（快捷键用键帽排版），有说明的行带 "?" 标记。其他二级面板尚未改成卡片风格。
+- [x] **U10 二级面板文字看不清 / 悬停变黑**（R15）：egui 0.29 主题跟随系统，系统浅色时子面板用了
+      浅色主题控件 → 固定深色主题并把样式写入深/浅两套；COL_MUTED 提亮到 #a0a0a0。
 - [x] **U6 提示浮窗标题为 "egui window"**：随 U8 一起解决（被拥有窗口不进任务栏，也不进 Alt+Tab）。
 - [x] **U7 连接指示灯跟随主题色变黄**（R13）：R12 把强调色改黄后，"已连接"也变黄，和"连接中"无法区分。
       状态语义色改为固定色、不跟主题：灰 = 未绑定 / 黄 = 连接中 / 绿 = 已连接、成功 / 红 = 失败。
@@ -52,6 +78,10 @@
 - [~] **B3 快照墙**：R12 的文档定位改动（leveldb 最近文件 + 严格名称匹配）待真机验证；快照里打开/切换流程回归。
       R13 已修其性能问题（未命中时每 2s 在 UI 线程全盘深扫）。仍可改进：文档定位整体挪到后台线程。
 - [ ] **B4 renderer 重载后注入钩子丢失**：目前要重连才恢复（与 F4 一并解决）。
+- [x] **B5 pla-ui 无声退出**：经用户确认是手动退出，不是 bug。保留诊断日志 `%TEMP%\pla-ui.log`
+      （启动 / 正常退出 / 点 × / panic 含 backtrace），以后真出问题时可查。
+- [ ] **B6 关闭 Plasticity 后进程残留**：旧 launch 方式下（代理持有调试会话）关窗后主进程 + 3 个辅助进程
+      不退出，直到代理结束。新方式（快捷方式启动、代理独立）下是否还有，待用户下次关闭 Plasticity 时确认。
 
 ## F — CDP 地基（主通道可持续）
 

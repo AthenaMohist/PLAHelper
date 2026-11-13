@@ -25,8 +25,21 @@ const COL_BTN_HOVER: egui::Color32 = egui::Color32::from_rgb(0x3d, 0x3d, 0x3d);
 /// Plasticity 主题强调黄(取色自用户 Plasticity 26.2.3 激活态按钮实测像素 #ca8a1e)。
 /// 只用于"主题"类着色(激活按钮/选中/钉住手柄); **状态语义色不跟主题**, 见下方。
 const COL_ACCENT: egui::Color32 = egui::Color32::from_rgb(0xca, 0x8a, 0x1e);
-const COL_TEXT: egui::Color32 = egui::Color32::from_rgb(0xcc, 0xcc, 0xcc);
-const COL_MUTED: egui::Color32 = egui::Color32::from_rgb(0x8a, 0x8a, 0x8a);
+const COL_TEXT: egui::Color32 = egui::Color32::from_rgb(0xd4, 0xd4, 0xd4);
+/// R15: 0x8a 在 #181818 底上对比度不足(用户反馈看不清) → 0xa0。
+const COL_MUTED: egui::Color32 = egui::Color32::from_rgb(0xa0, 0xa0, 0xa0);
+// ---- R15: 原生风格设置控件(取色参照 Plasticity 26.2.3 右侧属性面板) ----
+/// 分组卡片底色(比面板底亮一级)。
+const COL_CARD: egui::Color32 = egui::Color32::from_rgb(0x27, 0x27, 0x27);
+/// 分组标题(大写)。
+const COL_SECTION: egui::Color32 = egui::Color32::from_rgb(0xbc, 0xbc, 0xbc);
+/// 数值框底色 / 悬停。
+const COL_FIELD: egui::Color32 = egui::Color32::from_rgb(0x3a, 0x3a, 0x3a);
+const COL_FIELD_HOVER: egui::Color32 = egui::Color32::from_rgb(0x46, 0x46, 0x46);
+/// 步进按钮(−/+)底色。
+const COL_STEPPER: egui::Color32 = egui::Color32::from_rgb(0x4a, 0x4a, 0x4a);
+/// 开关关闭时的轨道色。
+const COL_TOGGLE_OFF: egui::Color32 = egui::Color32::from_rgb(0x4e, 0x4e, 0x4e);
 // ---- 状态语义色(固定, 与主题无关): 灰=未绑定 / 黄=连接中 / 绿=已连接·成功 / 红=失败 ----
 const COL_YELLOW: egui::Color32 = egui::Color32::from_rgb(0xd9, 0xa8, 0x2c);
 const COL_GREEN: egui::Color32 = egui::Color32::from_rgb(0x3e, 0xa3, 0x4d);
@@ -94,6 +107,8 @@ const PANEL_DIM: [f32; 2] = [280.0, 170.0];
 const PANEL_SETTINGS: [f32; 2] = [300.0, 560.0];
 
 fn main() -> eframe::Result<()> {
+    pla_ui::diag::install_panic_hook();
+    pla_ui::diag::log("start");
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size(TOOLBAR_SIZE)
@@ -104,11 +119,13 @@ fn main() -> eframe::Result<()> {
             .with_window_level(egui::WindowLevel::AlwaysOnTop),
         ..Default::default()
     };
-    eframe::run_native(
+    let r = eframe::run_native(
         "pla-ui",
         opts,
         Box::new(|cc| Ok::<Box<dyn eframe::App>, _>(Box::new(PlaApp::new(cc)))),
-    )
+    );
+    pla_ui::diag::log(&format!("run_native returned: {:?}", r.as_ref().err()));
+    r
 }
 
 struct PlaApp {
@@ -229,6 +246,20 @@ struct PlaApp {
     rename_buf: String,
     /// 上次圆角轮询时刻(DWM 圆角状态在 thread_local ROUND_STATE)。
     last_round_poll: Instant,
+    /// Q1: 方向键步进旋转 — 设置面板打开时从 Plasticity 配置重读。
+    step_loaded: bool,
+    /// 方向键绑定是否已在 keymap.json 里(None = 读取失败)。
+    step_bound: Option<bool>,
+    /// 步进角输入框缓冲(度)。
+    step_deg_buf: String,
+    /// 最近一次读写结果 (是否出错, 文本)。
+    step_msg: Option<(bool, String)>,
+    /// F7: CDP 代理守护(Plasticity 带调试端口时自动拉起 9333 代理)。
+    proxy: pla_ui::cdp_mode::ProxyManager,
+    /// F7: 是否已配置为 CDP 模式启动(None = 未读取)。
+    cdp_startup: Option<bool>,
+    /// F7: 最近一次配置结果 (是否出错, 文本)。
+    cdp_startup_msg: Option<(bool, String)>,
 }
 
 impl Drop for PlaApp {
@@ -333,7 +364,18 @@ fn apply_plasticity_style(ctx: &egui::Context) {
     ]
     .into();
     style.spacing.item_spacing = egui::vec2(6.0, 4.0);
-    ctx.set_style(style);
+    // R15: egui 0.29 的 set_style 只设"当前主题", 而主题默认跟随系统 —— 系统为浅色时
+    // 二级面板拿到的是浅色主题控件(白底输入框、深色文字、悬停变黑), 贴在我们的深色面板上
+    // 几乎看不见(用户截图)。固定深色主题, 并把同一套样式写进深/浅两个主题。
+    ctx.set_theme(egui::ThemePreference::Dark);
+    ctx.set_style_of(egui::Theme::Dark, style.clone());
+    ctx.set_style_of(egui::Theme::Light, style);
+}
+
+/// 角度显示: 最多两位小数, 去掉多余的 0(15 / 22.5 / 7.25)。
+fn fmt_deg(d: f64) -> String {
+    let s = format!("{d:.2}");
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
 /// bridge 状态文本 → 圆点颜色。
@@ -355,6 +397,373 @@ fn section_header(ui: &mut egui::Ui, text: &str) {
             .strong()
             .color(COL_MUTED),
     );
+}
+
+// ================= R15: 原生风格设置控件 + 悬停三级面板 =================
+//
+// 视觉参照 Plasticity 26.2.3 右侧属性面板: 分组 = 圆角卡片 + 大写粗体标题; 每行
+// 左标签右控件; 开关 = 胶囊轨道(开 = 强调黄, 白色圆钮); 数值 = 圆角深灰框, 白色居中;
+// 步进数值两侧 −/+。说明文字不占面板空间, 悬停时在面板旁弹出三级面板。
+
+/// 三级面板的一行。
+#[derive(Clone)]
+enum InfoLine {
+    /// 普通说明(自动换行)。
+    Text(String),
+    /// 快捷键: 键帽 + 说明。
+    Key(String, String),
+}
+
+fn info_text(s: impl Into<String>) -> InfoLine {
+    InfoLine::Text(s.into())
+}
+
+fn info_key(k: &str, d: &str) -> InfoLine {
+    InfoLine::Key(k.into(), d.into())
+}
+
+/// 本帧要显示的三级面板。
+#[derive(Clone)]
+struct InfoHint {
+    title: &'static str,
+    lines: Vec<InfoLine>,
+    /// 发起悬停的面板屏幕矩形(逻辑 pt)— 三级面板贴其右侧, 放不下则左侧。
+    panel: egui::Rect,
+    /// 悬停行的屏幕 y(逻辑 pt)。
+    row_y: f32,
+}
+
+thread_local! {
+    static INFO_HINT: std::cell::RefCell<Option<InfoHint>> = std::cell::RefCell::new(None);
+    /// 三级面板实测内容高度(按标题), 隐藏渲染阶段测出, 显示前即调整好窗口高度。
+    static INFO_HEIGHT: std::cell::RefCell<std::collections::HashMap<&'static str, f32>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// 悬停时登记三级面板(由根视口在面板旁渲染)。
+fn hover_info(ui: &egui::Ui, rect: egui::Rect, hovered: bool, title: &'static str, lines: Vec<InfoLine>) {
+    if !hovered {
+        return;
+    }
+    let Some(inner) = ui.ctx().input(|i| i.viewport().inner_rect) else {
+        return;
+    };
+    INFO_HINT.with(|h| {
+        *h.borrow_mut() = Some(InfoHint { title, lines, panel: inner, row_y: inner.min.y + rect.min.y });
+    });
+}
+
+/// 画文字; bold = 横向错开 0.6pt 叠画(内置 SimHei 无粗体字形, 用伪粗体)。
+fn paint_text(
+    painter: &egui::Painter,
+    pos: egui::Pos2,
+    anchor: egui::Align2,
+    text: &str,
+    size: f32,
+    color: egui::Color32,
+    bold: bool,
+) -> egui::Rect {
+    let font = egui::FontId::proportional(size);
+    let r = painter.text(pos, anchor, text, font.clone(), color);
+    if bold {
+        painter.text(pos + egui::vec2(0.6, 0.0), anchor, text, font, color);
+    }
+    r
+}
+
+fn lerp_color(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
+    let l = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    egui::Color32::from_rgb(l(a.r(), b.r()), l(a.g(), b.g()), l(a.b(), b.b()))
+}
+
+/// 设置行高度。
+const ROW_H: f32 = 28.0;
+/// 右侧控件(数值框)占行宽比例。
+const FIELD_FRAC: f32 = 0.5;
+
+/// 行标签(常态浅灰, 悬停变白加粗); 有说明时在标签后画一个小 "?" 圈。
+fn paint_row_label(ui: &egui::Ui, rect: egui::Rect, text: &str, hovered: bool, has_info: bool) {
+    let r = paint_text(
+        ui.painter(),
+        egui::pos2(rect.left(), rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        text,
+        12.5,
+        if hovered { egui::Color32::WHITE } else { COL_TEXT },
+        hovered,
+    );
+    if has_info {
+        let c = egui::pos2(r.right() + 9.0, rect.center().y);
+        let col = if hovered { egui::Color32::WHITE } else { COL_MUTED };
+        ui.painter().circle_stroke(c, 5.5, egui::Stroke::new(1.0, col));
+        ui.painter().text(c, egui::Align2::CENTER_CENTER, "?", egui::FontId::proportional(8.5), col);
+    }
+}
+
+/// 原生风格分组卡片: 圆角浅一级底 + 大写粗体标题(标题悬停可弹说明)。
+fn settings_card<R>(
+    ui: &mut egui::Ui,
+    title: &str,
+    info: Option<(&'static str, Vec<InfoLine>)>,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    egui::Frame::none()
+        .fill(COL_CARD)
+        .rounding(egui::Rounding::same(8.0))
+        .inner_margin(egui::Margin { left: 10.0, right: 10.0, top: 7.0, bottom: 5.0 })
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            let (rect, resp) =
+                ui.allocate_exact_size(egui::vec2(ui.available_width(), 18.0), egui::Sense::hover());
+            let hovered = resp.hovered() && info.is_some();
+            let r = paint_text(
+                ui.painter(),
+                egui::pos2(rect.left(), rect.center().y),
+                egui::Align2::LEFT_CENTER,
+                title,
+                11.5,
+                if hovered { egui::Color32::WHITE } else { COL_SECTION },
+                true,
+            );
+            if let Some((t, lines)) = info {
+                let c = egui::pos2(r.right() + 9.0, rect.center().y);
+                let col = if hovered { egui::Color32::WHITE } else { COL_MUTED };
+                ui.painter().circle_stroke(c, 5.5, egui::Stroke::new(1.0, col));
+                ui.painter().text(c, egui::Align2::CENTER_CENTER, "?", egui::FontId::proportional(8.5), col);
+                hover_info(ui, rect, resp.hovered(), t, lines);
+            }
+            add(ui)
+        })
+        .inner
+}
+
+/// 开关行: 整行可点; 返回 Response(changed = 本帧切换)。
+fn toggle_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    on: &mut bool,
+    info: Option<(&'static str, Vec<InfoLine>)>,
+) -> egui::Response {
+    let (rect, mut resp) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), ROW_H), egui::Sense::click());
+    if resp.clicked() {
+        *on = !*on;
+        resp.mark_changed();
+    }
+    let hovered = resp.hovered();
+    paint_row_label(ui, rect, label, hovered, info.is_some());
+    let t = ui.ctx().animate_bool(resp.id, *on);
+    let track = egui::Rect::from_center_size(
+        egui::pos2(rect.right() - 17.0, rect.center().y),
+        egui::vec2(34.0, 18.0),
+    );
+    let off = if hovered { lerp_color(COL_TOGGLE_OFF, egui::Color32::WHITE, 0.12) } else { COL_TOGGLE_OFF };
+    ui.painter().rect_filled(track, egui::Rounding::same(9.0), lerp_color(off, COL_ACCENT, t));
+    let kx = egui::lerp((track.left() + 9.0)..=(track.right() - 9.0), t);
+    ui.painter().circle_filled(egui::pos2(kx, track.center().y), 6.5, egui::Color32::WHITE);
+    if let Some((title, lines)) = info {
+        hover_info(ui, rect, hovered, title, lines);
+    }
+    resp
+}
+
+/// 只读信息行: 左标签, 右侧值(过长省略)。
+fn value_row(ui: &mut egui::Ui, label: &str, value: &str, color: egui::Color32) {
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 22.0), egui::Sense::hover());
+    paint_row_label(ui, rect, label, false, false);
+    let max_w = rect.width() * 0.68;
+    let font = egui::FontId::proportional(12.0);
+    let mut shown = value.to_string();
+    let width = |s: &str| ui.fonts(|f| f.layout_no_wrap(s.into(), font.clone(), color).size().x);
+    if width(&shown) > max_w {
+        let chars: Vec<char> = value.chars().collect();
+        let mut n = chars.len();
+        while n > 1 && width(&format!("{}…", chars[..n].iter().collect::<String>())) > max_w {
+            n -= 1;
+        }
+        shown = format!("{}…", chars[..n].iter().collect::<String>());
+    }
+    ui.painter().text(
+        egui::pos2(rect.right(), rect.center().y),
+        egui::Align2::RIGHT_CENTER,
+        &shown,
+        font,
+        color,
+    );
+    if shown != value {
+        resp.on_hover_text(value);
+    }
+}
+
+/// 右侧数值框矩形。
+fn field_rect(row: egui::Rect) -> egui::Rect {
+    let w = row.width() * FIELD_FRAC;
+    egui::Rect::from_min_size(
+        egui::pos2(row.right() - w, row.center().y - 12.0),
+        egui::vec2(w, 24.0),
+    )
+}
+
+/// 可直接输入 + 两侧 −/+ 的数值行。返回 (提交: 回车或失焦, 步进: -1/0/+1)。
+fn stepper_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    buf: &mut String,
+    suffix: &str,
+    info: Option<(&'static str, Vec<InfoLine>)>,
+) -> (bool, i32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), ROW_H), egui::Sense::hover());
+    let hovered = ui.rect_contains_pointer(rect);
+    paint_row_label(ui, rect, label, hovered, info.is_some());
+    let field = field_rect(rect);
+    ui.painter().rect_filled(field, egui::Rounding::same(6.0), COL_FIELD);
+    let bw = 24.0;
+    let minus = egui::Rect::from_min_size(field.min, egui::vec2(bw, field.height()));
+    let plus = egui::Rect::from_min_size(egui::pos2(field.right() - bw, field.top()), egui::vec2(bw, field.height()));
+    let mut step = 0;
+    for (r, sign, glyph, round) in [
+        (minus, -1, "−", egui::Rounding { nw: 6.0, sw: 6.0, ne: 0.0, se: 0.0 }),
+        (plus, 1, "+", egui::Rounding { nw: 0.0, sw: 0.0, ne: 6.0, se: 6.0 }),
+    ] {
+        let b = ui.interact(r, ui.id().with((label, sign)), egui::Sense::click());
+        let fill = if b.hovered() { lerp_color(COL_STEPPER, egui::Color32::WHITE, 0.15) } else { COL_STEPPER };
+        ui.painter().rect_filled(r, round, fill);
+        ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, glyph, egui::FontId::proportional(14.0), egui::Color32::WHITE);
+        if b.clicked() {
+            step = sign;
+        }
+    }
+    let mid = egui::Rect::from_min_max(egui::pos2(minus.right(), field.top()), egui::pos2(plus.left(), field.bottom()));
+    let edit = ui.put(
+        mid.shrink2(egui::vec2(4.0, 3.0)),
+        egui::TextEdit::singleline(buf)
+            .frame(false)
+            .horizontal_align(egui::Align::Center)
+            .font(egui::FontId::proportional(13.0))
+            .text_color(egui::Color32::WHITE)
+            .hint_text("默认"),
+    );
+    if !suffix.is_empty() {
+        ui.painter().text(
+            egui::pos2(mid.right() - 6.0, mid.center().y),
+            egui::Align2::RIGHT_CENTER,
+            suffix,
+            egui::FontId::proportional(12.0),
+            COL_MUTED,
+        );
+    }
+    if let Some((title, lines)) = info {
+        hover_info(ui, rect, hovered, title, lines);
+    }
+    (edit.lost_focus(), step)
+}
+
+/// 拖拽/点击编辑的整数行(原生风格数值框)。返回 changed。
+fn drag_row<T: egui::emath::Numeric>(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut T,
+    range: std::ops::RangeInclusive<T>,
+    info: Option<(&'static str, Vec<InfoLine>)>,
+) -> bool {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), ROW_H), egui::Sense::hover());
+    let hovered = ui.rect_contains_pointer(rect);
+    paint_row_label(ui, rect, label, hovered, info.is_some());
+    let field = field_rect(rect);
+    let changed = ui
+        .allocate_new_ui(egui::UiBuilder::new().max_rect(field), |ui| {
+            let v = ui.visuals_mut();
+            for (w, fill) in [
+                (&mut v.widgets.inactive, COL_FIELD),
+                (&mut v.widgets.hovered, COL_FIELD_HOVER),
+                (&mut v.widgets.active, COL_FIELD_HOVER),
+            ] {
+                w.weak_bg_fill = fill;
+                w.bg_fill = fill;
+                w.bg_stroke = egui::Stroke::NONE;
+                w.rounding = egui::Rounding::same(6.0);
+                w.fg_stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
+                w.expansion = 0.0;
+            }
+            ui.style_mut().override_font_id = Some(egui::FontId::proportional(13.0));
+            ui.add_sized(field.size(), egui::DragValue::new(value).range(range)).changed()
+        })
+        .inner;
+    if let Some((title, lines)) = info {
+        hover_info(ui, rect, hovered, title, lines);
+    }
+    changed
+}
+
+/// 渲染三级面板(由根视口在所有面板之后调用, 与 HUD 同理: 面板本帧写入的悬停才能本帧显示)。
+fn show_info_popup(ctx: &egui::Context, h: InfoHint) {
+    const W: f32 = 320.0;
+    let key = h.title;
+    let height = INFO_HEIGHT.with(|m| m.borrow().get(key).copied()).unwrap_or(120.0);
+    let monitor_w = ctx.input(|i| i.viewport().monitor_size).map_or(f32::MAX, |s| s.x);
+    let x = if h.panel.right() + 8.0 + W <= monitor_w {
+        h.panel.right() + 8.0
+    } else {
+        h.panel.left() - 8.0 - W
+    };
+    let y = (h.row_y - 10.0).max(h.panel.top());
+    let (hide, reveal) = viewport_reveal(ctx, key);
+    let mut builder = egui::ViewportBuilder::default()
+        .with_decorations(false)
+        .with_resizable(false)
+        .with_transparent(true)
+        .with_window_level(egui::WindowLevel::AlwaysOnTop)
+        .with_active(false)
+        .with_position(egui::pos2(x, y))
+        .with_inner_size(egui::vec2(W, height));
+    if hide {
+        builder = builder.with_visible(false);
+    }
+    ctx.show_viewport_immediate(egui::ViewportId::from_hash_of(("info-popup", key)), builder, |ictx, _class| {
+        if reveal {
+            ictx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        }
+        egui::CentralPanel::default()
+            .frame(panel_frame().inner_margin(egui::Margin::symmetric(12.0, 10.0)))
+            .show(ictx, |ui| {
+                let top = ui.cursor().min.y;
+                ui.spacing_mut().item_spacing.y = 6.0;
+                ui.label(egui::RichText::new(h.title).size(13.0).strong().color(egui::Color32::WHITE));
+                for line in &h.lines {
+                    match line {
+                        InfoLine::Text(t) => {
+                            ui.add(egui::Label::new(egui::RichText::new(t).size(12.0).color(COL_TEXT)).wrap());
+                        }
+                        InfoLine::Key(k, d) => {
+                            ui.horizontal(|ui| {
+                                egui::Frame::none()
+                                    .fill(COL_FIELD)
+                                    .rounding(egui::Rounding::same(4.0))
+                                    .inner_margin(egui::Margin::symmetric(6.0, 2.0))
+                                    .show(ui, |ui| {
+                                        ui.label(egui::RichText::new(k).size(12.0).color(egui::Color32::WHITE));
+                                    });
+                                // 显式换行: 横排里 Label 默认不换行, 超宽会撑大内容区,
+                                // 连带后面的说明文字都越过右边框(R15 实测)。
+                                ui.add(egui::Label::new(egui::RichText::new(d).size(12.0).color(COL_TEXT)).wrap());
+                            });
+                        }
+                    }
+                }
+                // 实测内容高度(用光标位置, 不用 min_rect — CentralPanel 的 min_rect 含整个可用区)
+                let content = ui.cursor().min.y - top;
+                let want = (content + 10.0 * 2.0 + 2.0 * PANEL_BORDER_INSET + 4.0).ceil();
+                INFO_HEIGHT.with(|m| {
+                    let mut m = m.borrow_mut();
+                    if m.get(key).map_or(true, |old| (old - want).abs() > 0.5) {
+                        m.insert(key, want);
+                        ictx.request_repaint();
+                    }
+                });
+            });
+        paint_panel_border(ictx);
+    });
 }
 
 /// 面板浅灰轮廓宽度(逻辑 pt)与颜色。
@@ -1023,6 +1432,13 @@ impl PlaApp {
             show_entities: false,
             show_dim: false,
             show_settings: false,
+            step_loaded: false,
+            step_bound: None,
+            step_deg_buf: String::new(),
+            step_msg: None,
+            proxy: pla_ui::cdp_mode::ProxyManager::default(),
+            cdp_startup: None,
+            cdp_startup_msg: None,
             show_vpstate: false,
     toolbar_drag_pos: None,
     toolbar_dragging: false,
@@ -1390,6 +1806,8 @@ impl PlaApp {
                 self.show_settings = !self.show_settings;
                 if self.show_settings {
                     self.close_secondary_panels_except(PanelId::Settings);
+                    // Q1: 每次打开都重读(用户可能在 Plasticity 里改过)
+                    self.step_loaded = false;
                 }
             }
         }
@@ -1581,6 +1999,55 @@ impl PlaApp {
         self.last_snap_anchor = new_anchor;
         // 物理 → egui points: OuterPosition 用 points(见 egui 0.29 ViewportInfo)。
         ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(desired_pt));
+    }
+
+    /// Q1: 从 Plasticity 配置重读方向键绑定状态与步进角。
+    fn reload_step_config(&mut self) {
+        use pla_ui::plasticity_config as pc;
+        self.step_msg = None;
+        match pc::arrow_bindings_installed() {
+            Ok(b) => self.step_bound = Some(b),
+            Err(e) => {
+                self.step_bound = None;
+                self.step_msg = Some((true, e));
+            }
+        }
+        match pc::read_step_deg() {
+            Ok(Some(d)) => self.step_deg_buf = fmt_deg(d),
+            Ok(None) => self.step_deg_buf.clear(), // 未设置 = Plasticity 内置默认
+            Err(e) => self.step_msg = Some((true, e)),
+        }
+    }
+
+    /// Q1: 输入框提交 → 写 settings.json(度 → 弧度)。
+    fn apply_step_deg(&mut self) {
+        let raw = self.step_deg_buf.trim().trim_end_matches('°').trim();
+        if raw.is_empty() {
+            return;
+        }
+        self.step_msg = Some(match raw.parse::<f64>() {
+            Ok(d) => match pla_ui::plasticity_config::write_step_deg(d) {
+                Ok(()) => {
+                    self.step_deg_buf = fmt_deg(d);
+                    // settings.json 不会被 Plasticity 重载 → 有 CDP 时实时改运行时值。
+                    if self.cdp_connected() {
+                        self.cdp.send(pla_bridge::cdp::CdpCmd::Eval(
+                            pla_ui::plasticity_config::live_step_js(d),
+                        ));
+                        (false, format!("已设为每次 {}°(立即生效)", fmt_deg(d)))
+                    } else {
+                        (false, format!("已设为每次 {}°(重启 Plasticity 后生效)", fmt_deg(d)))
+                    }
+                }
+                Err(e) => (true, e),
+            },
+            Err(_) => (true, format!("「{raw}」不是数字")),
+        });
+    }
+
+    /// CDP 通道是否已连上 Plasticity。
+    fn cdp_connected(&self) -> bool {
+        self.cdp_status.contains("已连接")
     }
 
     fn is_in_toolbar_snap_zone(dp: egui::Pos2, da: egui::Pos2) -> bool {
@@ -1846,7 +2313,14 @@ impl eframe::App for PlaApp {
         [0.0, 0.0, 0.0, 0.0]
     }
 
+    /// R14 诊断: 正常退出留痕(区分"用户关闭"与"无声崩溃/被外部结束")。
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        pla_ui::diag::log("on_exit (正常关闭)");
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // F7: Plasticity 以 CDP 模式运行而代理没起时自动拉起(内部 3s 节流)。
+        self.proxy.tick();
         self.poll_bridge();
         self.update_snap(ctx);
         // R9-2: 一级面板拖动中(二级面板别据此误判"用户挪了我")。
@@ -1996,6 +2470,7 @@ impl eframe::App for PlaApp {
                         hovered = Some(("关闭".into(), "退出 PLA 助手工具栏".into()));
                     }
                     if close_resp.clicked() {
+                        pla_ui::diag::log("工具栏 × 被点击");
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                 });
@@ -3377,50 +3852,216 @@ impl eframe::App for PlaApp {
                     &mut flag,
                     true,
                     |ui| {
-                        section_header(ui, "BRIDGE");
-                        ui.monospace(&self.bridge.url);
-                        let bind_text = match &self.snap_target {
-                            Some(t) => format!("绑定窗口: {}", t.title),
-                            None => "绑定窗口: 未绑定(等待 Plasticity…)".into(),
-                        };
-                        ui.label(egui::RichText::new(bind_text).small().color(COL_MUTED));
-                        ui.label(
-                            egui::RichText::new(format!("状态: {}", self.bridge_status)).small(),
+                        if !self.step_loaded {
+                            self.step_loaded = true;
+                            self.reload_step_config();
+                            self.cdp_startup = Some(pla_ui::cdp_mode::cdp_startup_enabled());
+                        }
+                        // R15: 原生风格分组卡片; 说明文字全部移到悬停三级面板。
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 6.0;
+                        settings_card(
+                            ui,
+                            "BRIDGE",
+                            Some((
+                                "官方 Bridge",
+                                vec![info_text(
+                                    "Plasticity 自带的 WebSocket 服务(偏好设置 → Server, 端口 8980)。\
+                                     pla-ui 用它读取实体网格; 只读, 不能修改模型。",
+                                )],
+                            )),
+                            |ui| {
+                                value_row(ui, "地址", &self.bridge.url, COL_TEXT);
+                                let bind_text = match &self.snap_target {
+                                    Some(t) => t.title.clone(),
+                                    None => "未绑定(等待 Plasticity…)".into(),
+                                };
+                                value_row(ui, "绑定窗口", &bind_text, COL_TEXT);
+                                value_row(ui, "状态", &self.bridge_status, status_color(&self.bridge_status));
+                            },
                         );
-                        ui.separator();
-                        section_header(ui, "AUTO SNAPSHOT");
-                        ui.checkbox(&mut self.auto_snap_enabled, "启用自动快照(需 CDP 已连接)");
-                        ui.horizontal(|ui| {
-                            ui.label("定时(分钟):");
-                            ui.add(
-                                egui::DragValue::new(&mut self.auto_interval_min)
-                                    .range(0..=1440),
+                        // ---- F7: Plasticity 默认以 CDP 模式运行(pla-ui 托管代理) ----
+                        settings_card(
+                            ui,
+                            "CDP MODE",
+                            Some((
+                                "CDP 通道",
+                                vec![
+                                    info_text(
+                                        "pla-ui 经 CDP 读写 Plasticity 的运行时状态: 选择集、视口状态、\
+                                         角度即时生效、Alt+←/→ 绕屏幕轴旋转都依赖它。",
+                                    ),
+                                    info_text("代理(9333)由 pla-ui 在 Plasticity 带调试端口启动时自动拉起(需要 node)。"),
+                                ],
+                            )),
+                            |ui| {
+                                let cdp_col = if self.cdp_connected() { COL_GREEN } else { COL_MUTED };
+                                value_row(ui, "CDP", &self.cdp_status, cdp_col);
+                                value_row(ui, "代理", &self.proxy.status, COL_TEXT);
+                        let mut cdp_on = self.cdp_startup.unwrap_or(false);
+                        if toggle_row(
+                            ui,
+                            "默认以 CDP 模式启动",
+                            &mut cdp_on,
+                            Some((
+                                "Plasticity 默认以 CDP 模式启动",
+                                vec![
+                                    info_text(
+                                        "开启: 任务栏 / 开始菜单快捷方式与 .plasticity 双击打开, 改为带调试端口 9334 \
+                                         启动已打补丁的 Plasticity。下次启动 Plasticity 生效; 关闭即恢复原样。",
+                                    ),
+                                    info_text("调试端口只监听本机(局域网不可达), 但本机程序可借此控制 Plasticity。"),
+                                    info_text("公用桌面快捷方式需管理员权限, 不会修改。"),
+                                ],
+                            )),
+                        )
+                        .changed()
+                        {
+                            self.cdp_startup_msg = Some(
+                                match pla_ui::cdp_mode::set_cdp_startup(cdp_on) {
+                                    Ok(lines) => {
+                                        self.cdp_startup = Some(cdp_on);
+                                        let failed = lines.iter().any(|l| l.contains("失败"));
+                                        (failed, lines.join("\n"))
+                                    }
+                                    Err(e) => (true, e),
+                                },
                             );
-                            ui.label("定步数:");
-                            ui.add(egui::DragValue::new(&mut self.auto_steps).range(0..=1000));
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("上限(个):");
-                            ui.add(egui::DragValue::new(&mut self.snap_max_count).range(0..=500));
-                            ui.label("保留(天):");
-                            ui.add(egui::DragValue::new(&mut self.snap_max_age_days).range(0..=365));
-                        });
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "当前步数: {} — 快照按文档保存副本, 未保存新内容时自动跳过",
-                                if self.cdp_undo >= 0 { self.cdp_undo.to_string() } else { "-".into() }
-                            ))
-                            .small()
-                            .color(COL_MUTED),
+                        }
+                        if let Some((is_err, msg)) = &self.cdp_startup_msg {
+                            ui.label(
+                                egui::RichText::new(msg)
+                                    .small()
+                                    .color(if *is_err { COL_RED } else { COL_GREEN }),
+                            );
+                        }
+                            },
                         );
-                        ui.separator();
-                        section_header(ui, "HOTKEYS");
-                        ui.label(
-                            egui::RichText::new("提示: 右键工具栏按钮可直接开始录制")
-                                .small()
-                                .color(COL_MUTED),
+                        // ---- Q1: 方向键步进旋转(写 Plasticity 自己的 keymap/settings) ----
+                        settings_card(ui, "ORBIT STEP", None, |ui| {
+                        let mut bound = self.step_bound.unwrap_or(false);
+                        if toggle_row(
+                            ui,
+                            "方向键步进旋转视角",
+                            &mut bound,
+                            Some((
+                                "方向键步进旋转视角",
+                                vec![
+                                    info_key("←  /  →", "左右旋转"),
+                                    info_key("↑  /  ↓", "上下旋转"),
+                                    info_key("Alt+←  /  Alt+→", "绕屏幕轴旋转(需 CDP)"),
+                                    info_text("每按一下转动的角度见下一项。"),
+                                    info_text(
+                                        "按键写入 ~/.plasticity/config/v2/keymap.json, Plasticity 自动加载。\
+                                         视口立方体右键的旋转按钮固定 90°, 不受此设置影响。",
+                                    ),
+                                ],
+                            )),
+                        )
+                        .changed()
+                        {
+                            self.step_msg = Some(
+                                match pla_ui::plasticity_config::set_arrow_bindings(bound) {
+                                    Ok(()) => {
+                                        self.step_bound = Some(bound);
+                                        // keymap.json 会被 Plasticity 自动重载(有延迟);
+                                        // 有 CDP 时顺带立即生效。
+                                        if self.cdp_connected() {
+                                            self.cdp.send(pla_bridge::cdp::CdpCmd::Eval(
+                                                pla_ui::plasticity_config::live_bindings_js(bound),
+                                            ));
+                                        }
+                                        (
+                                            false,
+                                            if bound {
+                                                "已绑定 ←→↑↓ 与 Alt+←/→".into()
+                                            } else {
+                                                "已解除方向键绑定".into()
+                                            },
+                                        )
+                                    }
+                                    Err(e) => (true, e),
+                                },
+                            );
+                        }
+                        let (mut commit_step, step) = stepper_row(
+                            ui,
+                            "每按一下转动",
+                            &mut self.step_deg_buf,
+                            "°",
+                            Some((
+                                "每按一下转动的角度",
+                                vec![
+                                    info_text("单位 °, 范围 0.1–180; 直接输入后回车, 或点两侧 − / + 按 5° 调整。"),
+                                    info_text(
+                                        "写入 Plasticity 的 settings.json。CDP 已连接时立即生效, \
+                                         否则重启 Plasticity 后生效。Alt+←/→ 的旋转也用这个角度。",
+                                    ),
+                                ],
+                            )),
                         );
-                        egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
+                        if step != 0 {
+                            let cur: f64 = self
+                                .step_deg_buf
+                                .trim()
+                                .trim_end_matches('°')
+                                .parse()
+                                .unwrap_or(15.0);
+                            let next = (cur + 5.0 * step as f64).clamp(
+                                pla_ui::plasticity_config::STEP_DEG_MIN,
+                                pla_ui::plasticity_config::STEP_DEG_MAX,
+                            );
+                            self.step_deg_buf = fmt_deg(next);
+                            commit_step = true;
+                        }
+                        if commit_step {
+                            self.apply_step_deg();
+                        }
+                        if let Some((is_err, msg)) = &self.step_msg {
+                            ui.label(
+                                egui::RichText::new(msg)
+                                    .small()
+                                    .color(if *is_err { COL_RED } else { COL_GREEN }),
+                            );
+                        }
+                        });
+                        let steps_now = if self.cdp_undo >= 0 { self.cdp_undo.to_string() } else { "-".into() };
+                        settings_card(ui, "AUTO SNAPSHOT", None, |ui| {
+                            toggle_row(
+                                ui,
+                                "启用自动快照",
+                                &mut self.auto_snap_enabled,
+                                Some((
+                                    "自动快照",
+                                    vec![
+                                        info_text("需 CDP 已连接。按「定时」或「定步数」(撤销栈步数增加)触发。"),
+                                        info_text("快照 = 文档同级 snapshot/ 下的副本; 文档未保存新内容时自动跳过。"),
+                                        info_text(format!("当前步数: {steps_now}")),
+                                    ],
+                                )),
+                            );
+                            drag_row(ui, "定时(分钟)", &mut self.auto_interval_min, 0..=1440,
+                                Some(("定时(分钟)", vec![info_text("每隔多少分钟拍一张; 0 = 不按时间触发。")])));
+                            drag_row(ui, "定步数", &mut self.auto_steps, 0..=1000,
+                                Some(("定步数", vec![info_text("撤销栈每增加多少步拍一张; 0 = 不按步数触发。")])));
+                            drag_row(ui, "数量上限", &mut self.snap_max_count, 0..=500,
+                                Some(("数量上限", vec![info_text("每个文档最多保留多少张快照(收藏的除外), 超出删最旧的; 0 = 不限。")])));
+                            drag_row(ui, "保留天数", &mut self.snap_max_age_days, 0..=365,
+                                Some(("保留天数", vec![info_text("超过多少天的快照会被清理(收藏的除外); 0 = 不限。")])));
+                        });
+                        settings_card(
+                            ui,
+                            "HOTKEYS",
+                            Some((
+                                "快捷键",
+                                vec![
+                                    info_text("点「绑定」后按下组合键完成录制; 也可以右键工具栏按钮直接开始录制。"),
+                                    info_text("快捷键是全局的(Plasticity 在前台时也有效), 保存在 pla-ui 同级的 hotkeys.json。"),
+                                ],
+                            )),
+                            |ui| {
                             for a in Action::ALL {
                                 let key = format!("{a:?}");
                                 ui.horizontal(|ui| {
@@ -3451,11 +4092,18 @@ impl eframe::App for PlaApp {
                                     ui.colored_label(COL_RED, format!("! 冲突: {k} → {acts:?}"));
                                 }
                             }
-                        });
+                            },
+                        );
+                            });
                     },
                 );
                 self.show_settings = flag;
             }
+        }
+
+        // ---- R15: 设置项悬停三级面板(面板本帧登记, 本帧渲染; 不悬停即关闭) ----
+        if let Some(h) = INFO_HINT.with(|x| x.borrow_mut().take()) {
+            show_info_popup(ctx, h);
         }
 
         // ---- HUD 视口: 悬停提示 + 操作通知, 弹在工具栏右侧 ----

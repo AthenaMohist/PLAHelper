@@ -244,6 +244,58 @@ const INJECT_JS: &str = r#"(function(){
   return 'ok';
 })()"#;
 
+/// R14: 注册 `pla:roll:left` / `pla:roll:right` — 绕屏幕法线(视线)轴按步进角滚转。
+///
+/// Plasticity 自带 `viewport:roll:*` 固定 90°、不读步进角; `orbit:rotate:*` 只有上下左右。
+/// 实测(26.2.3): 把轨道控制器的目标朝向 `quaternionEnd` 右乘绕本地 Z 轴的旋转即为滚转 —
+/// 视线方向不变、相机不平移, 阻尼动画自然过渡, 角度精确(15° 实测)。
+/// 步进角每次现读 `orbitControls.rotateDiscreteIncrement`, 与方向键一致、随设置实时变化。
+/// left = 画面逆时针(相机绕本地 Z 负转), right = 画面顺时针。
+/// 监听器挂在 `<plasticity-viewport>` 元素上(与 orbit:rotate:* 同处), 按元素标记幂等;
+/// 视口元素重建或页面重载后由周期钩子补注册。keymap 绑定见 pla-ui `plasticity_config`。
+const ROLL_HOOK_JS: &str = r#"(function(){
+  var ed = window.__PLA_EDITOR__;
+  if (!ed || !ed.registry || !ed.viewports) return 'no-editor';
+  var reg = ed.registry;
+  // 幂等判断看注册表本身(不用元素标记: 标记可能先于注册失败而被置上)。
+  function registered(el){
+    var m = reg.inlineListenersByCommandName;
+    var w = m && (m instanceof Map ? m.get('pla:roll:left') : m['pla:roll:left']);
+    return !!(w && w.has && w.has(el));
+  }
+  var els = document.querySelectorAll('plasticity-viewport');
+  var n = 0;
+  for (var i = 0; i < els.length; i++) {
+    var el = els[i];
+    if (registered(el)) continue;
+    (function(el){
+      function vpOf(){
+        var best = null;
+        ed.viewports.forEach(function(v){
+          if (!best && v && v.orbitControls && v.orbitControls.domElement && el.contains(v.orbitControls.domElement)) best = v;
+        });
+        return best || ed._activeViewport || ed.viewports.values().next().value;
+      }
+      function roll(sign){
+        var v = vpOf(); if (!v || !v.orbitControls || !v.camera) return;
+        var oc = v.orbitControls;
+        var Q = oc.quaternionEnd.constructor, V = v.camera.position.constructor;
+        var step = oc.rotateDiscreteIncrement || (Math.PI / 12);
+        oc.quaternionEnd.multiply(new Q().setFromAxisAngle(new V(0, 0, 1), sign * step));
+        oc.needsUpdate = true;
+        try { oc.setNeedsUpdate(); } catch (e) {}
+      }
+      // Plasticity 的 CommandRegistry.add 只有对象形式: add(target, {命令名: 回调})(arity 2)。
+      reg.add(el, {
+        'pla:roll:left': function(){ roll(-1); },
+        'pla:roll:right': function(){ roll(1); }
+      });
+    })(el);
+    if (registered(el)) n++;
+  }
+  return 'ok:' + n;
+})()"#;
+
 /// R7-27: 错误捕获注入 — 页面重载后钩子会丢, 故与 INJECT_JS 合并一次注入。
 /// Plasticity 把命令期异常经 `ed.signals.environmentChanged` 派发(载荷是 Error 实例,
 /// 带 stack); 助手把它抓下来存进 window.__PLA_LAST_ERROR__, 由 SEL_SNAPSHOT_JS
@@ -1012,6 +1064,8 @@ async fn session_loop(
             // Plasticity 侧的命令报错, 例如 G 移动的 "reading 'active'")。
             if hook_tick % 5 == 0 {
                 let _ = eval_roundtrip(ws, &mut mid, ERR_HOOK_JS).await;
+                // R14: Alt+←/→ 步进滚转命令(视口元素重建/页面重载后自动补注册)。
+                let _ = eval_roundtrip(ws, &mut mid, ROLL_HOOK_JS).await;
             }
             hook_tick += 1;
             let raw = eval_roundtrip(ws, &mut mid, SEL_SNAPSHOT_JS).await?;

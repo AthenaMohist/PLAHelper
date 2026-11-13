@@ -38,5 +38,9 @@ windows = { version = "0.52", features = [
     "Win32_Graphics_Gdi",
     # Graphics_Dwm: Win11 系统圆角 DWMWA_WINDOW_CORNER_PREFERENCE(R13, 取代 SetWindowRgn)。
     "Win32_Graphics_Dwm",
+    # System_Registry: F7 CDP 模式启动 — HKCU 覆盖 .plasticity 双击打开命令(R14)。
+    "Win32_System_Registry",
+    # Security: windows-0.52 把 RegCreateKeyExW 放在该 feature 之后(SECURITY_ATTRIBUTES 参数)。
+    "Win32_Security",
     "Win32_Storage_Xps",
 ] }
