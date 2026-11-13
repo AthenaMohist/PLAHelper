@@ -762,6 +762,9 @@ pub fn table_ui(ui: &mut egui::Ui, id: u64, t: &mut Table, st: &mut TableState, 
             Some(Hit::RowHeader(r)) => (Some(r), None),
             _ => (Some(st.cursor.0), Some(st.cursor.1)),
         };
+        // R31d: 菜单项不换行, 宽度按最长项撑开(英文"Add 5 column(s) right"以前被折成两行)
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+        ui.set_min_width(150.0);
         let mut done = false;
         // R31b: "添加 [x] 行/列" — x 默认 1, 可改
         if st.menu_count == 0 {
