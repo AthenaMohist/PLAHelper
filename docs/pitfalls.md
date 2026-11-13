@@ -41,6 +41,10 @@
 | 38 | 选择集应用: 第一个实体的面选中了, 其他实体却整个被选中 | Plasticity 点击语义(R21 实测): 点**未选实体**上的面 → 选中整个实体; 在同一点再点一次 → 换成该面(下钻), 第三次不变。管线每个面只点一次 | 点完后由垫片判定"未选中但所属实体已介入"的目标, 原坐标再 shift+点, 最多 3 轮(R21.1) |
 | 39 | 恢复视口后缩放不生效, 动一下视口才变 | `cam.set` 写了轨道控制器的 zoom/zoomEnd 等, 但没调 `setNeedsUpdate()`(`needsUpdate` 是计数器), 控制器的更新循环要等下次交互才跑 | 写完统一 `markOrbitDirty`; 自检回读要等控制器收敛(~1.5s, 后台窗口帧率被节流)(R21.1) |
 | 40 | node 内置 WebSocket 连不上 9333 代理(1006) | 代理手写的握手与 undici 的 WebSocket 客户端不兼容(Rust tungstenite 正常) | 调试脚本改走主进程 inspector + `__PLA_PROXY_SENDS[hwnd]`; F4 用 Rust 重写代理时一并解决 |
+| 41 | `click.addById` 选中后 Move 一接手选择就没了("缺活跃实体上下文") | addById 不产生命令、不派发 selectionDelta; 真实点击是经 executor 执行的 `ClickChangeSelectionCommand`; 且 `addById('2:<vid>')` 写进的是畸形条目 `"<vid>:undefined"` | 自建 `SelectionCommand` 子类, execute 里调 `changeSelection.onClick`, 经 `editor.enqueue` 执行(selection-by-command.md) |
+| 42 | `await editor.enqueue(cmd)` 永远不返回 | Promise 要等整条命令链结束, 后续默认命令(如 OffsetFace)在等输入 | 不 await; 监听 `commandEnded` 判断本命令结束 |
+| 43 | 入队的选择命令不执行 | 活动命令等待输入时新命令排队 | 入队前 `executor.cancelActiveCommand()` |
+| 44 | 在 body 上派发 `command:move` 没反应 | 它是挂在 `plasticity-viewport` 上的选择器式监听 | 以视口元素为目标派发 |
 | 14 | 切换面板时旧面板滞留、新面板不出现、点击丢失 | R12 加深的文档定位(`find_latest_doc`)每次未命中都全盘深扫(热缓存 ~2s, 冷缓存 ~19s), 面板每帧取文档目录, 2s TTL 一过就在 UI 线程重扫 | 分阶段: leveldb + Recent 命中即返回; 深扫未命中负缓存 60s(R13) |
 
 ## 假按钮教训
