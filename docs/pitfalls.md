@@ -49,6 +49,7 @@
 | 46 | 选择集面板一律"无截图" | R9 把存档挪到文档同级, 但保存/列表/读取/取名仍写 exe 同级, 只有截图/收藏/改名/删除用新目录; 迁移只在新目录不存在时复制一次 | 全部经唯一入口 `cdp_selections_dir()`; 迁移改为每进程一次"补齐缺失或更新的文件"(R23) |
 | 47 | 同窗口换文件后快照/选择集截图仍是旧文件的(文件和恢复都对) | egui 按 URI 缓存解码纹理, URI 只用名字 `bytes://SS001`; 清自己的字节缓存不会清 egui 的。另: 拖动模式提前 return 不更新 doc_key; 文档切换只重置部分缓存 | URI 带内容指纹 `png_uri()`; 切文档 `forget_all_images()`; `sync_doc_key()` 两条路径都调, `reset_doc_scoped()` 为按文档状态唯一清单(R26) |
 | 48 | 想给 exe 嵌图标, 但 embed-resource/winresource 都要 windres 或 rc.exe | 本机 Rust 是 x86_64-pc-windows-gnu, 没装 binutils/Windows SDK | `build.rs` 自己生成只含 `.rsrc` 节的 COFF(.o)(资源树 + ADDR32NB 重定位), `rustc-link-arg-bins` 交给 ld 合并; 用 `ExtractAssociatedIcon` 验证(R28) |
+| 49 | 笔记窗口拖动/调大小后鼠标移到别的窗口再回来, 窗口自己跟着拖、越拉越大 | 用了 OS `StartDrag`/`BeginResize`: 模态循环吞掉松手事件, egui 的按键状态卡在"按下", 之后任意 drag_started 又触发一次(同 R9 一级面板的老坑, 新窗口重踩) | 自管会话: `SetCapture` + 屏幕坐标 delta 发 `OuterPosition`/`InnerSize`; 开始/结束以 `primary_button_down()`(GetAsyncKeyState)为准。新窗口一律不要用 StartDrag/BeginResize(R30b) |
 | 14 | 切换面板时旧面板滞留、新面板不出现、点击丢失 | R12 加深的文档定位(`find_latest_doc`)每次未命中都全盘深扫(热缓存 ~2s, 冷缓存 ~19s), 面板每帧取文档目录, 2s TTL 一过就在 UI 线程重扫 | 分阶段: leveldb + Recent 命中即返回; 深扫未命中负缓存 60s(R13) |
 
 ## 假按钮教训

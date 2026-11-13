@@ -57,6 +57,9 @@ pub fn load_notes_rect() -> Option<[f32; 4]> {
     for (i, x) in a.iter().enumerate() {
         r[i] = x.as_f64()? as f32;
     }
+    // R30b: 防御 — 早期拖动 bug 可能存下离谱尺寸, 读入时封顶
+    r[2] = r[2].min(1600.0);
+    r[3] = r[3].min(1400.0);
     (r[2] >= 120.0 && r[3] >= 120.0).then_some(r)
 }
 

@@ -176,6 +176,8 @@ struct PlaApp {
     notes_open_rect: Option<[f32; 4]>,
     /// 上次写进偏好文件的外框(变化且松手后再写)。
     notes_saved_rect: Option<[f32; 4]>,
+    /// R30b: 笔记窗口自管拖动/调大小会话(SetCapture + 屏幕坐标 delta; 不用 OS StartDrag/BeginResize)。
+    notes_drag: Option<NotesDrag>,
     /// R8-1: 视口状态面板。
     show_vpstate: bool,
     /// R8b: 工具栏拖动位置(None=自动吸附; Some=用户拖到的位置, 逻辑 pt)。
@@ -1889,6 +1891,7 @@ impl PlaApp {
             notes: pla_ui::notes_ui::NotesPanel::new(),
             notes_open_rect: None,
             notes_saved_rect: pla_ui::prefs::load_notes_rect(),
+            notes_drag: None,
             step_loaded: false,
             step_bound: None,
             step_deg_buf: String::new(),
@@ -2360,7 +2363,9 @@ impl PlaApp {
         let mut open = true;
         let mut live_rect: Option<[f32; 4]> = None;
         let mut pointer_down = false;
+        let mut start: Option<NotesDragMode> = None;
         let notes = &mut self.notes;
+        let notes_drag = &mut self.notes_drag;
         ctx.show_viewport_immediate(egui::ViewportId::from_hash_of(ID), builder, |ctx, _class| {
             if reveal {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
@@ -2372,7 +2377,7 @@ impl PlaApp {
                 // ---- 标题行: 拖动柄 + 标题 + 文档名 + × ----
                 let (row, drag) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 22.0), egui::Sense::click_and_drag());
                 if drag.drag_started() {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                    start = Some(NotesDragMode::Move);
                 }
                 let p = ui.painter();
                 for dy in [-4.0f32, 0.0, 4.0] {
@@ -2422,7 +2427,7 @@ impl PlaApp {
                             ctx.set_cursor_icon(icon);
                         }
                         if resp.drag_started() {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(dir));
+                            start = Some(NotesDragMode::Resize(dir));
                         }
                     }
                     // 右下角斜纹提示
@@ -2439,7 +2444,37 @@ impl PlaApp {
             if let (Some(o), Some(inner)) = vp {
                 live_rect = Some([o.left(), o.top(), inner.width(), inner.height()]);
             }
-            pointer_down = ctx.input(|i| i.pointer.any_down());
+            // ---- R30b: 自管拖动/调大小 —— 开始与结束都以鼠标左键**物理**状态为准 ----
+            // (旧版用 OS StartDrag/BeginResize: 模态循环吞掉松手事件 → egui 以为一直按着,
+            //  鼠标移到别的窗口再回来就自己又开始拖/调大小, 窗口越拉越大。pitfalls #49)
+            let phys_down = pla_ui::window_drag::primary_button_down();
+            let ppp = ctx.pixels_per_point().max(0.01);
+            if let (Some(mode), None, true, Some(r)) = (start, notes_drag.as_ref(), phys_down, live_rect) {
+                if let (Some(c), Some(h)) = (
+                    pla_ui::window_drag::cursor_pos_phys(),
+                    pla_ui::window_drag::find_own_window(ID, r[2], ppp),
+                ) {
+                    pla_ui::window_drag::set_capture(h);
+                    *notes_drag = Some(NotesDrag { mode, cursor: c, rect: r, last: r });
+                }
+            }
+            if let Some(d) = notes_drag.as_mut() {
+                if !phys_down {
+                    pla_ui::window_drag::release_capture();
+                    *notes_drag = None;
+                } else if let Some(c) = pla_ui::window_drag::cursor_pos_phys() {
+                    let next = d.apply((c.0 - d.cursor.0) / ppp, (c.1 - d.cursor.1) / ppp);
+                    if (next[0] - d.last[0]).abs() > 0.4 || (next[1] - d.last[1]).abs() > 0.4 {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(next[0], next[1])));
+                    }
+                    if (next[2] - d.last[2]).abs() > 0.4 || (next[3] - d.last[3]).abs() > 0.4 {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(next[2], next[3])));
+                    }
+                    d.last = next;
+                    ctx.request_repaint();
+                }
+            }
+            pointer_down = phys_down || notes_drag.is_some();
         });
         // 位置/大小变了且已松手 → 写偏好(拖动/调整中不写, 免得每帧写盘)
         if let Some(r) = live_rect {
@@ -3111,6 +3146,77 @@ fn header_extra_and_show(
         },
     );
     *open = flag;
+}
+
+/// R30b: 笔记窗口拖动/调大小会话。
+#[derive(Clone, Copy)]
+enum NotesDragMode {
+    Move,
+    Resize(egui::viewport::ResizeDirection),
+}
+
+#[derive(Clone, Copy)]
+struct NotesDrag {
+    mode: NotesDragMode,
+    /// 开始时的鼠标屏幕物理坐标。
+    cursor: (f32, f32),
+    /// 开始时的窗口 [x, y, 宽, 高](逻辑 pt)。
+    rect: [f32; 4],
+    /// 上次发出的目标(没变就不重发命令)。
+    last: [f32; 4],
+}
+
+impl NotesDrag {
+    const MIN_W: f32 = 220.0;
+    const MIN_H: f32 = 160.0;
+
+    /// 鼠标位移(逻辑 pt) → 新外框。调左/上边时右/下边保持不动(最小尺寸处截住)。
+    fn apply(&self, dx: f32, dy: f32) -> [f32; 4] {
+        use egui::viewport::ResizeDirection as D;
+        let [x, y, w, h] = self.rect;
+        match self.mode {
+            NotesDragMode::Move => [x + dx, y + dy, w, h],
+            NotesDragMode::Resize(dir) => {
+                let (mut nx, mut ny, mut nw, mut nh) = (x, y, w, h);
+                let east = matches!(dir, D::East | D::NorthEast | D::SouthEast);
+                let west = matches!(dir, D::West | D::NorthWest | D::SouthWest);
+                let south = matches!(dir, D::South | D::SouthEast | D::SouthWest);
+                let north = matches!(dir, D::North | D::NorthEast | D::NorthWest);
+                if east {
+                    nw = (w + dx).max(Self::MIN_W);
+                }
+                if west {
+                    nw = (w - dx).max(Self::MIN_W);
+                    nx = x + w - nw;
+                }
+                if south {
+                    nh = (h + dy).max(Self::MIN_H);
+                }
+                if north {
+                    nh = (h - dy).max(Self::MIN_H);
+                    ny = y + h - nh;
+                }
+                [nx, ny, nw, nh]
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod notes_drag_tests {
+    use super::*;
+    use egui::viewport::ResizeDirection as D;
+
+    #[test]
+    fn move_and_resize_math() {
+        let d = |mode| NotesDrag { mode, cursor: (0.0, 0.0), rect: [100.0, 100.0, 300.0, 400.0], last: [0.0; 4] };
+        assert_eq!(d(NotesDragMode::Move).apply(10.0, -5.0), [110.0, 95.0, 300.0, 400.0]);
+        assert_eq!(d(NotesDragMode::Resize(D::SouthEast)).apply(20.0, 30.0), [100.0, 100.0, 320.0, 430.0]);
+        // 拖左边向右: 宽变小, 右边不动
+        assert_eq!(d(NotesDragMode::Resize(D::West)).apply(50.0, 0.0), [150.0, 100.0, 250.0, 400.0]);
+        // 缩到最小尺寸后截住, 右/下边仍不动
+        assert_eq!(d(NotesDragMode::Resize(D::NorthWest)).apply(500.0, 500.0), [180.0, 340.0, 220.0, 160.0]);
+    }
 }
 
 impl eframe::App for PlaApp {

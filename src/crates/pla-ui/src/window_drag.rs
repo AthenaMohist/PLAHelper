@@ -99,6 +99,14 @@ mod imp {
         Some((pt.x as f32, pt.y as f32))
     }
 
+    /// R30b: 鼠标左键**物理**状态(GetAsyncKeyState, 不经 egui)。
+    /// egui 的 `primary_down()` 在 OS 模态拖动/调整后可能卡在 true(松手事件被吞),
+    /// 拖动/调整会话的开始与结束都以这里为准。左右键交换时 VK_LBUTTON 仍指主键。
+    pub fn primary_button_down() -> bool {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
+        unsafe { (GetAsyncKeyState(VK_LBUTTON.0 as i32) as u16 & 0x8000) != 0 }
+    }
+
     /// 捕获鼠标: 之后鼠标移出窗口也能继续收到移动事件(拖动连贯的前提)。
     pub fn set_capture(hwnd: isize) {
         unsafe {
@@ -122,6 +130,9 @@ mod imp {
     }
     pub fn set_capture(_hwnd: isize) {}
     pub fn release_capture() {}
+    pub fn primary_button_down() -> bool {
+        false
+    }
     pub fn cursor_pos_phys() -> Option<(f32, f32)> {
         None
     }
