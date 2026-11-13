@@ -433,6 +433,7 @@ struct CapsView {
     age_s: Option<u64>,
     cdp_status: String,
     proxy_status: String,
+    bridge_status: String,
 }
 
 fn avail_style(a: &Availability) -> (&'static str, egui::Color32) {
@@ -495,9 +496,10 @@ fn caps_panel_ui(ui: &mut egui::Ui, v: &CapsView, reprobe: &mut bool) {
             ],
         )),
         |ui| {
-            let connected = caps.is_some();
-            value_row(ui, "连接", &v.cdp_status, if connected { COL_GREEN } else { COL_MUTED });
+            value_row(ui, "连接", &v.cdp_status, cdp_status_color(&v.cdp_status));
             value_row(ui, "代理", &v.proxy_status, COL_TEXT);
+            // Bridge 是只读冗余通道(实体网格), 与 CDP 能力无关; 断开不影响本面板任何功能。
+            value_row(ui, "Bridge(只读)", &v.bridge_status, status_color(&v.bridge_status));
             match caps {
                 None => value_row(ui, "能力", "CDP 未连接, 能力未知", COL_MUTED),
                 Some(r) => {
@@ -584,6 +586,17 @@ fn caps_panel_ui(ui: &mut egui::Ui, v: &CapsView, reprobe: &mut bool) {
                 ui.add(egui::Label::new(egui::RichText::new(format!("{k} → {p}")).size(11.0).color(COL_YELLOW)).wrap());
             }
         });
+    }
+}
+
+/// CDP 状态文本(pla-bridge `CdpEvent::Status`)→ 圆点颜色(U7 语义: 黄 连接中 / 绿 已连接 / 红 未连上)。
+fn cdp_status_color(status: &str) -> egui::Color32 {
+    if status.contains("已连接") {
+        COL_GREEN
+    } else if status.contains("连接中") || status.contains("重试中") {
+        COL_YELLOW
+    } else {
+        COL_RED
     }
 }
 
@@ -2663,18 +2676,18 @@ impl eframe::App for PlaApp {
                     if dot_resp.double_clicked() {
                         reset_to_snap = true;
                     }
+                    // R18.1: 内点 = CDP(主通道)连接状态; bridge(只读冗余)只进悬停提示与能力面板。
                     let dot_color = if self.snap_target.is_none() {
                         COL_GRAY_DOT
                     } else {
-                        status_color(&self.bridge_status)
+                        cdp_status_color(&self.cdp_status)
                     };
                     ui.painter().circle_filled(dot_rect.center(), 4.0, dot_color);
-                    // F2: 外环 = CDP 能力健康度(绿 全部可用 / 黄 部分 / 红 无编辑器 / 无环 未连接)。
+                    // F2: 外环只在能力受损时出现(黄 部分可用 / 红 未找到编辑器); 全部可用或未连接不画。
                     let ring = match pla_ui::features::health(self.cdp_caps.as_ref()) {
-                        Health::Unknown => None,
+                        Health::Unknown | Health::Full => None,
                         Health::NoEditor => Some(COL_RED),
                         Health::Partial => Some(COL_YELLOW),
-                        Health::Full => Some(COL_GREEN),
                     };
                     if let Some(c) = ring {
                         ui.painter().circle_stroke(dot_rect.center(), 5.4, egui::Stroke::new(1.2, c));
@@ -2692,9 +2705,9 @@ impl eframe::App for PlaApp {
                         hovered = Some((
                             "PLA 助手".into(),
                             format!(
-                                "{win}\nBridge: {}\n{}\n单击: CDP 能力面板 · 双击: 归位",
-                                self.bridge_status,
-                                self.cdp_summary()
+                                "{win}\n{}\nBridge(只读): {}\n单击: CDP 能力面板 · 双击: 归位",
+                                self.cdp_summary(),
+                                self.bridge_status
                             ),
                         ));
                     }
@@ -4399,6 +4412,7 @@ impl eframe::App for PlaApp {
                     age_s: self.cdp_caps_at.map(|t| t.elapsed().as_secs()),
                     cdp_status: self.cdp_status.clone(),
                     proxy_status: self.proxy.status.clone(),
+                    bridge_status: self.bridge_status.clone(),
                 };
                 let mut reprobe = false;
                 show_child_window(
