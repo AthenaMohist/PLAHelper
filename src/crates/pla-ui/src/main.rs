@@ -2261,6 +2261,56 @@ impl PlaApp {
         }
     }
 
+    /// R7-17 / R26: doc_key 跟随绑定窗口标题("model1.plasticity - Plasticity" → "model1")。
+    /// 同一窗口内换文件(标题变)也会触发; 吸附/拖动两条路径都调用。
+    fn sync_doc_key(&mut self) {
+        let Some(title) = self.snap_target.as_ref().map(|t| t.title.clone()) else {
+            return;
+        };
+        let derived = Self::doc_key_from_title(&title);
+        if derived != self.doc_key {
+            pla_ui::diag::log(&format!("doc switch: {} -> {}", self.doc_key, derived));
+            self.doc_key = derived;
+            self.reset_doc_scoped();
+        }
+    }
+
+    /// R26: 文档切换时作废**所有**按 doc_key 归档的状态 —— 唯一清单, 新增按文档存的字段必须加到这里。
+    /// (以前只重置了一部分: 视口状态列表、选择集/视口截图缓存按名字缓存, 新文档同名 SG001 会显示旧图。)
+    fn reset_doc_scoped(&mut self) {
+        // 实体 / 当前选择镜像
+        self.entities.clear();
+        self.sel_cdp_members.clear();
+        self.sel_save_pending = None;
+        // 快照墙
+        self.snapshots = pla_ui::snapshot::list_snapshots(&self.doc_key);
+        self.snap_pngs.clear();
+        self.snap_favs = pla_ui::snapshot::load_favs(&self.doc_key);
+        self.snap_infos = pla_ui::snapshot::load_meta_infos(&self.doc_key);
+        self.snap_selected.clear();
+        self.snap_delete_confirm = None;
+        self.rename_edit = None;
+        self.last_auto_mtime = None;
+        // 选择集
+        self.sel_saved.clear();
+        self.sel_saved_loaded = false;
+        self.sel_pngs.clear();
+        self.sel_selected.clear();
+        self.sel_delete_confirm = None;
+        self.sel_rename = None;
+        // 视口状态
+        self.vp_states.clear();
+        self.vp_states_loaded = false;
+        self.vp_pngs.clear();
+        self.vp_pending_state = None;
+        self.vp_delete_confirm = None;
+        self.vp_rename = None;
+        // 尺寸驱动(关联选择集)
+        self.dim_sets.clear();
+        self.dim_set_sel = 0;
+        self.dim_loaded = false;
+    }
+
     fn update_snap(&mut self, ctx: &egui::Context) {
         if self.last_snap_poll.elapsed() < Duration::from_millis(SNAP_POLL_MS) {
             return;
@@ -2287,6 +2337,8 @@ impl PlaApp {
                         // 保持拖动位置: 只更新绑定/探测, 不发 OuterPosition
                         self.snap_target = Some(target.clone());
                         self.cdp.set_target(Some(target.hwnd));
+                        // R26: 拖动模式也要跟随同窗口内的文档切换(以前这里提前 return, doc_key 不更新)。
+                        self.sync_doc_key();
                         if self.last_probe_poll.elapsed()
                             >= Duration::from_millis(PROBE_POLL_MS)
                             || self
@@ -2308,23 +2360,7 @@ impl PlaApp {
         self.snap_target = bound;
         // R19: CDP 跟随绑定窗口(多窗口时每个助手只读写自己那扇窗口的 renderer)。
         self.cdp.set_target(self.snap_target.as_ref().map(|t| t.hwnd));
-        // R7-17: doc_key 跟随绑定窗口标题("model1.plasticity - Plasticity" →
-        // "model1") — 多文档/多窗口时快照/选择集/实体缓存按文档隔离(PRD 验收)。
-        if let Some(target) = self.snap_target.clone() {
-            let derived = Self::doc_key_from_title(&target.title);
-            if derived != self.doc_key {
-                self.doc_key = derived;
-                // 文档切换: 全部按 doc_key 归档的缓存失效重载
-                self.entities.clear();
-                self.snapshots = pla_ui::snapshot::list_snapshots(&self.doc_key);
-                self.snap_pngs.clear();
-                self.snap_favs = pla_ui::snapshot::load_favs(&self.doc_key);
-                self.snap_infos = pla_ui::snapshot::load_meta_infos(&self.doc_key);
-                self.sel_cdp_members.clear();
-                self.sel_saved_loaded = false;
-                self.dim_loaded = false;
-            }
-        }
+        self.sync_doc_key();
         // 用 owned 克隆避免在 self 上叠加可变借用。
         let Some(target) = self.snap_target.clone() else {
             // 未绑定: 清缓存, 等 Plasticity 出现。
