@@ -21,26 +21,34 @@
   // 1. 内部结构表（唯一来源）。Plasticity 升级改名时，在对应行追加备选路径即可。
   //    键 -> [根, 备选路径...]
   //    根：ed = Editor；sel = 当前 Selection；vp = 视口（见 viewport()）；oc = 视口的轨道控制器；
-  //        reg = 命令注册表(CommandRegistry)。
+  //        reg = 命令注册表(CommandRegistry)；click = 选择点击器；cs = changeSelection；
+  //        exec = 命令执行器；km = KeymapManager；kb = 键盘。
+  //    方法类表键一律挂在其所属对象的根下, 调用时 this = 该对象(见 invokeOn)。
   // =====================================================================
   var LOC = {
     'ed.selection':            ['ed', 'selection'],
     'ed.viewports':            ['ed', 'viewports'],
     'ed.activeViewport':       ['ed', '_activeViewport', 'activeViewport'],
-    'ed.click.addById':        ['ed', 'click.addById'],
-    'ed.click.clear':          ['ed', 'click.clear'],
-    'ed.hover':                ['ed', 'changeSelection.onHover'],
-    'ed.cancelCommand':        ['ed', 'executor.cancelActiveCommand'],
+    'ed.click':                ['ed', 'click'],
+    'click.addById':           ['click', 'addById'],
+    'click.clear':             ['click', 'clear'],
+    'ed.changeSelection':      ['ed', 'changeSelection'],
+    'cs.onHover':              ['cs', 'onHover'],
+    'ed.executor':             ['ed', 'executor'],
+    'exec.cancel':             ['exec', 'cancelActiveCommand'],
     'ed.undoStack':            ['ed', 'history._undoStack', 'history.undoStack'],
     'ed.geoVersion':           ['ed', 'geo._version', 'geo.version'],
     'ed.errorSignal':          ['ed', 'signals.environmentChanged'],
     'ed.registry':             ['ed', 'registry'],
     'reg.add':                 ['reg', 'add'],
     'reg.listeners':           ['reg', 'inlineListenersByCommandName'],
-    'ed.keymaps.add':          ['ed', 'keymaps.add'],
-    'ed.keymaps.bindings':     ['ed', 'keymaps.keyBindings'],
-    'ed.keyboard.update':      ['ed', 'keyboard.updateKeymap'],
+    'ed.keymaps':              ['ed', 'keymaps'],
+    'km.add':                  ['km', 'add'],
+    'km.bindings':             ['km', 'keyBindings'],
+    'ed.keyboard':             ['ed', 'keyboard'],
+    'kb.update':               ['kb', 'updateKeymap'],
     'ed.settings.orbit':       ['ed', 'settings.OrbitControls'],
+    'orbitSettings.step':      ['orbitSettings', 'rotateDiscreteIncrement'],
     'ed.shading.mode':         ['ed', 'shading.mode'],
     'ed.shading.section':      ['ed', 'shading._sectionMode'],
     'ed.shading.changed':      ['ed', 'shading.signals.shadingChanged'],
@@ -64,7 +72,10 @@
     'oc.quaternion':           ['oc', 'quaternion'],
     'oc.quaternionEnd':        ['oc', 'quaternionEnd'],
     'oc.step':                 ['oc', 'rotateDiscreteIncrement'],
-    'oc.update':               ['oc', 'update']
+    'oc.update':               ['oc', 'update'],
+    'oc.domElement':           ['oc', 'domElement'],
+    'oc.needsUpdate':          ['oc', 'needsUpdate'],
+    'oc.setNeedsUpdate':       ['oc', 'setNeedsUpdate']
   };
 
   // 选择集里的各类 id 集合：[对外的 kind, Selection 上的集合名]。sel.ids.<kind> 表键由此生成。
@@ -94,7 +105,31 @@
     vnodeChildren: '__k',
     outlinerComponent: 'Outliner',
     outlinerSections: ['OutlinerSection', 'Memoed'],
-    vnodeScanLimit: 80000
+    vnodeScanLimit: 80000,
+    // 命令进行中 Plasticity 挂在 <body> 上的属性(取消命令后要清掉, 否则悬停管线不恢复)。
+    bodyBusyAttrs: ['gizmo', 'command'],
+    // 悬停命中项里携带拓扑对象的字段(按顺序取第一个存在的)与其版本 id 字段。
+    hitItemKeys: ['topologyItem', 'object'],
+    versionIdKey: 'versionId',
+    // click.addById 的面 id 前缀(实测: '2:<versionId>' 选中面)。
+    faceIdPrefix: '2:',
+    // 扫描累积表上限(防异常增长)。
+    scanMapLimit: 512,
+    // three.js 相机字段。
+    perspectiveFlag: 'isPerspectiveCamera',
+    // 着色模式的标签字段与切换时需要的 prev 结构字段。
+    shadingTagKey: 'tag',
+    shadingPrevField: 'prev',
+    shadingPrevKeys: ['materials', 'isTinted'],
+    // Atom KeymapManager 的 KeyBinding 字段。
+    keyBindingFields: { selector: 'selector', keys: 'keystrokes', command: 'command' },
+    // 常驻维护(补注册滚转命令等)的最小间隔(ms)。
+    maintainEveryMs: 2000,
+    // 剖面 / 构造面的向量字段。
+    planeVecKeys: ['p', 'n', 'x', 'y'],
+    rendererKeys: ['antiAlias', 'toneMapping', 'toneMappingExposure'],
+    gridKeys: ['every', 'size'],
+    cameraExtraKeys: ['fov', 'zoom', 'near', 'far']
   };
 
   // =====================================================================
@@ -107,17 +142,17 @@
   var CAPS = {
     'editor':    { needs: [] },
     'sel.read':  { needs: ['sel.selected', 'sel.size'], optional: selKindKeys },
-    'sel.write': { needs: ['ed.click.addById', 'ed.click.clear', 'ed.cancelCommand'] },
+    'sel.write': { needs: ['click.addById', 'click.clear', 'exec.cancel'] },
     'hist.read': { needs: ['ed.undoStack', 'ed.geoVersion'] },
     'cam.read':  { needs: ['vp.camera'], optional: ['vp.orbit'].concat(orbitKeys) },
     'cam.write': { needs: ['vp.camera', 'vp.orbit', 'oc.quaternionEnd', 'oc.targetEnd', 'oc.radiusEnd', 'vp.render'] },
     'cam.nav':   { needs: ['vp.navigate'] },
-    'cam.step':  { needs: ['oc.step'], optional: ['ed.settings.orbit'] },
-    'cam.roll':  { needs: ['reg.add', 'reg.listeners', 'oc.quaternionEnd', 'oc.step'] },
-    'scan':      { needs: ['ed.hover', 'vp.pointer', 'ed.cancelCommand', 'ed.click.clear'] },
+    'cam.step':  { needs: ['oc.step'], optional: ['orbitSettings.step'] },
+    'cam.roll':  { needs: ['reg.add', 'reg.listeners', 'oc.quaternionEnd', 'oc.step'], optional: ['oc.domElement'] },
+    'scan':      { needs: ['cs.onHover', 'vp.pointer', 'exec.cancel', 'click.clear'] },
     'vp.state':  { needs: ['vp.camera', 'vp.orbit', 'ed.shading.mode', 'ed.shading.changed', 'ed.sections'],
                    optional: ['ed.shading.section', 'vp.cplane', 'vp.settings.renderer', 'vp.settings.ao', 'vp.settings.grid', 'vp.container'] },
-    'keymap':    { needs: ['ed.keymaps.add', 'ed.keymaps.bindings'], optional: ['ed.keyboard.update'] },
+    'keymap':    { needs: ['km.add', 'km.bindings'], optional: ['kb.update'] },
     'cmd.dispatch': { needs: ['reg.add', 'reg.listeners'] },
     'err.hook':  { needs: ['ed.errorSignal'] },
     'tree':      { needs: [], dom: true },
@@ -131,7 +166,8 @@
   // 3. 解析器
   // =====================================================================
   var MISS = {};
-  var state = { ed: null, finder: null, gen: 0, hooks: {}, lastError: null, hits: {}, pings: 0 };
+  var state = { ed: null, finder: null, gen: 0, hooks: {}, lastError: null, hits: {}, pings: 0,
+                scan: null, disposables: [], lastMaintain: 0 };
 
   function errMsg(e) { return e && e.message ? String(e.message) : String(e); }
 
@@ -159,6 +195,12 @@
       case 'vp': return viewport();
       case 'oc': return get('vp.orbit');
       case 'reg': return get('ed.registry');
+      case 'click': return get('ed.click');
+      case 'cs': return get('ed.changeSelection');
+      case 'exec': return get('ed.executor');
+      case 'km': return get('ed.keymaps');
+      case 'kb': return get('ed.keyboard');
+      case 'orbitSettings': return get('ed.settings.orbit');
     }
     return undefined;
   }
@@ -207,6 +249,15 @@
   function setVec(obj, arr) {
     if (!obj || !arr || typeof obj.set !== 'function') return false;
     try { obj.set.apply(obj, arr); return true; } catch (e) { return false; }
+  }
+
+  // 调用方法类表键: this = 该表键所属的根对象(如 click.clear 的 this = ed.click)。缺失抛 CapError。
+  function invokeOn(key, args, base) {
+    var spec = LOC[key];
+    var owner = base !== undefined ? base : rootOf(spec[0]);
+    var fn = need(key, base);
+    if (typeof fn !== 'function') throw new CapError(key, [key]);
+    return fn.apply(owner, args || []);
   }
 
   function call0(obj, key) {
@@ -353,11 +404,20 @@
       if (!capState(h[1]).ok) return;
       try { state.hooks[h[0]] = h[2]() || function () {}; } catch (e) {}
     });
+    // 常驻维护(节流): 视口元素可能重建, 滚转命令要补注册。
+    var now = Date.now();
+    if (now - state.lastMaintain >= NAMES.maintainEveryMs) {
+      state.lastMaintain = now;
+      if (capState('cam.roll').ok) { try { maintainRollCommands(); } catch (e) {} }
+    }
   }
 
   function disposeHooks() {
     Object.keys(state.hooks).forEach(function (k) { try { state.hooks[k](); } catch (e) {} });
     state.hooks = {};
+    try { endScan(); } catch (e) {}
+    state.disposables.forEach(function (d) { try { d.dispose(); } catch (e) {} });
+    state.disposables = [];
   }
 
   // =====================================================================
@@ -431,7 +491,7 @@
     var cam = need('vp.camera');
     cam.position.set(o.px, o.py, o.pz);
     cam.quaternion.set(o.qx, o.qy, o.qz, o.qw);
-    var persp = cam.isPerspectiveCamera === true;
+    var persp = cam[NAMES.perspectiveFlag] === true;
     var proj = false;
     if (persp) {
       if (typeof o.zoom === 'number' && typeof cam.zoom === 'number') { cam.zoom = o.zoom; proj = true; }
@@ -487,21 +547,385 @@
     return true;
   });
 
+  // ---- 注册到 Plasticity 的命令一律"委托": 回调触发时才去找**当前**的 window.__PLA__ ----
+  // 回调若闭包捕获某个垫片实例, 热替换后它仍指向旧实例(R21 实测: 旧实例的 ping 回调让新实例计数不动)。
+  // 哪些元素已挂委托记在页面级唯一的 __PLA_PAGE__ 上(跨实例存续), 热替换不会重复注册。
+  function pageState() {
+    var p = W.__PLA_PAGE__;
+    // delegated: 命令注册表 → { 命令名: WeakSet(已挂委托的元素) }(editor 换代 = 新注册表, 要重新挂)。
+    if (!p) { p = { delegated: new WeakMap() }; W.__PLA_PAGE__ = p; }
+    return p;
+  }
+
+  function ensureDelegate(cmdName, el, action, force) {
+    var page = pageState();
+    var reg = need('ed.registry');
+    var byName = page.delegated.get(reg);
+    if (!byName) { byName = {}; page.delegated.set(reg, byName); }
+    var set = byName[cmdName] || (byName[cmdName] = new WeakSet());
+    if (set.has(el)) return false;
+    // 已有别处注册的同名回调(旧版助手留下的)且不强制: 不再叠加, 避免一次按键执行两次。
+    if (!force && hasListener(cmdName, el)) return false;
+    var map = {};
+    map[cmdName] = function () {
+      var cur = W.__PLA__;
+      if (cur && typeof cur._onCommand === 'function') cur._onCommand(action, el);
+    };
+    // CommandRegistry.add 只有对象形式 add(target, {名: 回调})(pitfalls #21)。
+    var d = invokeOn('reg.add', [el, map]);
+    if (d && typeof d.dispose === 'function') state.disposables.push(d);
+    set.add(el);
+    return true;
+  }
+
+  // 委托回调的落点(由当前实例执行)。
+  function onCommand(action, el) {
+    if (action === 'ping') state.pings++;
+    else if (action === 'rollLeft') rollBy(viewportOfElement(el), -1);
+    else if (action === 'rollRight') rollBy(viewportOfElement(el), 1);
+  }
+
   // 自检用: 在视口元素上注册一个空命令(幂等), 派发它, 确认回调真的执行了。
   // 覆盖"注册(对象形式 add)→ 派发 → 回调"整条链(滚转、命令派发层都依赖它)。
   def('cmd.ping', 'cmd.dispatch', function () {
     var el = viewportElement();
     if (!el) throw new Error('no viewport element (' + CFG.viewportSelector + ')');
     var name = CFG.pingCommand;
-    if (!hasListener(name, el)) {
-      var map = {};
-      map[name] = function () { state.pings++; };
-      // CommandRegistry.add 只有对象形式 add(target, {名: 回调})(pitfalls #21)。
-      need('reg.add').call(need('ed.registry'), el, map);
-    }
+    ensureDelegate(name, el, 'ping', false);
     var before = state.pings;
     dispatchOn(el, name);
+    if (state.pings === before) {
+      // 只有旧实例留下的(闭包式)回调: 强制补挂委托(ping 是空操作, 叠加无害)再试一次。
+      ensureDelegate(name, el, 'ping', true);
+      dispatchOn(el, name);
+    }
     return { registered: hasListener(name, el), fired: state.pings > before };
+  });
+
+  // ---- 选择写入 / 取消命令 ----
+  function clearBusyAttrs() {
+    NAMES.bodyBusyAttrs.forEach(function (a) { try { document.body.removeAttribute(a); } catch (e) {} });
+  }
+
+  def('sel.cancelCommand', 'sel.write', function () {
+    invokeOn('exec.cancel');
+    clearBusyAttrs();
+    return true;
+  });
+  def('sel.clear', 'sel.write', function () { invokeOn('click.clear'); return true; });
+  // 按版本 id 临时选中一个面(遮挡补救用: 只为 navigateToSelection 取景, 不走点击管线)。
+  def('sel.addFaceById', 'sel.write', function (a) {
+    if (!a || a.versionId === undefined) throw new Error('sel.addFaceById needs {versionId}');
+    invokeOn('click.addById', [NAMES.faceIdPrefix + a.versionId]);
+    return true;
+  });
+  def('sel.faceIds', 'sel.read', function () {
+    var s = need('sel.selected');
+    var out = [];
+    var set = get('sel.ids.face', s);
+    var vk = NAMES.versionIdKey;
+    if (set && typeof set.forEach === 'function') {
+      set.forEach(function (x) { out.push(String(x && x[vk] !== undefined ? x[vk] : x)); });
+    }
+    var size = get('sel.size', s);
+    return { selN: typeof size === 'number' ? size : -1, faces: out };
+  });
+
+  // ---- 悬停扫描(选择集应用): 包装 changeSelection.onHover, 页面侧自读指针坐标累积 id → 坐标 ----
+  // 数据源铁律: 只信这张累积表; selection.hits 是陈旧的点击会话, 不可用(v4 教训)。
+  function hitVersionId(h) {
+    if (!h) return null;
+    for (var i = 0; i < NAMES.hitItemKeys.length; i++) {
+      var t = h[NAMES.hitItemKeys[i]];
+      if (t && t[NAMES.versionIdKey] !== undefined) return String(t[NAMES.versionIdKey]);
+    }
+    return null;
+  }
+
+  function endScan() {
+    var sc = state.scan;
+    state.scan = null;
+    if (sc && get('cs.onHover', sc.cs) === sc.wrapped) put('cs.onHover', sc.orig, sc.cs);
+  }
+
+  def('scan.begin', 'scan', function (a) {
+    // 命令进行中悬停管线是暂停的 → 先取消活动命令、清 body 忙碌属性。
+    try { invokeOn('exec.cancel'); } catch (e) {}
+    if (!a || !a.keepSel) { try { invokeOn('click.clear'); } catch (e2) {} }
+    clearBusyAttrs();
+    var canvas = document.querySelector(CFG.viewportSelector + ' canvas');
+    if (!canvas) throw new Error('no viewport canvas');
+    var cs = need('ed.changeSelection');
+    var cur = need('cs.onHover');
+    if (!state.scan || state.scan.cs !== cs || cur !== state.scan.wrapped) {
+      var orig = cur;
+      var wrapped = function () {
+        try {
+          var m = state.scan && state.scan.map;
+          var pe = get('vp.pointer');
+          var hits = arguments[0];
+          // onHover 自带的 x/y 参数恒为 0 → 自读视口最后一次指针事件(与 CDP Input 同一坐标系)。
+          if (m && pe && typeof pe.clientX === 'number' && hits && hits.length) {
+            var n = Object.keys(m).length;
+            for (var i = 0; i < hits.length && n < NAMES.scanMapLimit; i++) {
+              var vid = hitVersionId(hits[i]);
+              if (vid && !m[vid]) { m[vid] = [Math.round(pe.clientX), Math.round(pe.clientY)]; n++; }
+            }
+          }
+        } catch (e3) {}
+        return orig.apply(cs, arguments);
+      };
+      put('cs.onHover', wrapped, cs);
+      state.scan = { cs: cs, orig: orig, wrapped: wrapped, map: {} };
+    }
+    state.scan.map = {};
+    var r = canvas.getBoundingClientRect();
+    return [Math.round(r.x), Math.round(r.y), Math.round(r.width), Math.round(r.height)];
+  });
+  // 累积表: { versionId: [x, y] }(只记首次命中坐标)。
+  def('scan.read', 'scan', function () {
+    var m = state.scan && state.scan.map;
+    var o = {};
+    if (m) Object.keys(m).forEach(function (k) { o[k] = m[k]; });
+    return o;
+  });
+  def('scan.clear', 'scan', function () { if (state.scan) state.scan.map = {}; return true; });
+  // 结束扫描: 还原 onHover(不再常驻包装), 唤醒重绘。
+  def('scan.end', 'scan', function () {
+    endScan();
+    call0(viewport(), 'vp.render');
+    return true;
+  });
+
+  // ---- 视角 / 视口杂项 ----
+  def('cam.navigateToSelection', 'cam.nav', function () { invokeOn('vp.navigate', [], viewport()); return true; });
+  def('cam.render', 'cam.read', function () { invokeOn('vp.render', [], viewport()); return true; });
+  def('cam.vpRect', 'cam.read', function () {
+    var r = need('vp.container').getBoundingClientRect();
+    return { x: r.x, y: r.y, width: r.width, height: r.height, scale: 1 };
+  });
+  // 步进角(弧度)即时生效: Plasticity 不重载 settings.json, 值缓存在各视口轨道控制器上(pitfalls #18)。
+  // 内存里的设置也一并改, 防 Plasticity 写回旧值。
+  def('cam.setOrbitStep', 'cam.step', function (a) {
+    if (!a || typeof a.rad !== 'number') throw new Error('cam.setOrbitStep needs {rad}');
+    var settings = put('orbitSettings.step', a.rad);
+    var n = 0;
+    var vps = get('ed.viewports');
+    if (vps) vps.forEach(function (v) { var oc = get('vp.orbit', v); if (oc && put('oc.step', a.rad, oc)) n++; });
+    return { viewports: n, settings: settings };
+  });
+
+  // ---- 滚转: 轨道控制器目标朝向右乘绕本地 Z 轴的旋转(视线不变、阻尼过渡, 角度 = 步进角) ----
+  function viewportOfElement(el) {
+    var best = null;
+    var vps = get('ed.viewports');
+    if (el && vps) {
+      vps.forEach(function (v) {
+        if (best) return;
+        var oc = get('vp.orbit', v);
+        var dom = oc && get('oc.domElement', oc);
+        if (dom && el.contains && el.contains(dom)) best = v;
+      });
+    }
+    return best || get('ed.activeViewport') || viewport();
+  }
+
+  function rollBy(v, sign) {
+    var oc = need('vp.orbit', v);
+    var cam = need('vp.camera', v);
+    var qe = need('oc.quaternionEnd', oc);
+    var Q = qe.constructor;
+    var V = cam.position.constructor;
+    var step = get('oc.step', oc) || Math.PI / 12;
+    qe.multiply(new Q().setFromAxisAngle(new V(0, 0, 1), sign * step));
+    put('oc.needsUpdate', true, oc);
+    try { invokeOn('oc.setNeedsUpdate', [], oc); } catch (e) {}
+    return step;
+  }
+
+  def('cam.roll', 'cam.roll', function (a) {
+    return { step: rollBy(viewportOfElement(null), a && a.sign < 0 ? -1 : 1) };
+  });
+
+  // 在每个视口元素上注册滚转命令(keymap 把 Alt+←/→ 绑到它们)。视口元素重建 / 页面重载后自动补注册。
+  // 委托式(见 ensureDelegate): 热替换后执行的是当前实例的 rollBy。
+  function maintainRollCommands() {
+    var names = CFG.rollCommands;
+    var els = document.querySelectorAll(CFG.viewportSelector);
+    var n = 0;
+    for (var i = 0; i < els.length; i++) {
+      if (ensureDelegate(names.left, els[i], 'rollLeft', false)) n++;
+      ensureDelegate(names.right, els[i], 'rollRight', false);
+    }
+    return n;
+  }
+
+  // ---- 按键绑定(运行时): 先删同选择器下我们的(现行 / 旧版)绑定, 再按需加 ----
+  def('keymap.setBindings', 'keymap', function (a) {
+    if (!a || typeof a.bindings !== 'object') throw new Error('keymap.setBindings needs {enable, bindings, legacy?, source?}');
+    var km = need('ed.keymaps');
+    var list = need('km.bindings');
+    var f = NAMES.keyBindingFields;
+    var sel = CFG.viewportSelector;
+    var cur = a.bindings;
+    var old = a.legacy || {};
+    var kept = list.filter(function (b) {
+      return !(b[f.selector] === sel && (cur[b[f.keys]] === b[f.command] || old[b[f.keys]] === b[f.command]));
+    });
+    put('km.bindings', kept, km);
+    if (a.enable) {
+      var m = {};
+      m[sel] = cur;
+      invokeOn('km.add', [a.source || 'pla-helper', m]);
+    }
+    try { invokeOn('kb.update'); } catch (e) {}
+    return { enabled: !!a.enable, removed: list.length - kept.length };
+  });
+
+  // ---- 视口显示状态: 保存 / 恢复(格式与 R8-1 存档兼容) ----
+  // 每段独立 try, 失败原因逐段记录(以前空 catch 让整段静默消失, R10)。
+  function vecFields(obj) {
+    var o = {};
+    NAMES.planeVecKeys.forEach(function (k) { o[k] = v3(obj[k]); });
+    return o;
+  }
+
+  function primFields(src, keys) {
+    var o = {};
+    keys.forEach(function (k) {
+      var v = src[k];
+      if (typeof v === 'number' || typeof v === 'boolean' || typeof v === 'string') o[k] = v;
+    });
+    return o;
+  }
+
+  function assignPrims(dst, src, keys) {
+    keys.forEach(function (k) {
+      if (src[k] === undefined || src[k] === null) return;
+      var v = src[k];
+      if (typeof dst[k] === 'number' && typeof v === 'string' && v !== '' && !isNaN(Number(v))) v = Number(v);
+      try { dst[k] = v; } catch (e) {}
+    });
+  }
+
+  function listOf(x) {
+    if (Array.isArray(x)) return x;
+    var a = [];
+    try { x.forEach(function (y) { a.push(y); }); } catch (e) {}
+    return a;
+  }
+
+  def('vp.save', 'vp.state', function () {
+    var out = { failed: [] };
+    function seg(name, fn) { try { fn(); } catch (e) { out.failed.push(name + ':' + errMsg(e)); } }
+    seg('cam', function () {
+      var cam = need('vp.camera');
+      var c = { px: cam.position.x, py: cam.position.y, pz: cam.position.z,
+                qx: cam.quaternion.x, qy: cam.quaternion.y, qz: cam.quaternion.z, qw: cam.quaternion.w };
+      NAMES.cameraExtraKeys.forEach(function (k) { c[k] = typeof cam[k] === 'number' ? cam[k] : null; });
+      out.cam = c;
+    });
+    seg('orbit', function () {
+      var oc = need('vp.orbit');
+      var o = {};
+      ORBIT_FIELDS.forEach(function (f) {
+        [f[0], f[0] + 'End'].forEach(function (name) {
+          var val = get('oc.' + name, oc);
+          o[name] = f[3] === 'v3' ? v3(val) : (typeof val === 'number' ? val : null);
+        });
+      });
+      out.orbit = o;
+    });
+    seg('shading', function () {
+      var tag = NAMES.shadingTagKey;
+      var m = get('ed.shading.mode');
+      var s = get('ed.shading.section');
+      out.shading = { mode: m ? m[tag] : null, section: s ? s[tag] : null };
+    });
+    seg('sections', function () {
+      out.sections = listOf(need('ed.sections')).map(function (s) {
+        var o = vecFields(s);
+        o.enabled = !!s.enabled;
+        return o;
+      });
+    });
+    seg('cplane', function () { var cp = get('vp.cplane'); if (cp) out.cplane = vecFields(cp); });
+    seg('renderer', function () { out.renderer = primFields(need('vp.settings.renderer'), NAMES.rendererKeys); });
+    seg('ao', function () {
+      var ao = need('vp.settings.ao');
+      out.ao = primFields(ao, Object.keys(ao).filter(function (k) { return typeof ao[k] !== 'string'; }));
+    });
+    seg('grid', function () { out.grid = primFields(need('vp.settings.grid'), NAMES.gridKeys); });
+    try {
+      var r = need('vp.container').getBoundingClientRect();
+      out.vpRect = [r.x, r.y, r.width, r.height];
+      out.dpr = W.devicePixelRatio || 1;
+    } catch (e) {}
+    out.err = '';
+    return out;
+  });
+
+  def('vp.restore', 'vp.state', function (S) {
+    S = S || {};
+    var applied = [], missing = [], failed = [];
+    function seg(name, present, fn) {
+      if (!present) { missing.push(name); return; }
+      try { fn(); } catch (e) { failed.push(name + ':' + errMsg(e)); }
+    }
+    seg('cam', !!S.cam, function () {
+      var cam = need('vp.camera');
+      var view = {};
+      Object.keys(S.cam).forEach(function (k) { view[k] = S.cam[k]; });
+      if (S.orbit) view.orbit = S.orbit;
+      // 正交相机不写投影参数(R7-31h) — 如实标注没应用的项。
+      if (cam[NAMES.perspectiveFlag] !== true) {
+        if (typeof S.cam.zoom === 'number') missing.push('zoom(正交未应用)');
+        if (typeof S.cam.fov === 'number') missing.push('fov(正交未应用)');
+      }
+      var r = API['cam.set'].fn(view);
+      applied.push('cam');
+      if (r.proj) applied.push('proj');
+      if (r.orbit) applied.push('orbit');
+    });
+    if (!S.orbit) missing.push('orbit');
+    seg('shading', !!(S.shading && S.shading.mode), function () {
+      var tag = NAMES.shadingTagKey;
+      var m = need('ed.shading.mode');
+      if (m[tag] !== S.shading.mode) {
+        // 切换链(R8-1 实测): 构造合法 prev → 改 tag → 派发 shadingChanged。
+        var prev = {};
+        prev[tag] = m[tag];
+        NAMES.shadingPrevKeys.forEach(function (k) { prev[k] = m[k]; });
+        m[NAMES.shadingPrevField] = prev;
+        m[tag] = S.shading.mode;
+        need('ed.shading.changed').dispatch(m);
+      }
+      if (S.shading.section) { var sm = get('ed.shading.section'); if (sm) sm[tag] = S.shading.section; }
+      applied.push('shading');
+    });
+    seg('sections', Array.isArray(S.sections), function () {
+      var cur = listOf(need('ed.sections'));
+      var n = Math.min(cur.length, S.sections.length);
+      for (var i = 0; i < n; i++) {
+        var d = S.sections[i], s = cur[i];
+        try { s.enabled = !!d.enabled; } catch (e) {}
+        NAMES.planeVecKeys.forEach(function (k) { setVec(s[k], d[k]); });
+      }
+      // 数量对齐: 多余的禁用; 缺的无法凭空造(如实只恢复 n 个)。
+      for (var j = S.sections.length; j < cur.length; j++) { try { cur[j].enabled = false; } catch (e2) {} }
+      applied.push('sections:' + n);
+    });
+    seg('cplane', !!S.cplane, function () {
+      var cp = get('vp.cplane');
+      if (!cp) throw new Error('null');
+      NAMES.planeVecKeys.forEach(function (k) { setVec(cp[k], S.cplane[k]); });
+      applied.push('cplane');
+    });
+    seg('renderer', !!S.renderer, function () { assignPrims(need('vp.settings.renderer'), S.renderer, NAMES.rendererKeys); applied.push('renderer'); });
+    seg('ao', !!S.ao, function () { var ao = need('vp.settings.ao'); assignPrims(ao, S.ao, Object.keys(S.ao)); applied.push('ao'); });
+    seg('grid', !!S.grid, function () { assignPrims(need('vp.settings.grid'), S.grid, NAMES.gridKeys); applied.push('grid'); });
+    call0(viewport(), 'vp.render');
+    return { applied: applied, missing: missing, failed: failed };
   });
 
   def('err.last', 'err.hook', function () { return state.lastError; });
@@ -546,6 +970,8 @@
       return JSON.stringify(out);
     },
     hasEditor: function () { return !!editor(); },
+    // 委托命令回调的落点(见 ensureDelegate); 不是对外接口, Rust 不调用。
+    _onCommand: function (action, el) { try { onCommand(action, el); } catch (e) {} },
     bindEditor: function (e) {
       if (!isEditor(e)) return false;
       W[CFG.editorGlobal] = e;
@@ -553,13 +979,10 @@
     },
     dispose: function () {
       disposeHooks();
-      if (W.__PLA_HOOK__ && W.__PLA_HOOK__.shim === self) delete W.__PLA_HOOK__;
       if (W.__PLA__ === self) delete W.__PLA__;
     }
   };
 
-  // 兼容期别名（F1b 迁移完写路径后删除）：旧片段经 __PLA_HOOK__.findEditor 也走同一个获取入口。
-  W.__PLA_HOOK__ = { shim: self, findEditor: function () { return editor(); } };
   W.__PLA__ = self;
   ensureHooks();
   return JSON.stringify({ installed: true, api: API_VERSION, rev: CFG.rev, editor: !!editor() });

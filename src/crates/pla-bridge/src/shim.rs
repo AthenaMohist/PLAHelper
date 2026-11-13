@@ -28,6 +28,10 @@ pub const VIEWPORT_SELECTOR: &str = "plasticity-viewport";
 /// 自检用空命令名（`cmd.ping` 注册并派发它，验证"注册 → 派发 → 回调"整条链）。
 pub const PING_COMMAND: &str = "pla:shim:ping";
 
+/// 滚转命令名(垫片在视口元素上注册; pla-ui keymap 把 Alt+←/→ 绑到它们)。
+pub const ROLL_LEFT_COMMAND: &str = "pla:roll:left";
+pub const ROLL_RIGHT_COMMAND: &str = "pla:roll:right";
+
 /// 接口名（与 `pla-shim.js` 的 `def()` 一一对应；新增接口两边同时加，契约测试会检查）。
 pub mod api {
     pub const CORE_PROBE: &str = "core.probe";
@@ -41,11 +45,29 @@ pub mod api {
     pub const CMD_PING: &str = "cmd.ping";
     pub const ERR_LAST: &str = "err.last";
     pub const TREE_LIST: &str = "tree.list";
+    pub const SEL_CANCEL_COMMAND: &str = "sel.cancelCommand";
+    pub const SEL_CLEAR: &str = "sel.clear";
+    pub const SEL_ADD_FACE_BY_ID: &str = "sel.addFaceById";
+    pub const SEL_FACE_IDS: &str = "sel.faceIds";
+    pub const SCAN_BEGIN: &str = "scan.begin";
+    pub const SCAN_READ: &str = "scan.read";
+    pub const SCAN_CLEAR: &str = "scan.clear";
+    pub const SCAN_END: &str = "scan.end";
+    pub const CAM_NAVIGATE: &str = "cam.navigateToSelection";
+    pub const CAM_RENDER: &str = "cam.render";
+    pub const CAM_VP_RECT: &str = "cam.vpRect";
+    pub const CAM_SET_ORBIT_STEP: &str = "cam.setOrbitStep";
+    pub const CAM_ROLL: &str = "cam.roll";
+    pub const KEYMAP_SET_BINDINGS: &str = "keymap.setBindings";
+    pub const VP_SAVE: &str = "vp.save";
+    pub const VP_RESTORE: &str = "vp.restore";
 
     /// 全部接口名（契约测试用）。
     pub const ALL: &[&str] = &[
         CORE_PROBE, CORE_HEALTH, CORE_APIS, SEL_SNAPSHOT, HIST_STATE, CAM_GET, CAM_SET, CMD_DISPATCH,
-        CMD_PING, ERR_LAST, TREE_LIST,
+        CMD_PING, ERR_LAST, TREE_LIST, SEL_CANCEL_COMMAND, SEL_CLEAR, SEL_ADD_FACE_BY_ID, SEL_FACE_IDS,
+        SCAN_BEGIN, SCAN_READ, SCAN_CLEAR, SCAN_END, CAM_NAVIGATE, CAM_RENDER, CAM_VP_RECT,
+        CAM_SET_ORBIT_STEP, CAM_ROLL, KEYMAP_SET_BINDINGS, VP_SAVE, VP_RESTORE,
     ];
 }
 
@@ -211,6 +233,7 @@ pub fn config_json() -> Value {
         "editorSignature": EDITOR_SIGNATURE,
         "viewportSelector": VIEWPORT_SELECTOR,
         "pingCommand": PING_COMMAND,
+        "rollCommands": { "left": ROLL_LEFT_COMMAND, "right": ROLL_RIGHT_COMMAND },
     })
 }
 

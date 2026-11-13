@@ -38,8 +38,9 @@ pub enum CdpCmd {
     RefreshTree,
     /// F2: 立即重新探测能力(结果无变化也上报, 供面板"重新探测")。
     ProbeCaps,
-    /// 通用 evaluate(R7-16): 尺寸驱动命令派发等自动化尝试。
-    Eval(String),
+    /// F1b: 调一个垫片接口(名字来自 `shim::api`), 结果经 `CdpEvent::CallResult` 回报。
+    /// 取代 R7-16 的通用 Eval(界面不再拼 JS)。
+    Call { name: &'static str, args: Value },
     Shutdown,
 }
 
@@ -78,8 +79,8 @@ pub enum CdpEvent {
     Selection(SelectionSnapshot),
     /// 实体树（OutlinerSection 平铺, 含 curves/instances）。
     Tree(Vec<TreeNode>),
-    /// Eval 回包。
-    EvalResult(String),
+    /// `CdpCmd::Call` 的回包: 接口名 + v 或错误说明。
+    CallResult { name: &'static str, result: Result<Value, String> },
     /// R8-1: 视口状态采集回包(JSON 字符串; err 字段非空表示失败)。
     VpStateResult(String),
     /// R8-1: 视口截图回包(PNG 字节数)。
@@ -169,58 +170,6 @@ impl CdpHandle {
         }
     }
 }
-
-/// R14: 注册 `pla:roll:left` / `pla:roll:right` — 绕屏幕法线(视线)轴按步进角滚转。
-///
-/// Plasticity 自带 `viewport:roll:*` 固定 90°、不读步进角; `orbit:rotate:*` 只有上下左右。
-/// 实测(26.2.3): 把轨道控制器的目标朝向 `quaternionEnd` 右乘绕本地 Z 轴的旋转即为滚转 —
-/// 视线方向不变、相机不平移, 阻尼动画自然过渡, 角度精确(15° 实测)。
-/// 步进角每次现读 `orbitControls.rotateDiscreteIncrement`, 与方向键一致、随设置实时变化。
-/// left = 画面逆时针(相机绕本地 Z 负转), right = 画面顺时针。
-/// 监听器挂在 `<plasticity-viewport>` 元素上(与 orbit:rotate:* 同处), 按元素标记幂等;
-/// 视口元素重建或页面重载后由周期钩子补注册。keymap 绑定见 pla-ui `plasticity_config`。
-const ROLL_HOOK_JS: &str = r#"(function(){
-  var ed = window.__PLA_EDITOR__;
-  if (!ed || !ed.registry || !ed.viewports) return 'no-editor';
-  var reg = ed.registry;
-  // 幂等判断看注册表本身(不用元素标记: 标记可能先于注册失败而被置上)。
-  function registered(el){
-    var m = reg.inlineListenersByCommandName;
-    var w = m && (m instanceof Map ? m.get('pla:roll:left') : m['pla:roll:left']);
-    return !!(w && w.has && w.has(el));
-  }
-  var els = document.querySelectorAll('plasticity-viewport');
-  var n = 0;
-  for (var i = 0; i < els.length; i++) {
-    var el = els[i];
-    if (registered(el)) continue;
-    (function(el){
-      function vpOf(){
-        var best = null;
-        ed.viewports.forEach(function(v){
-          if (!best && v && v.orbitControls && v.orbitControls.domElement && el.contains(v.orbitControls.domElement)) best = v;
-        });
-        return best || ed._activeViewport || ed.viewports.values().next().value;
-      }
-      function roll(sign){
-        var v = vpOf(); if (!v || !v.orbitControls || !v.camera) return;
-        var oc = v.orbitControls;
-        var Q = oc.quaternionEnd.constructor, V = v.camera.position.constructor;
-        var step = oc.rotateDiscreteIncrement || (Math.PI / 12);
-        oc.quaternionEnd.multiply(new Q().setFromAxisAngle(new V(0, 0, 1), sign * step));
-        oc.needsUpdate = true;
-        try { oc.setNeedsUpdate(); } catch (e) {}
-      }
-      // Plasticity 的 CommandRegistry.add 只有对象形式: add(target, {命令名: 回调})(arity 2)。
-      reg.add(el, {
-        'pla:roll:left': function(){ roll(-1); },
-        'pla:roll:right': function(){ roll(1); }
-      });
-    })(el);
-    if (registered(el)) n++;
-  }
-  return 'ok:' + n;
-})()"#;
 
 fn cdp_thread_main(
     port: u16,
@@ -351,8 +300,6 @@ async fn session_loop(
     let mut last_snapshot = String::new();
     let mut last_tree = String::new();
     let mut sel_tick: u32 = 0;
-    // 滚转命令补注册节流计数(每 5 轮 ≈ 2.5s 一次; F1b 迁入垫片钩子后删除)。
-    let mut hook_tick: u32 = 0;
 
     // F1: 注入垫片(错误捕获钩子由垫片按 editor 代际自动安装); F2: 上报能力。
     let mut last_caps: Option<shim::CapsReport> = None;
@@ -368,15 +315,9 @@ async fn session_loop(
         // --- UI 命令(非阻塞) ---
         match cmd_rx.try_recv() {
             Ok(CdpCmd::Shutdown) => return Err(anyhow::anyhow!("shutdown")),
-            Ok(CdpCmd::Eval(expr)) => {
-                match eval_roundtrip(ws, &mut mid, &expr).await {
-                    Ok(r) => {
-                        let _ = ev_tx.send(CdpEvent::EvalResult(r));
-                    }
-                    Err(e) => {
-                        let _ = ev_tx.send(CdpEvent::EvalResult(format!("ERR: {e}")));
-                    }
-                }
+            Ok(CdpCmd::Call { name, args }) => {
+                let result = shim_call(ws, &mut mid, name, args).await.map_err(|e| e.to_string());
+                let _ = ev_tx.send(CdpEvent::CallResult { name, result });
             }
             Ok(CdpCmd::ProbeCaps) => {
                 last_caps = None; // 强制上报
@@ -497,31 +438,17 @@ async fn session_loop(
                             }
                         }
                     }
-                let js = match apply_sel_js(&entries, gi > 0) {
-                    Ok(j) => j,
-                    Err(e) => {
-                        let _ = ev_tx.send(CdpEvent::Status(format!("选择集应用失败: {e}")));
-                        continue;
-                    }
-                };
-                // Phase A: 准备 — 取消活动命令(hover 管线在命令期间暂停!),
-                // 清选择, 装扫描 spy, 取视口矩形。返回 [x,y,w,h]
-                let prep = match eval_roundtrip(ws, &mut mid, &js).await {
+                // Phase A: 准备(垫片 scan.begin) — 取消活动命令(悬停管线在命令期间暂停)、
+                // 首组清选择(多相机组的第 2+ 组保留前面已点好的)、装扫描包装, 返回画布矩形 [x,y,w,h]。
+                let prep = shim_call(ws, &mut mid, shim::api::SCAN_BEGIN, serde_json::json!({ "keepSel": gi > 0 }))
+                    .await
+                    .and_then(|v| Ok(serde_json::from_value::<(i64, i64, i64, i64)>(v)?));
+                let rect: (i64, i64, i64, i64) = match prep {
                     Ok(r) => r,
                     Err(e) => {
-                        let _ = ev_tx.send(CdpEvent::Status(format!(
-                            "选择集应用失败(准备阶段): {e}"
-                        )));
-                        continue 'groups;
-                    }
-                };
-                let rect: (i64, i64, i64, i64) = match serde_json::from_str::<(i64,i64,i64,i64)>(&prep) {
-                    Ok(r) => r,
-                    Err(_) => {
-                        // prep 是错误 JSON {err:...}
-                        let (ok, fail, errs) = parse_apply_result(&prep);
-                        total_fail += fail as usize;
-                        fail_parts.push(errs);
+                        let _ = ev_tx.send(CdpEvent::Status(format!("选择集应用失败(准备阶段): {e}")));
+                        total_fail += entries.len();
+                        fail_parts.push(format!("准备失败: {e}"));
                         continue 'groups;
                     }
                 };
@@ -544,7 +471,7 @@ async fn session_loop(
                         let _ = dispatch_mouse_move(ws, &mut mid, x, y).await;
                         tokio::time::sleep(Duration::from_millis(SCAN_STEP_MS)).await;
                     }
-                    match eval_roundtrip(ws, &mut mid, MAP_READ_JS).await {
+                    match scan_read(ws, &mut mid).await {
                         Ok(s) => absorb_map(&s, &mut pos_map),
                         Err(e) => {
                             eprintln!("[pla-cdp] map read(粗网格行级) 传输失败: {e:#}");
@@ -569,7 +496,7 @@ async fn session_loop(
                             let _ = dispatch_mouse_move(ws, &mut mid, x, y).await;
                             tokio::time::sleep(Duration::from_millis(SCAN_STEP_MS)).await;
                         }
-                        match eval_roundtrip(ws, &mut mid, MAP_READ_JS).await {
+                        match scan_read(ws, &mut mid).await {
                             Ok(s) => absorb_map(&s, &mut pos_map),
                             Err(e) => {
                                 eprintln!("[pla-cdp] map read(细网格行级) 传输失败: {e:#}");
@@ -637,16 +564,8 @@ async fn session_loop(
                 // Phase D(v5.1): 校验 + 唤醒渲染。verify 回读 faceIds, 对每个
                 // 已定位目标 id 求交集 — 没进 faceIds 的即同坐标组里被遮挡的,
                 // 如实计失败(旋转视角分离是标准解法, 不尝试自动分离)。
-                let verify = r#"(function(){
-  var ed=window.__PLA_EDITOR__;
-  if(!ed||!ed.selection){ var f=window.__PLA_HOOK__; if(f) ed=f.findEditor(); if(ed) window.__PLA_EDITOR__=ed; }
-  if(!ed||!ed.selection) return JSON.stringify({ok:0,fail:0,errs:['no-editor']});
-  var s=ed.selection.selected;
-  var vp=null; ed.viewports.forEach(function(v){if(!vp)vp=v});
-  try{ if(vp&&vp.setNeedsRender) vp.setNeedsRender() }catch(e){}
-  delete window.__PLA_SCAN__;
-  return JSON.stringify({selN:(typeof s.size==='number')?s.size:-1, faces:(function(){var a=[];try{s.faceIds.forEach(function(x){a.push(String(x&&x.versionId!==undefined?x.versionId:x))})}catch(e){}return a})()});})()"#;
-                let verify_raw = eval_roundtrip(ws, &mut mid, verify).await;
+                shim_fire(ws, &mut mid, shim::api::CAM_RENDER, Value::Null).await;
+                let verify_raw = sel_face_ids(ws, &mut mid).await;
                 if let Err(ref e) = verify_raw {
                     eprintln!("[pla-cdp] verify eval 失败: {e:#}");
                 }
@@ -671,7 +590,7 @@ async fn session_loop(
                             rect.1 + rect.3 / 2,
                         )
                         .await;
-                        let _ = eval_roundtrip(ws, &mut mid, CLEAR_MAP_JS).await;
+                        shim_fire(ws, &mut mid, shim::api::SCAN_END, Value::Null).await;
                         continue 'groups;
                     }
                 };
@@ -710,16 +629,13 @@ async fn session_loop(
                             }
                             // 1) addById 临时选中该面(navigateToSelection 只读选择,
                             //    不需要点击管线的活跃实体上下文)
-                            let select_js = format!(
-                                "(function(){{try{{var ed=window.__PLA_EDITOR__;if(!ed||!ed.selection){{var f=window.__PLA_HOOK__;if(f)ed=f.findEditor();}}if(!ed)return 'no-ed';ed.click.addById('2:{}');return 'ok'}}catch(e){{return 'EXC'}}}})()",
-                                occ_id
-                            );
-                            if let Err(e) = eval_roundtrip(ws, &mut mid, &select_js).await {
+                            let pick = serde_json::json!({ "versionId": occ_id });
+                            if let Err(e) = shim_call(ws, &mut mid, shim::api::SEL_ADD_FACE_BY_ID, pick).await {
                                 eprintln!("[pla-cdp] 补救选择 {occ_id} 失败: {e:#}");
                                 continue;
                             }
                             // 2) 转到该面正视
-                            if let Err(e) = eval_roundtrip(ws, &mut mid, NAV_TO_SELECTION_JS).await {
+                            if let Err(e) = shim_call(ws, &mut mid, shim::api::CAM_NAVIGATE, Value::Null).await {
                                 eprintln!("[pla-cdp] navigateToSelection 失败: {e:#}");
                                 continue;
                             }
@@ -734,7 +650,7 @@ async fn session_loop(
                                     let _ = dispatch_mouse_move(ws, &mut mid, x, y).await;
                                     tokio::time::sleep(Duration::from_millis(25)).await;
                                 }
-                                if let Ok(s) = eval_roundtrip(ws, &mut mid, MAP_READ_JS).await {
+                                if let Ok(s) = scan_read(ws, &mut mid).await {
                                     let mut m2 = std::collections::HashMap::new();
                                     absorb_map(&s, &mut m2);
                                     if let Some(&(px, py)) = m2.get(occ_id) {
@@ -745,12 +661,12 @@ async fn session_loop(
                             }
                             // 4) shift+click 补选 + 取消可能的自动命令
                             if let Some((px, py)) = occ_pos {
-                                let _ = eval_roundtrip(ws, &mut mid, CLEAR_MAP_JS).await;
+                                shim_fire(ws, &mut mid, shim::api::SCAN_CLEAR, Value::Null).await;
                                 if dispatch_mouse_click(ws, &mut mid, px, py, true).await.is_ok() {
-                                    let _ = eval_roundtrip(ws, &mut mid, CANCEL_CMD_JS).await;
+                                    shim_fire(ws, &mut mid, shim::api::SEL_CANCEL_COMMAND, Value::Null).await;
                                     tokio::time::sleep(Duration::from_millis(250)).await;
                                     // 复核: 进 faceIds 才算救回
-                                    if let Ok(v) = eval_roundtrip(ws, &mut mid, VERIFY_FACES_JS).await {
+                                    if let Ok(v) = sel_face_ids(ws, &mut mid).await {
                                         if let Some(fs) = extract_face_ids(&v) {
                                             if fs.contains(occ_id) {
                                                 rescued_occ.push(occ_id.clone());
@@ -792,9 +708,8 @@ async fn session_loop(
                 let ok = tally.confirmed;
                 let fail = misses.len() + tally.occluded + click_failed.len();
                 let _ = dispatch_mouse_move(ws, &mut mid, rect.0 + rect.2 / 2, rect.1 + rect.3 / 2).await;
-                // 唤醒 hover 后清累积表: 点击完成后的正常 hover 又会写入新命中,
-                // 留着既无用途也会无限增长(甚至干扰下次应用), 统一在收尾清零。
-                let _ = eval_roundtrip(ws, &mut mid, CLEAR_MAP_JS).await;
+                // 收尾: 结束扫描(还原 onHover 包装、清累积表、唤醒重绘)。
+                shim_fire(ws, &mut mid, shim::api::SCAN_END, Value::Null).await;
                 // R8: 组结果并入汇总(不再逐组发 Status, 统一收尾一条)
                 total_ok += ok;
                 total_fail += fail;
@@ -840,71 +755,38 @@ async fn session_loop(
             }
             // ---- R8-1: 视口状态采集/恢复 + 视口裁剪截图 ----
             Ok(CdpCmd::VpStateSave) => {
-                let r = eval_roundtrip(ws, &mut mid, VPSTATE_SNAPSHOT_JS).await;
-                match r {
-                    Ok(s) => {
-                        let _ = ev_tx.send(CdpEvent::VpStateResult(s));
-                    }
-                    Err(e) => {
-                        let _ = ev_tx.send(CdpEvent::VpStateResult(format!(
-                            "{{\"err\":\"{e}\"}}"
-                        )));
-                    }
-                }
+                // 回包格式与 R8-1 存档一致(err 字段非空 = 失败)。
+                let s = match shim_call(ws, &mut mid, shim::api::VP_SAVE, Value::Null).await {
+                    Ok(v) => v.to_string(),
+                    Err(e) => serde_json::json!({ "err": e.to_string() }).to_string(),
+                };
+                let _ = ev_tx.send(CdpEvent::VpStateResult(s));
             }
             Ok(CdpCmd::VpStateApply(state)) => {
-                let js = VPSTATE_RESTORE_JS_TMPL.replace("__STATE__", &state);
-                match eval_roundtrip(ws, &mut mid, &js).await {
-                    Ok(r) => {
-                        let _ = ev_tx.send(CdpEvent::Status(fmt_vpstate_apply_result(&r)));
-                    }
-                    Err(e) => {
-                        let _ = ev_tx
-                            .send(CdpEvent::Status(format!("视口状态恢复失败: {e}")));
-                    }
-                }
+                let msg = match serde_json::from_str::<Value>(&state) {
+                    Err(e) => format!("视口状态恢复失败: 存档无法解析({e})"),
+                    Ok(s) => match shim_call(ws, &mut mid, shim::api::VP_RESTORE, s).await {
+                        Ok(r) => fmt_vpstate_apply_result(&r.to_string()),
+                        Err(e) => format!("视口状态恢复失败: {e}"),
+                    },
+                };
+                let _ = ev_tx.send(CdpEvent::Status(msg));
             }
             Ok(CdpCmd::CaptureViewport(out_path)) => {
                 // 视口 DOM rect(CSS px) → clip(逻辑 px); captureScreenshot
                 // 的 clip 以 CSS 像素为单位(与 viewport 缩放无关, 按 dpr 放大输出)。
-                let rect_js = r#"(function(){
-  var ed=window.__PLA_EDITOR__;
-  if(!ed||!ed.selection){ var f=window.__PLA_HOOK__; if(f) ed=f.findEditor(); if(ed) window.__PLA_EDITOR__=ed; }
-  if(!ed) return '';
-  var vps=[]; ed.viewports.forEach(function(v){vps.push(v)});
-  if(!vps.length) return '';
-  try{ var r=vps[0].container.getBoundingClientRect();
-    return JSON.stringify({x:r.x,y:r.y,width:r.width,height:r.height,scale:1}) }catch(e){ return '' }})()"#;
-                let rect_raw = match eval_roundtrip(ws, &mut mid, rect_js).await {
-                    Ok(s) if !s.is_empty() => s,
-                    _ => {
-                        let _ = ev_tx.send(CdpEvent::Status(
-                            "视口截图失败: 读不到视口区域(仍将保存, 无缩略图)".into(),
-                        ));
-                        let _ = ev_tx.send(CdpEvent::ViewportPng(0));
-                        continue;
-                    }
-                };
-                let clip: Value = match serde_json::from_str(&rect_raw) {
+                let clip: Value = match shim_call(ws, &mut mid, shim::api::CAM_VP_RECT, Value::Null).await {
                     Ok(v) => v,
                     Err(e) => {
                         let _ = ev_tx.send(CdpEvent::Status(format!(
-                            "视口截图失败: rect 解析 {e}(仍将保存, 无缩略图)"
+                            "视口截图失败: 读不到视口区域({e}), 仍将保存, 无缩略图"
                         )));
                         let _ = ev_tx.send(CdpEvent::ViewportPng(0));
                         continue;
                     }
                 };
                 // 先强制渲染一帧(按需渲染模式下 canvas 可能是旧帧)
-                let force = r#"(function(){
-  var ed=window.__PLA_EDITOR__;
-  if(!ed){ var f=window.__PLA_HOOK__; if(f) ed=f.findEditor(); }
-  if(!ed) return 'no-ed';
-  var vps=[]; ed.viewports.forEach(function(v){vps.push(v)});
-  if(!vps.length) return 'no-vp';
-  try{ vps[0].setNeedsRender() }catch(e){}
-  return 'ok'})()"#;
-                let _ = eval_roundtrip(ws, &mut mid, force).await;
+                shim_fire(ws, &mut mid, shim::api::CAM_RENDER, Value::Null).await;
                 tokio::time::sleep(Duration::from_millis(120)).await;
                 let shot = serde_json::json!({
                     "id": mid,
@@ -1012,11 +894,7 @@ async fn session_loop(
                 }
                 Err(e) => eprintln!("[pla-cdp] 垫片探活失败: {e:#}"),
             }
-            if hook_tick % 5 == 0 {
-                // R14: Alt+←/→ 步进滚转命令(视口元素重建/页面重载后自动补注册)。
-                let _ = eval_roundtrip(ws, &mut mid, ROLL_HOOK_JS).await;
-            }
-            hook_tick += 1;
+            // (Alt+←/→ 滚转命令的注册/补注册由垫片常驻维护, 随每次调用节流执行。)
             let raw = eval_roundtrip(ws, &mut mid, &shim::batch_expr(&poll_calls())).await?;
             if raw != last_snapshot {
                 last_snapshot = raw.clone();
@@ -1058,10 +936,32 @@ async fn install_shim(ws: &mut WsStream, mid: &mut u64) -> Option<shim::CapsRepo
     probe_caps(ws, mid).await
 }
 
+/// 调一个垫片接口, 返回其 v(失败带能力 / 异常说明)。
+pub(crate) async fn shim_call(ws: &mut WsStream, mid: &mut u64, name: &str, args: Value) -> anyhow::Result<Value> {
+    let raw = eval_roundtrip(ws, mid, &shim::call_expr(name, &args)).await?;
+    Ok(shim::parse_reply(&raw)?)
+}
+
+/// 选择集应用: 读扫描累积表(JSON {versionId: [x, y]}), 交给 `absorb_map`。
+async fn scan_read(ws: &mut WsStream, mid: &mut u64) -> anyhow::Result<String> {
+    Ok(shim_call(ws, mid, shim::api::SCAN_READ, Value::Null).await?.to_string())
+}
+
+/// 选择集应用: 读当前选中面的版本 id(JSON {selN, faces}), 交给 `extract_face_ids`。
+async fn sel_face_ids(ws: &mut WsStream, mid: &mut u64) -> anyhow::Result<String> {
+    Ok(shim_call(ws, mid, shim::api::SEL_FACE_IDS, Value::Null).await?.to_string())
+}
+
+/// 不关心结果的垫片调用(收尾/唤醒类): 失败只记日志。
+async fn shim_fire(ws: &mut WsStream, mid: &mut u64, name: &str, args: Value) {
+    if let Err(e) = shim_call(ws, mid, name, args).await {
+        eprintln!("[pla-cdp] {name} 失败: {e:#}");
+    }
+}
+
 /// 读当前视角(垫片 `cam.get`), 返回 JSON 字符串 {px..qw, zoom?, fov?, orbit?}。
 async fn cam_get(ws: &mut WsStream, mid: &mut u64) -> anyhow::Result<String> {
-    let raw = eval_roundtrip(ws, mid, &shim::call_expr(shim::api::CAM_GET, &Value::Null)).await?;
-    Ok(shim::parse_reply(&raw)?.to_string())
+    Ok(shim_call(ws, mid, shim::api::CAM_GET, Value::Null).await?.to_string())
 }
 
 /// 切到给定视角(垫片 `cam.set`; 参数 = `cam_get` 的 JSON, 老存档可缺 orbit/zoom/fov)。
@@ -1194,327 +1094,7 @@ fn selection_from_batch(raw: &str) -> SelectionSnapshot {
     }
 }
 
-/// v5: ApplySel Phase A — 鼠标管线的准备脚本(累积式 hover spy 版)。
-/// 取消活动命令(hover 管线在命令期间暂停) + 清选择 + 清 gizmo/command body
-/// 属性 + 装累积 spy + 清零累积表 + 返回视口 rect "[x,y,w,h]" 或错误 JSON。
-///
-/// 累积式 spy(v5 提速核心, 已实测): 包装 ed.changeSelection.onHover 信号,
-/// 回调内**自读** vp.lastPointerEvent.clientX/Y(=页面坐标, CDP Input 同一
-/// 坐标系; onHover 自带的 x/y 参数恒 0 不可用), 把本次 hits 里每个
-/// topologyItem||object 的 versionId 累积进 window.__PLA_MAP__(id→{x,y},
-/// **只记首次出现** — 后续命中不覆盖, 保证坐标来自确定扫过的点)。
-/// Rust 侧扫描只发 mouseMoved, 零 per-point eval, 行级读一次表即可。
-///
-/// 幂等: window.__PLA_SPY5B__ 标记已装; 已装时仅清空 __PLA_MAP__ 复用。
-/// (调试期页面里可能残留旧版 spy — 只要 __PLA_MAP__ 由本 spy 写入即兼容。)
-///
-/// 数据源铁律: 本管线只信 spy 累积表; ed.selection.hits.hits 是 stale 点击
-/// 会话(合成 onClick 也会写它), 绝不可作扫描数据源(v4 的教训)。
-fn apply_sel_js(entries: &[ApplyEntry], keep_sel: bool) -> anyhow::Result<String> {
-    // Phase A 只需 entries 用于去重校验(空校验在 Rust 侧), 这里生成准备脚本。
-    // R8: keep_sel=true(多相机组的第 2+ 组)跳过 click.clear — 保住前面组
-    // 已点好的选择; 首组 keep_sel=false 维持"替换语义"。
-    let _ = entries;
-    let clear_js = if keep_sel { "" } else { "try{ ed.click.clear() }catch(e){}" };
-    let js = r#"(function(){
-  var ed=window.__PLA_EDITOR__;
-  if(!ed||!ed.selection){ var f=window.__PLA_HOOK__; if(f) ed=f.findEditor(); if(ed) window.__PLA_EDITOR__=ed; }
-  if(!ed||!ed.selection) return JSON.stringify({ok:0,fail:0,errs:['no-editor']});
-  try{ ed.executor.cancelActiveCommand() }catch(e){}
-  __CLEAR_SEL__
-  document.body.removeAttribute('gizmo');
-  document.body.removeAttribute('command');
-  var c=document.querySelector('plasticity-viewport canvas');
-  if(!c) return JSON.stringify({ok:0,fail:0,errs:['no-canvas']});
-  var cs = ed.changeSelection;
-  if(cs && cs.onHover && window.__PLA_SPY_VER__ !== 2){
-    var orig = cs.onHover;
-    var wrapped = function(hits){
-      try{
-        var edDyn = window.__PLA_HOOK__ ? window.__PLA_HOOK__.findEditor() : null;
-        if(!edDyn) edDyn = ed;
-        var vp=null; edDyn.viewports.forEach(function(v){if(!vp)vp=v});
-        var pe = vp && vp.lastPointerEvent;
-        var px = pe && typeof pe.clientX==='number' ? pe.clientX : null;
-        var py = pe && typeof pe.clientY==='number' ? pe.clientY : null;
-        if(px!==null && py!==null && hits && hits.length){
-          var m = window.__PLA_MAP__;
-          if(!m){ m={}; window.__PLA_MAP__=m }
-          for(var i=0;i<hits.length;i++){
-            var t = hits[i] && (hits[i].topologyItem || hits[i].object);
-            var vid = t && t.versionId!==undefined ? String(t.versionId) : null;
-            if(vid && !m[vid]) m[vid]={x:px,y:py};
-          }
-        }
-      }catch(e2){}
-      if(typeof orig==='function'){ try{ return orig.apply(cs, arguments) }catch(e3){} }
-      return undefined;
-    };
-    try{ Object.defineProperty(wrapped,'name',{value:'__plaSpy5b'}) }catch(e4){}
-    cs.onHover = wrapped;
-    window.__PLA_SPY5B__ = true;
-    window.__PLA_SPY_VER__ = 2;
-  }
-  window.__PLA_MAP__ = {};
-  var r=c.getBoundingClientRect();
-  return JSON.stringify([Math.round(r.x),Math.round(r.y),Math.round(r.width),Math.round(r.height)]);
-})()"#;
-    Ok(js.replace("__CLEAR_SEL__", clear_js))
-}
 
-/// v5: 收尾清累积表 — 点击完成后的正常 hover 又会写入新命中, 表留着既无用
-/// 又会无限增长(甚至污染下次应用), Phase D 唤醒 hover 后统一清零。
-const CLEAR_MAP_JS: &str = r#"(function(){
-  try{ if(window.__PLA_MAP__) window.__PLA_MAP__={} }catch(e){}
-  return '1';})()"#;
-
-/// v5: 读取累积表 — 返回 spy 在扫描中累积的全部 id→[x,y](JSON 对象, 值为
-/// 数组形, 与 Rust 侧 (i64,i64) 元组反序列化匹配)。表空/未装 spy → "{}"。
-const MAP_READ_JS: &str = r#"(function(){
-  var m = window.__PLA_MAP__;
-  if(!m) return '{}';
-  var o={}; var n=0;
-  for(var k in m){
-    if(!Object.prototype.hasOwnProperty.call(m,k)) continue;
-    var v=m[k];
-    if(v && typeof v.x==='number' && typeof v.y==='number'){
-      o[k]=[Math.round(v.x),Math.round(v.y)];
-      if(++n>=512) break;
-    }
-  }
-  return JSON.stringify(o);})()"#;
-
-
-/// v5.2: 转到当前选择正视(navigateToSelection, 实测相机立即响应;
-/// 动画驱动, 调用方需等待 ~700ms 让相机稳定)。
-const NAV_TO_SELECTION_JS: &str = r#"(function(){
-  var ed=window.__PLA_EDITOR__;
-  if(!ed||!ed.selection){ var f=window.__PLA_HOOK__; if(f) ed=f.findEditor(); if(ed) window.__PLA_EDITOR__=ed; }
-  if(!ed||!ed.selection) return 'no-ed';
-  var vp=null; ed.viewports.forEach(function(v){if(!vp)vp=v});
-  if(!vp||typeof vp.navigateToSelection!=='function') return 'no-nav';
-  try{ vp.navigateToSelection(); return 'ok' }catch(e){ return 'EXC' }})()"#;
-
-/// R8-1: 视口状态采集 — 相机全参数(position/quaternion/zoom/fov) + orbitControls
-/// (target/focalOffset/radius) + shading(mode.tag/_sectionMode.tag) + 剖面数组
-/// (ed.sections.sections: enabled/p/n/x/y) + 参考面(vp._constructionPlane: p/n/x/y)
-/// + renderer/ao/grid 设置。返回 JSON; err 字段非空 = 失败。
-const VPSTATE_SNAPSHOT_JS: &str = r#"(function(){
-  var ed=window.__PLA_EDITOR__;
-  if(!ed||!ed.selection){ var f=window.__PLA_HOOK__; if(f) ed=f.findEditor(); if(ed) window.__PLA_EDITOR__=ed; }
-  if(!ed||!ed.selection) return JSON.stringify({err:'no-editor'});
-  var vps=[]; ed.viewports.forEach(function(v){vps.push(v)});
-  if(!vps.length) return JSON.stringify({err:'no-viewport'});
-  var vp=vps[0];
-  var out={};
-  // R10: 逐段记录失败原因。以前每段一个空 catch, 26.x 里任何结构变化(如
-  // vp.settings 搬走、orbitControls 改名)都会让该段**静默消失**, 恢复时对应
-  // 项跳过且仍返回 ok —— 用户看到的就是"全都恢复不了"却没有任何线索。
-  out.failed=[];
-  function v3(v){ return v&&v.x!==undefined ? [v.x,v.y,v.z] : null }
-  try{
-    var c=vp.camera;
-    out.cam={px:c.position.x,py:c.position.y,pz:c.position.z,
-      qx:c.quaternion.x,qy:c.quaternion.y,qz:c.quaternion.z,qw:c.quaternion.w,
-      fov:(typeof c.fov==='number')?c.fov:null, zoom:(typeof c.zoom==='number')?c.zoom:null,
-      near:(typeof c.near==='number')?c.near:null, far:(typeof c.far==='number')?c.far:null};
-  }catch(e){ out.failed.push('cam:'+(e&&e.message?e.message:'EXC')) }
-  try{
-    var oc=vp.orbitControls;
-    // R10(实测): orbitControls 是**阻尼**的 — 每个量都有 x / xEnd 两份, 每帧把
-    // x 往 xEnd 插值。只写 x 而 xEnd 还是旧值时, 相机会被动画拉回旧取景 ——
-    // 这就是"恢复后视角/缩放不对"的直接原因。两份都要存、都要写。
-    out.orbit={target:v3(oc.target), targetEnd:v3(oc.targetEnd),
-      focal:v3(oc.focalOffset), focalEnd:v3(oc.focalOffsetEnd),
-      radius:(typeof oc.radius==='number')?oc.radius:null,
-      radiusEnd:(typeof oc.radiusEnd==='number')?oc.radiusEnd:null,
-      zoom:(typeof oc.zoom==='number')?oc.zoom:null,
-      zoomEnd:(typeof oc.zoomEnd==='number')?oc.zoomEnd:null};
-  }catch(e){ out.failed.push('orbit:'+(e&&e.message?e.message:'EXC')) }
-  try{ out.shading={mode: ed.shading.mode?ed.shading.mode.tag:null,
-    section: ed.shading._sectionMode?ed.shading._sectionMode.tag:null} }catch(e){ out.failed.push('shading:'+(e&&e.message?e.message:'EXC')) }
-  try{
-    var arr=[];
-    ed.sections.sections.forEach(function(s){
-      arr.push({enabled:!!s.enabled, p:v3(s.p), n:v3(s.n), x:v3(s.x), y:v3(s.y)});
-    });
-    out.sections=arr;
-  }catch(e){ out.failed.push('sections:'+(e&&e.message?e.message:'EXC')) }
-  try{
-    var cp=vp._constructionPlane;
-    if(cp) out.cplane={p:v3(cp.p), n:v3(cp.n), x:v3(cp.x), y:v3(cp.y)};
-  }catch(e){ out.failed.push('cplane:'+(e&&e.message?e.message:'EXC')) }
-  try{
-    var r=vp.settings.Viewport.renderer;
-    out.renderer={antiAlias:!!r.antiAlias, toneMapping:String(r.toneMapping||''),
-      toneMappingExposure:(typeof r.toneMappingExposure==='number')?r.toneMappingExposure:null};
-  }catch(e){ out.failed.push('renderer:'+(e&&e.message?e.message:'EXC')) }
-  try{
-    var ao=vp.settings.Viewport.ao;
-    var av={};
-    Object.keys(ao).forEach(function(k){ var v=ao[k]; if(typeof v==='number'||typeof v==='boolean') av[k]=v });
-    out.ao=av;
-  }catch(e){ out.failed.push('ao:'+(e&&e.message?e.message:'EXC')) }
-  try{
-    var g=vp.settings.Grid;
-    out.grid={every:(typeof g.every==='number')?g.every:null, size:(typeof g.size==='number')?g.size:null};
-  }catch(e){ out.failed.push('grid:'+(e&&e.message?e.message:'EXC')) }
-  // 视口 DOM rect(CSS 像素) + dpr — 截图裁剪用
-  try{
-    var r2=vp.container.getBoundingClientRect();
-    out.vpRect=[r2.x,r2.y,r2.width,r2.height];
-    out.dpr=window.devicePixelRatio||1;
-  }catch(e){}
-  out.err='';
-  return JSON.stringify(out);})()"#;
-
-/// R8-1: 视口状态恢复 — 与 VPSTATE_SNAPSHOT_JS 对称。相机直写(正交模式禁碰
-/// 投影矩阵, v6 经验); shading 切换链 = 写 mode.tag + 构造合法 prev + dispatch
-/// shadingChanged(mode) + setNeedsRender(实测, R8-1 探测验证); 剖面/参考面数值
-/// 直写 + setNeedsRender。返回 'ok' 或错误描述。
-const VPSTATE_RESTORE_JS_TMPL: &str = r#"(function(){
-  var S=__STATE__;
-  var ed=window.__PLA_EDITOR__;
-  if(!ed||!ed.selection){ var f=window.__PLA_HOOK__; if(f) ed=f.findEditor(); if(ed) window.__PLA_EDITOR__=ed; }
-  if(!ed||!ed.selection) return 'no-editor';
-  var vps=[]; ed.viewports.forEach(function(v){vps.push(v)});
-  if(!vps.length) return 'no-viewport';
-  var vp=vps[0];
-  var applied=[];
-  // R10: 以前每段空 catch + 只回 applied 列表 —— 任何一段没生效就"无声跳过",
-  // 面板显示"已恢复"但界面/视角纹丝不动。现在分段记录 missing(存档里没有)
-  // 与 failed(写的时候抛了), 回包原样交回 Rust 侧如实显示。
-  var missing=[];
-  var failed=[];
-  function ex(e){ return e&&e.message?e.message:'EXC' }
-  function setV3(dst,src){ if(dst&&dst.set&&src){ try{ dst.set(src[0],src[1],src[2]); return true }catch(e){} } return false }
-  try{
-    if(S.cam){
-      var c=vp.camera;
-      c.position.set(S.cam.px,S.cam.py,S.cam.pz);
-      c.quaternion.set(S.cam.qx,S.cam.qy,S.cam.qz,S.cam.qw);
-      // R10: 缩放(fov/zoom)以前**根本没有恢复** —— 相机位姿对了但取景范围
-      // 不对, 用户看到的就是"视角恢复不了"。只在透视相机上写: 正交
-      // ProxyCamera 的 updateProjectionMatrix 有破坏性副作用(R7-31h)。
-      var persp = (c.isPerspectiveCamera===true);
-      var proj=false;
-      if(typeof S.cam.zoom==='number' && typeof c.zoom==='number'){
-        if(persp){ c.zoom=S.cam.zoom; proj=true } else { missing.push('zoom(正交未应用)') }
-      }
-      if(typeof S.cam.fov==='number' && typeof c.fov==='number'){
-        if(persp){ c.fov=S.cam.fov; proj=true } else { missing.push('fov(正交未应用)') }
-      }
-      if(proj){ try{ c.updateProjectionMatrix() }catch(e1){} applied.push('proj') }
-      applied.push('cam');
-    } else { missing.push('cam') }
-  }catch(e){ failed.push('cam:'+ex(e)) }
-  try{
-    if(S.orbit){
-      var oc=vp.orbitControls;
-      // R10(实测): x / xEnd 成对写 —— 只写当前值会被阻尼动画拉回旧取景。
-      function svEnd(dst,src){ if(dst&&dst.set&&src){ try{ dst.set(src[0],src[1],src[2]); return true }catch(e){} } return false }
-      setV3(oc.target,S.orbit.target);
-      svEnd(oc.targetEnd,S.orbit.targetEnd||S.orbit.target);
-      setV3(oc.focalOffset,S.orbit.focal);
-      svEnd(oc.focalOffsetEnd,S.orbit.focalEnd||S.orbit.focal);
-      if(typeof S.orbit.radius==='number'){
-        oc.radius=S.orbit.radius;
-        if(S.orbit.radiusEnd!==undefined&&S.orbit.radiusEnd!==null) oc.radiusEnd=S.orbit.radiusEnd; else oc.radiusEnd=S.orbit.radius;
-      }
-      if(typeof S.orbit.zoom==='number'){
-        oc.zoom=S.orbit.zoom;
-        if(S.orbit.zoomEnd!==undefined&&S.orbit.zoomEnd!==null) oc.zoomEnd=S.orbit.zoomEnd; else oc.zoomEnd=S.orbit.zoom;
-      }
-      // 朝向也同步给 orbit(否则用户下一次拖动会从旧朝向"跳"回来)
-      if(S.cam&&oc.quaternion&&oc.quaternion.set){
-        try{ oc.quaternion.set(S.cam.qx,S.cam.qy,S.cam.qz,S.cam.qw) }catch(e2){}
-        try{ if(oc.quaternionEnd&&oc.quaternionEnd.set) oc.quaternionEnd.set(S.cam.qx,S.cam.qy,S.cam.qz,S.cam.qw) }catch(e3){}
-      }
-      try{ if(typeof oc.update==='function') oc.update() }catch(e2){}
-      applied.push('orbit');
-    } else { missing.push('orbit') }
-  }catch(e){ failed.push('orbit:'+ex(e)) }
-  try{
-    if(S.shading&&S.shading.mode){
-      var m=ed.shading.mode;
-      if(m&&m.tag!==S.shading.mode){
-        m.prev={tag:m.tag, materials:m.materials, isTinted:!!m.isTinted};
-        m.tag=S.shading.mode;
-        try{ ed.shading.signals.shadingChanged.dispatch(m) }catch(e2){ failed.push('shading:dispatch') }
-      } else if(!m){ failed.push('shading:no-mode') }
-      if(S.shading.section&&ed.shading._sectionMode){
-        try{ ed.shading._sectionMode.tag=S.shading.section }catch(e2){ failed.push('shading:section') }
-      }
-      applied.push('shading');
-    } else { missing.push('shading') }
-  }catch(e){ failed.push('shading:'+ex(e)) }
-  try{
-    if(S.sections&&Array.isArray(S.sections)){
-      var cur=ed.sections.sections;
-      var curArr=Array.isArray(cur)?cur:(function(){var a=[];try{cur.forEach(function(x){a.push(x)})}catch(e9){}return a})();
-      // 数量对齐: 多余的禁用, 缺的无法凭空造(如实跳过)
-      for(var i=0;i<curArr.length&&i<S.sections.length;i++){
-        var d=S.sections[i], s=curArr[i];
-        try{ s.enabled=!!d.enabled }catch(e2){}
-        setV3(s.p,d.p); setV3(s.n,d.n); setV3(s.x,d.x); setV3(s.y,d.y);
-      }
-      for(var j=S.sections.length;j<curArr.length;j++){ try{ curArr[j].enabled=false }catch(e3){} }
-      applied.push('sections:'+Math.min(curArr.length,S.sections.length));
-    } else { missing.push('sections') }
-  }catch(e){ failed.push('sections:'+ex(e)) }
-  try{
-    if(S.cplane){
-      var cp=vp._constructionPlane;
-      if(cp){ setV3(cp.p,S.cplane.p); setV3(cp.n,S.cplane.n); setV3(cp.x,S.cplane.x); setV3(cp.y,S.cplane.y);
-        applied.push('cplane'); } else { failed.push('cplane:null') }
-    } else { missing.push('cplane') }
-  }catch(e){ failed.push('cplane:'+ex(e)) }
-  try{
-    if(S.renderer){
-      var r=vp.settings.Viewport.renderer;
-      if(typeof S.renderer.antiAlias==='boolean') r.antiAlias=S.renderer.antiAlias;
-      if(S.renderer.toneMapping) r.toneMapping=S.renderer.toneMapping;
-      if(typeof S.renderer.toneMappingExposure==='number') r.toneMappingExposure=S.renderer.toneMappingExposure;
-      applied.push('renderer');
-    } else { missing.push('renderer') }
-  }catch(e){ failed.push('renderer:'+ex(e)) }
-  try{
-    if(S.ao){
-      var ao=vp.settings.Viewport.ao;
-      Object.keys(S.ao).forEach(function(k){ try{ ao[k]=S.ao[k] }catch(e2){} });
-      applied.push('ao');
-    } else { missing.push('ao') }
-  }catch(e){ failed.push('ao:'+ex(e)) }
-  try{
-    if(S.grid){
-      var g=vp.settings.Grid;
-      if(typeof S.grid.every==='number') g.every=S.grid.every;
-      if(typeof S.grid.size==='number') g.size=S.grid.size;
-      applied.push('grid');
-    } else { missing.push('grid') }
-  }catch(e){ failed.push('grid:'+ex(e)) }
-  try{ vp.setNeedsRender() }catch(e){}
-  return JSON.stringify({applied:applied, missing:missing, failed:failed});})()"#;
-
-
-/// v5.2: 取消活动命令 + 清 body 的 gizmo/command 属性(补选后收尾)。
-const CANCEL_CMD_JS: &str = r#"(function(){
-  var ed=window.__PLA_EDITOR__;
-  if(!ed){ var f=window.__PLA_HOOK__; if(f) ed=f.findEditor(); }
-  if(!ed) return 'no-ed';
-  try{ ed.executor.cancelActiveCommand() }catch(e){}
-  document.body.removeAttribute('gizmo');
-  document.body.removeAttribute('command');
-  return 'ok'})()"#;
-
-/// v5.2: 复核当前 faceIds(补救后判定该面是否真的进了选择)。
-const VERIFY_FACES_JS: &str = r#"(function(){
-  var ed=window.__PLA_EDITOR__;
-  if(!ed||!ed.selection){ var f=window.__PLA_HOOK__; if(f) ed=f.findEditor(); if(ed) window.__PLA_EDITOR__=ed; }
-  if(!ed||!ed.selection) return JSON.stringify({selN:-1, faces:[]});
-  var s=ed.selection.selected;
-  return JSON.stringify({selN:(typeof s.size==='number')?s.size:-1,
-    faces:(function(){var a=[];try{s.faceIds.forEach(function(x){a.push(String(x&&x.versionId!==undefined?x.versionId:x))})}catch(e){}return a})()});})()"#;
 
 /// v5: 吸收 MAP_READ_JS 回包(JSON 对象字符串)进 pos_map。
 /// 回包异常时不吞错误 — 打日志供诊断, 已定位的不受影响。
@@ -1997,36 +1577,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dump_apply_sel_js() {
-        let entries = vec![
-            ApplyEntry { kind: "face".into(), id: "14f2025".into(), key: None, camera: None },
-            ApplyEntry { kind: "edge".into(), id: "14e1984".into(), key: None, camera: None },
-            ApplyEntry { kind: "solid".into(), id: "7".into(), key: None, camera: None },
-        ];
-        let js = apply_sel_js(&entries, false).unwrap();
-        eprintln!("===GENERATED-JS-BEGIN===");
-        eprintln!("{js}");
-        eprintln!("===GENERATED-JS-END===");
-        // 基本健全性: 不得含 // 注释痕迹, 必须完整收尾
-        assert!(!js.contains("//"), "JS 内含 // 注释会吞掉后续代码");
-        assert!(js.ends_with("})()"), "JS 未完整收尾");
-        // v5: Phase A 关键步骤存在
-        assert!(js.contains("cancelActiveCommand"), "缺少取消活动命令");
-        // R8: keep_sel 分支 — 首组有 clear, 后续组没有
-        let js_keep = apply_sel_js(&entries, true).unwrap();
-        assert!(!js_keep.contains("click.clear"), "keep_sel 组不应清选择");
-        assert!(js.contains("click.clear"), "首组应清选择");
-        assert!(js.contains("getBoundingClientRect"), "缺少视口矩形获取");
-        // v5: 累积式 hover spy 装配
-        assert!(js.contains("__PLA_SPY5B__"), "缺少 spy 幂等标记");
-        assert!(js.contains("__PLA_MAP__"), "缺少累积表");
-        assert!(js.contains("lastPointerEvent"), "缺少页面侧自读坐标");
-        assert!(js.contains("changeSelection"), "缺少 onHover 信号包装");
-        // v5 铁律: 不得读 stale 点击会话
-        assert!(!js.contains("selection.hits"), "Phase A 禁用 stale hits 数据源");
-    }
-
-    #[test]
     fn pick_page_follows_bound_window() {
         let multi = serde_json::json!([
             {"type":"page","title":"a.plasticity - Plasticity","hwnd":"111","webSocketDebuggerUrl":"ws://x/hwnd/111"},
@@ -2067,13 +1617,6 @@ mod tests {
         let s = selection_from_batch(r#"{"sel.snapshot":{"ok":false,"err":"cap:editor","missing":["editor"]}}"#);
         assert_eq!((s.ok, s.state.as_str()), (false, "no-editor"));
         assert_eq!(selection_from_batch(r#"{"__noShim":true}"#).state, "no-shim");
-    }
-
-    #[test]
-    fn map_read_js_sane() {
-        assert!(!MAP_READ_JS.contains("//"), "JS 内含 // 注释");
-        assert!(MAP_READ_JS.ends_with("})()"), "MAP_READ_JS 未完整收尾");
-        assert!(MAP_READ_JS.contains("__PLA_MAP__"));
     }
 
     #[test]

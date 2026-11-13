@@ -49,13 +49,17 @@
 | cam | `cam.get` | cam.read | ✓ F1a |
 | err | `err.last`（安装时挂监听） | err.hook | ✓ F1a |
 | tree | `tree.list` | tree | ✓ F1a |
-| sel | `sel.faceIds` `sel.clear` `sel.addById` `sel.cancelCommand` | sel.write | F1b |
-| scan | `scan.begin` `scan.read` `scan.clear` `scan.end`（还原 onHover） | scan | F1b |
 | cam | `cam.set` | cam.write | ✓ R20（cdp.rs 相机读写已全部改走垫片） |
 | cmd | `cmd.dispatch` `cmd.ping`（自检: 注册→派发→回调） | cmd.dispatch | ✓ R20 |
-| cam | `cam.navigateToSelection` `cam.roll` `cam.setOrbitStep` `cam.vpRect` `cam.render` | cam.nav / cam.step / cam.roll | F1b |
-| vp | `vp.save` `vp.restore` | vp.state | F1b |
-| cmd | `cmd.setArrowBindings` | keymap | F1b |
+| sel | `sel.faceIds` `sel.clear` `sel.addFaceById` `sel.cancelCommand` | sel.read / sel.write | ✓ R21 |
+| scan | `scan.begin` `scan.read` `scan.clear` `scan.end`（还原 onHover） | scan | ✓ R21 |
+| cam | `cam.navigateToSelection` `cam.roll` `cam.setOrbitStep` `cam.vpRect` `cam.render` | cam.nav / cam.step / cam.roll / cam.read | ✓ R21 |
+| vp | `vp.save` `vp.restore`（R8-1 存档格式兼容） | vp.state | ✓ R21 |
+| keymap | `keymap.setBindings` | keymap | ✓ R21 |
+
+**命令注册一律委托式**（R21）：注册到 Plasticity CommandRegistry 的回调触发时才找当前 `window.__PLA__._onCommand`，
+不闭包任何实例；已挂委托的元素记在页面级 `__PLA_PAGE__`（按注册表区分）。这是页面上除 `__PLA__` 外唯一的全局，
+专门承载"跨垫片实例存续"的状态。
 | 预留 | `mat.set`(N1) `cmd.exec`(N2) `bool.run`(N4) `asset.place`(N5) | 探测显示 todo | N 节 |
 
 ## 4b. 能力 → 功能 → 界面（F2）

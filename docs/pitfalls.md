@@ -36,6 +36,8 @@
 | 33 | 两个 Plasticity 窗口时, 第二个窗口的助手读写的是第一个窗口 | 一个进程多个 BrowserWindow; 代理写死 `getAllWindows()[0]` | 代理按窗口列目标(带 hwnd, ws 路径 /hwnd/<n>), pla-bridge 按绑定 HWND 连接(R19) |
 | 34 | 助手在切到别的程序后仍压在最上面 | 所有视口固定 `AlwaysOnTop` | 前台判定后用 SetWindowPos 切换: 非前台时 NOTOPMOST 并插到绑定窗口正上方; 只在 WS_EX_TOPMOST 与期望不符时动手(winit 改样式不碰置顶位)(R19) |
 | 35 | 重建 pla-ui 后助手全不见了 | 用户多开时有多个 pla-ui 进程; `Stop-Process -Name pla-ui` 全停, 而 `(Get-Process pla-ui).Path` 是数组, `Start-Process` 直接报错, 一个都没起来 | 构建前记下实例数, 按实例数逐个启动(间隔几秒, 各自认领窗口); 用工具栏窗口属性 `PLA_BOUND_HWND` 核对绑定(R20) |
+| 36 | 垫片热替换后 `cmd.ping` "已注册但回调没执行" | 旧实例注册到 Plasticity 的命令回调闭包捕获了旧实例的状态; 新实例看到"已注册"就不再注册, 回调却在给旧实例计数 | 命令回调一律委托: 触发时找当前 `window.__PLA__._onCommand`; 已挂委托的元素记在页面级 `__PLA_PAGE__`(按注册表区分), 热替换不重复注册(R21) |
+| 37 | 第二个 Plasticity 窗口的 Bridge 永远连不上 | 每个窗口的 Bridge 服务端都监听 8980, 只有第一个成功, 其余监听失败后自行关闭 | 多窗口时属正常; 助手/自检提示中写明(R21) |
 | 14 | 切换面板时旧面板滞留、新面板不出现、点击丢失 | R12 加深的文档定位(`find_latest_doc`)每次未命中都全盘深扫(热缓存 ~2s, 冷缓存 ~19s), 面板每帧取文档目录, 2s TTL 一过就在 UI 线程重扫 | 分阶段: leveldb + Recent 命中即返回; 深扫未命中负缓存 60s(R13) |
 
 ## 假按钮教训

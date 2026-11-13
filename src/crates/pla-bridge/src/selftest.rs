@@ -109,6 +109,32 @@ async fn fingerprint(ws: &mut WsStream, mid: &mut u64) -> Option<(i64, i64, Stri
     Some((h["undo"].as_i64()?, h["geoVer"].as_i64()?, s.to_string()))
 }
 
+/// 去掉与状态无关、每次都可能变的字段(视口屏幕矩形、DPR、失败段说明)。
+fn strip_volatile(v: &Value) -> Value {
+    let mut v = v.clone();
+    if let Some(o) = v.as_object_mut() {
+        for k in ["vpRect", "dpr", "failed", "err"] {
+            o.remove(k);
+        }
+    }
+    v
+}
+
+/// JSON 结构相等, 数值允许相对误差 eps(相机/轨道量经阻尼更新后有浮点抖动)。
+fn json_close(a: &Value, b: &Value, eps: f64) -> bool {
+    match (a, b) {
+        (Value::Number(x), Value::Number(y)) => {
+            let (x, y) = (x.as_f64().unwrap_or(0.0), y.as_f64().unwrap_or(0.0));
+            (x - y).abs() <= eps * (1.0 + x.abs().max(y.abs()))
+        }
+        (Value::Array(x), Value::Array(y)) => x.len() == y.len() && x.iter().zip(y).all(|(p, q)| json_close(p, q, eps)),
+        (Value::Object(x), Value::Object(y)) => {
+            x.len() == y.len() && x.iter().all(|(k, p)| y.get(k).is_some_and(|q| json_close(p, q, eps)))
+        }
+        _ => a == b,
+    }
+}
+
 fn has_numbers(v: &Value, keys: &[&str]) -> Result<(), String> {
     let missing: Vec<&str> = keys.iter().copied().filter(|k| !v[*k].is_number()).collect();
     if missing.is_empty() {
@@ -240,7 +266,8 @@ pub async fn run(cdp_port: u16, inspector_port: u16, hwnd: Option<isize>) -> Rep
     if let Some(b) = &caps.bridge_server {
         if b.closed_while_enabled() {
             r.add(S_CAPS, "Bridge 服务端", Level::Warn,
-                "设置开着但服务端已关闭(启动时端口被占用?)— 偏好设置 → Network 关掉再打开 Server");
+                "设置开着但服务端已关闭: 端口被占用(另一个 Plasticity 窗口占着, 或上次没退干净); \
+                 单窗口时到偏好设置 → Network 关掉再打开 Server");
         } else if b.state == Some(0) {
             r.add(S_CAPS, "Bridge 服务端", Level::Pass, format!("运行中, 端口 {}", b.port.unwrap_or(0)));
         }
@@ -307,8 +334,31 @@ pub async fn run(cdp_port: u16, inspector_port: u16, hwnd: Option<isize>) -> Rep
         Ok(v) => r.add(S_ROUNDTRIP, "cmd.ping 注册→派发→回调", Level::Fail, format!("回调未执行({v})")),
         Err(e) => r.add(S_ROUNDTRIP, "cmd.ping 注册→派发→回调", Level::Fail, e),
     }
-    r.add(S_ROUNDTRIP, "选择 保存→清空→还原", Level::Skip, "F1b 把选择写接口迁入垫片后加入");
-    r.add(S_ROUNDTRIP, "视口状态 保存→还原", Level::Skip, "F1b 把视口状态接口迁入垫片后加入");
+    // 视口状态: 存一份 → 原样恢复 → 再存一份, 两份应一致(着色模式相同时不会派发切换)。
+    match call(ws, mid, api::VP_SAVE, &Value::Null).await {
+        Ok(s0) => match call(ws, mid, api::VP_RESTORE, &s0).await {
+            Ok(res) => {
+                let failed = res["failed"].as_array().map(|a| a.len()).unwrap_or(0);
+                let applied: Vec<&str> = res["applied"].as_array().map(|a| a.iter().filter_map(|x| x.as_str()).collect()).unwrap_or_default();
+                match call(ws, mid, api::VP_SAVE, &Value::Null).await {
+                    Ok(s1) => {
+                        let same = json_close(&strip_volatile(&s0), &strip_volatile(&s1), 1e-6);
+                        let level = if !same || failed > 0 { Level::Fail } else { Level::Pass };
+                        r.add(S_ROUNDTRIP, "vp.restore ← vp.save", level, if same && failed == 0 {
+                            format!("前后一致; 已应用 {}", applied.join(","))
+                        } else {
+                            format!("前后{}; 失败段 {}", if same { "一致" } else { "不一致" }, res["failed"])
+                        });
+                    }
+                    Err(e) => r.add(S_ROUNDTRIP, "vp.restore ← vp.save", Level::Fail, e),
+                }
+            }
+            Err(e) => r.add(S_ROUNDTRIP, "vp.restore ← vp.save", Level::Fail, e),
+        },
+        Err(e) => r.add(S_ROUNDTRIP, "vp.restore ← vp.save", Level::Fail, e),
+    }
+    r.add(S_ROUNDTRIP, "选择 写入", Level::Skip,
+        "选择写入走真实点击管线(会改变用户选择), 自检不做; 由契约测试覆盖接口");
 
     // ================= 守护: 文档绝不能被改动 =================
     let after = fingerprint(ws, mid).await;
@@ -335,6 +385,17 @@ pub async fn run(cdp_port: u16, inspector_port: u16, hwnd: Option<isize>) -> Rep
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_close_tolerates_float_jitter_only() {
+        let a = json!({"cam": {"px": 1.0, "q": [0.0, 1.0]}, "mode": "Shaded", "vpRect": [0, 0, 1, 1]});
+        let b = json!({"cam": {"px": 1.0 + 1e-9, "q": [0.0, 1.0]}, "mode": "Shaded", "vpRect": [5, 5, 9, 9]});
+        assert!(json_close(&strip_volatile(&a), &strip_volatile(&b), 1e-6));
+        let c = json!({"cam": {"px": 1.1, "q": [0.0, 1.0]}, "mode": "Shaded"});
+        assert!(!json_close(&strip_volatile(&a), &c, 1e-6));
+        let d = json!({"cam": {"px": 1.0, "q": [0.0, 1.0]}, "mode": "Matcap"});
+        assert!(!json_close(&strip_volatile(&a), &d, 1e-6));
+    }
 
     #[test]
     fn report_exit_codes_and_json() {

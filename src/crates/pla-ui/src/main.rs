@@ -1830,9 +1830,11 @@ impl PlaApp {
                         self.live_sel.clear();
                     }
                 }
-                pla_bridge::cdp::CdpEvent::EvalResult(s) => {
-                    self.set_notice((false, format!("CDP: {}", s)));
-                }
+                pla_bridge::cdp::CdpEvent::CallResult { name, result } => match result {
+                    // 即时生效类调用成功时不打扰(面板上已显示"立即生效"); 失败如实提示。
+                    Ok(v) => pla_ui::diag::log(&format!("CDP {name} ok: {v}")),
+                    Err(e) => self.set_notice((true, format!("即时生效失败({name}): {e}"))),
+                },
                 // R8-1: 视口状态采集回包 → 暂存并立即补发截图命令(串行化,
                 // 避免 VpStateSave/CaptureViewport 回包交错导致 pending 空)。
                 pla_bridge::cdp::CdpEvent::VpStateResult(state) => {
@@ -2284,9 +2286,8 @@ impl PlaApp {
                     // settings.json 不会被 Plasticity 重载 → 能力可用时实时改运行时值。
                     match self.feature_block(Feature::OrbitStepLive) {
                         None => {
-                            self.cdp.send(pla_bridge::cdp::CdpCmd::Eval(
-                                pla_ui::plasticity_config::live_step_js(d),
-                            ));
+                            let (name, args) = pla_ui::plasticity_config::live_step_call(d);
+                            self.cdp.send(pla_bridge::cdp::CdpCmd::Call { name, args });
                             (false, format!("已设为每次 {}°(立即生效)", fmt_deg(d)))
                         }
                         Some(why) => (
@@ -2310,8 +2311,8 @@ impl PlaApp {
             .filter(|b| b.closed_while_enabled());
         match closed {
             Some(b) if !self.bridge_status.starts_with("已连接") => format!(
-                "Plasticity 的 Bridge 服务已停止(端口 {} 多半在启动时被占用)。到 Plasticity 偏好设置 → Network, \
-                 把 Server 关掉再打开即可恢复",
+                "这个窗口的 Bridge 服务已停止: 端口 {} 被占用 — 多窗口时只有一个窗口能占用它; \
+                 单窗口时多半是上次没退干净, 到偏好设置 → Network 把 Server 关掉再打开即可",
                 b.port.unwrap_or(8980)
             ),
             _ => self.bridge_status.clone(),
@@ -4317,9 +4318,9 @@ impl eframe::App for PlaApp {
                                         // keymap.json 会被 Plasticity 自动重载(有延迟);
                                         // 能力可用时顺带立即生效。
                                         if self.feature_block(Feature::ArrowKeysLive).is_none() {
-                                            self.cdp.send(pla_bridge::cdp::CdpCmd::Eval(
-                                                pla_ui::plasticity_config::live_bindings_js(bound),
-                                            ));
+                                            let (name, args) =
+                                                pla_ui::plasticity_config::live_bindings_call(bound);
+                                            self.cdp.send(pla_bridge::cdp::CdpCmd::Call { name, args });
                                         }
                                         (
                                             false,

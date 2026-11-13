@@ -1,8 +1,8 @@
 //! R8-1: 视口状态存档 — 保存/恢复摄像机、缩放、剖面、参考面、显示模式。
 //!
 //! 存储布局: exe 同级 `viewstates/<doc_key>/VS001.json` + `VS001.png`(截图),
-//! meta.json 存收藏/创建时间(与快照墙边车同构)。状态本体是 CDP 采集的
-//! VPSTATE_SNAPSHOT_JS JSON 字符串, 恢复时原样交给 VPSTATE_RESTORE_JS。
+//! meta.json 存收藏/创建时间(与快照墙边车同构)。状态本体是垫片 `vp.save` 的 JSON
+//! (格式与 R8-1 存档兼容), 恢复时原样交给垫片 `vp.restore`。
 
 use std::path::PathBuf;
 

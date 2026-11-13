@@ -25,15 +25,15 @@ pub const ORBIT_SELECTOR: &str = pla_bridge::shim::VIEWPORT_SELECTOR;
 ///
 /// R14 用户要求: 左右、上下与 Plasticity 原生命令方向对调(按键方向 = 模型转动方向);
 /// Alt+←/→ = 绕屏幕法线(视线)轴旋转。Plasticity 自带的 `viewport:roll:*` 固定 90°,
-/// 不读步进角 → 用 pla-ui 经 CDP 注册的 `pla:roll:*`(见 pla-bridge `ROLL_HOOK_JS`),
+/// 不读步进角 → 用垫片在视口元素上注册的滚转命令(命令名单一来源 = `pla_bridge::shim`),
 /// 未连 CDP 时 Alt+←/→ 无效果。
 pub const ARROW_BINDINGS: [(&str, &str); 6] = [
     ("left", "orbit:rotate:right"),
     ("right", "orbit:rotate:left"),
     ("up", "orbit:rotate:down"),
     ("down", "orbit:rotate:up"),
-    ("alt-left", "pla:roll:left"),
-    ("alt-right", "pla:roll:right"),
+    ("alt-left", pla_bridge::shim::ROLL_LEFT_COMMAND),
+    ("alt-right", pla_bridge::shim::ROLL_RIGHT_COMMAND),
 ];
 
 /// 旧版(R14 首版)写过的绑定 — 停用/迁移时一并清掉。
@@ -161,46 +161,27 @@ pub fn set_arrow_bindings(enable: bool) -> Result<(), String> {
 //   - Plasticity 改任何偏好设置时会用内存值整体重写 settings.json →
 //     有 CDP 时把内存里的 `ed.settings` 一并改掉, 防止被旧值覆盖。
 
-/// 实时生效: 运行时设置 + 每个视口轨道控制器的缓存值。返回给 UI 的提示文本。
-pub fn live_step_js(deg: f64) -> String {
-    let rad = deg.to_radians();
-    format!(
-        "(() => {{ const ed = window.__PLA_EDITOR__; \
-         if (!ed) return '步进角: 未找到 Plasticity 编辑器, 重启 Plasticity 后生效'; \
-         const r = {rad}; \
-         if (ed.settings && ed.settings.OrbitControls) ed.settings.OrbitControls.rotateDiscreteIncrement = r; \
-         let n = 0; for (const v of ed.viewports || []) {{ if (v && v.orbitControls) {{ v.orbitControls.rotateDiscreteIncrement = r; n++; }} }} \
-         return n ? '步进角已实时生效: 每次 {deg_s}°' : '步进角: 未找到视口, 重启 Plasticity 后生效'; }})()",
-        deg_s = trim_num(deg),
-    )
+/// 实时生效(步进角): 垫片接口 `cam.setOrbitStep` + 参数(弧度)。
+/// 垫片同时改内存设置与各视口轨道控制器的缓存值; UI 经 `CdpCmd::Call` 发送。
+pub fn live_step_call(deg: f64) -> (&'static str, serde_json::Value) {
+    (pla_bridge::shim::api::CAM_SET_ORBIT_STEP, serde_json::json!({ "rad": deg.to_radians() }))
 }
 
-/// 实时生效: 运行时 keymap 加/删方向键绑定(先删掉任何来源的同款绑定, 再按需加)。
-pub fn live_bindings_js(enable: bool) -> String {
-    let pairs: Vec<String> = ARROW_BINDINGS
-        .iter()
-        .map(|(k, c)| format!("'{k}': '{c}'"))
-        .collect();
-    let legacy: Vec<String> = LEGACY_BINDINGS
-        .iter()
-        .map(|(k, c)| format!("'{k}': '{c}'"))
-        .collect();
-    format!(
-        "(() => {{ const ed = window.__PLA_EDITOR__; \
-         if (!ed || !ed.keymaps) return '方向键: 未找到 Plasticity 编辑器'; \
-         const km = ed.keymaps; const map = {{ {pairs} }}; const old = {{ {legacy} }}; \
-         km.keyBindings = km.keyBindings.filter(b => !(b.selector === '{ORBIT_SELECTOR}' && (map[b.keystrokes] === b.command || old[b.keystrokes] === b.command))); \
-         if ({enable}) km.add('pla-helper', {{ '{ORBIT_SELECTOR}': map }}); \
-         try {{ ed.keyboard && ed.keyboard.updateKeymap && ed.keyboard.updateKeymap(); }} catch (e) {{}} \
-         return {enable} ? '方向键步进旋转已实时生效' : '方向键绑定已实时移除'; }})()",
-        pairs = pairs.join(", "),
-        legacy = legacy.join(", "),
+/// 实时生效(方向键绑定): 垫片接口 `keymap.setBindings` + 参数。
+/// 先删视口选择器下我们的(现行 / 旧版)绑定, enable 时再加现行的; 绑定表与写 keymap.json 共用同一份常量。
+pub fn live_bindings_call(enable: bool) -> (&'static str, serde_json::Value) {
+    let obj = |pairs: &[(&str, &str)]| -> serde_json::Map<String, serde_json::Value> {
+        pairs.iter().map(|(k, c)| (k.to_string(), serde_json::Value::String(c.to_string()))).collect()
+    };
+    (
+        pla_bridge::shim::api::KEYMAP_SET_BINDINGS,
+        serde_json::json!({
+            "enable": enable,
+            "bindings": obj(&ARROW_BINDINGS),
+            "legacy": obj(&LEGACY_BINDINGS),
+            "source": "pla-helper",
+        }),
     )
-}
-
-fn trim_num(v: f64) -> String {
-    let s = format!("{v:.2}");
-    s.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
 // ---------------------------------------------------------------- 纯文本层
@@ -576,19 +557,18 @@ mod tests {
     }
 
     #[test]
-    fn live_scripts_carry_the_right_values() {
-        let js = live_step_js(30.0);
-        assert!(js.contains("orbitControls.rotateDiscreteIncrement = r"));
-        assert!(js.contains(&format!("const r = {};", 30f64.to_radians())));
-        assert!(js.contains("每次 30°"));
-        let on = live_bindings_js(true);
-        assert!(on.contains("'left': 'orbit:rotate:right'"));
-        assert!(on.contains("'alt-left': 'pla:roll:left'"));
+    fn live_calls_carry_the_right_values() {
+        let (name, args) = live_step_call(30.0);
+        assert_eq!(name, "cam.setOrbitStep");
+        assert!((args["rad"].as_f64().unwrap() - 30f64.to_radians()).abs() < 1e-12);
+        let (name, on) = live_bindings_call(true);
+        assert_eq!(name, "keymap.setBindings");
+        assert_eq!(on["enable"], true);
+        assert_eq!(on["bindings"]["left"], "orbit:rotate:right");
+        assert_eq!(on["bindings"]["alt-left"], "pla:roll:left");
         // 旧映射也会被实时清掉
-        assert!(on.contains("const old = { 'left': 'orbit:rotate:left'"));
-        assert!(on.contains("km.add('pla-helper', { 'plasticity-viewport': map })"));
-        assert!(on.contains("if (true)"));
-        assert!(live_bindings_js(false).contains("if (false)"));
+        assert_eq!(on["legacy"]["left"], "orbit:rotate:left");
+        assert_eq!(live_bindings_call(false).1["enable"], false);
     }
 
     #[test]

@@ -94,6 +94,7 @@
       的归档与 doc_key 来源，必要时按快照元数据里的源文件名过滤。
 - [~] **B7 Bridge 连不上但设置里端口开着**（R19 诊断）：CDP 实查 Plasticity 的 Bridge 服务端 `_state=2`（已关闭）、无监听地址，
       多半是启动时 8980 被上一个没退干净的 Plasticity 占着（见 B6），监听失败后服务端自行关闭，设置开关仍显示开。
+      R21 补充：**多窗口时每个窗口都想监听 8980，只有一个能成功**，其余窗口的服务端必然是关闭状态（自检对第二个窗口报 WARN）。
       恢复：Plasticity 偏好设置 → Network 把 Server 关掉再打开。pla-ui 现在会识别这种情况并在状态里直接写明原因和办法。
 - [ ] **B4 renderer 重载后注入钩子丢失**：目前要重连才恢复（与 F4 一并解决）。
 - [x] **B5 pla-ui 无声退出**：经用户确认是手动退出，不是 bug。保留诊断日志 `%TEMP%\pla-ui.log`
@@ -110,8 +111,13 @@
             选择轮询改为一次 `batch`（每项独立降级）；删掉 `INJECT/HOOK_PROBE/SEL_SNAPSHOT/TREE/ERR_HOOK` 五段旧 JS；
             `pla-app cdp-probe` 一键注入 + 探测 + 只读回读；node 契约测试 11 项。
             真机：全部能力可用，editor 由 **Preact 遍历**找到（26.2.3 可用 → F4 重定位可免堆快照）。
-      - [ ] **F1b**：迁移写路径（选择集扫描/点击、视口状态、滚转、步进角、keymap），删除剩余旧常量与 `__PLA_HOOK__` 兼容别名；
-            迁完后在 F3 自检里补上选择、视口状态的回环。（相机读写已在 R20 迁完。）
+      - [~] **F1b**（R21，契约测试 21 项 + 双窗口真机自检 0 FAIL；待用户手动回归）：
+            写路径全部迁入垫片——`sel.cancelCommand/clear/addFaceById/faceIds`、`scan.begin/read/clear/end`（结束时还原 onHover，
+            不再常驻包装）、`cam.navigateToSelection/render/vpRect/setOrbitStep/roll`、`keymap.setBindings`、`vp.save/restore`（存档格式兼容）。
+            cdp.rs 删掉 13 段旧 JS（409 行），pla-ui 的两段即时生效 JS 改为 `CdpCmd::Call{接口名, JSON 参数}`；`__PLA_HOOK__` 别名删除；
+            滚转命令名单一来源 = `shim::ROLL_*_COMMAND`。内部结构表把方法挂到所属对象根下（click/cs/exec/km/kb/reg），调用 this 正确。
+            注册到 Plasticity 的命令回调改为**委托式**（触发时找当前 `__PLA__`），热替换后不再落到旧实例（pitfalls #36）。
+            F3 自检补上 `vp.restore ← vp.save` 回环；选择写入走真实点击管线（会改变用户选择），自检不做，由契约测试覆盖。
 - [~] **F2 能力探测**（R17，待用户确认设置面板观感）：连接时逐项探测所需内部结构 → 功能开关；面板明示失效项，杜绝静默失败。
       - pla-bridge：`shim::cap` 能力名（契约测试与 JS `CAPS` 对齐）+ `CapsReport`；`CdpEvent::Caps` 在注入后、
         ok↔noed 变化时、每 ~30s 重探（有变化才发），断开发 `None`。
