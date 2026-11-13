@@ -26,6 +26,9 @@
 | 23 | 停用"CDP 模式启动"会删掉 .plasticity 的用户级关联 | Plasticity 安装器本身就在 HKCU 写了 `plasticity_auto_file\shell\open\command`, 不是我们新建的 | 启用时把原命令备份到 `PlaHelperPrevCommand`, 停用时写回; 只有整键是我们新建(`PlaHelperCreated`)才整键删除(R14) |
 | 24 | 二级面板输入框白底、文字悬停变黑、很多字看不清 | egui 0.29 `set_style` 只改"当前主题", 主题默认跟随系统; 系统浅色时子面板用浅色主题控件, 贴在我们手绘的深色面板上 | `set_theme(Dark)` + `set_style_of(Dark/Light, 同一样式)`(R15) |
 | 25 | 悬停说明浮窗右侧文字被截断 | 横排(`ui.horizontal`)里的 Label 默认不换行, 超宽会撑大内容区, 连带后续换行文字都越过右边框 | 说明文字一律 `Label::new(..).wrap()`(R15) |
+| 26 | 视口状态的渲染/AO/网格段在 26.2.3 恢复不了, 却没人发现 | `vp.settings.Viewport.renderer/ao`、`vp.settings.Grid` 在 26.2.3 已不存在; 旧片段每段各自 try/catch, 失败只进 failed 列表 | 垫片能力探测把它列为 `optionalMissing`(R16); 原则: 内部路径只写在垫片 LOC 表里, 由探测统一报缺失 |
+| 27 | 以为 26.2.3 只能靠堆快照找 editor | 当年的死路清单没试 Preact vnode 树; 实测 `#root.__k` → `Outliner.props.model.editor` 在 26.2.3 仍可用(组件名未被压缩) | 垫片 FINDERS: 全局名 → Preact 遍历; 堆快照只作后备(R16) |
+| 28 | 代理链路收不到 `Page.loadEventFired` | pla-cdp-v8 代理只回转发命令的回包, `eventCb` 从未调用; 假 target id 写死, 也看不到 target 变化 | F4 在主进程侧感知 renderer 重载(待做) |
 | 14 | 切换面板时旧面板滞留、新面板不出现、点击丢失 | R12 加深的文档定位(`find_latest_doc`)每次未命中都全盘深扫(热缓存 ~2s, 冷缓存 ~19s), 面板每帧取文档目录, 2s TTL 一过就在 UI 线程重扫 | 分阶段: leveldb + Recent 命中即返回; 深扫未命中负缓存 60s(R13) |
 
 ## 假按钮教训

@@ -75,6 +75,8 @@
       - 遮挡补救链（自身相机 → addById → navigateToSelection → 重扫）；
       - 应用后焦点交还 Plasticity、实时镜像与存档成员一致性。
 - [~] **B2 视口状态**：相机/shading(matcap)/剖面/构造面恢复（26.1.3 像素级通过，26.2.3 未测）；正交相机 zoom 目前跳过。
+      R16 能力探测发现：26.2.3 视口上已没有 `settings.Viewport.renderer/ao`、`settings.Grid` → 这三段保存/恢复必然失败，
+      需在 F1b 找到新位置（在垫片 LOC 表补备选路径即可）。
 - [~] **B3 快照墙**：R12 的文档定位改动（leveldb 最近文件 + 严格名称匹配）待真机验证；快照里打开/切换流程回归。
       R13 已修其性能问题（未命中时每 2s 在 UI 线程全盘深扫）。仍可改进：文档定位整体挪到后台线程。
 - [ ] **B4 renderer 重载后注入钩子丢失**：目前要重连才恢复（与 F4 一并解决）。
@@ -85,11 +87,19 @@
 
 ## F — CDP 地基（主通道可持续）
 
-- [ ] **F1 JS 垫片层**：注入带版本号的 `window.__PLA__`（getSelection / setMaterial / placeAsset / boolean / camera…），
-      把 `cdp.rs` 里散落的 JS 片段收口；Rust 只调垫片。
+- [~] **F1 JS 垫片层**：注入带版本号的 `window.__PLA__`，把 `cdp.rs` 里散落的 JS 片段收口；Rust 只调垫片。
+      设计与四条硬规则（内部结构单表、能力由表生成、接口名单一来源、常量不复写）见 `docs/know-how/cdp-shim-design.md`。
+      - [x] **F1a**（R16，2026-11-13 真机验证）：`src/crates/pla-bridge/js/pla-shim.js` + `pla_bridge::shim`；
+            框架（LOC 表/CAPS/接口表/钩子代际管理/热替换）+ 只读接口 `core.* / sel.snapshot / hist.state / cam.get / err.last / tree.list`；
+            选择轮询改为一次 `batch`（每项独立降级）；删掉 `INJECT/HOOK_PROBE/SEL_SNAPSHOT/TREE/ERR_HOOK` 五段旧 JS；
+            `pla-app cdp-probe` 一键注入 + 探测 + 只读回读；node 契约测试 11 项。
+            真机：全部能力可用，editor 由 **Preact 遍历**找到（26.2.3 可用 → F4 重定位可免堆快照）。
+      - [ ] **F1b**：迁移写路径（选择集扫描/点击、相机写入、视口状态、滚转、步进角、keymap），删除剩余旧常量与 `__PLA_HOOK__` 兼容别名。
 - [ ] **F2 能力探测**：连接时逐项探测所需内部结构 → 功能开关；面板明示失效项，杜绝静默失败。
 - [ ] **F3 契约测试**：`pla-app cdp-selftest` 一键跑全部探测 + 读写回环。
 - [ ] **F4 Editor 自动重定位**：挂 `Page.loadEventFired` / target 变化，自动重新堆定位并重注垫片。
+      R16 已知：代理不转发 CDP 事件、假 target id 固定 → 必须在主进程侧感知重载；
+      垫片已能经 Preact 遍历自取 editor，重载后只要重注垫片即可，堆快照降为后备。
 - [ ] **F5 锁版本**：关闭 Plasticity 自动更新，归档已验证版本安装包；升级流程 = 先跑 F3。
 - [ ] **F6 堆快照解析**：JS 版一次性 `JSON.parse`，快照过大（>~500MB）会失败 → 改流式解析或加尺寸告警。
 

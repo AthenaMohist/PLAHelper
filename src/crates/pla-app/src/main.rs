@@ -244,6 +244,7 @@ fn main() {
         println!("  dim-update <doc_key> <name> <new_value>        走 bridge: 顶点平移写回");
         println!("  entities <doc_key>                            列出 bridge 实体(id/kind/name)");
         println!("  cdp-eval <js>                                 经 CDP(9333) 在 Plasticity renderer 执行 JS");
+        println!("  cdp-probe                                     注入垫片 __PLA__ 并打印能力探测 + 只读接口回读");
         println!("  doc-list / ping");
         return;
     }
@@ -278,6 +279,28 @@ fn main() {
         "cdp-eval" => { need(1);
             match rt.block_on(pla_bridge::cdp::cdp_eval_once(9333, &a[0])) {
                 Ok(v) => println!("{v}"),
+                Err(e) => { eprintln!("CDP ERROR: {e}"); std::process::exit(1); }
+            }
+        },
+        "cdp-probe" => {
+            // F1: 单个 CDP 会话内注入垫片 + 能力探测 + 只读接口回读(不写任何东西)。
+            use pla_bridge::shim::{self, api};
+            let reads: Vec<(&str, serde_json::Value)> = [api::SEL_SNAPSHOT, api::HIST_STATE, api::CAM_GET, api::ERR_LAST, api::TREE_LIST]
+                .iter().map(|n| (*n, serde_json::Value::Null)).collect();
+            let expr = format!(
+                "(function(){{var i={};return JSON.stringify({{install:JSON.parse(i),probe:JSON.parse({}),read:JSON.parse({})}})}})()",
+                shim::install_expr(),
+                shim::call_expr(api::CORE_PROBE, &serde_json::Value::Null),
+                shim::batch_expr(&reads),
+            );
+            match rt.block_on(pla_bridge::cdp::cdp_eval_once(9333, &expr)) {
+                Ok(v) => {
+                    let s: String = serde_json::from_str(&v).unwrap_or(v);
+                    match serde_json::from_str::<serde_json::Value>(&s) {
+                        Ok(j) => println!("{}", serde_json::to_string_pretty(&j).unwrap()),
+                        Err(_) => println!("{s}"),
+                    }
+                }
                 Err(e) => { eprintln!("CDP ERROR: {e}"); std::process::exit(1); }
             }
         },

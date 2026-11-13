@@ -18,7 +18,8 @@ use std::path::{Path, PathBuf};
 /// 用户 keymap 里鼠标手势所在的 `orbit-controls` **不是 DOM 元素**(页面里 0 个),
 /// 是 Plasticity 轨道控制器自己按名字读的虚拟选择器 → 键盘绑定写在那里永远不会匹配
 /// (R14 首版的失败原因)。
-pub const ORBIT_SELECTOR: &str = "plasticity-viewport";
+/// 单一来源: `pla_bridge::shim::VIEWPORT_SELECTOR`(垫片注入配置用的也是它)。
+pub const ORBIT_SELECTOR: &str = pla_bridge::shim::VIEWPORT_SELECTOR;
 
 /// 方向键 → 步进旋转命令。
 ///

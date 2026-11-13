@@ -7,6 +7,7 @@ pub mod protocol;
 pub mod reconnect;
 pub mod request_id;
 pub mod session_table;
+pub mod shim;
 
 pub use connection::{BridgeClient, BridgeConfig};
 pub use error::BridgeError;

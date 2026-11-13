@@ -17,6 +17,8 @@ use std::time::Duration;
 
 use serde_json::Value;
 
+use crate::shim;
+
 /// UI → CDP 线程命令。
 #[derive(Debug)]
 pub enum CdpCmd {
@@ -89,7 +91,8 @@ pub enum CdpEvent {
 /// None = 纯数值 id(solid/sheet 的 kernel item id)。应用时原样回放。
 #[derive(Debug, Clone)]
 pub struct SelItem {
-    pub kind: &'static str,
+    /// 成员类型(solid/sheet/face/edge/…), 取值表唯一来源 = 垫片 `SEL_KINDS`。
+    pub kind: String,
     pub id: String,
     pub name: String,
     pub ctor: String,
@@ -154,96 +157,6 @@ impl CdpHandle {
     }
 }
 
-const SEL_SNAPSHOT_JS: &str = r#"(function(){
-  var ed = window.__PLA_EDITOR__;
-  if (!ed || !ed.selection) {
-    var f = window.__PLA_HOOK__; if (f) ed = f.findEditor();
-    if (ed) window.__PLA_EDITOR__ = ed;
-  }
-  if (!ed || !ed.selection) return JSON.stringify({st:'no-editor'});
-  var s = ed.selection.selected;
-  if (!s) return JSON.stringify({st:'no-sel'});
-  // R7-21: id 集合元素保真采集 — 纯数值原样; 对象形(face/edge 的 {id,versionId,...})
-  // 抽 own 可枚举属性 + __ctor + __str(String 化), 应用时按原结构回放。
-  function idset(n){ try{ var v=s[n]; if(v&&typeof v.forEach==='function'){ var o=[]; v.forEach(function(x){
-      if(x===null||x===undefined){ o.push(null) }
-      else if(typeof x==='object'){
-        var c={__ctor:(x.constructor&&x.constructor.name)||''};
-        try{ Object.keys(x).forEach(function(k){ var val=x[k]; if(val===null||typeof val!=='object') c[k]=val }) }catch(e){}
-        try{ c.__str=String(x) }catch(e2){}
-        o.push(c)
-      } else { o.push(x) }
-  }); return o } return [] }catch(e){ return [] } }
-  var undo=-1, geoVer=-1;
-  try{ undo = ed.history._undoStack.length }catch(e){}
-  try{ geoVer = ed.geo._version!==undefined? ed.geo._version : ed.geo.version }catch(e){}
-  var cam=null;
-  try{ var vp2=null; ed.viewports.forEach(function(v){if(!vp2)vp2=v});
-    if(vp2&&vp2.camera){ var c2=vp2.camera;
-      cam={px:c2.position.x,py:c2.position.y,pz:c2.position.z,
-           qx:c2.quaternion.x,qy:c2.quaternion.y,qz:c2.quaternion.z,qw:c2.quaternion.w}; } }catch(e){}
-  var lastErr = null;
-  try{ var le = window.__PLA_LAST_ERROR__; if(le && le.msg) lastErr = { msg: String(le.msg).slice(0,200), stack: String(le.stack||'').slice(0,600), ts: le.ts }; }catch(e){}
-  return JSON.stringify({ st:'ok', size: (typeof s.size==='number')? s.size : -1,
-    undo: undo, geoVer: geoVer, err: lastErr, cam: cam,
-    ids: idset('ids'),
-    solidIds: idset('solidIds'), sheetIds: idset('sheetIds'),
-    faceIds: idset('faceIds'), edgeIds: idset('edgeIds'),
-    segmentIds: idset('segmentIds'), curveIds: idset('curveIds'),
-    curveVertexIds: idset('curveVertexIds'), groupIds: idset('groupIds'),
-    planeIds: idset('planeIds') });
-})()"#;
-
-/// 探活: hook 与 editor 引用是否还在页面里(页面重载会清掉)。
-/// 返回 "1" = 健在, "0" = 需要重新注入。
-const HOOK_PROBE_JS: &str = r#"(function(){
-  return (window.__PLA_HOOK__ && window.__PLA_EDITOR__) ? "1" : "0";
-})()"#;
-
-const TREE_JS: &str = r#"(function(){
-  var root = document.getElementById('root');
-  if (!root || !root.__k) return JSON.stringify([]);
-  var out = []; var q = [root.__k]; var g = 0; var seen = [];
-  function seenHas(v){ for (var i=0;i<seen.length;i++) if (seen[i]===v) return true; return false }
-  while(q.length && g++ < 80000){
-    var v = q.shift();
-    if(!v || typeof v!=='object' || seenHas(v)) continue;
-    seen.push(v);
-    if(typeof v.type==='function' && (v.type.name==='OutlinerSection'||v.type.name==='Memoed') && v.props && v.props.object){
-      var o = v.props.object;
-      out.push({ name: String(o.name||''), ctor: (o.constructor&&o.constructor.name)||'',
-                 indent: v.props.indent||0, selected: !!v.props.selected });
-    }
-    var k = v.__k;
-    if(Array.isArray(k)) q.push.apply(q, k);
-    else if(k && typeof k==='object') q.push(k);
-  }
-  return JSON.stringify(out);
-})()"#;
-
-const INJECT_JS: &str = r#"(function(){
-  if (window.__PLA_HOOK__) return 'already';
-  window.__PLA_HOOK__ = { findEditor: function(){
-    try{
-      var root = document.getElementById('root');
-      if(!root || !root.__k) return null;
-      var q=[root.__k], g=0, seen=[];
-      function sh(v){ for(var i=0;i<seen.length;i++) if(seen[i]===v) return true; return false }
-      while(q.length && g++<80000){
-        var v=q.shift();
-        if(!v||typeof v!=='object'||sh(v))continue;
-        seen.push(v);
-        if(typeof v.type==='function'&&v.type.name==='Outliner'&&v.props&&v.props.model&&v.props.model.editor) return v.props.model.editor;
-        var k=v.__k;
-        if(Array.isArray(k)) q.push.apply(q,k);
-        else if(k&&typeof k==='object') q.push(k);
-      }
-    }catch(e){}
-    return null;
-  }};
-  return 'ok';
-})()"#;
-
 /// R14: 注册 `pla:roll:left` / `pla:roll:right` — 绕屏幕法线(视线)轴按步进角滚转。
 ///
 /// Plasticity 自带 `viewport:roll:*` 固定 90°、不读步进角; `orbit:rotate:*` 只有上下左右。
@@ -294,33 +207,6 @@ const ROLL_HOOK_JS: &str = r#"(function(){
     if (registered(el)) n++;
   }
   return 'ok:' + n;
-})()"#;
-
-/// R7-27: 错误捕获注入 — 页面重载后钩子会丢, 故与 INJECT_JS 合并一次注入。
-/// Plasticity 把命令期异常经 `ed.signals.environmentChanged` 派发(载荷是 Error 实例,
-/// 带 stack); 助手把它抓下来存进 window.__PLA_LAST_ERROR__, 由 SEL_SNAPSHOT_JS
-/// 带回 Rust 侧显示 —— 用户在助手面板就能看到 "Move Item / ...reading 'active'" 这类
-/// 报错原文, 不必只盯着 Plasticity 的弹窗。
-const ERR_HOOK_JS: &str = r#"(function(){
-  if (window.__PLA_ERR_HOOK__) return 'already';
-  var ed = null;
-  try{ var f = window.__PLA_HOOK__; if (f) ed = f.findEditor(); }catch(e){}
-  if (!ed || !ed.signals || !ed.signals.environmentChanged) return 'no-editor';
-  window.__PLA_ERR_HOOK__ = true;
-  window.__PLA_LAST_ERROR__ = null;
-  try {
-    ed.signals.environmentChanged.add(function(p){
-      try {
-        if (!p) return;
-        var isErr = (p instanceof Error) || (p && p.message && p.stack);
-        if (!isErr) return;
-        window.__PLA_LAST_ERROR__ = { msg: String(p.message || p).slice(0,200),
-                                      stack: String(p.stack || '').slice(0,800),
-                                      ts: Date.now() };
-      } catch(e){}
-    });
-  } catch(e){ return 'hook-fail'; }
-  return 'ok';
 })()"#;
 
 fn cdp_thread_main(port: u16, cmd_rx: Receiver<CdpCmd>, ev_tx: std::sync::mpsc::Sender<CdpEvent>) {
@@ -403,9 +289,8 @@ async fn connect_page(port: u16) -> anyhow::Result<WsStream> {
         None => ws_url,
     };
     let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await?;
-    // 双发握手: Runtime.enable + 注入 hook
+    // 握手: Runtime.enable(垫片由 session_loop 注入并读回结果)
     ws_send(&mut ws, serde_json::json!({"id":1,"method":"Runtime.enable"})).await?;
-    ws_send(&mut ws, serde_json::json!({"id":2,"method":"Runtime.evaluate","params":{"expression":INJECT_JS,"returnByValue":true}})).await?;
     Ok(ws)
 }
 
@@ -419,12 +304,11 @@ async fn session_loop(
     let mut last_snapshot = String::new();
     let mut last_tree = String::new();
     let mut sel_tick: u32 = 0;
-    // R7-27: 错误钩子补注节流计数(每 5 轮 ≈ 2.5s 探一次)。
+    // 滚转命令补注册节流计数(每 5 轮 ≈ 2.5s 一次; F1b 迁入垫片钩子后删除)。
     let mut hook_tick: u32 = 0;
 
-    // 注入 hook(读取结果丢弃)
-    ws_send(ws, json_eval(mid, INJECT_JS)).await?;
-    mid += 1;
+    // F1: 注入垫片(错误捕获钩子由垫片按 editor 代际自动安装)。
+    install_shim(ws, &mut mid).await;
 
     loop {
         // --- UI 命令(非阻塞) ---
@@ -441,10 +325,17 @@ async fn session_loop(
                 }
             }
             Ok(CdpCmd::RefreshTree) => {
-                let tree_raw = eval_roundtrip(ws, &mut mid, TREE_JS).await?;
+                let tree_raw = eval_roundtrip(ws, &mut mid, &shim::call_expr(shim::api::TREE_LIST, &Value::Null)).await?;
                 if tree_raw != last_tree {
                     last_tree = tree_raw.clone();
-                    let nodes: Vec<Value> = serde_json::from_str(&tree_raw).unwrap_or_default();
+                    let nodes: Vec<Value> = match shim::parse_reply(&tree_raw) {
+                        Ok(Value::Array(a)) => a,
+                        Ok(_) => Vec::new(),
+                        Err(e) => {
+                            eprintln!("[pla-cdp] 实体树不可用: {e}");
+                            Vec::new()
+                        }
+                    };
                     let _ = ev_tx.send(CdpEvent::Tree(
                         nodes
                             .into_iter()
@@ -1045,106 +936,26 @@ async fn session_loop(
         // --- 轮询选择快照(每 2 个 tick ≈ 1s; 500ms 底噪) ---
         sel_tick += 1;
         if sel_tick % 2 == 0 {
-            // R7-25: 页面上下文可能被重置 — Plasticity renderer reload(切文档/
-            // 崩溃恢复)会产生**新的 CDP target**(实测 target id 由 66CCF320… 变为
-            // 97D532B6…), 旧 target 上注入的 window.__PLA_HOOK__ / __PLA_EDITOR__
-            // 随之蒸发。此时所有 JS 都拿不到 editor → 选择快照恒空、ApplySel 报
-            // no-editor。轮询前先探活, 缺失就重新注入(INJECT_JS 幂等)。
-            match eval_roundtrip(ws, &mut mid, HOOK_PROBE_JS).await {
-                Ok(p) if p.trim() == "1" => {}
-                Ok(_) => {
-                    eprintln!("[pla-cdp] hook 丢失(页面已重载?), 重新注入");
-                    let _ = eval_roundtrip(ws, &mut mid, INJECT_JS).await;
+            // R7-25: renderer reload(切文档/崩溃恢复)会清掉页面上的垫片。
+            // 探活: stale = 垫片缺失或接口版本不符 → 重注; noed = 垫片在但 editor 丢了
+            // (重新定位 editor 是 F4 的事, 这里如实上报 no-editor)。
+            match eval_roundtrip(ws, &mut mid, &shim::probe_expr()).await {
+                Ok(p) if p.trim() == "stale" => {
+                    eprintln!("[pla-cdp] 垫片缺失(页面已重载?), 重新注入");
+                    install_shim(ws, &mut mid).await;
                 }
-                Err(e) => {
-                    eprintln!("[pla-cdp] hook 探活失败: {e:#}");
-                }
+                Ok(_) => {}
+                Err(e) => eprintln!("[pla-cdp] 垫片探活失败: {e:#}"),
             }
-            // R7-27: 错误捕获钩子随页面重载一起丢, 缺了就补注(否则助手看不到
-            // Plasticity 侧的命令报错, 例如 G 移动的 "reading 'active'")。
             if hook_tick % 5 == 0 {
-                let _ = eval_roundtrip(ws, &mut mid, ERR_HOOK_JS).await;
                 // R14: Alt+←/→ 步进滚转命令(视口元素重建/页面重载后自动补注册)。
                 let _ = eval_roundtrip(ws, &mut mid, ROLL_HOOK_JS).await;
             }
             hook_tick += 1;
-            let raw = eval_roundtrip(ws, &mut mid, SEL_SNAPSHOT_JS).await?;
+            let raw = eval_roundtrip(ws, &mut mid, &shim::batch_expr(&poll_calls())).await?;
             if raw != last_snapshot {
                 last_snapshot = raw.clone();
-                let v: Value = serde_json::from_str(&raw)?;
-                if v["st"] == "ok" {
-                    let mut items = Vec::new();
-                    // R7-21: 元素分型 — 纯数值(solid/sheet kernel id)→key=None;
-                    // 对象形(face/edge {id,versionId,...})→key=原始 JSON 原样保存/回放。
-                    for (kind, key) in [
-                        ("solid", "solidIds"),
-                        ("sheet", "sheetIds"),
-                        ("face", "faceIds"),
-                        ("edge", "edgeIds"),
-                        ("segment", "segmentIds"),
-                        ("curve", "curveIds"),
-                        ("curveVertex", "curveVertexIds"),
-                        ("group", "groupIds"),
-                        ("plane", "planeIds"),
-                    ] {
-                        if let Some(arr) = v[key].as_array() {
-                            for it in arr {
-                                let (id, raw) = match it {
-                                    Value::String(sv) => (sv.clone(), None),
-                                    Value::Number(nv) => (nv.to_string(), None),
-                                    Value::Object(ov) => {
-                                        let raw = Value::Object(ov.clone()).to_string();
-                                        let id = ov
-                                            .get("id")
-                                            .map(|x| match x {
-                                                Value::String(s) => s.clone(),
-                                                other => other.to_string(),
-                                            })
-                                            .or_else(|| {
-                                                ov.get("__str").and_then(|s| s.as_str()).map(String::from)
-                                            })
-                                            .unwrap_or_default();
-                                        (id, Some(raw))
-                                    }
-                                    _ => (String::new(), None),
-                                };
-                                items.push(SelItem {
-                                    kind,
-                                    id,
-                                    name: String::new(),
-                                    ctor: kind.to_string(),
-                                    key: raw,
-                                });
-                            }
-                        }
-                    }
-                    let _ = ev_tx.send(CdpEvent::Selection(SelectionSnapshot {
-                        ok: true,
-                        state: "ok".into(),
-                        size: v["size"].as_i64().unwrap_or(-1),
-                        items,
-                        undo_len: v["undo"].as_i64().unwrap_or(-1),
-                        geo_ver: v["geoVer"].as_i64().unwrap_or(-1),
-                        error: v["err"]["msg"].as_str().map(|m| {
-                            (
-                                m.to_string(),
-                                v["err"]["stack"].as_str().unwrap_or("").to_string(),
-                            )
-                        }),
-                        camera: v["cam"].as_object().map(|c| Value::Object(c.clone()).to_string()),
-                    }));
-                } else {
-                    let _ = ev_tx.send(CdpEvent::Selection(SelectionSnapshot {
-                        ok: false,
-                        state: v["st"].as_str().unwrap_or("unknown").to_string(),
-                        size: -1,
-                        items: Vec::new(),
-                        undo_len: -1,
-                        geo_ver: -1,
-                        error: None,
-                        camera: None,
-                    }));
-                }
+                let _ = ev_tx.send(CdpEvent::Selection(selection_from_batch(&raw)));
             }
         }
 
@@ -1168,6 +979,118 @@ fn json_eval(mid: u64, expr: &str) -> Value {
         "method": "Runtime.evaluate",
         "params": {"expression": expr, "returnByValue": true, "awaitPromise": true, "userGesture": true}
     })
+}
+
+/// F1: 注入垫片并记录探测结果(哪项能力失效、走了哪些备选路径)。失败不致命: 下轮探活会重试。
+async fn install_shim(ws: &mut WsStream, mid: &mut u64) {
+    match eval_roundtrip(ws, mid, &shim::install_expr()).await {
+        Ok(r) => eprintln!("[pla-cdp] 垫片注入: {r}"),
+        Err(e) => {
+            eprintln!("[pla-cdp] 垫片注入失败: {e:#}");
+            return;
+        }
+    }
+    match eval_roundtrip(ws, mid, &shim::call_expr(shim::api::CORE_PROBE, &Value::Null)).await {
+        Ok(raw) => match shim::parse_reply(&raw) {
+            Ok(p) => {
+                let bad: Vec<String> = p["caps"]
+                    .as_object()
+                    .map(|m| {
+                        m.iter()
+                            .filter(|(_, c)| c["ok"] != true && c.get("todo").is_none())
+                            .map(|(k, c)| format!("{k}{}", c["missing"]))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                eprintln!(
+                    "[pla-cdp] 能力探测: editor={} 失效={:?} 备选路径={}",
+                    p["editor"], bad, p["altPaths"]
+                );
+            }
+            Err(e) => eprintln!("[pla-cdp] 能力探测失败: {e}"),
+        },
+        Err(e) => eprintln!("[pla-cdp] 能力探测失败: {e:#}"),
+    }
+}
+
+/// 选择轮询一次取回的接口(一次 evaluate, 每项独立成败)。
+fn poll_calls() -> [(&'static str, Value); 4] {
+    [
+        (shim::api::SEL_SNAPSHOT, Value::Null),
+        (shim::api::HIST_STATE, Value::Null),
+        (shim::api::CAM_GET, Value::Null),
+        (shim::api::ERR_LAST, Value::Null),
+    ]
+}
+
+/// 把轮询批量回包转成 UI 用的快照。选择读取失败 = 整体不可用(state 说明原因);
+/// 撤销栈/相机/报错各自失败只置空对应字段(能力降级, 不拖垮选择)。
+fn selection_from_batch(raw: &str) -> SelectionSnapshot {
+    let names: Vec<&str> = poll_calls().iter().map(|(n, _)| *n).collect();
+    let mut res: std::collections::HashMap<String, Result<Value, shim::ShimErr>> =
+        shim::parse_batch(raw, &names).into_iter().collect();
+    let mut take = |n: &str| res.remove(n).unwrap_or(Err(shim::ShimErr::Bad(n.into())));
+    let sel = take(shim::api::SEL_SNAPSHOT);
+    let hist = take(shim::api::HIST_STATE).ok();
+    let cam = take(shim::api::CAM_GET).ok();
+    let err = take(shim::api::ERR_LAST).ok();
+    let sel = match sel {
+        Ok(v) => v,
+        Err(e) => {
+            return SelectionSnapshot {
+                ok: false,
+                state: match e {
+                    shim::ShimErr::NoEditor => "no-editor".into(),
+                    shim::ShimErr::NoShim => "no-shim".into(),
+                    other => other.to_string(),
+                },
+                size: -1,
+                undo_len: -1,
+                geo_ver: -1,
+                ..Default::default()
+            }
+        }
+    };
+    // R7-21: 元素分型 — 纯数值(solid/sheet kernel id)→key=None;
+    // 对象形(face/edge {id,versionId,...})→key=原始 JSON 原样保存/回放。
+    let items = sel["items"]
+        .as_array()
+        .map(|a| a.as_slice())
+        .unwrap_or(&[])
+        .iter()
+        .map(|it| {
+            let kind = it["kind"].as_str().unwrap_or("").to_string();
+            let (id, key) = match &it["e"] {
+                Value::String(s) => (s.clone(), None),
+                Value::Number(n) => (n.to_string(), None),
+                Value::Object(o) => {
+                    let id = o
+                        .get("id")
+                        .map(|x| match x {
+                            Value::String(s) => s.clone(),
+                            other => other.to_string(),
+                        })
+                        .or_else(|| o.get("__str").and_then(|s| s.as_str()).map(String::from))
+                        .unwrap_or_default();
+                    (id, Some(Value::Object(o.clone()).to_string()))
+                }
+                _ => (String::new(), None),
+            };
+            SelItem { ctor: kind.clone(), kind, id, name: String::new(), key }
+        })
+        .collect();
+    SelectionSnapshot {
+        ok: true,
+        state: "ok".into(),
+        size: sel["size"].as_i64().unwrap_or(-1),
+        items,
+        undo_len: hist.as_ref().and_then(|h| h["undo"].as_i64()).unwrap_or(-1),
+        geo_ver: hist.as_ref().and_then(|h| h["geoVer"].as_i64()).unwrap_or(-1),
+        error: err.as_ref().and_then(|e| {
+            e["msg"].as_str().map(|m| (m.to_string(), e["stack"].as_str().unwrap_or("").to_string()))
+        }),
+        camera: cam.filter(|c| c.is_object()).map(|c| c.to_string()),
+    }
 }
 
 /// v5: ApplySel Phase A — 鼠标管线的准备脚本(累积式 hover spy 版)。
@@ -2090,6 +2013,35 @@ mod tests {
         assert!(js.contains("changeSelection"), "缺少 onHover 信号包装");
         // v5 铁律: 不得读 stale 点击会话
         assert!(!js.contains("selection.hits"), "Phase A 禁用 stale hits 数据源");
+    }
+
+    #[test]
+    fn selection_from_batch_degrades_per_item() {
+        // 完整回包
+        let raw = r#"{"sel.snapshot":{"ok":true,"v":{"size":2,"items":[{"kind":"solid","e":7},{"kind":"face","e":{"__ctor":"FaceId","id":5,"versionId":"14f2025","__str":"F5"}}]}},
+            "hist.state":{"ok":true,"v":{"undo":3,"geoVer":9}},
+            "cam.get":{"ok":true,"v":{"px":1,"py":2,"pz":3,"qx":0,"qy":0,"qz":0,"qw":1}},
+            "err.last":{"ok":true,"v":{"msg":"boom","stack":"at x"}}}"#;
+        let s = selection_from_batch(raw);
+        assert!(s.ok);
+        assert_eq!((s.size, s.undo_len, s.geo_ver), (2, 3, 9));
+        assert_eq!(s.items[0].kind, "solid");
+        assert_eq!(s.items[0].id, "7");
+        assert!(s.items[0].key.is_none());
+        assert_eq!(s.items[1].id, "5");
+        assert!(s.items[1].key.as_ref().unwrap().contains("14f2025"));
+        assert_eq!(s.error, Some(("boom".into(), "at x".into())));
+        assert!(s.camera.unwrap().contains("\"qw\":1"));
+        // 撤销栈能力失效: 选择照常, undo 置 -1(降级而非整体失败)
+        let raw = r#"{"sel.snapshot":{"ok":true,"v":{"size":0,"items":[]}},
+            "hist.state":{"ok":false,"err":"cap:hist.read","missing":["ed.undoStack"]},
+            "cam.get":{"ok":true,"v":null},"err.last":{"ok":true,"v":null}}"#;
+        let s = selection_from_batch(raw);
+        assert!(s.ok && s.undo_len == -1 && s.camera.is_none() && s.error.is_none());
+        // 没有 editor / 没有垫片
+        let s = selection_from_batch(r#"{"sel.snapshot":{"ok":false,"err":"cap:editor","missing":["editor"]}}"#);
+        assert_eq!((s.ok, s.state.as_str()), (false, "no-editor"));
+        assert_eq!(selection_from_batch(r#"{"__noShim":true}"#).state, "no-shim");
     }
 
     #[test]

@@ -1557,7 +1557,7 @@ impl PlaApp {
                         let mut new_keys: Vec<String> = snap
                             .items
                             .iter()
-                            .map(|it| pla_ui::selection::member_key(it.kind, &it.id))
+                            .map(|it| pla_ui::selection::member_key(&it.kind, &it.id))
                             .collect();
                         new_keys.sort();
                         if new_keys != self.live_sel_keys {
@@ -1570,7 +1570,7 @@ impl PlaApp {
                                 .items
                                 .iter()
                                 .map(|it| {
-                                    let key = pla_ui::selection::member_key(it.kind, &it.id);
+                                    let key = pla_ui::selection::member_key(&it.kind, &it.id);
                                     let kept_cam = old.iter().find_map(|(k, i, _, _, c)| {
                                         (pla_ui::selection::member_key(k, i) == key)
                                             .then(|| c.clone())
