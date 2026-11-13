@@ -340,6 +340,8 @@ pub async fn run(cdp_port: u16, inspector_port: u16, hwnd: Option<isize>) -> Rep
             Ok(res) => {
                 let failed = res["failed"].as_array().map(|a| a.len()).unwrap_or(0);
                 let applied: Vec<&str> = res["applied"].as_array().map(|a| a.iter().filter_map(|x| x.as_str()).collect()).unwrap_or_default();
+                // 恢复后轨道控制器被标记需要更新, 会按阻尼收敛一两帧 — 等它稳定再回读(后台窗口帧率被节流, 留足余量)。
+                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
                 match call(ws, mid, api::VP_SAVE, &Value::Null).await {
                     Ok(s1) => {
                         let same = json_close(&strip_volatile(&s0), &strip_volatile(&s1), 1e-6);

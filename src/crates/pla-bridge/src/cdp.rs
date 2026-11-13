@@ -564,6 +564,11 @@ async fn session_loop(
                 // Phase D(v5.1): 校验 + 唤醒渲染。verify 回读 faceIds, 对每个
                 // 已定位目标 id 求交集 — 没进 faceIds 的即同坐标组里被遮挡的,
                 // 如实计失败(旋转视角分离是标准解法, 不尝试自动分离)。
+                // Phase C2(R21): 下钻 — 首次点到未选实体上的面只会选中整个实体, 在原坐标补点直到换成面。
+                let drilled = drill_passes(ws, &mut mid, &clicked).await;
+                if drilled > 0 {
+                    eprintln!("[pla-cdp] 下钻补点 {drilled} 次(实体 → 面)");
+                }
                 shim_fire(ws, &mut mid, shim::api::CAM_RENDER, Value::Null).await;
                 let verify_raw = sel_face_ids(ws, &mut mid).await;
                 if let Err(ref e) = verify_raw {
@@ -665,6 +670,8 @@ async fn session_loop(
                                 if dispatch_mouse_click(ws, &mut mid, px, py, true).await.is_ok() {
                                     shim_fire(ws, &mut mid, shim::api::SEL_CANCEL_COMMAND, Value::Null).await;
                                     tokio::time::sleep(Duration::from_millis(250)).await;
+                                    // R21: 点中的可能只是整个实体 → 下钻补点
+                                    drill_passes(ws, &mut mid, &[(occ_id.clone(), px, py)]).await;
                                     // 复核: 进 faceIds 才算救回
                                     if let Ok(v) = sel_face_ids(ws, &mut mid).await {
                                         if let Some(fs) = extract_face_ids(&v) {
@@ -950,6 +957,42 @@ async fn scan_read(ws: &mut WsStream, mid: &mut u64) -> anyhow::Result<String> {
 /// 选择集应用: 读当前选中面的版本 id(JSON {selN, faces}), 交给 `extract_face_ids`。
 async fn sel_face_ids(ws: &mut WsStream, mid: &mut u64) -> anyhow::Result<String> {
     Ok(shim_call(ws, mid, shim::api::SEL_FACE_IDS, Value::Null).await?.to_string())
+}
+
+/// 选择集应用的下钻补点(R21): Plasticity 点未选实体上的面会先选中**整个实体**, 再点一次才换成该面。
+/// 由垫片判定哪些目标"还没选中但所属实体已介入"(`sel.faceIds{targets}` 的 drill), 在原坐标再 shift+点一次;
+/// 最多 3 轮(同一实体上多个面时, 下钻一个会让实体从"选中"变成"已有面选中", 其余面下一轮直接点中)。
+/// 返回补点次数。
+async fn drill_passes(ws: &mut WsStream, mid: &mut u64, located: &[(String, i64, i64)]) -> usize {
+    let targets: Vec<&str> = located.iter().map(|(id, _, _)| id.as_str()).collect();
+    let mut clicks = 0;
+    for _ in 0..3 {
+        let v = match shim_call(ws, mid, shim::api::SEL_FACE_IDS, serde_json::json!({ "targets": targets })).await {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("[pla-cdp] 下钻判定失败: {e:#}");
+                break;
+            }
+        };
+        let drill: Vec<String> = v["drill"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        if drill.is_empty() {
+            break;
+        }
+        let mut done: std::collections::HashSet<(i64, i64)> = std::collections::HashSet::new();
+        for id in &drill {
+            if let Some((_, x, y)) = located.iter().find(|(i, _, _)| i == id) {
+                if done.insert((*x, *y)) && dispatch_mouse_click(ws, mid, *x, *y, true).await.is_ok() {
+                    clicks += 1;
+                }
+            }
+        }
+        shim_fire(ws, mid, shim::api::SEL_CANCEL_COMMAND, Value::Null).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    clicks
 }
 
 /// 不关心结果的垫片调用(收尾/唤醒类): 失败只记日志。

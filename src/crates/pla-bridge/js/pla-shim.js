@@ -113,6 +113,8 @@
     versionIdKey: 'versionId',
     // click.addById 的面 id 前缀(实测: '2:<versionId>' 选中面)。
     faceIdPrefix: '2:',
+    // 拓扑项版本 id 的格式 '<实体 id><类型字母><序号>'(如 '375f566465' = 实体 375 的面): 第 1 组 = 所属实体 id。
+    topoOwnerPattern: '^(\\d+)[a-z]\\d+$',
     // 扫描累积表上限(防异常增长)。
     scanMapLimit: 512,
     // three.js 相机字段。
@@ -520,9 +522,17 @@
     }
     if (persp && proj) { try { cam.updateProjectionMatrix(); } catch (e) {} }
     call0(oc, 'oc.update');
+    // 标记轨道控制器"需要更新": 否则它的更新循环要等下一次交互才跑(R21 用户反馈: 恢复后缩放要动一下视口才生效)。
+    markOrbitDirty(oc);
     call0(viewport(), 'vp.render');
     return { proj: proj, orbit: orbit };
   });
+
+  function markOrbitDirty(oc) {
+    if (!oc) return;
+    try { invokeOn('oc.setNeedsUpdate', [], oc); return; } catch (e) {}
+    put('oc.needsUpdate', 1, oc);
+  }
 
   // ---- 命令派发: 对视口元素派发 CustomEvent(Plasticity CommandRegistry 的执行方式) ----
   function viewportElement() {
@@ -619,16 +629,41 @@
     invokeOn('click.addById', [NAMES.faceIdPrefix + a.versionId]);
     return true;
   });
-  def('sel.faceIds', 'sel.read', function () {
-    var s = need('sel.selected');
+  function topoOwner(vid) {
+    var m = new RegExp(NAMES.topoOwnerPattern).exec(String(vid));
+    return m ? m[1] : null;
+  }
+
+  function idList(s, kind) {
     var out = [];
-    var set = get('sel.ids.face', s);
+    var set = get('sel.ids.' + kind, s);
     var vk = NAMES.versionIdKey;
     if (set && typeof set.forEach === 'function') {
-      set.forEach(function (x) { out.push(String(x && x[vk] !== undefined ? x[vk] : x)); });
+      set.forEach(function (x) { out.push(String(x && typeof x === 'object' && x[vk] !== undefined ? x[vk] : x)); });
     }
+    return out;
+  }
+
+  // 当前选中的面 / 实体; 给了 targets(目标面版本 id)时再算 drill:
+  // 还没选中、但所属实体已"介入"(实体本身被选中, 或它的别的面已选中)的目标 —— 再点一次即可下钻到面。
+  // Plasticity 点击语义(R21 实测): 点未选实体上的面 → 选中整个实体; 再点一次 → 换成该面。
+  // 所属实体完全没介入的目标说明点到了别的东西(被遮挡), 不在 drill 里, 交给转视角补救。
+  def('sel.faceIds', 'sel.read', function (a) {
+    var s = need('sel.selected');
+    var faces = idList(s, 'face');
+    var solids = idList(s, 'solid');
     var size = get('sel.size', s);
-    return { selN: typeof size === 'number' ? size : -1, faces: out };
+    var out = { selN: typeof size === 'number' ? size : -1, faces: faces, solids: solids };
+    if (a && Array.isArray(a.targets)) {
+      var engaged = {};
+      solids.forEach(function (x) { engaged[x] = true; });
+      faces.forEach(function (f) { var o = topoOwner(f); if (o) engaged[o] = true; });
+      out.drill = a.targets.filter(function (t) {
+        var o = topoOwner(t);
+        return faces.indexOf(String(t)) < 0 && o !== null && engaged[o] === true;
+      });
+    }
+    return out;
   });
 
   // ---- 悬停扫描(选择集应用): 包装 changeSelection.onHover, 页面侧自读指针坐标累积 id → 坐标 ----
@@ -738,8 +773,7 @@
     var V = cam.position.constructor;
     var step = get('oc.step', oc) || Math.PI / 12;
     qe.multiply(new Q().setFromAxisAngle(new V(0, 0, 1), sign * step));
-    put('oc.needsUpdate', true, oc);
-    try { invokeOn('oc.setNeedsUpdate', [], oc); } catch (e) {}
+    markOrbitDirty(oc);
     return step;
   }
 
