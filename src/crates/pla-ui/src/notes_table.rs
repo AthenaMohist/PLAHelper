@@ -42,6 +42,10 @@ struct Clip {
     values: Vec<Vec<String>>,
     /// 放进系统剪贴板的文本(粘贴时比对: 一致 = 来自本表格, 用公式; 否则当外部 TSV)。
     tsv: String,
+    /// R32: Ctrl+X 剪切 —— 源格子到粘贴时才清空, 指向它们的公式跟着搬(Excel 语义); 一次性。
+    cut: bool,
+    /// 来源表格(块 id)。剪切只在同一张表里按"搬移"处理, 贴到别的表 = 普通粘贴。
+    table: u64,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -383,6 +387,20 @@ pub fn table_ui(ui: &mut egui::Ui, id: u64, t: &mut Table, st: &mut TableState, 
                     let end = lay.nearest_cell(pp);
                     let rr = lay.sel_rect((start.0.min(end.0), start.1.min(end.1), start.0.max(end.0), start.1.max(end.1)));
                     p.rect_stroke(rr, egui::Rounding::same(1.0), Stroke::new(1.5f32, th.green));
+                }
+            }
+            // R32: 剪切源虚线框(同 Excel 的"蚂蚁线")
+            if let Some(cl) = st.clip.as_ref().filter(|c| c.cut && c.table == id) {
+                let (or, oc) = cl.origin;
+                let h = cl.raw.len().max(1);
+                let w = cl.raw.iter().map(|r| r.len()).max().unwrap_or(1).max(1);
+                let (r1, c1) = ((or + h - 1).min(t.rows() - 1), (oc + w - 1).min(t.cols() - 1));
+                if or < t.rows() && oc < t.cols() {
+                    let rr = lay.sel_rect((or, oc, r1, c1)).shrink(1.0);
+                    let pts = [rr.left_top(), rr.right_top(), rr.right_bottom(), rr.left_bottom(), rr.left_top()];
+                    for s in egui::Shape::dashed_line(&pts, Stroke::new(1.5f32, th.text), 4.0, 3.0) {
+                        p.add(s);
+                    }
                 }
             }
             // 选区边框 + 填充柄 / 填充预览
@@ -1075,6 +1093,10 @@ fn keyboard(ui: &mut egui::Ui, t: &mut Table, st: &mut TableState, values: &[Vec
                     }
                     Key::Escape => {
                         st.anchor = st.cursor;
+                        // 取消剪切(去掉虚线框)
+                        if st.clip.as_ref().map_or(false, |c| c.cut) {
+                            st.clip = None;
+                        }
                     }
                     _ => {}
                 }
@@ -1087,10 +1109,7 @@ fn keyboard(ui: &mut egui::Ui, t: &mut Table, st: &mut TableState, values: &[Vec
                 }
             }
             egui::Event::Copy => copy(ui, t, st, values, false),
-            egui::Event::Cut => {
-                copy(ui, t, st, values, true);
-                changed = true;
-            }
+            egui::Event::Cut => copy(ui, t, st, values, true),
             egui::Event::Paste(text) => {
                 let values_only = ui.input(|i| i.modifiers.shift);
                 if paste(t, st, &text, values_only) {
@@ -1103,7 +1122,7 @@ fn keyboard(ui: &mut egui::Ui, t: &mut Table, st: &mut TableState, values: &[Vec
     changed
 }
 
-fn copy(ui: &egui::Ui, t: &mut Table, st: &mut TableState, values: &[Vec<Value>], cut: bool) {
+fn copy(ui: &egui::Ui, t: &Table, st: &mut TableState, values: &[Vec<Value>], cut: bool) {
     let (r0, c0, r1, c1) = st.sel_rect();
     let raw: Vec<Vec<String>> = (r0..=r1).map(|r| t.cells[r][c0..=c1].to_vec()).collect();
     let vals: Vec<Vec<String>> = (r0..=r1)
@@ -1111,20 +1130,51 @@ fn copy(ui: &egui::Ui, t: &mut Table, st: &mut TableState, values: &[Vec<Value>]
         .collect();
     let tsv = vals.iter().map(|row| row.join("\t")).collect::<Vec<_>>().join("\n");
     ui.ctx().output_mut(|o| o.copied_text = tsv.clone());
-    st.clip = Some(Clip { origin: (r0, c0), raw, values: vals, tsv });
-    if cut {
-        for r in r0..=r1 {
-            for c in c0..=c1 {
-                t.cells[r][c].clear();
-            }
+    // R32: 剪切不立即清空 — 粘贴时才"搬走"(源格虚线框提示, Esc 取消)
+    let table = st.active.unwrap_or(0);
+    st.clip = Some(Clip { origin: (r0, c0), raw, values: vals, tsv, cut, table });
+}
+
+/// R32: 剪切后的粘贴 = 搬移(Excel): 不平铺; 表内所有指向源块的引用跟到新位置; 源格清空; 剪贴板用完即失效。
+fn paste_cut(t: &mut Table, st: &mut TableState, clip: &Clip, values_only: bool) -> bool {
+    let (or, oc) = clip.origin;
+    let h = clip.raw.len();
+    let w = clip.raw.iter().map(|r| r.len()).max().unwrap_or(1);
+    let (sr1, sc1) = (or + h - 1, oc + w - 1);
+    let (dr0, dc0, _, _) = st.sel_rect();
+    let (dr, dc) = (dr0 as i64 - or as i64, dc0 as i64 - oc as i64);
+    grow(t, dr0 + h, dc0 + w);
+    let moved: Vec<Vec<String>> = if values_only {
+        clip.values.clone()
+    } else {
+        clip.raw.iter().map(|row| row.iter().map(|s| formula::move_block(s, or, oc, sr1, sc1, dr, dc)).collect()).collect()
+    };
+    if !values_only {
+        rewrite_all(t, |s| formula::move_block(s, or, oc, sr1, sc1, dr, dc));
+    }
+    for r in or..=sr1.min(t.rows() - 1) {
+        for c in oc..=sc1.min(t.cols() - 1) {
+            t.cells[r][c].clear();
         }
     }
+    for (i, row) in moved.into_iter().enumerate() {
+        for (j, v) in row.into_iter().enumerate() {
+            t.cells[dr0 + i][dc0 + j] = v;
+        }
+    }
+    st.anchor = (dr0, dc0);
+    st.cursor = (dr0 + h - 1, dc0 + w - 1);
+    st.clip = None;
+    true
 }
 
 /// 粘贴: 剪贴板文本与上次复制一致 → 用内部剪贴板(公式按位移改写; values_only 只贴值);
 /// 否则当外部 TSV(Excel 等)。选区比剪贴板大且是整数倍 → 平铺(同 Excel)。
 fn paste(t: &mut Table, st: &mut TableState, text: &str, values_only: bool) -> bool {
     let internal = st.clip.as_ref().filter(|c| c.tsv.replace("\r\n", "\n").trim_end() == text.replace("\r\n", "\n").trim_end()).cloned();
+    if let Some(c) = internal.as_ref().filter(|c| c.cut && Some(c.table) == st.active) {
+        return paste_cut(t, st, c, values_only);
+    }
     let (grid, origin): (Vec<Vec<String>>, Option<(usize, usize)>) = match &internal {
         Some(c) if values_only => (c.values.clone(), None),
         Some(c) => (c.raw.clone(), Some(c.origin)),
@@ -1208,13 +1258,41 @@ mod tests {
         let (r0, c0, r1, c1) = st.sel_rect();
         let raw: Vec<Vec<String>> = (r0..=r1).map(|r| t.cells[r][c0..=c1].to_vec()).collect();
         let v: Vec<Vec<String>> = vec![vec![vals[0][1].display()]];
-        st.clip = Some(Clip { origin: (0, 1), raw, values: v, tsv: "6".into() });
+        st.clip = Some(Clip { origin: (0, 1), raw, values: v, tsv: "6".into(), cut: false, table: 1 });
         st.select(1, 2, 1);
         assert!(paste(&mut t, &mut st, "6", false));
         assert_eq!(t.cells[2][1], "=A3+1", "公式按位移改写");
         st.select(1, 1, 1);
         assert!(paste(&mut t, &mut st, "6", true));
         assert_eq!(t.cells[1][1], "6", "只贴值");
+    }
+
+    #[test]
+    fn cut_paste_moves_cells_and_redirects_refs() {
+        // A1=5, B1 =A1*2; 剪切 A1 贴到 A3 → A3=5, A1 空, B1 变成 =A3*2
+        let mut t = tbl(&[&["5", "=A1*2"], &["", ""], &["", ""]]);
+        let mut st = TableState::default();
+        st.select(7, 0, 0);
+        st.clip = Some(Clip { origin: (0, 0), raw: vec![vec!["5".into()]], values: vec![vec!["5".into()]], tsv: "5".into(), cut: true, table: 7 });
+        st.select(7, 2, 0);
+        assert!(paste(&mut t, &mut st, "5", false));
+        assert_eq!(t.cells[0][0], "");
+        assert_eq!(t.cells[2][0], "5");
+        assert_eq!(t.cells[0][1], "=A3*2", "指向被剪切格的公式跟到新位置");
+        assert!(st.clip.is_none(), "剪切粘贴一次后失效");
+        // 被搬的公式本身不做相对平移(与复制不同)
+        let mut t2 = tbl(&[&["1", "=A1+10"], &["", ""]]);
+        st.select(7, 0, 1);
+        st.clip = Some(Clip { origin: (0, 1), raw: vec![vec!["=A1+10".into()]], values: vec![vec!["11".into()]], tsv: "11".into(), cut: true, table: 7 });
+        st.select(7, 1, 1);
+        assert!(paste(&mut t2, &mut st, "11", false));
+        assert_eq!(t2.cells[1][1], "=A1+10");
+        // 贴到另一张表 = 普通粘贴(不清空来源)
+        let mut t3 = tbl(&[&["", ""]]);
+        st.clip = Some(Clip { origin: (0, 0), raw: vec![vec!["x".into()]], values: vec![vec!["x".into()]], tsv: "x".into(), cut: true, table: 99 });
+        st.select(7, 0, 1);
+        assert!(paste(&mut t3, &mut st, "x", false));
+        assert_eq!(t3.cells[0][1], "x");
     }
 
     #[test]

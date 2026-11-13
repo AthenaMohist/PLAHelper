@@ -1594,6 +1594,23 @@ pub fn move_cols(src: &str, from: usize, n: usize, to: usize) -> String {
     move_axis(src, Axis::Col, from, n, to)
 }
 
+/// R32: cut & paste (Excel semantics): cells in the block `r0..=r1 × c0..=c1` moved by (d_row, d_col).
+/// Refs pointing INTO the block follow it (relative and absolute alike); a range follows only when it lies
+/// entirely inside the block (Excel leaves partially-overlapping ranges alone). Refs elsewhere are untouched.
+/// Apply this to every formula in the table, including the moved cells themselves (which are NOT shifted
+/// the way a copy would be).
+pub fn move_block(src: &str, r0: usize, c0: usize, r1: usize, c1: usize, d_row: i64, d_col: i64) -> String {
+    let inside = |p: RefParts| p.row >= r0 && p.row <= r1 && p.col >= c0 && p.col <= c1;
+    let mv = |p: RefParts| -> Option<RefParts> {
+        if inside(p) {
+            Some(RefParts { row: offset(p.row, d_row, MAX_ROWS)?, col: offset(p.col, d_col, MAX_COLS)?, ..p })
+        } else {
+            Some(p)
+        }
+    };
+    rewrite(src, mv, |a, b| if inside(a) && inside(b) { Some((mv(a)?, mv(b)?)) } else { Some((a, b)) })
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1604,6 +1621,17 @@ mod tests {
 
     fn e(s: &str) -> String {
         eval_expr(s).display()
+    }
+
+    #[test]
+    fn move_block_follows_cut_cells_only() {
+        // A1:A2 剪切到 C5(下移 4 行、右移 2 列)
+        assert_eq!(move_block("=A1+B1", 0, 0, 1, 0, 4, 2), "=C5+B1", "只有块内的引用跟着走");
+        assert_eq!(move_block("=SUM(A1:A2)", 0, 0, 1, 0, 4, 2), "=SUM(C5:C6)", "整段在块内 → 跟着走");
+        assert_eq!(move_block("=SUM(A1:A3)", 0, 0, 1, 0, 4, 2), "=SUM(A1:A3)", "部分重叠 → 不动(同 Excel)");
+        assert_eq!(move_block("=$A$2*2", 0, 0, 1, 0, 4, 2), "=$C$6*2", "绝对引用也跟着走");
+        assert_eq!(move_block("=A1", 0, 0, 0, 0, -1, 0), "=#REF!", "移出表外 → #REF!");
+        assert_eq!(move_block("text", 0, 0, 0, 0, 1, 1), "text");
     }
 
     #[test]

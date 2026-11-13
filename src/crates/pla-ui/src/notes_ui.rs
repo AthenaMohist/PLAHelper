@@ -1203,17 +1203,53 @@ mod fmt {
     }
 
     /// 去掉与选区相交的该类颜色(选区为空 → 整行)。标签另有一种颜色时只删这一项, 保留标签。
+    /// R32: 选区只盖住某段颜色的一部分(且那段里面没有嵌套标签)→ 拆成「前段 · 去色的中段 · 后段」,
+    /// 只清选中的字; 其余情况(整段被选中 / 有嵌套)按整段处理。
     pub fn clear_spans(text: &str, s: usize, e: usize, kind: SpanKind) -> (String, usize, usize) {
         let c: Vec<char> = text.chars().collect();
         let n = c.len();
         let (s, e) = (s.min(e).min(n), e.max(s).min(n));
         let whole = s == e;
+        let tags = notes::span_tags(text);
         let mut edits = Vec::new();
-        for t in notes::span_tags(text) {
-            if kind.get(&t).is_none() || !(whole || (t.open.0 < e && s < t.close.1)) {
+        // (拆段起点(原坐标), 中段在重建文本里的偏移, 中段长度)
+        let mut split_sel: Option<(usize, usize, usize)> = None;
+        for t in &tags {
+            if kind.get(t).is_none() || !(whole || (t.open.0 < e && s < t.close.1)) {
                 continue;
             }
-            let (fc, fb) = with_kind(&t, kind, None);
+            let (cs, ce) = (t.open.1, t.close.0);
+            let (a, b) = (s.max(cs), e.min(ce));
+            let partial = !whole && a < b && (a > cs || b < ce);
+            let nested = tags.iter().any(|u| u.open.0 >= cs && u.close.1 <= ce);
+            if partial && !nested && split_sel.is_none() {
+                let open_s: String = c[t.open.0..t.open.1].iter().collect();
+                let (fc, fb) = with_kind(t, kind, None);
+                let mut rebuilt = String::new();
+                if a > cs {
+                    rebuilt.push_str(&open_s);
+                    rebuilt.extend(&c[cs..a]);
+                    rebuilt.push_str("</span>");
+                }
+                let mid_open = open_tag(fc, fb);
+                if let Some(m) = &mid_open {
+                    rebuilt.push_str(m);
+                }
+                let mid_off = rebuilt.chars().count();
+                rebuilt.extend(&c[a..b]);
+                if mid_open.is_some() {
+                    rebuilt.push_str("</span>");
+                }
+                if b < ce {
+                    rebuilt.push_str(&open_s);
+                    rebuilt.extend(&c[b..ce]);
+                    rebuilt.push_str("</span>");
+                }
+                split_sel = Some((t.open.0, mid_off, b - a));
+                edits.push((t.open.0, t.close.1, rebuilt));
+                continue;
+            }
+            let (fc, fb) = with_kind(t, kind, None);
             match open_tag(fc, fb) {
                 Some(tag) => edits.push((t.open.0, t.open.1, tag)),
                 None => {
@@ -1221,6 +1257,11 @@ mod fmt {
                     edits.push((t.close.0, t.close.1, String::new()));
                 }
             }
+        }
+        // 拆过段: 新选区 = 拆段起点在新文本里的位置 + 中段在重建文本里的偏移(其余编辑造成的平移由 map 算)
+        if let Some((seg_start, off, len)) = split_sel {
+            let (out, new_start, _) = apply_edits(&c, edits, seg_start, seg_start);
+            return (out, new_start + off, new_start + off + len);
         }
         apply_edits(&c, edits, s, e)
     }
@@ -1305,6 +1346,32 @@ mod fmt {
             assert_eq!(sel(&r), "d");
             // 没有该类颜色 → 不变
             assert_eq!(clear_spans("x<span style=\"color:#FF6B6B\">y</span>", 0, 0, SpanKind::Bg).0, "x<span style=\"color:#FF6B6B\">y</span>");
+        }
+
+        #[test]
+        fn clear_part_of_a_span_splits_it() {
+            let open = "<span style=\"color:#FF6B6B\">";
+            let src = format!("x{open}红色文字</span>y");
+            let o = open.chars().count();
+            // 选中 "色文"(内容下标 1..3)
+            let s = 1 + o + 1;
+            let r = clear_spans(&src, s, s + 2, SpanKind::Color);
+            assert_eq!(r.0, format!("x{open}红</span>色文{open}字</span>y"));
+            assert_eq!(sel(&r), "色文", "选区仍指向被清色的字");
+            // 选中开头部分: 没有前段
+            let r2 = clear_spans(&src, 1 + o, 1 + o + 2, SpanKind::Color);
+            assert_eq!(r2.0, format!("x红色{open}文字</span>y"));
+            assert_eq!(sel(&r2), "红色");
+            // 带两种颜色的段: 中段保留另一种(背景)
+            let both = "<span style=\"color:#FF6B6B; background:#1E3A5F\">";
+            let src3 = format!("{both}ab</span>");
+            let b = both.chars().count();
+            let r3 = clear_spans(&src3, b + 1, b + 2, SpanKind::Color);
+            assert_eq!(r3.0, format!("{both}a</span><span style=\"background:#1E3A5F\">b</span>"));
+            assert_eq!(sel(&r3), "b");
+            // 渲染结果: 中段无文字色
+            let spans = notes::inline_spans(&r.0);
+            assert!(spans.iter().any(|(t, st)| t == "色文" && st.color.is_none()));
         }
     }
 }
