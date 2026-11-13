@@ -3494,17 +3494,28 @@ impl eframe::App for PlaApp {
                                 // 单独一列: 占满列高, 底部给报错信息留位置。
                                 .max_height((ui.available_height() - if self.cdp_err_msg.is_some() { 80.0 } else { 0.0 }).max(60.0))
                                 .show(ui, |ui| {
-                                    for it in self.live_sel.clone() {
-                                        let label = if it.name.is_empty() {
-                                            format!("{} ({})", it.ctor, it.kind)
-                                        } else {
-                                            format!("{} ({})", it.name, it.kind)
-                                        };
-                                        ui.label(
-                                            egui::RichText::new(format!("● {label}")).color(
-                                                if it.kind == "face" { COL_YELLOW } else { COL_TEXT },
-                                            ),
+                                    // R24: 按所属物体分组; 组头 = 物体名 + 各类数量, 行 = 曲面类型 + 短编号(面/边没有名字)。
+                                    for (group, items) in pla_ui::sel_labels::group_live_selection(&self.live_sel) {
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(format!("{}  · {}", group, pla_ui::sel_labels::kind_counts(&items)))
+                                                    .small()
+                                                    .strong()
+                                                    .color(COL_MUTED),
+                                            )
+                                            .truncate(),
                                         );
+                                        for it in items {
+                                            ui.add(
+                                                egui::Label::new(
+                                                    egui::RichText::new(format!("  ● {}", pla_ui::sel_labels::row_label(it)))
+                                                        .color(if it.kind == "face" { COL_YELLOW } else { COL_TEXT }),
+                                                )
+                                                .truncate(),
+                                            )
+                                            .on_hover_text(format!("{} {}", it.kind, it.id));
+                                        }
+                                        ui.add_space(4.0);
                                     }
                                 });
                         } else {

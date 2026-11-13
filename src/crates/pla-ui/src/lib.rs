@@ -5,6 +5,7 @@ pub mod features;
 pub mod hotkey;
 pub mod plasticity_config;
 pub mod round_corners;
+pub mod sel_labels;
 pub mod selection;
 pub mod snapshot;
 pub mod titlebar_probe;

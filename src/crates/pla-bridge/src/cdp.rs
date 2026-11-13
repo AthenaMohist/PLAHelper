@@ -99,9 +99,14 @@ pub struct SelItem {
     /// 成员类型(solid/sheet/face/edge/…), 取值表唯一来源 = 垫片 `SEL_KINDS`。
     pub kind: String,
     pub id: String,
+    /// 自身名字(实体/片体/曲线等物体; 面/边没有名字)。
     pub name: String,
     pub ctor: String,
     pub key: Option<String>,
+    /// R24: 所属物体名(面/边; 大纲里的名字)。空 = 读不到。
+    pub owner: String,
+    /// R24: 曲面类型原名(面: Plane / Cylinder / Sphere / Torus / BlendSurf …)。空 = 非面或读不到。
+    pub surface: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -696,7 +701,9 @@ fn selection_from_batch(raw: &str) -> SelectionSnapshot {
                 }
                 _ => (String::new(), None),
             };
-            SelItem { ctor: kind.clone(), kind, id, name: String::new(), key }
+            let info = &it["info"];
+            let s = |k: &str| info[k].as_str().unwrap_or("").to_string();
+            SelItem { ctor: kind.clone(), kind, id, name: s("name"), key, owner: s("ownerName"), surface: s("surface") }
         })
         .collect();
     SelectionSnapshot {
@@ -1040,7 +1047,7 @@ mod tests {
     #[test]
     fn selection_from_batch_degrades_per_item() {
         // 完整回包
-        let raw = r#"{"sel.snapshot":{"ok":true,"v":{"size":2,"items":[{"kind":"solid","e":7},{"kind":"face","e":{"__ctor":"FaceId","id":5,"versionId":"14f2025","__str":"F5"}}]}},
+        let raw = r#"{"sel.snapshot":{"ok":true,"v":{"size":2,"items":[{"kind":"solid","e":7,"info":{"name":"Body7"}},{"kind":"face","e":{"__ctor":"FaceId","id":5,"versionId":"14f2025","__str":"F5"},"info":{"ownerName":"plate","surface":"Plane"}}]}},
             "hist.state":{"ok":true,"v":{"undo":3,"geoVer":9}},
             "cam.get":{"ok":true,"v":{"px":1,"py":2,"pz":3,"qx":0,"qy":0,"qz":0,"qw":1}},
             "err.last":{"ok":true,"v":{"msg":"boom","stack":"at x"}}}"#;
@@ -1051,6 +1058,8 @@ mod tests {
         assert_eq!(s.items[0].id, "7");
         assert!(s.items[0].key.is_none());
         assert_eq!(s.items[1].id, "5");
+        assert_eq!(s.items[0].name, "Body7");
+        assert_eq!((s.items[1].owner.as_str(), s.items[1].surface.as_str()), ("plate", "Plane"));
         assert!(s.items[1].key.as_ref().unwrap().contains("14f2025"));
         assert_eq!(s.error, Some(("boom".into(), "at x".into())));
         assert!(s.camera.unwrap().contains("\"qw\":1"));

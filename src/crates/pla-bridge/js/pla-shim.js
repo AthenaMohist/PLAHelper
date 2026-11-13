@@ -35,6 +35,10 @@
     'geo.lookupTopo':          ['geo', 'lookupTopologyItemById'],
     'geo.lookupItem':          ['geo', 'lookupItemById'],
     'ed.enqueue':              ['ed', 'enqueue'],
+    // 物体名(大纲里显示的名字): nodes.getName(nodes.item2key(视图))。
+    'ed.nodes':                ['ed', 'nodes'],
+    'nodes.getName':           ['nodes', 'getName'],
+    'nodes.item2key':          ['nodes', 'item2key'],
     // 选择命令基类 SelectionCommand 的来源: 任一已注册的选择类命令(原生点击命令类只在闭包里)。
     'cmd.selectionBaseHolder': ['ed', 'commands.DeselectAllCommand'],
     'sig.commandEnded':        ['ed', 'selection.signals.commandEnded', 'signals.commandEnded'],
@@ -116,8 +120,16 @@
     // sel.apply: 支持的成员类型; 其中按拓扑项查(lookupTopologyItemById)的类型, 其余按物体查(lookupItemById)。
     applyKinds: ['face', 'edge', 'solid', 'sheet', 'curve'],
     topologyKinds: ['face', 'edge'],
-    // 几何库查找结果里视图对象的字段。
+    // 几何库查找结果里视图对象 / 几何模型的字段。
     lookupViewKey: 'view',
+    lookupModelKey: 'model',
+    // 拓扑项视图上指向所属物体(实体/片体)的字段。
+    parentItemKey: 'parentItem',
+    // 面模型取曲面: model.GetSurface() → { surface: <Plane|Cylinder|Sphere|Torus|BlendSurf…>, … }。
+    surfaceGetter: 'GetSurface',
+    surfaceInnerKey: 'surface',
+    // 选择项描述缓存上限(按版本 id 缓存: 几何一变版本 id 就变, 不会过期)。
+    describeCacheLimit: 5000,
     // ChangeSelectionModifier(实测): 0 替换 / 1 追加 / 2 移除 / 3 切换。
     modReplace: 0,
     modAdd: 1,
@@ -174,7 +186,7 @@
   // =====================================================================
   var MISS = {};
   var state = { ed: null, finder: null, gen: 0, hooks: {}, lastError: null, hits: {}, pings: 0,
-                selCmd: null, disposables: [], lastMaintain: 0 };
+                selCmd: null, disposables: [], lastMaintain: 0, describeCache: new Map() };
 
   function errMsg(e) { return e && e.message ? String(e.message) : String(e); }
 
@@ -203,6 +215,7 @@
       case 'oc': return get('vp.orbit');
       case 'reg': return get('ed.registry');
       case 'geo': return get('ed.geo');
+      case 'nodes': return get('ed.nodes');
       case 'cs': return get('ed.changeSelection');
       case 'exec': return get('ed.executor');
       case 'km': return get('ed.keymaps');
@@ -457,7 +470,12 @@
     SEL_KINDS.forEach(function (k) {
       var set = get('sel.ids.' + k[0], s);
       if (!set || typeof set.forEach !== 'function') return;
-      set.forEach(function (x) { items.push({ kind: k[0], e: idElem(x) }); });
+      set.forEach(function (x) {
+        var vk = NAMES.versionIdKey;
+        var id = String(x && typeof x === 'object' && x[vk] !== undefined ? x[vk] : x);
+        // info: 可读描述(所属物体名 / 自身名字 / 曲面类型), 供界面区分同类项。
+        items.push({ kind: k[0], e: idElem(x), info: describe(k[0], id) });
+      });
     });
     var size = get('sel.size', s);
     return { size: typeof size === 'number' ? size : -1, items: items };
@@ -642,7 +660,8 @@
   // 按 (kind, id) 查视图对象: 拓扑项(面/边…)走 lookupTopologyItemById, 物体(实体/片体/曲线…)走 lookupItemById。
   function firstView(v) { return v && typeof v.values === 'function' && !v.isObject3D ? v.values().next().value : v; }
 
-  function viewOf(kind, id) {
+  // 几何库查找结果 { view, model, … }; 查不到 → null。
+  function lookupOf(kind, id) {
     var t = null;
     if (NAMES.topologyKinds.indexOf(kind) >= 0) {
       try { t = invokeOn('geo.lookupTopo', [String(id)]); } catch (e) { t = null; }
@@ -651,7 +670,51 @@
       try { t = invokeOn('geo.lookupItem', [isNaN(n) ? id : n]); } catch (e) { t = null; }
       if (!t && !isNaN(n)) { try { t = invokeOn('geo.lookupItem', [String(id)]); } catch (e2) { t = null; } }
     }
+    return t || null;
+  }
+
+  function viewOf(kind, id) {
+    var t = lookupOf(kind, id);
     return t ? firstView(t[NAMES.lookupViewKey]) : null;
+  }
+
+  // 物体在大纲里的名字(实体/片体/曲线…)。
+  function nameOf(view) {
+    if (!view) return null;
+    try {
+      var n = invokeOn('nodes.getName', [invokeOn('nodes.item2key', [view])]);
+      return typeof n === 'string' && n ? n : null;
+    } catch (e) { return null; }
+  }
+
+  // 选择项的可读描述(界面区分同类项用): 拓扑项 → 所属物体名 + 曲面类型(面); 物体 → 自身名字。
+  // 按 kind:版本 id 缓存 — 几何一变版本 id 就变, 缓存不会过期; 超上限整表清空。
+  function describe(kind, id) {
+    var key = kind + ':' + id;
+    var hit = state.describeCache.get(key);
+    if (hit) return hit;
+    var info = {};
+    var t = lookupOf(kind, id);
+    var view = t ? firstView(t[NAMES.lookupViewKey]) : null;
+    if (view) {
+      if (NAMES.topologyKinds.indexOf(kind) >= 0) {
+        var owner = view[NAMES.parentItemKey];
+        var on = nameOf(owner);
+        if (on) info.ownerName = on;
+        try {
+          var model = t[NAMES.lookupModelKey];
+          var s = model && typeof model[NAMES.surfaceGetter] === 'function' ? model[NAMES.surfaceGetter]() : null;
+          var inner = s && s[NAMES.surfaceInnerKey];
+          if (inner && inner.constructor && inner.constructor.name) info.surface = inner.constructor.name;
+        } catch (e) {}
+      } else {
+        var n = nameOf(view);
+        if (n) info.name = n;
+      }
+    }
+    if (state.describeCache.size >= NAMES.describeCacheLimit) state.describeCache.clear();
+    state.describeCache.set(key, info);
+    return info;
   }
 
   // 构造一个"命中"(与真实拾取结果同构, 实测 {distance, point, intersectable, object, distance2d})。
