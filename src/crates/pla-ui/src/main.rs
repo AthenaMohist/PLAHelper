@@ -1266,6 +1266,19 @@ struct SnapItemActions {
     delete: bool,
 }
 
+/// R26: 截图纹理 URI —— egui 按 URI 缓存解码后的纹理, 只用名字(SS001/SG001…)做 URI 时,
+/// 换文件或删掉重拍同名项会一直显示第一张图。URI 里带上内容指纹(长度 + 稀疏采样哈希),
+/// 内容不同 → URI 不同 → 必然重新解码。采样而非全量哈希: 每帧每张图都要算, PNG 可达数 MB。
+fn png_uri(kind: &str, name: &str, bytes: &[u8]) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a
+    let step = (bytes.len() / 2048).max(1);
+    for b in bytes.iter().step_by(step).chain(bytes.iter().rev().take(64)) {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("bytes://{kind}/{name}#{}-{h:016x}", bytes.len())
+}
+
 /// PNG 尺寸解析(只读 IHDR 头, 不解码): 签名 8B + len 4B + "IHDR" 4B + W 4B + H 4B。
 /// 我们的截图 PNG 由 wincap.rs 生成, 结构确定; 解析失败返回 None 走占位。
 fn png_dims(bytes: &[u8]) -> Option<(f32, f32)> {
@@ -1323,7 +1336,7 @@ fn snap_image(
     let draw = |ui: &mut egui::Ui| -> egui::Response {
         if let Some(bytes) = png {
             ui.add(
-                egui::Image::from_bytes(format!("bytes://{name}"), bytes.clone())
+                egui::Image::from_bytes(png_uri("snap", name, bytes), bytes.clone())
                     .fit_to_exact_size(egui::vec2(iw, ih))
                     .sense(egui::Sense::click()),
             )
@@ -2263,16 +2276,19 @@ impl PlaApp {
 
     /// R7-17 / R26: doc_key 跟随绑定窗口标题("model1.plasticity - Plasticity" → "model1")。
     /// 同一窗口内换文件(标题变)也会触发; 吸附/拖动两条路径都调用。
-    fn sync_doc_key(&mut self) {
+    /// 返回 true = 本次发生了文档切换。
+    fn sync_doc_key(&mut self) -> bool {
         let Some(title) = self.snap_target.as_ref().map(|t| t.title.clone()) else {
-            return;
+            return false;
         };
         let derived = Self::doc_key_from_title(&title);
-        if derived != self.doc_key {
-            pla_ui::diag::log(&format!("doc switch: {} -> {}", self.doc_key, derived));
-            self.doc_key = derived;
-            self.reset_doc_scoped();
+        if derived == self.doc_key {
+            return false;
         }
+        pla_ui::diag::log(&format!("doc switch: {} -> {}", self.doc_key, derived));
+        self.doc_key = derived;
+        self.reset_doc_scoped();
+        true
     }
 
     /// R26: 文档切换时作废**所有**按 doc_key 归档的状态 —— 唯一清单, 新增按文档存的字段必须加到这里。
@@ -2338,7 +2354,9 @@ impl PlaApp {
                         self.snap_target = Some(target.clone());
                         self.cdp.set_target(Some(target.hwnd));
                         // R26: 拖动模式也要跟随同窗口内的文档切换(以前这里提前 return, doc_key 不更新)。
-                        self.sync_doc_key();
+                        if self.sync_doc_key() {
+                            ctx.forget_all_images();
+                        }
                         if self.last_probe_poll.elapsed()
                             >= Duration::from_millis(PROBE_POLL_MS)
                             || self
@@ -2360,7 +2378,9 @@ impl PlaApp {
         self.snap_target = bound;
         // R19: CDP 跟随绑定窗口(多窗口时每个助手只读写自己那扇窗口的 renderer)。
         self.cdp.set_target(self.snap_target.as_ref().map(|t| t.hwnd));
-        self.sync_doc_key();
+        if self.sync_doc_key() {
+            ctx.forget_all_images(); // 释放旧文档的截图纹理(URI 已带内容指纹, 这里只为回收内存)
+        }
         // 用 owned 克隆避免在 self 上叠加可变借用。
         let Some(target) = self.snap_target.clone() else {
             // 未绑定: 清缓存, 等 Plasticity 出现。
@@ -3749,7 +3769,7 @@ impl eframe::App for PlaApp {
                                                         egui::Layout::top_down(egui::Align::Center),
                                                         |ui| ui.add(
                                                             egui::Image::from_bytes(
-                                                                format!("bytes://sel-{}", meta.name),
+                                                                png_uri("sel", &meta.name, &bytes),
                                                                 bytes.clone(),
                                                             )
                                                             .fit_to_exact_size(egui::vec2(iw, img_h))
@@ -4123,7 +4143,7 @@ impl eframe::App for PlaApp {
                                                         egui::vec2(w, img_h),
                                                         egui::Layout::top_down(egui::Align::Center),
                                                         |ui| ui.add(
-                                                            egui::Image::from_bytes(format!("bytes://vp-{}", meta.name), bytes.clone())
+                                                            egui::Image::from_bytes(png_uri("vp", &meta.name, &bytes), bytes.clone())
                                                                 .fit_to_exact_size(egui::vec2(iw, img_h))
                                                                 .sense(egui::Sense::click()),
                                                         ),
