@@ -136,11 +136,7 @@ pub fn save_cdp_selection_with_camera(
     if members.is_empty() {
         return Err("实时选择勾选为空".into());
     }
-    let exe = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-        .unwrap_or_else(|| PathBuf::from("."));
-    let dir = exe.join("selections-cdp").join(sanitize(doc_key));
+    let dir = cdp_selections_dir(doc_key);
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建目录失败: {e}"))?;
     let items: Vec<CdpMember> = members
         .iter()
@@ -182,11 +178,7 @@ pub fn save_cdp_selection_only(
 
 /// R8-1: 选择集下一个自动名 SG001/SG002…(点保存按钮时用)。
 pub fn next_sg_name(doc_key: &str) -> String {
-    let exe = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-        .unwrap_or_else(|| PathBuf::from("."));
-    let dir = exe.join("selections-cdp").join(sanitize(doc_key));
+    let dir = cdp_selections_dir(doc_key);
     let mut max = 0u32;
     if let Ok(rd) = std::fs::read_dir(&dir) {
         for e in rd.flatten() {
@@ -215,16 +207,47 @@ fn legacy_selections_dir(doc_key: &str) -> PathBuf {
 }
 
 /// R8-1 / R9: 选择集存档目录 —— **跟随文档**: `<文档目录>/.pla/selections/<doc_key>`。
-/// 定位不到文档(未绑定/未保存)才退回 exe 同级旧位置。首次命中文档目录时把
-/// 旧存档复制过去(不删旧文件), 换机器也不丢历史集。
+/// 定位不到文档(未绑定/未保存)才退回 exe 同级旧位置。
+/// **唯一入口**: 保存 / 列表 / 读取 / 截图 / 收藏 / 改名 / 删除全部经它取目录
+/// (R23 前保存与列表还写 exe 同级、截图却从文档同级读 → 面板一律"无截图")。
 pub fn cdp_selections_dir(doc_key: &str) -> PathBuf {
     let legacy = legacy_selections_dir(doc_key);
     let dir = crate::snapshot::doc_side_dir(doc_key, "selections").unwrap_or_else(|| legacy.clone());
     if dir != legacy {
-        crate::snapshot::migrate_dir(&legacy, &dir);
+        merge_legacy_once(&legacy, &dir);
     }
     let _ = std::fs::create_dir_all(&dir);
     dir
+}
+
+/// 把旧位置里新目录没有(或比新目录新)的文件补过去; 每个进程每对目录只做一次(本函数每帧都会被调用)。
+/// 只复制不删除旧文件。
+fn merge_legacy_once(legacy: &std::path::Path, dir: &std::path::Path) {
+    thread_local! {
+        static DONE: std::cell::RefCell<std::collections::HashSet<PathBuf>> = Default::default();
+    }
+    let first = DONE.with(|d| d.borrow_mut().insert(dir.to_path_buf()));
+    if !first || !legacy.is_dir() {
+        return;
+    }
+    let _ = std::fs::create_dir_all(dir);
+    let Ok(rd) = std::fs::read_dir(legacy) else { return };
+    for e in rd.flatten() {
+        let src = e.path();
+        if !src.is_file() {
+            continue;
+        }
+        let dst = dir.join(e.file_name());
+        let newer = |a: &std::path::Path, b: &std::path::Path| -> bool {
+            match (a.metadata().and_then(|m| m.modified()), b.metadata().and_then(|m| m.modified())) {
+                (Ok(x), Ok(y)) => x > y,
+                _ => false,
+            }
+        };
+        if !dst.exists() || newer(&src, &dst) {
+            let _ = std::fs::copy(&src, &dst);
+        }
+    }
 }
 
 /// R8-1: 读选择集截图 PNG 字节。
@@ -276,11 +299,7 @@ pub fn save_cdp_selection(
     if members.is_empty() {
         return Err("实时选择勾选为空".into());
     }
-    let exe = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-        .unwrap_or_else(|| PathBuf::from("."));
-    let dir = exe.join("selections-cdp").join(sanitize(doc_key));
+    let dir = cdp_selections_dir(doc_key);
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建目录失败: {e}"))?;
     let items: Vec<CdpMember> = members
         .iter()
@@ -315,13 +334,7 @@ pub struct CdpSelMeta {
 }
 
 fn cdp_sel_path(doc_key: &str, name: &str) -> PathBuf {
-    let exe = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-        .unwrap_or_else(|| PathBuf::from("."));
-    exe.join("selections-cdp")
-        .join(sanitize(doc_key))
-        .join(format!("{}.json", sanitize(name)))
+    cdp_selections_dir(doc_key).join(format!("{}.json", sanitize(name)))
 }
 
 /// 读取单个选择集元数据(无文件→None; fav 缺省 false, 旧文件兼容)。
@@ -417,11 +430,7 @@ pub fn rename_cdp_selection(doc_key: &str, old: &str, new: &str) -> Result<(), S
 
 /// 列出已保存的 CDP 选择集(R7-16)。
 pub fn list_cdp_selections(doc_key: &str) -> Vec<String> {
-    let exe = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-        .unwrap_or_else(|| PathBuf::from("."));
-    let dir = exe.join("selections-cdp").join(sanitize(doc_key));
+    let dir = cdp_selections_dir(doc_key);
     let mut out = Vec::new();
     if let Ok(rd) = std::fs::read_dir(&dir) {
         for e in rd.flatten() {
@@ -447,14 +456,8 @@ pub fn list_cdp_selections_meta(doc_key: &str) -> Vec<CdpSelMeta> {
 }
 
 /// 读取 CDP 选择集成员。
-pub fn load_cdp_selection(doc_key: &str, name: &str) -> Option<Vec<CdpMember>> {    let exe = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-        .unwrap_or_else(|| PathBuf::from("."));
-    let path = exe
-        .join("selections-cdp")
-        .join(sanitize(doc_key))
-        .join(format!("{}.json", sanitize(name)));
+pub fn load_cdp_selection(doc_key: &str, name: &str) -> Option<Vec<CdpMember>> {    
+    let path = cdp_sel_path(doc_key, name);
     let data = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&data).ok().map(|v: serde_json::Value| {
         v["members"]

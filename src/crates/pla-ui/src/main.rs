@@ -103,7 +103,10 @@ const PANEL_VPSTATE: [f32; 2] = [232.0, 480.0];
 /// R7-6: 快照墙改窄加高(232x480) — 一行一个快照, 缩略图撑满内容宽。
 const PANEL_SNAPSHOTS: [f32; 2] = [232.0, 480.0];
 /// R7-20: 加高放选择集墙(96 滚动区)。
-const PANEL_ENTITIES: [f32; 2] = [280.0, 540.0];
+/// R23: 选择集面板 = 左列选择集墙(约 280) + 右列 ENTITIES(SEL_ENTITIES_COL_W)。
+const PANEL_ENTITIES: [f32; 2] = [520.0, 560.0];
+/// R23: 选择集面板右侧 ENTITIES 列宽。
+const SEL_ENTITIES_COL_W: f32 = 220.0;
 const PANEL_DIM: [f32; 2] = [280.0, 170.0];
 const PANEL_SETTINGS: [f32; 2] = [300.0, 560.0];
 /// F2: CDP 能力面板(点工具栏状态点打开)。
@@ -590,6 +593,56 @@ fn caps_panel_ui(ui: &mut egui::Ui, v: &CapsView, reprobe: &mut bool) {
                 ui.add(egui::Label::new(egui::RichText::new(format!("{k} → {p}")).size(11.0).color(COL_YELLOW)).wrap());
             }
         });
+    }
+}
+
+/// R23: 管理模式的「全选 / 反选」(快照墙、选择集、视口状态共用, 行为一致)。
+/// 全选: 已全部选中时再按 = 全部取消; 否则选中全部。反选: 逐项取反。
+fn select_all_invert_buttons(
+    ui: &mut egui::Ui,
+    all: &[String],
+    selected: &mut std::collections::HashSet<String>,
+) {
+    let everything = !all.is_empty() && all.iter().all(|n| selected.contains(n));
+    if ui
+        .small_button(if everything { "取消全选" } else { "全选" })
+        .on_hover_text("选中全部; 已全部选中时再按 = 全部取消")
+        .clicked()
+    {
+        if everything {
+            selected.clear();
+        } else {
+            selected.extend(all.iter().cloned());
+        }
+    }
+    if ui.small_button("反选").on_hover_text("选中的取消、没选中的选中").clicked() {
+        let next: std::collections::HashSet<String> =
+            all.iter().filter(|n| !selected.contains(*n)).cloned().collect();
+        *selected = next;
+    }
+}
+
+#[cfg(test)]
+mod select_all_tests {
+    // 纯逻辑部分(全选切换 / 反选)在 UI 外单测。
+    fn toggle_all(all: &[&str], sel: &mut std::collections::HashSet<String>) {
+        let everything = !all.is_empty() && all.iter().all(|n| sel.contains(*n));
+        if everything { sel.clear() } else { sel.extend(all.iter().map(|s| s.to_string())) }
+    }
+    #[test]
+    fn select_all_toggles_and_invert_flips() {
+        let all = ["a", "b", "c"];
+        let mut sel: std::collections::HashSet<String> = ["b".to_string()].into();
+        toggle_all(&all, &mut sel);
+        assert_eq!(sel.len(), 3, "部分选中 → 全选");
+        toggle_all(&all, &mut sel);
+        assert!(sel.is_empty(), "全部选中时再按 = 全部取消");
+        let mut sel: std::collections::HashSet<String> = ["a".to_string()].into();
+        let inv: std::collections::HashSet<String> = all.iter().filter(|n| !sel.contains(**n)).map(|s| s.to_string()).collect();
+        sel = inv;
+        let mut v: Vec<_> = sel.into_iter().collect();
+        v.sort();
+        assert_eq!(v, ["b", "c"]);
     }
 }
 
@@ -2319,6 +2372,25 @@ impl PlaApp {
         }
     }
 
+    /// R23: HUD(悬停提示 / 通知)的左缘 = 工具栏与当前打开的二级面板中较宽者的右侧 + 间隙。
+    /// 二级面板贴在工具栏下方、与工具栏左对齐, 比工具栏宽时 HUD 不能再按工具栏宽度放(会压在面板上)。
+    fn hud_left(&self, toolbar_x: f32) -> f32 {
+        let mut w = TOOLBAR_SIZE[0];
+        for (open, size) in [
+            (self.show_snapshots, PANEL_SNAPSHOTS),
+            (self.show_entities, PANEL_ENTITIES),
+            (self.show_vpstate, PANEL_VPSTATE),
+            (self.show_dim, PANEL_DIM),
+            (self.show_settings, PANEL_SETTINGS),
+            (self.show_caps, PANEL_CAPS),
+        ] {
+            if open {
+                w = w.max(size[0]);
+            }
+        }
+        toolbar_x + w + 8.0
+    }
+
     /// R19: 本实例工具栏根窗口(认领属性写在它上面); 找到后缓存。
     fn own_root(&mut self) -> Option<isize> {
         if self.root_hwnd.is_none() {
@@ -3052,6 +3124,8 @@ impl eframe::App for PlaApp {
                                         .small()
                                         .color(COL_MUTED),
                                 );
+                                let all = self.snapshots.clone();
+                                select_all_invert_buttons(ui, &all, &mut self.snap_selected);
                                 let del = ui.add(
                                     egui::Button::new(
                                         egui::RichText::new("删除所选")
@@ -3402,6 +3476,59 @@ impl eframe::App for PlaApp {
                         let mut open_err: Option<String> = None;
                         let inner_tip = std::cell::RefCell::new(None::<(String, String)>);
 
+                        // ============ ENTITIES: 右侧单独一列(R23 用户要求, 不再挤占选择集墙) ============
+                        egui::SidePanel::right("sel-entities-col")
+                            .resizable(false)
+                            .exact_width(SEL_ENTITIES_COL_W)
+                            .frame(egui::Frame::none().inner_margin(egui::Margin { left: 8.0, right: 0.0, top: 0.0, bottom: 0.0 }))
+                            .show_inside(ui, |ui| {
+                        section_header(ui, "ENTITIES");
+                        ui.label(
+                            egui::RichText::new(format!("实时选择({} 项): {}", self.sel_cdp_members.len(), self.cdp_status))
+                                .small()
+                                .color(COL_MUTED),
+                        );
+                        if !self.live_sel.is_empty() {
+                            egui::ScrollArea::vertical()
+                                .id_salt("live-sel")
+                                // 单独一列: 占满列高, 底部给报错信息留位置。
+                                .max_height((ui.available_height() - if self.cdp_err_msg.is_some() { 80.0 } else { 0.0 }).max(60.0))
+                                .show(ui, |ui| {
+                                    for it in self.live_sel.clone() {
+                                        let label = if it.name.is_empty() {
+                                            format!("{} ({})", it.ctor, it.kind)
+                                        } else {
+                                            format!("{} ({})", it.name, it.kind)
+                                        };
+                                        ui.label(
+                                            egui::RichText::new(format!("● {label}")).color(
+                                                if it.kind == "face" { COL_YELLOW } else { COL_TEXT },
+                                            ),
+                                        );
+                                    }
+                                });
+                        } else {
+                            ui.label(egui::RichText::new("(空 — 在 Plasticity 视口/树里选择实体)").small().color(COL_MUTED));
+                        }
+                        // R8-1(需求7): 报错信息溢出修复 — 包 ScrollArea + 换行
+                        if let Some(err) = self.cdp_err_msg.clone() {
+                            ui.separator();
+                            egui::ScrollArea::vertical()
+                                .id_salt("sel-err")
+                                .max_height(60.0)
+                                .show(ui, |ui| {
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(format!("⚠ {err}"))
+                                                .small()
+                                                .color(COL_RED),
+                                        )
+                                        .wrap(),
+                                    );
+                                });
+                        }
+
+                            });
                         // ============ SAVED SELECTIONS(置顶, 参照快照墙) ============
                         section_header(ui, "SAVED SELECTIONS");
                         if !self.sel_saved_loaded {
@@ -3432,10 +3559,8 @@ impl eframe::App for PlaApp {
                         // 动态高度: 内容少 = 内容高; 多 = 屏高 1/3 上限 + 滚动。
                         // 实现手段: ScrollArea max_height(预估值) — egui 无法先量后限,
                         // 用"行数×行高"估算内容高, 上限 = 屏高/3。
-                        let screen_h = ctx.screen_rect().height();
-                        let row_h = 66.0;
-                        let content_rows = fav_list.len() / 3 + other_list.len() + 1;
-                        let content_h = (content_rows as f32 * row_h + 30.0).min(screen_h / 3.0).max(72.0);
+                        // R23: 存档墙占满剩余高度(以前封顶屏高 1/3 → 收藏区挤得放不下一个); 管理模式给下方操作条留高度。
+                        let content_h = (ui.available_height() - if self.sel_manage { 40.0 } else { 0.0 }).max(72.0);
                         egui::ScrollArea::vertical()
                             .id_salt("sel-saved-wall")
                             .max_height(content_h)
@@ -3598,6 +3723,8 @@ impl eframe::App for PlaApp {
                         if self.sel_manage {
                             ui.horizontal(|ui| {
                                 ui.label(egui::RichText::new(format!("已选 {}", self.sel_selected.len())).small().color(COL_MUTED));
+                                let all: Vec<String> = self.sel_saved.iter().map(|m| m.name.clone()).collect();
+                                select_all_invert_buttons(ui, &all, &mut self.sel_selected);
                                 if ui.small_button("删除所选").clicked() && !self.sel_selected.is_empty() {
                                     let names: Vec<String> = self.sel_selected.iter().cloned().collect();
                                     match pla_ui::selection::delete_cdp_selections_batch(&self.doc_key, &names) {
@@ -3616,53 +3743,6 @@ impl eframe::App for PlaApp {
                                 }
                             });
                             ui.separator();
-                        }
-
-                        // ============ ENTITIES(实时选择镜像, 保留) ============
-                        ui.separator();
-                        section_header(ui, "ENTITIES");
-                        ui.label(
-                            egui::RichText::new(format!("实时选择({} 项): {}", self.sel_cdp_members.len(), self.cdp_status))
-                                .small()
-                                .color(COL_MUTED),
-                        );
-                        if !self.live_sel.is_empty() {
-                            egui::ScrollArea::vertical()
-                                .id_salt("live-sel")
-                                .max_height(90.0)
-                                .show(ui, |ui| {
-                                    for it in self.live_sel.clone() {
-                                        let label = if it.name.is_empty() {
-                                            format!("{} ({})", it.ctor, it.kind)
-                                        } else {
-                                            format!("{} ({})", it.name, it.kind)
-                                        };
-                                        ui.label(
-                                            egui::RichText::new(format!("● {label}")).color(
-                                                if it.kind == "face" { COL_YELLOW } else { COL_TEXT },
-                                            ),
-                                        );
-                                    }
-                                });
-                        } else {
-                            ui.label(egui::RichText::new("(空 — 在 Plasticity 视口/树里选择实体)").small().color(COL_MUTED));
-                        }
-                        // R8-1(需求7): 报错信息溢出修复 — 包 ScrollArea + 换行
-                        if let Some(err) = self.cdp_err_msg.clone() {
-                            ui.separator();
-                            egui::ScrollArea::vertical()
-                                .id_salt("sel-err")
-                                .max_height(60.0)
-                                .show(ui, |ui| {
-                                    ui.add(
-                                        egui::Label::new(
-                                            egui::RichText::new(format!("⚠ {err}"))
-                                                .small()
-                                                .color(COL_RED),
-                                        )
-                                        .wrap(),
-                                    );
-                                });
                         }
 
                         // ---- 统一执行动作(借用结束) ----
@@ -3836,10 +3916,8 @@ impl eframe::App for PlaApp {
                                 None => "状态数据缺失".into(),
                             }
                         };
-                        let screen_h = ctx.screen_rect().height();
-                        let row_h = 66.0;
-                        let content_rows = fav_list.len() / 3 + other_list.len() + 1;
-                        let content_h = (content_rows as f32 * row_h + 30.0).min(screen_h / 3.0).max(72.0);
+                        // R23: 存档墙占满剩余高度(以前封顶屏高 1/3 → 收藏区挤得放不下一个); 管理模式给下方操作条留高度。
+                        let content_h = (ui.available_height() - if self.sel_manage { 40.0 } else { 0.0 }).max(72.0);
                         egui::ScrollArea::vertical()
                             .id_salt("vp-wall")
                             .max_height(content_h)
@@ -3986,7 +4064,21 @@ impl eframe::App for PlaApp {
                         // 管理条
                         if self.sel_manage && self.show_vpstate {
                             ui.horizontal(|ui| {
-                                ui.label(egui::RichText::new("批量删除: 勾选要删的项").small().color(COL_MUTED));
+                                ui.label(egui::RichText::new(format!("已选 {}", self.sel_selected.len())).small().color(COL_MUTED));
+                                let all: Vec<String> = self.vp_states.iter().map(|m| m.name.clone()).collect();
+                                select_all_invert_buttons(ui, &all, &mut self.sel_selected);
+                                if ui.small_button("删除所选").clicked() && !self.sel_selected.is_empty() {
+                                    let names: Vec<String> = self.sel_selected.iter().cloned().collect();
+                                    match pla_ui::vpstate::delete_vpstates(&self.doc_key, &names) {
+                                        Ok(n) => {
+                                            self.vp_states_loaded = false;
+                                            for nm in &names { self.vp_pngs.remove(nm); }
+                                            self.sel_selected.clear();
+                                            self.set_notice((false, format!("已删除 {n} 个视口状态")));
+                                        }
+                                        Err(e) => self.set_notice((true, e)),
+                                    }
+                                }
                                 if ui.small_button("完成").clicked() {
                                     self.sel_manage = false;
                                     self.sel_selected.clear();
@@ -4152,14 +4244,8 @@ impl eframe::App for PlaApp {
                                     return;
                                 };
                                 let axis = ["X", "Y", "Z"][self.dim_axis.min(2)];
-                                let exe = std::env::current_exe()
-                                    .ok()
-                                    .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-                                    .unwrap_or_else(|| std::path::PathBuf::from("."));
-                                let dir = exe
-                                    .join("selections-cdp")
-                                    .join(&self.doc_key);
-                                let _ = std::fs::create_dir_all(&dir);
+                                // 与选择集同目录(唯一入口 cdp_selections_dir)。
+                                let dir = pla_ui::selection::cdp_selections_dir(&self.doc_key);
                                 let json = serde_json::json!({
                                     "set": name, "axis": axis, "value": self.dim_value,
                                 });
@@ -4502,7 +4588,7 @@ impl eframe::App for PlaApp {
                 let notice = self.notice.clone();
                 // F2: 高度按内容实测(多行提示 / 长通知不再被裁掉)。
                 let size = hud_size(ctx, &hint, &notice);
-                let desired = egui::pos2(tr.x + TOOLBAR_SIZE[0] + 8.0, tr.y + 2.0);
+                let desired = egui::pos2(self.hud_left(tr.x), tr.y + 2.0);
                 let mut hud = Some((hint, notice));
                 let mut open_flag = true; // notice 的 × 关闭经它传出
                 let (hud_hide, hud_reveal) = viewport_reveal(ctx, "hud-popup");
