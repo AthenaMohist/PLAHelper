@@ -1371,6 +1371,20 @@ fn png_uri(kind: &str, name: &str, bytes: &[u8]) -> String {
     format!("bytes://{kind}/{name}#{}-{h:016x}", bytes.len())
 }
 
+/// R29: 截图宽高比(Plasticity 窗口截图约 16:10)。缩略图高度都从格子宽度推出 —— 面板改宽/改窄时,
+/// 收藏区(3 列)和全部区(整宽)一起按比例缩放, 不再有写死的高度(以前收藏固定 56、全部区固定 96)。
+const THUMB_ASPECT: f32 = 0.62;
+
+/// 收藏格(3 列小图)的图片高度。
+fn fav_img_h_for(cell_w: f32) -> f32 {
+    (cell_w * THUMB_ASPECT).clamp(36.0, 120.0)
+}
+
+/// 全部区(整宽大图)的图片高度。
+fn big_img_h_for(w: f32) -> f32 {
+    (w * THUMB_ASPECT).clamp(60.0, 200.0)
+}
+
 /// PNG 尺寸解析(只读 IHDR 头, 不解码): 签名 8B + len 4B + "IHDR" 4B + W 4B + H 4B。
 /// 我们的截图 PNG 由 wincap.rs 生成, 结构确定; 解析失败返回 None 走占位。
 fn png_dims(bytes: &[u8]) -> Option<(f32, f32)> {
@@ -3400,7 +3414,7 @@ impl eframe::App for PlaApp {
                             let avail_w = ui.available_width();
                             let sp = ui.spacing().item_spacing.x;
                             let fav_cell_w = ((avail_w - sp * 2.0) / 3.0).max(40.0);
-                            let fav_img_h = 56.0_f32;
+                            let fav_img_h = fav_img_h_for(fav_cell_w);
                             let fav_row_h = fav_img_h + 26.0; // 图 + 名称 + 紧凑按钮行(R8e)
                             let big_cell_w = avail_w;
                             // 悬浮提示文本: SS 短名 + meta 里的源文档/拍摄时间
@@ -3948,7 +3962,7 @@ impl eframe::App for PlaApp {
                                 // 收藏行(3列, 定位同快照墙)
                                 if !fav_list.is_empty() {
                                     ui.label(egui::RichText::new(tr("★ 收藏", "★ Favorites")).small().strong().color(COL_MUTED));
-                                    let fav_img_h = 56.0;
+                                    let fav_img_h = fav_img_h_for(cell_w);
                                     let fav_row_h = fav_img_h + 26.0; // R8e: 图+名称+紧凑按钮行
                                     for trio in fav_list.chunks(3) {
                                         let row_rect = ui.allocate_exact_size(egui::vec2(avail_w, fav_row_h), egui::Sense::hover()).0;
@@ -3971,7 +3985,7 @@ impl eframe::App for PlaApp {
                                         ui.label(egui::RichText::new(tr("全部", "All")).small().strong().color(COL_MUTED));
                                     }
                                     for meta in &other_list {
-                                        let (del, fav, rn) = item(ui, meta, avail_w, 96.0);
+                                        let (del, fav, rn) = item(ui, meta, avail_w, big_img_h_for(avail_w));
                                         ui.add_space(4.0);
                                         if del { delete_ask = Some(meta.name.clone()); }
                                         if fav { fav_toggle = Some((meta.name.clone(), !meta.fav)); }
@@ -4320,7 +4334,7 @@ impl eframe::App for PlaApp {
                                 };
                                 if !fav_list.is_empty() {
                                     ui.label(egui::RichText::new(tr("★ 收藏", "★ Favorites")).small().strong().color(COL_MUTED));
-                                    let fav_img_h = 56.0;
+                                    let fav_img_h = fav_img_h_for(cell_w);
                                     let fav_row_h = fav_img_h + 26.0; // R8e: 图+名称+紧凑按钮行
                                     for trio in fav_list.chunks(3) {
                                         let row_rect = ui.allocate_exact_size(egui::vec2(avail_w, fav_row_h), egui::Sense::hover()).0;
@@ -4340,7 +4354,7 @@ impl eframe::App for PlaApp {
                                 if !other_list.is_empty() {
                                     ui.label(egui::RichText::new(tr("全部", "All")).small().strong().color(COL_MUTED));
                                     for meta in &other_list {
-                                        let (del, fav, rn) = item(ui, meta, avail_w, 96.0);
+                                        let (del, fav, rn) = item(ui, meta, avail_w, big_img_h_for(avail_w));
                                         ui.add_space(4.0);
                                         if del { delete_ask = Some(meta.name.clone()); }
                                         if fav { fav_toggle = Some((meta.name.clone(), !meta.fav)); }
