@@ -178,6 +178,9 @@ struct PlaApp {
     notes_saved_rect: Option<[f32; 4]>,
     /// R30b: 笔记窗口自管拖动/调大小会话(SetCapture + 屏幕坐标 delta; 不用 OS StartDrag/BeginResize)。
     notes_drag: Option<NotesDrag>,
+    /// R32: 笔记面板 panic 被拦下后的错误信息(面板改显示错误 + 重新载入按钮)。
+    notes_crash: Option<String>,
+    notes_crashed_saved: bool,
     /// R8-1: 视口状态面板。
     show_vpstate: bool,
     /// R8b: 工具栏拖动位置(None=自动吸附; Some=用户拖到的位置, 逻辑 pt)。
@@ -1892,6 +1895,8 @@ impl PlaApp {
             notes_open_rect: None,
             notes_saved_rect: pla_ui::prefs::load_notes_rect(),
             notes_drag: None,
+            notes_crash: None,
+            notes_crashed_saved: false,
             step_loaded: false,
             step_bound: None,
             step_deg_buf: String::new(),
@@ -2364,8 +2369,10 @@ impl PlaApp {
         let mut live_rect: Option<[f32; 4]> = None;
         let mut pointer_down = false;
         let mut start: Option<NotesDragMode> = None;
+        let mut reload_notes = false;
         let notes = &mut self.notes;
         let notes_drag = &mut self.notes_drag;
+        let notes_crash = &mut self.notes_crash;
         ctx.show_viewport_immediate(egui::ViewportId::from_hash_of(ID), builder, |ctx, _class| {
             if reveal {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
@@ -2399,7 +2406,30 @@ impl PlaApp {
                 if xresp.on_hover_text(tr("关闭(内容已自动保存)", "Close (content is saved automatically)")).clicked() {
                     open = false;
                 }
-                notes.ui(ui, &theme);
+                // R32: 崩溃隔离 —— 笔记面板里的 bug 只让面板显示错误, 不再带走整个助手
+                // (panic 冒到 winit 的窗口过程 = FFI 边界, 那里无法展开 → 进程直接终止, 见 pitfalls #50)。
+                match notes_crash.as_ref() {
+                    Some(msg) => {
+                        ui.add_space(8.0);
+                        ui.label(egui::RichText::new(tr("笔记面板出错了(助手本身没受影响)", "The notes panel hit an error (the helper itself is fine)")).color(COL_RED));
+                        ui.add(egui::Label::new(egui::RichText::new(msg).small().color(COL_MUTED)).wrap());
+                        ui.label(egui::RichText::new(tr("详情已写入 %TEMP%\\pla-ui.log", "Details were written to %TEMP%\\pla-ui.log")).small().color(COL_MUTED));
+                        if ui.button(tr("重新载入笔记", "Reload notes")).clicked() {
+                            reload_notes = true;
+                        }
+                    }
+                    None => {
+                        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| notes.ui(ui, &theme)));
+                        if let Err(p) = r {
+                            let msg = p
+                                .downcast_ref::<String>()
+                                .cloned()
+                                .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
+                                .unwrap_or_else(|| "panic".into());
+                            *notes_crash = Some(msg);
+                        }
+                    }
+                }
             });
             paint_panel_border(ctx);
             // ---- 调大小热区(四边 + 四角) ----
@@ -2485,6 +2515,18 @@ impl PlaApp {
                 }
                 self.notes_saved_rect = Some(r);
             }
+        }
+        if self.notes_crash.is_some() && !self.notes_crashed_saved {
+            // 出错前已输入的内容先落盘(数据结构本身是完整的, 只是某个操作逻辑出错)
+            self.notes.flush();
+            self.notes_crashed_saved = true;
+        }
+        if reload_notes {
+            let doc = self.doc_key.clone();
+            self.notes = pla_ui::notes_ui::NotesPanel::new();
+            self.notes.set_doc(&doc);
+            self.notes_crash = None;
+            self.notes_crashed_saved = false;
         }
         if !open {
             self.show_notes = false;
@@ -3199,6 +3241,36 @@ impl NotesDrag {
                 [nx, ny, nw, nh]
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod crash_isolation_tests {
+    /// R32: 帧中途在嵌套布局里 panic 并被 catch_unwind 拦下后, egui 上下文仍可继续跑后续帧。
+    #[test]
+    fn egui_survives_caught_panic_mid_frame() {
+        let ctx = egui::Context::default();
+        let mut caught = false;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    ui.horizontal(|ui| {
+                        ui.label("before");
+                        egui::ScrollArea::vertical().show(ui, |_ui| panic!("boom in notes"));
+                    });
+                }));
+                caught = r.is_err();
+                ui.label("panel still draws after the panic");
+            });
+        });
+        assert!(caught);
+        // 下一帧正常
+        let out = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.label("next frame ok");
+            });
+        });
+        assert!(!out.shapes.is_empty());
     }
 }
 
