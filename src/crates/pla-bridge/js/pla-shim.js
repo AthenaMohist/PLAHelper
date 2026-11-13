@@ -82,7 +82,27 @@
     'oc.update':               ['oc', 'update'],
     'oc.domElement':           ['oc', 'domElement'],
     'oc.needsUpdate':          ['oc', 'needsUpdate'],
-    'oc.setNeedsUpdate':       ['oc', 'setNeedsUpdate']
+    'oc.setNeedsUpdate':       ['oc', 'setNeedsUpdate'],
+    // ---- R33: 视口状态 v2(know-how/viewport-state.md) ----
+    'vp.snapshot':             ['vp', 'snapshot'],
+    'vp.init':                 ['vp', 'init'],
+    'vp.isRenderMode':         ['vp', 'isRenderMode'],
+    'vp.toggleRenderMode':     ['vp', 'toggleRenderMode'],
+    'vp.togglePerspective':    ['vp', 'togglePerspective'],
+    'ed.layers':               ['ed', 'layers'],
+    'ed.docSettings':          ['ed', 'document.settings'],
+    'ed.originator':           ['ed', 'originator'],
+    'ed.shadingDb':            ['ed', 'shading'],
+    'ed.sig.docSettings':      ['ed', 'signals.documentSettingsChanged'],
+    'nodes.state':             ['nodes', 'read'],
+    'orig.snapshot':           ['orig', 'snapshot'],
+    'orig.restore':            ['orig', 'restore'],
+    'ds.snapshot':             ['ds', 'snapshot'],
+    'ds.init':                 ['ds', 'init'],
+    'sh.snapshot':             ['sh', 'snapshot'],
+    'sh.init':                 ['sh', 'init'],
+    'sh.setMatcap':            ['sh', 'setMatcap'],
+    'exec.hasActive':          ['exec', 'hasActiveCommand']
   };
 
   // 选择集里的各类 id 集合：[对外的 kind, Selection 上的集合名]。sel.ids.<kind> 表键由此生成。
@@ -147,7 +167,33 @@
     planeVecKeys: ['p', 'n', 'x', 'y'],
     rendererKeys: ['antiAlias', 'toneMapping', 'toneMappingExposure'],
     gridKeys: ['every', 'size'],
-    cameraExtraKeys: ['fov', 'zoom', 'near', 'far']
+    cameraExtraKeys: ['fov', 'zoom', 'near', 'far'],
+    // ---- R33: 视口状态 v2 ----
+    vpStateVersion: 2,
+    // 视口上可读写的显示标量(getter/setter)。
+    vpScalars: ['fov', 'squish', 'curvatureScale', 'g0Scale', 'g1Scale', 'g2Scale'],
+    // LayerManager 的显示开关(getter/setter)。
+    layerFlags: ['isShowingEdges', 'isShowingFaces', 'isShowingCurves', 'isShowingMeshes', 'isShowingImages',
+                 'isShowingConstraints', 'isShowingControlPoints', 'isShowingContinuityLabels'],
+    // NodeState(nodes.read)里的可见性集合 + nodeKey → 稳定 id 的映射。
+    nodeVisSets: ['hidden', 'invisible'],
+    nodeIsolations: 'isolations',
+    node2id: 'node2id',
+    // memento 里 nodes 段的字段名(与 nodeVisSets 同名, 值是 Float64Array)。
+    mementoNodes: 'nodes',
+    // matcap 纹理上记来源文件的字段(texture.userData.filename)。
+    matcapFileKey: 'filename',
+    // Shader Mode 面板: 标题文字 + 按钮激活态属性。着色恢复必须点按钮(无按名查找的注册表; 在 shader
+    // 模式下直接 setMatcap 会让 matcap 变 undefined → 渲染循环停摆, 见 know-how/viewport-state.md)。
+    shaderPanelTitle: 'SHADER MODE',
+    shaderButtonStateAttr: 'data-state',
+    shaderButtonActive: 'active',
+    // shader 名 → 面板按钮图片名; matcap 按钮图片名 = matcap 文件名去扩展名。
+    shaderButtons: { isophotes: 'isophotes', draft: 'draft', zebraHorizontal: 'reflection_check_horizontal',
+                     zebraVertical: 'reflection_check_vertical', topo: 'topo', faceDirection: 'face-direction', curvature: 'curvature' },
+    // 这几个按钮共用 basic_side matcap, 内部状态分不开 → 存档时以面板激活态为准。
+    sharedMatcapButtons: ['color_matcap', 'black_silhouette', 'color_silhouette'],
+    sharedMatcapFile: 'basic_side'
   };
 
   // =====================================================================
@@ -170,7 +216,9 @@
     'cam.step':  { needs: ['oc.step'], optional: ['orbitSettings.step'] },
     'cam.roll':  { needs: ['reg.add', 'reg.listeners', 'oc.quaternionEnd', 'oc.step'], optional: ['oc.domElement'] },
     'vp.state':  { needs: ['vp.camera', 'vp.orbit', 'ed.shading.mode', 'ed.shading.changed', 'ed.sections'],
-                   optional: ['ed.shading.section', 'vp.cplane', 'vp.settings.renderer', 'vp.settings.ao', 'vp.settings.grid', 'vp.container'] },
+                   optional: ['ed.shading.section', 'vp.cplane', 'vp.settings.renderer', 'vp.settings.ao', 'vp.settings.grid', 'vp.container',
+                              'vp.snapshot', 'vp.init', 'vp.isRenderMode', 'vp.toggleRenderMode', 'vp.togglePerspective', 'ed.layers', 'ed.docSettings',
+                              'ed.originator', 'ed.shadingDb', 'nodes.state'] },
     'keymap':    { needs: ['km.add', 'km.bindings'], optional: ['kb.update'] },
     'cmd.dispatch': { needs: ['reg.add', 'reg.listeners'] },
     'err.hook':  { needs: ['ed.errorSignal'] },
@@ -221,6 +269,9 @@
       case 'km': return get('ed.keymaps');
       case 'kb': return get('ed.keyboard');
       case 'orbitSettings': return get('ed.settings.orbit');
+      case 'orig': return get('ed.originator');
+      case 'sh': return get('ed.shadingDb');
+      case 'ds': return get('ed.docSettings');
     }
     return undefined;
   }
@@ -925,6 +976,127 @@
     return a;
   }
 
+  // ---- R33: 视口状态 v2 辅助(全部名字走 LOC / NAMES) ----
+  function xyz(v) { return v ? { x: v.x, y: v.y, z: v.z } : null; }
+  function quat(q) {
+    if (!q) return null;
+    var pick = function (a, b) { return typeof q[a] === 'number' ? q[a] : q[b]; };
+    return { x: pick('x', '_x'), y: pick('y', '_y'), z: pick('z', '_z'), w: pick('w', '_w') };
+  }
+  function plain(o) {
+    return JSON.parse(JSON.stringify(o, function (k, v) { return (v && typeof v === 'object' && ArrayBuffer.isView(v)) ? Array.prototype.slice.call(v) : v; }));
+  }
+  function texFile(t) { return t && t.userData ? (t.userData[NAMES.matcapFileKey] || null) : null; }
+  function baseName(path) { var s = String(path || '').split('/').pop(); return s.replace(/\.[^.]+$/, ''); }
+
+  // Shader Mode 面板里带图片的按钮(DOM 由 Plasticity 自己渲染; 找不到 → 空数组, 调用方如实报告)。
+  function shaderButtons() {
+    var doc = W.document;
+    if (!doc || !doc.querySelectorAll) return [];
+    var title = null, all = doc.querySelectorAll('*');
+    for (var i = 0; i < all.length; i++) {
+      var e = all[i];
+      if (e.childElementCount === 0 && String(e.textContent || '').trim().toUpperCase() === NAMES.shaderPanelTitle) { title = e; break; }
+    }
+    var box = title;
+    for (var j = 0; j < 6 && box && box.querySelectorAll('button img').length < 8; j++) box = box.parentElement;
+    if (!box) return [];
+    var out = [];
+    var bs = box.querySelectorAll('button');
+    for (var k = 0; k < bs.length; k++) { var img = bs[k].querySelector('img'); if (img) out.push({ el: bs[k], name: baseName(img.getAttribute('src')) }); }
+    return out;
+  }
+
+  // 当前着色(存档用)。button = 应点的面板按钮名(恢复时按它点)。
+  function shadingNow() {
+    var s = invokeOn('sh.snapshot', [], get('ed.shadingDb'));
+    var matcap = texFile(s.matcap);
+    var shader = s.shader ? (s.shader.name || null) : null;
+    var button = shader ? (NAMES.shaderButtons[shader] || null) : (matcap ? baseName(matcap) : null);
+    if (!shader && matcap && baseName(matcap) === NAMES.sharedMatcapFile) {
+      // 共用 basic_side 的几个按钮: 以面板激活态为准(面板与内部一致时才采信)
+      var act = shaderButtons().filter(function (b) { return b.el.getAttribute(NAMES.shaderButtonStateAttr) === NAMES.shaderButtonActive; })[0];
+      button = act && NAMES.sharedMatcapButtons.indexOf(act.name) >= 0 ? act.name : NAMES.sharedMatcapButtons[s.isTinted ? 0 : 1];
+    }
+    return { mode: s.mode, matcap: matcap, tint: !!s.isTinted, shader: shader, button: button,
+             props: plain(s.shaderProperties || {}), rotation: s.rotation, intensity: s.intensity };
+  }
+
+  // 恢复着色: 点对应按钮(同面板操作一样完整切换模式), 再把 shader 参数写回。返回结果文字。
+  function applyShading(S) {
+    var sh = get('ed.shadingDb');
+    var cur = shadingNow();
+    var sameLook = cur.shader === S.shader && cur.matcap === S.matcap && cur.tint === S.tint;
+    if (!sameLook) {
+      var btn = shaderButtons().filter(function (b) { return b.name === S.button; })[0];
+      if (btn) {
+        btn.el.click();
+      } else if (!S.shader && S.matcap && !cur.shader && LOC['sh.setMatcap'] && get('sh.setMatcap')) {
+        // 兜底(自定义 matcap 等面板上没有的): 只在当前不是 shader 模式时直接 setMatcap
+        invokeOn('sh.setMatcap', [S.matcap, S.tint], sh);
+      } else {
+        throw new Error('no button ' + S.button);
+      }
+    }
+    var props = S.props || {};
+    var writeProps = function () {
+      var s = invokeOn('sh.snapshot', [], sh);
+      if ((s.shader ? s.shader.name : null) !== S.shader) return false;
+      var merged = {};
+      Object.keys(s.shaderProperties || {}).forEach(function (k) { merged[k] = s.shaderProperties[k]; });
+      Object.keys(props).forEach(function (k) { merged[k] = props[k]; });
+      s.shaderProperties = merged;
+      invokeOn('sh.init', [s], sh);
+      return true;
+    };
+    if (S.shader && Object.keys(props).length) {
+      // 按钮切换若是异步的, 稍后再写一次参数
+      if (!writeProps() && typeof W.setTimeout === 'function') W.setTimeout(writeProps, 400);
+    }
+    return sameLook ? 'shading(same)' : 'shading:' + S.button;
+  }
+
+  // 隐藏 / 眼睛关闭 → 稳定 id 列表。
+  function visibilityNow() {
+    var st = need('nodes.state');
+    var map = st[NAMES.node2id];
+    var ids = function (set) { var a = []; set.forEach(function (k) { var id = map.get(k); if (id) a.push(id); }); return a; };
+    var out = {};
+    NAMES.nodeVisSets.forEach(function (n) { out[n] = ids(st[n]); });
+    out[NAMES.nodeIsolations] = plain(st[NAMES.nodeIsolations] || []);
+    return out;
+  }
+
+  // 恢复可见性: 只改 memento 的 nodes 可见性字段, 走编辑器自己的 restore(与撤销同一条路, 场景才会刷新;
+  // 直接 setHidden 只改集合不刷新)。其余部分取当下快照 = 原地不动。
+  function applyVisibility(V, missing) {
+    var st = need('nodes.state');
+    var inv = new Map();
+    st[NAMES.node2id].forEach(function (id, k) { inv.set(id, k); });
+    var keysOf = function (list) {
+      var ks = [];
+      (list || []).forEach(function (id) { var k = inv.get(id); if (k === undefined) missing.push('node:' + id); else ks.push(k); });
+      return ks;
+    };
+    var want = {}, same = true;
+    NAMES.nodeVisSets.forEach(function (n) {
+      want[n] = keysOf(V[n]);
+      var cur = st[n];
+      if (cur.size !== want[n].length || !want[n].every(function (k) { return cur.has(k); })) same = false;
+    });
+    if (same) return 'vis(same)';
+    var exec = get('ed.executor');
+    if (exec && get('exec.hasActive') && invokeOn('exec.hasActive', [], exec)) throw new Error('command active');
+    var orig = need('ed.originator');
+    var m = invokeOn('orig.snapshot', [], orig);
+    var nodes = {};
+    Object.keys(m[NAMES.mementoNodes]).forEach(function (k) { nodes[k] = m[NAMES.mementoNodes][k]; });
+    NAMES.nodeVisSets.forEach(function (n) { nodes[n] = Float64Array.from(want[n]); });
+    m[NAMES.mementoNodes] = nodes;
+    invokeOn('orig.restore', [m], orig);
+    return 'vis:' + want[NAMES.nodeVisSets[0]].length + '/' + want[NAMES.nodeVisSets[1]].length;
+  }
+
   def('vp.save', 'vp.state', function () {
     var out = { failed: [] };
     function seg(name, fn) { try { fn(); } catch (e) { out.failed.push(name + ':' + errMsg(e)); } }
@@ -966,6 +1138,25 @@
       out.ao = primFields(ao, Object.keys(ao).filter(function (k) { return typeof ao[k] !== 'string'; }));
     });
     seg('grid', function () { out.grid = primFields(need('vp.settings.grid'), NAMES.gridKeys); });
+    // ---- R33 v2: 显示相关全部状态(旧字段保留, 老存档照常恢复) ----
+    out.v = NAMES.vpStateVersion;
+    seg('view', function () {
+      var V = viewport();
+      var s = invokeOn('vp.snapshot', [], V);
+      var oc = get('vp.orbit');
+      var zoom = oc && typeof get('oc.zoomEnd', oc) === 'number' ? get('oc.zoomEnd', oc) : s.camera.zoom;
+      out.view = {
+        camera: { mode: s.camera.mode, position: xyz(s.camera.position), quaternion: quat(s.camera.quaternion), zoom: zoom, fov: s.camera.fov },
+        target: xyz(s.target), focalOffset: xyz(s.focalOffset), isXRay: !!s.isXRay, showOverlays: !!s.showOverlays,
+        constructionPlane: s.constructionPlane ? { n: xyz(s.constructionPlane.n), o: xyz(s.constructionPlane.o) } : null
+      };
+    });
+    seg('renderMode', function () { out.renderMode = !!need('vp.isRenderMode'); });
+    seg('scalars', function () { var V = viewport(); out.scalars = primFields(V, NAMES.vpScalars); });
+    seg('layers', function () { out.layers = primFields(need('ed.layers'), NAMES.layerFlags); });
+    seg('shading2', function () { out.shading2 = shadingNow(); });
+    seg('doc', function () { out.doc = plain(invokeOn('ds.snapshot', [], need('ed.docSettings'))); });
+    seg('vis', function () { out.vis = visibilityNow(); });
     try {
       var r = need('vp.container').getBoundingClientRect();
       out.vpRect = [r.x, r.y, r.width, r.height];
@@ -981,6 +1172,25 @@
     function seg(name, present, fn) {
       if (!present) { missing.push(name); return; }
       try { fn(); } catch (e) { failed.push(name + ':' + errMsg(e)); }
+    }
+    var v2 = S.v === NAMES.vpStateVersion;
+    // ---- R33 v2 前段: 可见性 → 文档设置(网格/色调/AO) → render mode(它会改着色, 必须在着色之前) ----
+    if (v2) {
+      seg('vis', !!S.vis, function () { applied.push(applyVisibility(S.vis, missing)); });
+      seg('doc', !!S.doc, function () {
+        var ds = need('ed.docSettings');
+        // 文档设置一写就会让文件变"未保存" → 没变化就不写
+        if (JSON.stringify(plain(invokeOn('ds.snapshot', [], ds))) === JSON.stringify(S.doc)) { applied.push('doc(same)'); return; }
+        invokeOn('ds.init', [S.doc], ds);
+        var sig = get('ed.sig.docSettings');
+        if (sig && typeof sig.dispatch === 'function') sig.dispatch();
+        applied.push('doc');
+      });
+      seg('renderMode', typeof S.renderMode === 'boolean', function () {
+        var V = viewport();
+        if (!!need('vp.isRenderMode') !== S.renderMode) invokeOn('vp.toggleRenderMode', [], V);
+        applied.push('renderMode');
+      });
     }
     seg('cam', !!S.cam, function () {
       var cam = need('vp.camera');
@@ -998,7 +1208,8 @@
       if (r.orbit) applied.push('orbit');
     });
     if (!S.orbit) missing.push('orbit');
-    seg('shading', !!(S.shading && S.shading.mode), function () {
+    // v2 存档用 shading2(点按钮); 旧的改 tag 链只给老存档用。
+    seg('shading', !!(S.shading && S.shading.mode) && !(v2 && S.shading2), function () {
       var tag = NAMES.shadingTagKey;
       var m = need('ed.shading.mode');
       if (m[tag] !== S.shading.mode) {
@@ -1034,6 +1245,37 @@
     seg('renderer', !!S.renderer, function () { assignPrims(need('vp.settings.renderer'), S.renderer, NAMES.rendererKeys); applied.push('renderer'); });
     seg('ao', !!S.ao, function () { var ao = need('vp.settings.ao'); assignPrims(ao, S.ao, Object.keys(S.ao)); applied.push('ao'); });
     seg('grid', !!S.grid, function () { assignPrims(need('vp.settings.grid'), S.grid, NAMES.gridKeys); applied.push('grid'); });
+    // ---- R33 v2 后段: 着色(render mode 下由它接管, 不动) → 视角(vp.init) → 缩放 → 标量 → 显示开关 ----
+    if (v2) {
+      seg('shading2', !!S.shading2 && !S.renderMode, function () { applied.push(applyShading(S.shading2)); });
+      seg('view', !!S.view, function () {
+        var V = viewport();
+        var cur = invokeOn('vp.snapshot', [], V);
+        // 透视/正交: vp.init 不切换投影(实测), 模式不同先用视口自己的切换
+        var wantMode = S.view.camera && S.view.camera.mode;
+        if (wantMode && cur.camera && cur.camera.mode !== wantMode && get('vp.togglePerspective')) {
+          invokeOn('vp.togglePerspective', [], V);
+          cur = invokeOn('vp.snapshot', [], V);
+          applied.push('projection');
+        }
+        var next = {};
+        Object.keys(cur).forEach(function (k) { next[k] = cur[k]; });
+        var cam = {};
+        Object.keys(cur.camera).forEach(function (k) { cam[k] = cur.camera[k]; });
+        Object.keys(S.view.camera || {}).forEach(function (k) { cam[k] = S.view.camera[k]; });
+        next.camera = cam;
+        ['target', 'focalOffset', 'isXRay', 'showOverlays'].forEach(function (k) { if (S.view[k] !== undefined && S.view[k] !== null) next[k] = S.view[k]; });
+        if (S.view.constructionPlane) next.constructionPlane = S.view.constructionPlane;
+        invokeOn('vp.init', [next], V);
+        // vp.init 不恢复缩放: 写轨道控制器的 zoom / zoomEnd(阻尼两份)
+        var oc = get('vp.orbit');
+        var z = S.view.camera && S.view.camera.zoom;
+        if (oc && typeof z === 'number') { put('oc.zoom', z, oc); put('oc.zoomEnd', z, oc); }
+        applied.push('view');
+      });
+      seg('scalars', !!S.scalars, function () { assignPrims(viewport(), S.scalars, NAMES.vpScalars); applied.push('scalars'); });
+      seg('layers', !!S.layers, function () { assignPrims(need('ed.layers'), S.layers, NAMES.layerFlags); applied.push('layers'); });
+    }
     call0(viewport(), 'vp.render');
     return { applied: applied, missing: missing, failed: failed };
   });
