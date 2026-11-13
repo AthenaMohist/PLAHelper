@@ -115,6 +115,20 @@ impl TableState {
         (r0, c0, r1, c1)
     }
 
+    /// R31c: 把选区/编辑格夹回表内。**每次结构变化(删/移行列、粘贴、撤销)之后都要调**
+    /// —— 以前只在帧首调, 右键删除 3 行后同一帧里状态栏按旧选区下标读格子 → 越界崩溃。
+    fn clamp_to(&mut self, t: &Table) {
+        let (mr, mc) = (t.rows().saturating_sub(1), t.cols().saturating_sub(1));
+        self.anchor = (self.anchor.0.min(mr), self.anchor.1.min(mc));
+        self.cursor = (self.cursor.0.min(mr), self.cursor.1.min(mc));
+        if self.editing.as_ref().map_or(false, |e| e.r > mr || e.c > mc) {
+            self.editing = None;
+        }
+        if let Some((r, c)) = self.fill_to {
+            self.fill_to = Some((r.min(mr), c.min(mc)));
+        }
+    }
+
     /// 选区是整行(覆盖所有列) → (起行, 行数)。
     fn full_rows(&self, t: &Table) -> Option<(usize, usize)> {
         let (r0, c0, r1, c1) = self.sel_rect();
@@ -298,13 +312,7 @@ pub fn table_ui(ui: &mut egui::Ui, id: u64, t: &mut Table, st: &mut TableState, 
     let mut out = TableOut::default();
     let is_active = st.active == Some(id);
     if is_active {
-        // 结构变化后(删行列/外部改动)把选区夹回表内
-        let (mr, mc) = (t.rows() - 1, t.cols() - 1);
-        st.anchor = (st.anchor.0.min(mr), st.anchor.1.min(mc));
-        st.cursor = (st.cursor.0.min(mr), st.cursor.1.min(mc));
-        if st.editing.as_ref().map_or(false, |e| e.r > mr || e.c > mc) {
-            st.editing = None;
-        }
+        st.clamp_to(t);
     }
     let values = formula::eval_table(&t.cells);
     let avail = ui.available_width().max(60.0);
@@ -805,9 +813,14 @@ pub fn table_ui(ui: &mut egui::Ui, id: u64, t: &mut Table, st: &mut TableState, 
         if done {
             out.changed = true;
             st.editing = None;
+            st.clamp_to(t);
             ui.close_menu();
         }
     });
+    // 结构可能刚变(右键插删、拖动调换、粘贴) → 后面的代码按新尺寸读格子
+    if is_active {
+        st.clamp_to(t);
+    }
 
     // ---------------- 结束编辑 ----------------
     if is_active {
@@ -857,9 +870,10 @@ pub fn table_ui(ui: &mut egui::Ui, id: u64, t: &mut Table, st: &mut TableState, 
             };
             ui.label(egui::RichText::new(label).small().color(th.muted));
             if st.editing.is_none() {
-                let raw = &t.cells[st.cursor.0][st.cursor.1];
-                if raw.starts_with('=') {
-                    ui.label(egui::RichText::new(raw).small().monospace().color(th.muted));
+                if let Some(raw) = t.cells.get(st.cursor.0).and_then(|r| r.get(st.cursor.1)) {
+                    if raw.starts_with('=') {
+                        ui.label(egui::RichText::new(raw).small().monospace().color(th.muted));
+                    }
                 }
             }
         }
@@ -1263,6 +1277,27 @@ mod tests {
         assert_eq!(t2.col_w, [90.0, 50.0]);
         // 落在块内部 = 不动
         assert_eq!(move_rows(&mut t, 0, 2, 1), 0);
+    }
+
+    #[test]
+    fn delete_selected_rows_then_selection_stays_in_bounds() {
+        // 用户场景(R31c 崩溃): 4 行表选中后 3 行, 删除 → 同一帧继续按选区读格子不能越界
+        let mut t = tbl(&[&["a"], &["b"], &["c"], &["d"]]);
+        let mut st = TableState::default();
+        st.select(1, 1, 0);
+        st.cursor = (3, 0);
+        let (r0, _, r1, _) = st.sel_rect();
+        delete_rows(&mut t, r0, r1 - r0 + 1);
+        assert_eq!(t.rows(), 1);
+        st.clamp_to(&t);
+        let (r0, c0, r1, c1) = st.sel_rect();
+        assert!(r1 < t.rows() && c1 < t.cols());
+        assert_eq!(t.cells[st.cursor.0][st.cursor.1], "a");
+        assert_eq!((r0, c0), (0, 0));
+        // 编辑格也被清掉/夹回
+        st.editing = Some(EditCell { r: 5, c: 0, buf: String::new(), original: String::new(), focus_pending: false, caret: None });
+        st.clamp_to(&t);
+        assert!(st.editing.is_none());
     }
 
     #[test]

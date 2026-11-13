@@ -50,6 +50,7 @@
 | 47 | 同窗口换文件后快照/选择集截图仍是旧文件的(文件和恢复都对) | egui 按 URI 缓存解码纹理, URI 只用名字 `bytes://SS001`; 清自己的字节缓存不会清 egui 的。另: 拖动模式提前 return 不更新 doc_key; 文档切换只重置部分缓存 | URI 带内容指纹 `png_uri()`; 切文档 `forget_all_images()`; `sync_doc_key()` 两条路径都调, `reset_doc_scoped()` 为按文档状态唯一清单(R26) |
 | 48 | 想给 exe 嵌图标, 但 embed-resource/winresource 都要 windres 或 rc.exe | 本机 Rust 是 x86_64-pc-windows-gnu, 没装 binutils/Windows SDK | `build.rs` 自己生成只含 `.rsrc` 节的 COFF(.o)(资源树 + ADDR32NB 重定位), `rustc-link-arg-bins` 交给 ld 合并; 用 `ExtractAssociatedIcon` 验证(R28) |
 | 49 | 笔记窗口拖动/调大小后鼠标移到别的窗口再回来, 窗口自己跟着拖、越拉越大 | 用了 OS `StartDrag`/`BeginResize`: 模态循环吞掉松手事件, egui 的按键状态卡在"按下", 之后任意 drag_started 又触发一次(同 R9 一级面板的老坑, 新窗口重踩) | 自管会话: `SetCapture` + 屏幕坐标 delta 发 `OuterPosition`/`InnerSize`; 开始/结束以 `primary_button_down()`(GetAsyncKeyState)为准。新窗口一律不要用 StartDrag/BeginResize(R30b) |
+| 50 | 笔记表格选 3 行右键删除 → 助手闪退 | 选区只在帧首夹回表内; 右键菜单在帧中途删了行, 同一帧后面的状态栏还按旧选区下标 `t.cells[r][c]` 读 → 越界 panic(整个进程崩) | `TableState::clamp_to()` 在每次结构变化后立即调用 + 帧内二次夹回; 读格子改 `.get()`。panic 日志在 `%TEMP%\pla-ui.log`(R31c) |
 | 14 | 切换面板时旧面板滞留、新面板不出现、点击丢失 | R12 加深的文档定位(`find_latest_doc`)每次未命中都全盘深扫(热缓存 ~2s, 冷缓存 ~19s), 面板每帧取文档目录, 2s TTL 一过就在 UI 线程重扫 | 分阶段: leveldb + Recent 命中即返回; 深扫未命中负缓存 60s(R13) |
 
 ## 假按钮教训
