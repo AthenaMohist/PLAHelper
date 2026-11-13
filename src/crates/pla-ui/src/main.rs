@@ -14,6 +14,7 @@
 use std::time::{Duration, Instant};
 
 use pla_ui::bridge_thread::{BridgeCmd, BridgeEvent, BridgeHandle};
+use pla_ui::features::{Availability, Feature, Health};
 use pla_ui::hotkey::{Action, Hotkey, HotkeyMap};
 use pla_ui::round_corners;
 use pla_ui::window_finder;
@@ -161,6 +162,8 @@ struct PlaApp {
     /// CDP 会话句柄(R7-14): 实时选择/实体树通道(Plasticity 需 PLA-CDP 补丁版启动)。
     cdp: pla_bridge::cdp::CdpHandle,
     cdp_status: String,
+    /// F2: 最近一次能力探测(None = CDP 未连接/未探测)。功能可用性一律经 `features` 表判定。
+    cdp_caps: Option<pla_bridge::shim::CapsReport>,
     /// 实时选择快照 (kind, id, name, ctor)。
     live_sel: Vec<pla_bridge::cdp::SelItem>,
     /// R7-26: 上一次实时选择的 key 集合("kind:id"), 用于侦测选择变化。
@@ -1449,6 +1452,7 @@ impl PlaApp {
             sel_members: Vec::new(),
             cdp: pla_bridge::cdp::CdpHandle::spawn(9333),
             cdp_status: "CDP 连接中…".into(),
+            cdp_caps: None,
             live_sel: Vec::new(),
             live_sel_keys: Vec::new(),
             pending_focus: false,
@@ -1531,6 +1535,9 @@ impl PlaApp {
                         self.pending_focus = false;
                         self.focus_plasticity();
                     }
+                }
+                pla_bridge::cdp::CdpEvent::Caps(c) => {
+                    self.cdp_caps = c;
                 }
                 pla_bridge::cdp::CdpEvent::Selection(snap) => {
                     if snap.undo_len >= 0 {
@@ -2029,14 +2036,18 @@ impl PlaApp {
             Ok(d) => match pla_ui::plasticity_config::write_step_deg(d) {
                 Ok(()) => {
                     self.step_deg_buf = fmt_deg(d);
-                    // settings.json 不会被 Plasticity 重载 → 有 CDP 时实时改运行时值。
-                    if self.cdp_connected() {
-                        self.cdp.send(pla_bridge::cdp::CdpCmd::Eval(
-                            pla_ui::plasticity_config::live_step_js(d),
-                        ));
-                        (false, format!("已设为每次 {}°(立即生效)", fmt_deg(d)))
-                    } else {
-                        (false, format!("已设为每次 {}°(重启 Plasticity 后生效)", fmt_deg(d)))
+                    // settings.json 不会被 Plasticity 重载 → 能力可用时实时改运行时值。
+                    match self.feature_block(Feature::OrbitStepLive) {
+                        None => {
+                            self.cdp.send(pla_bridge::cdp::CdpCmd::Eval(
+                                pla_ui::plasticity_config::live_step_js(d),
+                            ));
+                            (false, format!("已设为每次 {}°(立即生效)", fmt_deg(d)))
+                        }
+                        Some(why) => (
+                            false,
+                            format!("已设为每次 {}°(重启 Plasticity 后生效; 即时生效不可用: {why})", fmt_deg(d)),
+                        ),
                     }
                 }
                 Err(e) => (true, e),
@@ -2048,6 +2059,39 @@ impl PlaApp {
     /// CDP 通道是否已连上 Plasticity。
     fn cdp_connected(&self) -> bool {
         self.cdp_status.contains("已连接")
+    }
+
+    /// F2: 功能不可用的原因(None = 可用, 降级也算可用)。判定一律走 `features` 表。
+    fn feature_block(&self, f: Feature) -> Option<String> {
+        match pla_ui::features::availability(self.cdp_caps.as_ref(), f) {
+            Availability::Blocked(why) => Some(why),
+            _ => None,
+        }
+    }
+
+    /// F2: 工具栏提示里的一行 CDP 能力摘要。
+    fn cdp_summary(&self) -> String {
+        let caps = self.cdp_caps.as_ref();
+        match pla_ui::features::health(caps) {
+            Health::Unknown => "CDP: 未连接".into(),
+            Health::NoEditor => "CDP: 已连接, 但未找到 Plasticity 编辑器".into(),
+            Health::Full => "CDP: 全部功能可用".into(),
+            Health::Partial => {
+                let (b, d) = pla_ui::features::summary(caps);
+                format!("CDP: {b} 项不可用, {d} 项部分可用(设置 → CDP CAPABILITIES)")
+            }
+        }
+    }
+
+    /// F2: 动作入口的拦截: 不可用时如实提示并返回 false(绝不静默无反应)。
+    fn require_feature(&mut self, f: Feature) -> bool {
+        match self.feature_block(f) {
+            None => true,
+            Some(why) => {
+                self.set_notice((true, format!("「{}」不可用: {why}", f.label())));
+                false
+            }
+        }
     }
 
     fn is_in_toolbar_snap_zone(dp: egui::Pos2, da: egui::Pos2) -> bool {
@@ -2399,6 +2443,17 @@ impl eframe::App for PlaApp {
                         status_color(&self.bridge_status)
                     };
                     ui.painter().circle_filled(dot_rect.center(), 4.0, dot_color);
+                    // F2: 外环 = CDP 能力健康度(绿 全部可用 / 黄 部分 / 红 无编辑器 / 无环 未连接)。
+                    let ring = match pla_ui::features::health(self.cdp_caps.as_ref()) {
+                        Health::Unknown => None,
+                        Health::NoEditor => Some(COL_RED),
+                        Health::Partial => Some(COL_YELLOW),
+                        Health::Full => Some(COL_GREEN),
+                    };
+                    if let Some(c) = ring {
+                        ui.painter().circle_stroke(dot_rect.center(), 5.4, egui::Stroke::new(1.2, c));
+                    }
+                    let cdp_tip = self.cdp_summary();
                     let bind_tip = match &self.snap_target {
                         Some(t) => format!("已绑定: {}\nbridge: {}/{}", t.title, self.bridge_status, self.bridge.url),
                         None => "未绑定 — 等待 Plasticity 窗口…\n(找到后自动吸附到其标题栏)".to_string(),
@@ -2407,8 +2462,8 @@ impl eframe::App for PlaApp {
                         hovered = Some((
                             "PLA 助手".into(),
                             match &self.snap_target {
-                                Some(t) => format!("已绑定: {} / {} (双击归位)", t.title, self.bridge_status),
-                                None => "未绑定 — 等待 Plasticity 窗口…".into(),
+                                Some(t) => format!("已绑定: {} / {} (双击归位)\n{cdp_tip}", t.title, self.bridge_status),
+                                None => format!("未绑定 — 等待 Plasticity 窗口…\n{cdp_tip}"),
                             },
                         ));
                     }
@@ -3341,7 +3396,7 @@ impl eframe::App for PlaApp {
                             }
                             self.sel_rename = None;
                         }
-                        if let Some(name) = apply_now {
+                        if let Some(name) = apply_now.filter(|_| self.require_feature(Feature::SelApply)) {
                             match pla_ui::selection::load_cdp_selection(&self.doc_key, &name) {
                                 Some(members) => {
                                     let entries: Vec<pla_bridge::cdp::ApplyEntry> = members
@@ -3379,7 +3434,7 @@ impl eframe::App for PlaApp {
                     self.hovered_hint = Some(t);
                 }
                 // 💾 保存: SG 自动命名 + 截图 → (pending 流程: 截图回包后落盘)
-                if do_save.get() {
+                if do_save.get() && self.require_feature(Feature::SelSave) {
                     if self.sel_cdp_members.is_empty() {
                         self.set_notice((true, "实时选择为空 — 请先在视口里选中目标".into()));
                     } else {
@@ -3670,7 +3725,7 @@ impl eframe::App for PlaApp {
                             }
                             self.vp_rename = None;
                         }
-                        if let Some(name) = apply_now {
+                        if let Some(name) = apply_now.filter(|_| self.require_feature(Feature::VpApply)) {
                             match pla_ui::vpstate::load_vpstate(&self.doc_key, &name) {
                                 Some(state) => {
                                     self.cdp.send(pla_bridge::cdp::CdpCmd::VpStateApply(state));
@@ -3690,7 +3745,7 @@ impl eframe::App for PlaApp {
                     self.hovered_hint = Some(t);
                 }
                 // 💾: 采集 + 截图 → pending 落盘
-                if do_save.get() {
+                if do_save.get() && self.require_feature(Feature::VpSave) {
                     // 串行流程: 先采集状态 → 回包后再截图(VpStateResult 处理器触发)
                     let tmp = pla_ui::vpstate::vpstate_dir(&self.doc_key)
                         .join("__shot_tmp.png");
@@ -3939,6 +3994,59 @@ impl eframe::App for PlaApp {
                         }
                             },
                         );
+                        // ---- F2: CDP 能力(功能可用性一律由 features 表推导) ----
+                        let caps = self.cdp_caps.clone();
+                        settings_card(
+                            ui,
+                            "CDP CAPABILITIES",
+                            Some((
+                                "CDP 能力",
+                                vec![
+                                    info_text(
+                                        "连接 Plasticity 时逐项探测 pla-ui 依赖的内部结构。某项失效说明当前 Plasticity \
+                                         版本改了内部实现: 相关功能会被拦截并说明原因, 不会静默失败。",
+                                    ),
+                                    info_text("黄色 = 可用, 但部分子项缺失(例如视口状态里的渲染/网格设置)。"),
+                                    info_text("悬停某一行可看完整原因; 命令行 pla-app cdp-probe 输出完整探测结果。"),
+                                ],
+                            )),
+                            |ui| match &caps {
+                                None => value_row(ui, "状态", "CDP 未连接, 能力未知", COL_MUTED),
+                                Some(r) => {
+                                    let ed = if r.editor {
+                                        format!("已找到({})", r.finder.as_deref().unwrap_or("?"))
+                                    } else {
+                                        "未找到".into()
+                                    };
+                                    value_row(ui, "编辑器", &ed, if r.editor { COL_GREEN } else { COL_RED });
+                                    for f in Feature::ALL {
+                                        let (txt, col) = match pla_ui::features::availability(Some(r), *f) {
+                                            Availability::Ok => ("可用".to_string(), COL_GREEN),
+                                            Availability::Degraded(m) => {
+                                                (format!("部分可用(缺 {})", m.join(", ")), COL_YELLOW)
+                                            }
+                                            Availability::Blocked(why) => (why, COL_RED),
+                                        };
+                                        value_row(ui, f.label(), &txt, col);
+                                    }
+                                    if !r.alt_paths.is_empty() {
+                                        let list: Vec<String> =
+                                            r.alt_paths.iter().map(|(k, p)| format!("{k}→{p}")).collect();
+                                        value_row(ui, "备选路径", &list.join("; "), COL_YELLOW);
+                                    }
+                                    value_row(
+                                        ui,
+                                        "垫片",
+                                        &format!(
+                                            "api {} · rev {}",
+                                            pla_bridge::shim::API_VERSION,
+                                            r.rev.get(..8).unwrap_or(&r.rev)
+                                        ),
+                                        COL_MUTED,
+                                    );
+                                }
+                            },
+                        );
                         // ---- Q1: 方向键步进旋转(写 Plasticity 自己的 keymap/settings) ----
                         settings_card(ui, "ORBIT STEP", None, |ui| {
                         let mut bound = self.step_bound.unwrap_or(false);
@@ -3967,8 +4075,8 @@ impl eframe::App for PlaApp {
                                     Ok(()) => {
                                         self.step_bound = Some(bound);
                                         // keymap.json 会被 Plasticity 自动重载(有延迟);
-                                        // 有 CDP 时顺带立即生效。
-                                        if self.cdp_connected() {
+                                        // 能力可用时顺带立即生效。
+                                        if self.feature_block(Feature::ArrowKeysLive).is_none() {
                                             self.cdp.send(pla_bridge::cdp::CdpCmd::Eval(
                                                 pla_ui::plasticity_config::live_bindings_js(bound),
                                             ));

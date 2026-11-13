@@ -42,6 +42,119 @@ pub mod api {
     ];
 }
 
+/// 能力名（与 `pla-shim.js` 的 `CAPS` 键一一对应；契约测试检查）。功能 → 能力的映射在 pla-ui `features.rs`。
+pub mod cap {
+    pub const EDITOR: &str = "editor";
+    pub const SEL_READ: &str = "sel.read";
+    pub const SEL_WRITE: &str = "sel.write";
+    pub const HIST_READ: &str = "hist.read";
+    pub const CAM_READ: &str = "cam.read";
+    pub const CAM_WRITE: &str = "cam.write";
+    pub const CAM_NAV: &str = "cam.nav";
+    pub const CAM_STEP: &str = "cam.step";
+    pub const CAM_ROLL: &str = "cam.roll";
+    pub const SCAN: &str = "scan";
+    pub const VP_STATE: &str = "vp.state";
+    pub const KEYMAP: &str = "keymap";
+    pub const ERR_HOOK: &str = "err.hook";
+    pub const TREE: &str = "tree";
+    pub const MAT_SET: &str = "mat.set";
+    pub const CMD_EXEC: &str = "cmd.exec";
+    pub const BOOL_RUN: &str = "bool.run";
+    pub const ASSET_PLACE: &str = "asset.place";
+
+    /// 全部能力名（契约测试用）。
+    pub const ALL: &[&str] = &[
+        EDITOR, SEL_READ, SEL_WRITE, HIST_READ, CAM_READ, CAM_WRITE, CAM_NAV, CAM_STEP, CAM_ROLL, SCAN,
+        VP_STATE, KEYMAP, ERR_HOOK, TREE, MAT_SET, CMD_EXEC, BOOL_RUN, ASSET_PLACE,
+    ];
+}
+
+/// 一项能力的探测结果。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CapState {
+    pub ok: bool,
+    /// 缺失的必需内部结构（垫片 LOC 表键）。
+    pub missing: Vec<String>,
+    /// 缺失的可选内部结构（能力降级但可用）。
+    pub optional_missing: Vec<String>,
+    /// 路线图预留、尚未实现（值 = 待办编号，如 "N1"）。
+    pub todo: Option<String>,
+}
+
+/// F2: 一次能力探测的结果（`core.probe` 回包的结构化形式）。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CapsReport {
+    /// 是否找到 Editor。
+    pub editor: bool,
+    /// 找到 Editor 的途径（global / preact）。
+    pub finder: Option<String>,
+    /// 垫片 rev。
+    pub rev: String,
+    pub caps: std::collections::BTreeMap<String, CapState>,
+    /// 走了备选路径的表键 → 实际命中的路径（Plasticity 改过名的痕迹）。
+    pub alt_paths: std::collections::BTreeMap<String, String>,
+}
+
+fn str_list(v: &Value) -> Vec<String> {
+    v.as_array()
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .unwrap_or_default()
+}
+
+impl CapsReport {
+    /// 由 `core.probe` 的 v 构造。
+    pub fn from_probe(v: &Value) -> Self {
+        let caps = v["caps"]
+            .as_object()
+            .map(|m| {
+                m.iter()
+                    .map(|(k, c)| {
+                        (
+                            k.clone(),
+                            CapState {
+                                ok: c["ok"].as_bool() == Some(true),
+                                missing: str_list(&c["missing"]),
+                                optional_missing: str_list(&c["optionalMissing"]),
+                                todo: c["todo"].as_str().map(String::from),
+                            },
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let alt_paths = v["altPaths"]
+            .as_object()
+            .map(|m| m.iter().map(|(k, p)| (k.clone(), p.as_str().unwrap_or("").to_string())).collect())
+            .unwrap_or_default();
+        CapsReport {
+            editor: v["editor"]["ok"].as_bool() == Some(true),
+            finder: v["editor"]["finder"].as_str().map(String::from),
+            rev: v["rev"].as_str().unwrap_or("").to_string(),
+            caps,
+            alt_paths,
+        }
+    }
+
+    /// 给定一组能力，返回不可用的那些：(能力名, 缺失的内部结构)。
+    /// 报告里没有的能力名视为不可用（垫片版本不含该能力），缺失列表写 `未知能力`。
+    pub fn blocked(&self, caps: &[&str]) -> Vec<(String, Vec<String>)> {
+        caps.iter()
+            .filter_map(|c| match self.caps.get(*c) {
+                Some(s) if s.ok => None,
+                Some(s) if s.todo.is_some() => Some((c.to_string(), vec![format!("尚未实现({})", s.todo.as_deref().unwrap_or(""))])),
+                Some(s) => Some((c.to_string(), s.missing.clone())),
+                None => Some((c.to_string(), vec!["未知能力".into()])),
+            })
+            .collect()
+    }
+
+    /// 已实现能力里失效的数量（todo 不计）。
+    pub fn failed_count(&self) -> usize {
+        self.caps.values().filter(|s| !s.ok && s.todo.is_none()).count()
+    }
+}
+
 const fn fnv1a(b: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     let mut i = 0;
@@ -231,6 +344,32 @@ mod tests {
         assert_eq!(none[0].1, Err(ShimErr::NoShim));
     }
 
+    #[test]
+    fn caps_report_from_probe() {
+        let v = json!({
+            "rev": "ab", "editor": {"ok": true, "finder": "preact"},
+            "caps": {
+                "sel.read": {"ok": true, "missing": []},
+                "sel.write": {"ok": false, "missing": ["ed.click.addById"]},
+                "vp.state": {"ok": true, "missing": [], "optionalMissing": ["vp.settings.grid"]},
+                "mat.set": {"ok": false, "missing": [], "todo": "N1"}
+            },
+            "altPaths": {"ed.undoStack": "history.undoStack"}
+        });
+        let r = CapsReport::from_probe(&v);
+        assert!(r.editor);
+        assert_eq!(r.finder.as_deref(), Some("preact"));
+        assert_eq!(r.failed_count(), 1, "todo 不计入失效");
+        assert_eq!(r.caps["vp.state"].optional_missing, vec!["vp.settings.grid".to_string()]);
+        assert_eq!(r.alt_paths["ed.undoStack"], "history.undoStack");
+        assert!(r.blocked(&[cap::SEL_READ, cap::VP_STATE]).is_empty());
+        let b = r.blocked(&[cap::SEL_READ, cap::SEL_WRITE, cap::MAT_SET, "nope"]);
+        assert_eq!(b.len(), 3);
+        assert_eq!(b[0], ("sel.write".into(), vec!["ed.click.addById".into()]));
+        assert!(b[1].1[0].contains("N1"));
+        assert_eq!(b[2].1, vec!["未知能力".to_string()]);
+    }
+
     /// 契约测试（R3）：用 node 在模拟页面里执行 Rust 生成的安装表达式，逐项校验接口与能力探测。
     /// 本机无 node 时跳过（打印提示，不算失败）。
     #[test]
@@ -243,6 +382,7 @@ mod tests {
             .arg(&tmp)
             .arg(serde_json::to_string(api::ALL).unwrap())
             .arg(API_VERSION.to_string())
+            .arg(serde_json::to_string(cap::ALL).unwrap())
             .output();
         let _ = std::fs::remove_file(&tmp);
         match out {

@@ -56,6 +56,14 @@
 | cmd | `cmd.dispatch` `cmd.setArrowBindings` | cmd.dispatch / keymap | F1b |
 | 预留 | `mat.set`(N1) `cmd.exec`(N2) `bool.run`(N4) `asset.place`(N5) | 探测显示 todo | N 节 |
 
+## 4b. 能力 → 功能 → 界面（F2）
+
+- 能力名：JS `CAPS` ↔ Rust `shim::cap`（契约测试对齐）。
+- 功能 → 能力：pla-ui `features.rs` 唯一一张表；`availability()` 给出 可用 / 降级（缺可选结构）/ 不可用（原因）。
+- 界面全部从这张表推导：动作入口 `require_feature()` 拦截并提示、设置卡片 CDP CAPABILITIES、工具栏外环。
+  **禁止**在界面代码里另写 "CDP 连上没有 / 某字段在不在" 的判断。
+- 新功能上线 = 垫片加能力 → `shim::cap` 加常量 → `features.rs` 加一行 → 动作入口调 `require_feature()`。
+
 ## 5. 落地顺序
 
 R16 F1a（框架 + 只读接口）→ R17 F2（Caps 事件 + 界面置灰 + 能力卡片）→ R18 F3（`pla-app cdp-selftest`）→

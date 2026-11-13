@@ -1,6 +1,7 @@
 pub mod bridge_thread;
 pub mod cdp_mode;
 pub mod diag;
+pub mod features;
 pub mod hotkey;
 pub mod plasticity_config;
 pub mod round_corners;

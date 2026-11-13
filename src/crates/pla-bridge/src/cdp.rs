@@ -84,6 +84,8 @@ pub enum CdpEvent {
     ViewportPng(usize),
     /// R7-28: 请 UI 把前台焦点交还 Plasticity(武装按键丢失时重试前置)。
     RequestFocus,
+    /// F2: 能力探测结果(变化时才发)。None = CDP 断开, 能力未知。
+    Caps(Option<shim::CapsReport>),
 }
 
 /// 一个选中条目。
@@ -231,6 +233,8 @@ fn cdp_thread_main(port: u16, cmd_rx: Receiver<CdpCmd>, ev_tx: std::sync::mpsc::
                         eprintln!("[pla-cdp] session err: {e:#}");
                         let _ = ev_tx.send(CdpEvent::Status(format!("CDP 断开: {e}")));
                     }
+                    // F2: 断开后能力未知(面板回到"未连接", 不保留过期的能力表)。
+                    let _ = ev_tx.send(CdpEvent::Caps(None));
                 }
                 Ok(Err(e)) => {
                     eprintln!("[pla-cdp] connect err: {e:#}");
@@ -307,8 +311,11 @@ async fn session_loop(
     // 滚转命令补注册节流计数(每 5 轮 ≈ 2.5s 一次; F1b 迁入垫片钩子后删除)。
     let mut hook_tick: u32 = 0;
 
-    // F1: 注入垫片(错误捕获钩子由垫片按 editor 代际自动安装)。
-    install_shim(ws, &mut mid).await;
+    // F1: 注入垫片(错误捕获钩子由垫片按 editor 代际自动安装); F2: 上报能力。
+    let mut last_caps: Option<shim::CapsReport> = None;
+    let mut last_probe = String::new();
+    let caps = install_shim(ws, &mut mid).await;
+    publish_caps(ev_tx, &mut last_caps, caps);
 
     loop {
         // --- UI 命令(非阻塞) ---
@@ -939,12 +946,22 @@ async fn session_loop(
             // R7-25: renderer reload(切文档/崩溃恢复)会清掉页面上的垫片。
             // 探活: stale = 垫片缺失或接口版本不符 → 重注; noed = 垫片在但 editor 丢了
             // (重新定位 editor 是 F4 的事, 这里如实上报 no-editor)。
+            // F2: 重注后、ok↔noed 变化时、以及每 ~30s(视口可能后建)重新探测能力。
             match eval_roundtrip(ws, &mut mid, &shim::probe_expr()).await {
                 Ok(p) if p.trim() == "stale" => {
                     eprintln!("[pla-cdp] 垫片缺失(页面已重载?), 重新注入");
-                    install_shim(ws, &mut mid).await;
+                    let caps = install_shim(ws, &mut mid).await;
+                    publish_caps(ev_tx, &mut last_caps, caps);
+                    last_probe = p.trim().to_string();
                 }
-                Ok(_) => {}
+                Ok(p) => {
+                    let p = p.trim().to_string();
+                    if p != last_probe || sel_tick % 60 == 0 {
+                        let caps = probe_caps(ws, &mut mid).await;
+                        publish_caps(ev_tx, &mut last_caps, caps);
+                    }
+                    last_probe = p;
+                }
                 Err(e) => eprintln!("[pla-cdp] 垫片探活失败: {e:#}"),
             }
             if hook_tick % 5 == 0 {
@@ -981,36 +998,58 @@ fn json_eval(mid: u64, expr: &str) -> Value {
     })
 }
 
-/// F1: 注入垫片并记录探测结果(哪项能力失效、走了哪些备选路径)。失败不致命: 下轮探活会重试。
-async fn install_shim(ws: &mut WsStream, mid: &mut u64) {
+/// F1: 注入垫片, 随后做一次能力探测。失败不致命: 下轮探活会重试。
+async fn install_shim(ws: &mut WsStream, mid: &mut u64) -> Option<shim::CapsReport> {
     match eval_roundtrip(ws, mid, &shim::install_expr()).await {
         Ok(r) => eprintln!("[pla-cdp] 垫片注入: {r}"),
         Err(e) => {
             eprintln!("[pla-cdp] 垫片注入失败: {e:#}");
-            return;
+            return None;
         }
     }
-    match eval_roundtrip(ws, mid, &shim::call_expr(shim::api::CORE_PROBE, &Value::Null)).await {
-        Ok(raw) => match shim::parse_reply(&raw) {
-            Ok(p) => {
-                let bad: Vec<String> = p["caps"]
-                    .as_object()
-                    .map(|m| {
-                        m.iter()
-                            .filter(|(_, c)| c["ok"] != true && c.get("todo").is_none())
-                            .map(|(k, c)| format!("{k}{}", c["missing"]))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                eprintln!(
-                    "[pla-cdp] 能力探测: editor={} 失效={:?} 备选路径={}",
-                    p["editor"], bad, p["altPaths"]
-                );
-            }
-            Err(e) => eprintln!("[pla-cdp] 能力探测失败: {e}"),
-        },
-        Err(e) => eprintln!("[pla-cdp] 能力探测失败: {e:#}"),
+    probe_caps(ws, mid).await
+}
+
+/// F2: 能力探测(只读)。
+async fn probe_caps(ws: &mut WsStream, mid: &mut u64) -> Option<shim::CapsReport> {
+    let raw = match eval_roundtrip(ws, mid, &shim::call_expr(shim::api::CORE_PROBE, &Value::Null)).await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[pla-cdp] 能力探测失败: {e:#}");
+            return None;
+        }
+    };
+    match shim::parse_reply(&raw) {
+        Ok(p) => Some(shim::CapsReport::from_probe(&p)),
+        Err(e) => {
+            eprintln!("[pla-cdp] 能力探测失败: {e}");
+            None
+        }
     }
+}
+
+/// F2: 探测结果有变化才上报 UI(并打日志: 哪项能力失效、走了哪些备选路径)。
+fn publish_caps(
+    ev_tx: &std::sync::mpsc::Sender<CdpEvent>,
+    last: &mut Option<shim::CapsReport>,
+    new: Option<shim::CapsReport>,
+) {
+    let Some(new) = new else { return };
+    if last.as_ref() == Some(&new) {
+        return;
+    }
+    let bad: Vec<String> = new
+        .caps
+        .iter()
+        .filter(|(_, s)| !s.ok && s.todo.is_none())
+        .map(|(k, s)| format!("{k}{:?}", s.missing))
+        .collect();
+    eprintln!(
+        "[pla-cdp] 能力探测: editor={} finder={:?} 失效={bad:?} 备选路径={:?}",
+        new.editor, new.finder, new.alt_paths
+    );
+    *last = Some(new.clone());
+    let _ = ev_tx.send(CdpEvent::Caps(Some(new)));
 }
 
 /// 选择轮询一次取回的接口(一次 evaluate, 每项独立成败)。
