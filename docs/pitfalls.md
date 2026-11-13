@@ -51,6 +51,8 @@
 | 48 | 想给 exe 嵌图标, 但 embed-resource/winresource 都要 windres 或 rc.exe | 本机 Rust 是 x86_64-pc-windows-gnu, 没装 binutils/Windows SDK | `build.rs` 自己生成只含 `.rsrc` 节的 COFF(.o)(资源树 + ADDR32NB 重定位), `rustc-link-arg-bins` 交给 ld 合并; 用 `ExtractAssociatedIcon` 验证(R28) |
 | 49 | 笔记窗口拖动/调大小后鼠标移到别的窗口再回来, 窗口自己跟着拖、越拉越大 | 用了 OS `StartDrag`/`BeginResize`: 模态循环吞掉松手事件, egui 的按键状态卡在"按下", 之后任意 drag_started 又触发一次(同 R9 一级面板的老坑, 新窗口重踩) | 自管会话: `SetCapture` + 屏幕坐标 delta 发 `OuterPosition`/`InnerSize`; 开始/结束以 `primary_button_down()`(GetAsyncKeyState)为准。新窗口一律不要用 StartDrag/BeginResize(R30b) |
 | 50 | 笔记表格选 3 行右键删除 → 助手闪退 | 选区只在帧首夹回表内; 右键菜单在帧中途删了行, 同一帧后面的状态栏还按旧选区下标 `t.cells[r][c]` 读 → 越界 panic(整个进程崩) | `TableState::clamp_to()` 在每次结构变化后立即调用 + 帧内二次夹回; 读格子改 `.get()`。panic 日志在 `%TEMP%\pla-ui.log`(R31c) |
+| 51 | 夜间无人时 CDP 截图"冻结"、memento 恢复抛 "reading 'Viewport'" | 显示器关闭/窗口被遮挡 → 页面 visibilityState=hidden, rAF 停(0 帧), 截图一直是最后一帧; 此时 `originator.restore` 连原样恢复当前快照都在 Plasticity 内部抛错 | 验收前先查 `document.visibilityState`/rAF; 垫片 `mementoGuard()` 在 hidden 时拒绝 memento 恢复并如实报告(R33) |
+| 52 | 视口状态实验把着色弄坏: 视口冻结、右侧面板不再刷新 | shader 模式下调 `shading.setMatcap(file)` → matcap 变 undefined → `TextureLoader.lookup` 每帧抛 → 渲染循环停; 面板 React 树随之失效(点击仍生效但界面不刷新) | 着色一律点面板按钮恢复; 垫片在 shader 模式下禁用 setMatcap 兜底; 面板失效需重开该文件(R33, know-how/viewport-state.md) |
 | 14 | 切换面板时旧面板滞留、新面板不出现、点击丢失 | R12 加深的文档定位(`find_latest_doc`)每次未命中都全盘深扫(热缓存 ~2s, 冷缓存 ~19s), 面板每帧取文档目录, 2s TTL 一过就在 UI 线程重扫 | 分阶段: leveldb + Recent 命中即返回; 深扫未命中负缓存 60s(R13) |
 
 ## 假按钮教训

@@ -193,7 +193,15 @@
                      zebraVertical: 'reflection_check_vertical', topo: 'topo', faceDirection: 'face-direction', curvature: 'curvature' },
     // 这几个按钮共用 basic_side matcap, 内部状态分不开 → 存档时以面板激活态为准。
     sharedMatcapButtons: ['color_matcap', 'black_silhouette', 'color_silhouette'],
-    sharedMatcapFile: 'basic_side'
+    sharedMatcapFile: 'basic_side',
+    // ---- R34: 材质状态(memento 字段) ----
+    mementoMaterials: 'materials',      // memento.materials = { version, counter, materials: [...] }
+    materialsList: 'materials',
+    materialsCounter: 'counter',
+    materialId: 'id',
+    materialUuid: 'uuid',
+    mementoNodeMaterials: 'materials',  // memento.nodes.materials = [nodeKeys(类型化数组), materialIds]
+    node2material: 'node2material'      // nodes.read.node2material: nodeKey → materialId
   };
 
   // =====================================================================
@@ -223,6 +231,7 @@
     'cmd.dispatch': { needs: ['reg.add', 'reg.listeners'] },
     'err.hook':  { needs: ['ed.errorSignal'] },
     'tree':      { needs: [], dom: true },
+    'mat.state': { needs: ['ed.originator', 'nodes.state'] },
     'mat.set':     { todo: 'N1' },
     'cmd.exec':    { todo: 'N2' },
     'bool.run':    { todo: 'N4' },
@@ -1056,6 +1065,14 @@
     return sameLook ? 'shading(same)' : 'shading:' + S.button;
   }
 
+  // memento 恢复(originator.restore)前的前置条件。实测(2026-11-14 夜): 窗口不可见(visibilityState=hidden,
+  // 显示器关闭/被遮挡)时连"原样恢复当前快照"都在 Plasticity 内部抛 "reading 'Viewport'" —— 不冒这个险。
+  function mementoGuard() {
+    var exec = get('ed.executor');
+    if (exec && get('exec.hasActive') && invokeOn('exec.hasActive', [], exec)) throw new Error('command active');
+    if (W.document && W.document.visibilityState === 'hidden') throw new Error('window hidden');
+  }
+
   // 隐藏 / 眼睛关闭 → 稳定 id 列表。
   function visibilityNow() {
     var st = need('nodes.state');
@@ -1085,8 +1102,7 @@
       if (cur.size !== want[n].length || !want[n].every(function (k) { return cur.has(k); })) same = false;
     });
     if (same) return 'vis(same)';
-    var exec = get('ed.executor');
-    if (exec && get('exec.hasActive') && invokeOn('exec.hasActive', [], exec)) throw new Error('command active');
+    mementoGuard();
     var orig = need('ed.originator');
     var m = invokeOn('orig.snapshot', [], orig);
     var nodes = {};
@@ -1278,6 +1294,62 @@
     }
     call0(viewport(), 'vp.render');
     return { applied: applied, missing: missing, failed: failed };
+  });
+
+  // ---- R34: 材质与颜色状态 —— 材质定义(glTF 风格: baseColorFactor / metallic / roughness …, uuid 稳定)
+  //      + 物体 → 材质的指派(物体按稳定 id, 材质按 uuid)。恢复走 memento(同可见性), 不进撤销栈。 ----
+  function materialsNow() {
+    var m = invokeOn('orig.snapshot', [], need('ed.originator'));
+    var defs = plain(m[NAMES.mementoMaterials][NAMES.materialsList] || []);
+    var id2uuid = {};
+    defs.forEach(function (d) { id2uuid[d[NAMES.materialId]] = d[NAMES.materialUuid]; });
+    var st = need('nodes.state');
+    var assign = [];
+    st[NAMES.node2material].forEach(function (mid, k) {
+      var sid = st[NAMES.node2id].get(k);
+      if (sid && id2uuid[mid] !== undefined) assign.push([sid, id2uuid[mid]]);
+    });
+    assign.sort(function (a, b) { return a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0; });
+    return { v: 1, materials: defs, assign: assign };
+  }
+
+  def('mat.save', 'mat.state', function () { return materialsNow(); });
+
+  def('mat.restore', 'mat.state', function (S) {
+    if (!S || !Array.isArray(S.materials) || !Array.isArray(S.assign)) throw new Error('mat.restore needs {materials, assign}');
+    var cur = materialsNow();
+    if (JSON.stringify(cur.materials) === JSON.stringify(S.materials) && JSON.stringify(cur.assign) === JSON.stringify(S.assign)) {
+      return { applied: ['materials(same)'], missing: [], failed: [] };
+    }
+    mementoGuard();
+    var missing = [];
+    var uuid2id = {}, maxId = 0;
+    S.materials.forEach(function (d) { uuid2id[d[NAMES.materialUuid]] = d[NAMES.materialId]; if (d[NAMES.materialId] > maxId) maxId = d[NAMES.materialId]; });
+    var st = need('nodes.state');
+    var inv = new Map();
+    st[NAMES.node2id].forEach(function (id, k) { inv.set(id, k); });
+    var keys = [], vals = [];
+    S.assign.forEach(function (p) {
+      var k = inv.get(p[0]), id = uuid2id[p[1]];
+      if (k === undefined) missing.push('node:' + p[0]);
+      else if (id === undefined) missing.push('material:' + p[1]);
+      else { keys.push(k); vals.push(id); }
+    });
+    var orig = need('ed.originator');
+    var m = invokeOn('orig.snapshot', [], orig);
+    var mats = {};
+    Object.keys(m[NAMES.mementoMaterials]).forEach(function (k) { mats[k] = m[NAMES.mementoMaterials][k]; });
+    mats[NAMES.materialsList] = S.materials;
+    mats[NAMES.materialsCounter] = Math.max(mats[NAMES.materialsCounter] || 0, maxId + 1);
+    m[NAMES.mementoMaterials] = mats;
+    var nodes = {};
+    Object.keys(m[NAMES.mementoNodes]).forEach(function (k) { nodes[k] = m[NAMES.mementoNodes][k]; });
+    var pair = nodes[NAMES.mementoNodeMaterials];
+    // 沿用 memento 原来的类型化数组类型
+    nodes[NAMES.mementoNodeMaterials] = [new pair[0].constructor(keys), new pair[1].constructor(vals)];
+    m[NAMES.mementoNodes] = nodes;
+    invokeOn('orig.restore', [m], orig);
+    return { applied: ['materials:' + S.materials.length, 'assign:' + keys.length], missing: missing, failed: [] };
   });
 
   def('err.last', 'err.hook', function () { return state.lastError; });

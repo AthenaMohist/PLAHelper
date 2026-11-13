@@ -56,12 +56,15 @@ pub mod api {
     pub const KEYMAP_SET_BINDINGS: &str = "keymap.setBindings";
     pub const VP_SAVE: &str = "vp.save";
     pub const VP_RESTORE: &str = "vp.restore";
+    /// R34: 材质与颜色状态(材质定义 + 物体指派)。
+    pub const MAT_SAVE: &str = "mat.save";
+    pub const MAT_RESTORE: &str = "mat.restore";
 
     /// 全部接口名（契约测试用）。
     pub const ALL: &[&str] = &[
         CORE_PROBE, CORE_HEALTH, CORE_APIS, SEL_SNAPSHOT, HIST_STATE, CAM_GET, CAM_SET, CMD_DISPATCH,
         CMD_PING, ERR_LAST, TREE_LIST, SEL_CANCEL_COMMAND, SEL_CLEAR, SEL_APPLY, CAM_NAVIGATE, CAM_RENDER, CAM_VP_RECT,
-        CAM_SET_ORBIT_STEP, CAM_ROLL, KEYMAP_SET_BINDINGS, VP_SAVE, VP_RESTORE,
+        CAM_SET_ORBIT_STEP, CAM_ROLL, KEYMAP_SET_BINDINGS, VP_SAVE, VP_RESTORE, MAT_SAVE, MAT_RESTORE,
     ];
 }
 
@@ -82,6 +85,8 @@ pub mod cap {
     pub const CMD_DISPATCH: &str = "cmd.dispatch";
     pub const ERR_HOOK: &str = "err.hook";
     pub const TREE: &str = "tree";
+    /// R34: 材质状态读写(memento)。
+    pub const MAT_STATE: &str = "mat.state";
     pub const MAT_SET: &str = "mat.set";
     pub const CMD_EXEC: &str = "cmd.exec";
     pub const BOOL_RUN: &str = "bool.run";
@@ -90,7 +95,7 @@ pub mod cap {
     /// 全部能力名（契约测试用）。
     pub const ALL: &[&str] = &[
         EDITOR, SEL_READ, SEL_WRITE, HIST_READ, CAM_READ, CAM_WRITE, CAM_NAV, CAM_STEP, CAM_ROLL, SEL_APPLY,
-        VP_STATE, KEYMAP, CMD_DISPATCH, ERR_HOOK, TREE, MAT_SET, CMD_EXEC, BOOL_RUN, ASSET_PLACE,
+        VP_STATE, KEYMAP, CMD_DISPATCH, ERR_HOOK, TREE, MAT_STATE, MAT_SET, CMD_EXEC, BOOL_RUN, ASSET_PLACE,
     ];
 }
 
