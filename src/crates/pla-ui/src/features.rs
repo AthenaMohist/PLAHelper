@@ -6,6 +6,61 @@
 
 use pla_bridge::shim::{cap, CapsReport};
 
+/// 功能分组（CDP 能力面板按组显示）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Group {
+    Selection,
+    View,
+    Input,
+    Document,
+}
+
+impl Group {
+    pub const ALL: &'static [Group] = &[Group::Selection, Group::View, Group::Input, Group::Document];
+
+    /// 卡片标题（大写英文，与设置面板卡片风格一致）+ 中文副标题。
+    pub fn title(self) -> (&'static str, &'static str) {
+        match self {
+            Group::Selection => ("SELECTION", "选择与选择集"),
+            Group::View => ("VIEW", "视角与视口状态"),
+            Group::Input => ("INPUT", "按键与命令"),
+            Group::Document => ("DOCUMENT", "文档、历史与诊断"),
+        }
+    }
+
+    pub fn features(self) -> impl Iterator<Item = Feature> {
+        Feature::ALL.iter().copied().filter(move |f| f.group() == self)
+    }
+}
+
+/// 能力的中文说明（面板显示用；能力名本身来自 `shim::cap`）。
+pub fn cap_label(c: &str) -> &'static str {
+    match c {
+        cap::EDITOR => "定位 Plasticity 编辑器",
+        cap::SEL_READ => "读取当前选择",
+        cap::SEL_WRITE => "按 id 选中 / 清空选择",
+        cap::HIST_READ => "读取撤销栈与几何版本",
+        cap::CAM_READ => "读取相机与轨道控制器",
+        cap::CAM_WRITE => "写入相机与轨道控制器",
+        cap::CAM_NAV => "转到选择正视",
+        cap::CAM_STEP => "改步进角(运行时)",
+        cap::CAM_ROLL => "注册滚转命令",
+        cap::SCAN => "悬停扫描定位",
+        cap::VP_STATE => "视口显示状态(着色/剖面/构造面…)",
+        cap::KEYMAP => "改按键绑定(运行时)",
+        cap::ERR_HOOK => "捕获命令报错",
+        cap::TREE => "读取实体树(Outliner)",
+        cap::MAT_SET => "材质方案",
+        cap::CMD_EXEC => "带参数执行命令",
+        cap::BOOL_RUN => "布尔运算",
+        cap::ASSET_PLACE => "放置常用件",
+        _ => "",
+    }
+}
+
+/// 路线图预留的能力（面板「ROADMAP」组显示其状态）。
+pub const ROADMAP_CAPS: &[&str] = &[cap::MAT_SET, cap::CMD_EXEC, cap::BOOL_RUN, cap::ASSET_PLACE];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Feature {
     SelMirror,
@@ -49,6 +104,15 @@ impl Feature {
             Feature::AutoSnapSteps => "自动快照(定步数)",
             Feature::ErrorDisplay => "Plasticity 报错显示",
             Feature::EntityTree => "实体树",
+        }
+    }
+
+    pub fn group(self) -> Group {
+        match self {
+            Feature::SelMirror | Feature::SelSave | Feature::SelApply => Group::Selection,
+            Feature::VpSave | Feature::VpApply | Feature::OrbitStepLive | Feature::Roll => Group::View,
+            Feature::ArrowKeysLive => Group::Input,
+            Feature::AutoSnapSteps | Feature::ErrorDisplay | Feature::EntityTree => Group::Document,
         }
     }
 
@@ -179,6 +243,18 @@ mod tests {
             for c in f.caps() {
                 assert!(cap::ALL.contains(c), "{f:?} 引用了未知能力 {c}");
             }
+        }
+    }
+
+    #[test]
+    fn groups_cover_features_and_caps_have_labels() {
+        let grouped: usize = Group::ALL.iter().map(|g| g.features().count()).sum();
+        assert_eq!(grouped, Feature::ALL.len(), "每个功能必须恰好属于一个分组");
+        for c in cap::ALL {
+            assert!(!cap_label(c).is_empty(), "能力 {c} 缺中文说明");
+        }
+        for c in ROADMAP_CAPS {
+            assert!(cap::ALL.contains(c));
         }
     }
 

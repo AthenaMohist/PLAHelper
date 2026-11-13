@@ -106,6 +106,8 @@ const PANEL_SNAPSHOTS: [f32; 2] = [232.0, 480.0];
 const PANEL_ENTITIES: [f32; 2] = [280.0, 540.0];
 const PANEL_DIM: [f32; 2] = [280.0, 170.0];
 const PANEL_SETTINGS: [f32; 2] = [300.0, 560.0];
+/// F2: CDP 能力面板(点工具栏状态点打开)。
+const PANEL_CAPS: [f32; 2] = [320.0, 600.0];
 
 fn main() -> eframe::Result<()> {
     pla_ui::diag::install_panic_hook();
@@ -148,6 +150,8 @@ struct PlaApp {
     show_entities: bool,
     show_dim: bool,
     show_settings: bool,
+    /// F2: CDP 能力面板(点工具栏状态点开关)。
+    show_caps: bool,
     /// R8-1: 视口状态面板。
     show_vpstate: bool,
     /// R8b: 工具栏拖动位置(None=自动吸附; Some=用户拖到的位置, 逻辑 pt)。
@@ -164,6 +168,8 @@ struct PlaApp {
     cdp_status: String,
     /// F2: 最近一次能力探测(None = CDP 未连接/未探测)。功能可用性一律经 `features` 表判定。
     cdp_caps: Option<pla_bridge::shim::CapsReport>,
+    /// 最近一次收到能力探测的时刻。
+    cdp_caps_at: Option<Instant>,
     /// 实时选择快照 (kind, id, name, ctor)。
     live_sel: Vec<pla_bridge::cdp::SelItem>,
     /// R7-26: 上一次实时选择的 key 集合("kind:id"), 用于侦测选择变化。
@@ -379,6 +385,206 @@ fn apply_plasticity_style(ctx: &egui::Context) {
 fn fmt_deg(d: f64) -> String {
     let s = format!("{d:.2}");
     s.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
+/// 按字符截断(超长加 …)。
+fn truncate_chars(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        s.to_string()
+    } else {
+        format!("{}…", s.chars().take(n).collect::<String>())
+    }
+}
+
+/// HUD 宽度(逻辑 pt)。
+const HUD_W: f32 = 260.0;
+
+/// HUD 尺寸: 宽固定, 高按内容实测(与 HUD 内的换行宽度一致)。
+fn hud_size(
+    ctx: &egui::Context,
+    hint: &Option<(String, String)>,
+    notice: &Option<(bool, String)>,
+) -> egui::Vec2 {
+    // 内容可用宽 = HUD 宽 - 面板外边距/内边距/边框(约 6pt×2) - 余量。
+    let wrap_w = HUD_W - 18.0;
+    let h = |text: &str, font: egui::FontId| {
+        ctx.fonts(|f| f.layout(text.to_owned(), font, egui::Color32::WHITE, wrap_w).size().y)
+    };
+    let sp = ctx.style().spacing.item_spacing.y;
+    let body = egui::TextStyle::Body.resolve(&ctx.style());
+    let mut total = 10.0; // 上下内边距 + 边框
+    if let Some((l1, l2)) = hint {
+        total += h(l1, egui::FontId::proportional(12.5)) + sp + h(l2, egui::FontId::proportional(11.5));
+    }
+    if let Some((_, msg)) = notice {
+        if hint.is_some() {
+            total += sp * 2.0 + 6.0; // 分隔线
+        }
+        total += 20.0 + sp + h(msg, body);
+    }
+    egui::vec2(HUD_W, (total + 6.0).ceil())
+}
+
+// ================= F2: CDP 能力面板 =================
+
+/// 能力面板一帧所需的数据快照(避免面板闭包借用 self)。
+struct CapsView {
+    caps: Option<pla_bridge::shim::CapsReport>,
+    age_s: Option<u64>,
+    cdp_status: String,
+    proxy_status: String,
+}
+
+fn avail_style(a: &Availability) -> (&'static str, egui::Color32) {
+    match a {
+        Availability::Ok => ("可用", COL_GREEN),
+        Availability::Degraded(_) => ("部分可用", COL_YELLOW),
+        Availability::Blocked(_) => ("不可用", COL_RED),
+    }
+}
+
+/// 能力明细行: 色点 + 能力名 + 中文说明; 有缺失时下一行列出缺的内部结构(垫片 LOC 表键)。
+fn cap_line(ui: &mut egui::Ui, name: &str, st: Option<&pla_bridge::shim::CapState>) {
+    let (col, extra) = match st {
+        None => (COL_MUTED, Some("垫片未提供该能力".to_string())),
+        Some(s) if s.todo.is_some() => (COL_MUTED, Some(format!("路线图预留({}), 尚未实现", s.todo.as_deref().unwrap_or("")))),
+        Some(s) if !s.ok => (COL_RED, Some(format!("缺: {}", s.missing.join(", ")))),
+        Some(s) if !s.optional_missing.is_empty() => {
+            (COL_YELLOW, Some(format!("缺可选: {}", s.optional_missing.join(", "))))
+        }
+        Some(_) => (COL_GREEN, None),
+    };
+    ui.horizontal(|ui| {
+        ui.add_space(10.0);
+        let (r, _) = ui.allocate_exact_size(egui::vec2(8.0, 14.0), egui::Sense::hover());
+        ui.painter().circle_filled(r.center(), 3.0, col);
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(format!("{name}  {}", pla_ui::features::cap_label(name)))
+                    .size(11.0)
+                    .color(COL_MUTED),
+            )
+            .wrap(),
+        );
+    });
+    if let Some(t) = extra {
+        ui.horizontal(|ui| {
+            ui.add_space(28.0);
+            ui.add(egui::Label::new(egui::RichText::new(t).size(10.5).color(col)).wrap());
+        });
+    }
+}
+
+fn caps_panel_ui(ui: &mut egui::Ui, v: &CapsView, reprobe: &mut bool) {
+    use pla_ui::features::{availability, Group, ROADMAP_CAPS};
+    let caps = v.caps.as_ref();
+    // ---- 概览 ----
+    settings_card(
+        ui,
+        "OVERVIEW",
+        Some((
+            "CDP 能力",
+            vec![
+                info_text(
+                    "连接 Plasticity 时逐项探测 pla-ui 依赖的内部结构。某项失效说明当前 Plasticity 版本改了内部实现: \
+                     相关功能会被拦截并说明原因, 不会静默失败。",
+                ),
+                info_text("绿 = 可用; 黄 = 可用但缺可选子项; 红 = 不可用; 灰 = 预留 / 未知。"),
+                info_text("缺失项写的是垫片内部结构表的键; Plasticity 升级后在垫片表里补备选路径即可恢复。"),
+                info_text("工具栏状态点外环与本面板同源; 命令行 pla-app cdp-probe 输出原始探测结果。"),
+            ],
+        )),
+        |ui| {
+            let connected = caps.is_some();
+            value_row(ui, "连接", &v.cdp_status, if connected { COL_GREEN } else { COL_MUTED });
+            value_row(ui, "代理", &v.proxy_status, COL_TEXT);
+            match caps {
+                None => value_row(ui, "能力", "CDP 未连接, 能力未知", COL_MUTED),
+                Some(r) => {
+                    let ed = if r.editor {
+                        format!("已找到(经 {})", r.finder.as_deref().unwrap_or("?"))
+                    } else {
+                        "未找到".into()
+                    };
+                    value_row(ui, "编辑器", &ed, if r.editor { COL_GREEN } else { COL_RED });
+                    let (b, d) = pla_ui::features::summary(caps);
+                    let ok = Feature::ALL.len() - b - d;
+                    let col = if b > 0 { COL_RED } else if d > 0 { COL_YELLOW } else { COL_GREEN };
+                    value_row(ui, "功能", &format!("{ok} 可用 · {d} 部分 · {b} 不可用"), col);
+                    value_row(
+                        ui,
+                        "垫片",
+                        &format!("api {} · rev {}", pla_bridge::shim::API_VERSION, r.rev.get(..8).unwrap_or(&r.rev)),
+                        COL_MUTED,
+                    );
+                }
+            }
+            if let Some(s) = v.age_s {
+                value_row(ui, "上次探测", &format!("{s} 秒前"), COL_MUTED);
+            }
+            ui.add_space(2.0);
+            let btn = egui::Button::new(egui::RichText::new("重新探测").size(12.0).color(egui::Color32::WHITE))
+                .rounding(egui::Rounding::same(6.0))
+                .fill(COL_BTN)
+                .min_size(egui::vec2(ui.available_width(), 24.0));
+            if ui.add_enabled(caps.is_some(), btn).clicked() {
+                *reprobe = true;
+            }
+        },
+    );
+    // ---- 按组: 功能状态 + 所需能力明细 ----
+    for g in Group::ALL {
+        let (title, sub) = g.title();
+        settings_card(ui, title, None, |ui| {
+            ui.label(egui::RichText::new(sub).size(10.5).color(COL_MUTED));
+            for f in g.features() {
+                let a = availability(caps, f);
+                let (txt, col) = avail_style(&a);
+                value_row(ui, f.label(), txt, col);
+                if let Some(r) = caps {
+                    for c in f.caps() {
+                        cap_line(ui, c, r.caps.get(*c));
+                    }
+                } else if let Availability::Blocked(why) = &a {
+                    ui.horizontal(|ui| {
+                        ui.add_space(10.0);
+                        ui.label(egui::RichText::new(why.as_str()).size(10.5).color(COL_MUTED));
+                    });
+                }
+            }
+        });
+    }
+    let Some(r) = caps else { return };
+    // ---- 路线图预留 ----
+    settings_card(ui, "ROADMAP", None, |ui| {
+        ui.label(egui::RichText::new("后续功能所需能力(垫片已登记, 尚未实现)").size(10.5).color(COL_MUTED));
+        for c in ROADMAP_CAPS {
+            cap_line(ui, c, r.caps.get(*c));
+        }
+    });
+    // ---- 其他能力: 探测结果里有、但没有任何功能引用的(自动收录新能力, 保证完整) ----
+    let used: std::collections::HashSet<&str> = Feature::ALL
+        .iter()
+        .flat_map(|f| f.caps().iter().copied())
+        .chain(ROADMAP_CAPS.iter().copied())
+        .collect();
+    let others: Vec<&String> = r.caps.keys().filter(|k| !used.contains(k.as_str())).collect();
+    if !others.is_empty() {
+        settings_card(ui, "OTHER", None, |ui| {
+            for c in others {
+                cap_line(ui, c, r.caps.get(c));
+            }
+        });
+    }
+    // ---- 备选路径: Plasticity 改过名、垫片靠备选路径兜住的结构 ----
+    if !r.alt_paths.is_empty() {
+        settings_card(ui, "ALT PATHS", None, |ui| {
+            ui.label(egui::RichText::new("这些结构走了垫片表里的备选路径(说明 Plasticity 改过名)").size(10.5).color(COL_MUTED));
+            for (k, p) in &r.alt_paths {
+                ui.add(egui::Label::new(egui::RichText::new(format!("{k} → {p}")).size(11.0).color(COL_YELLOW)).wrap());
+            }
+        });
+    }
 }
 
 /// bridge 状态文本 → 圆点颜色。
@@ -929,6 +1135,7 @@ enum PanelId {
     VpState,
     Dim,
     Settings,
+    Caps,
 }
 
 /// 快照项交互结果(由 snap_item 采集, 调用方统一执行)。
@@ -1435,6 +1642,7 @@ impl PlaApp {
             show_entities: false,
             show_dim: false,
             show_settings: false,
+            show_caps: false,
             step_loaded: false,
             step_bound: None,
             step_deg_buf: String::new(),
@@ -1453,6 +1661,7 @@ impl PlaApp {
             cdp: pla_bridge::cdp::CdpHandle::spawn(9333),
             cdp_status: "CDP 连接中…".into(),
             cdp_caps: None,
+            cdp_caps_at: None,
             live_sel: Vec::new(),
             live_sel_keys: Vec::new(),
             pending_focus: false,
@@ -1537,6 +1746,7 @@ impl PlaApp {
                     }
                 }
                 pla_bridge::cdp::CdpEvent::Caps(c) => {
+                    self.cdp_caps_at = c.as_ref().map(|_| Instant::now());
                     self.cdp_caps = c;
                 }
                 pla_bridge::cdp::CdpEvent::Selection(snap) => {
@@ -1837,6 +2047,18 @@ impl PlaApp {
         if keep != PanelId::Settings {
             self.show_settings = false;
         }
+        if keep != PanelId::Caps {
+            self.show_caps = false;
+        }
+    }
+
+    /// F2: 开关 CDP 能力面板(与其他二级面板互斥); 打开时顺带重新探测一次。
+    fn toggle_caps_panel(&mut self) {
+        self.show_caps = !self.show_caps;
+        if self.show_caps {
+            self.close_secondary_panels_except(PanelId::Caps);
+            self.cdp.send(pla_bridge::cdp::CdpCmd::ProbeCaps);
+        }
     }
 
     fn set_notice(&mut self, n: (bool, String)) {
@@ -2078,7 +2300,11 @@ impl PlaApp {
             Health::Full => "CDP: 全部功能可用".into(),
             Health::Partial => {
                 let (b, d) = pla_ui::features::summary(caps);
-                format!("CDP: {b} 项不可用, {d} 项部分可用(设置 → CDP CAPABILITIES)")
+                match (b, d) {
+                    (0, d) => format!("CDP: {d} 项功能部分可用"),
+                    (b, 0) => format!("CDP: {b} 项功能不可用"),
+                    (b, d) => format!("CDP: {b} 项不可用, {d} 项部分可用"),
+                }
             }
         }
     }
@@ -2453,21 +2679,25 @@ impl eframe::App for PlaApp {
                     if let Some(c) = ring {
                         ui.painter().circle_stroke(dot_rect.center(), 5.4, egui::Stroke::new(1.2, c));
                     }
-                    let cdp_tip = self.cdp_summary();
-                    let bind_tip = match &self.snap_target {
-                        Some(t) => format!("已绑定: {}\nbridge: {}/{}", t.title, self.bridge_status, self.bridge.url),
-                        None => "未绑定 — 等待 Plasticity 窗口…\n(找到后自动吸附到其标题栏)".to_string(),
-                    };
+                    // F2: 单击 = 开关 CDP 能力面板; 双击 = 归位(见上)。
+                    if dot_resp.clicked() {
+                        self.toggle_caps_panel();
+                    }
                     if dot_resp.hovered() {
+                        // 一行一项, 长标题截断 — HUD 按内容高度自适应(见 hud_size)。
+                        let win = match &self.snap_target {
+                            Some(t) => format!("窗口: {}", truncate_chars(&t.title, 20)),
+                            None => "窗口: 未绑定, 等待 Plasticity…".into(),
+                        };
                         hovered = Some((
                             "PLA 助手".into(),
-                            match &self.snap_target {
-                                Some(t) => format!("已绑定: {} / {} (双击归位)\n{cdp_tip}", t.title, self.bridge_status),
-                                None => format!("未绑定 — 等待 Plasticity 窗口…\n{cdp_tip}"),
-                            },
+                            format!(
+                                "{win}\nBridge: {}\n{}\n单击: CDP 能力面板 · 双击: 归位",
+                                self.bridge_status,
+                                self.cdp_summary()
+                            ),
                         ));
                     }
-                    let _ = bind_tip;
                     ui.separator();
 
                     for a in TOOLBAR_ACTIONS {
@@ -2627,6 +2857,9 @@ impl eframe::App for PlaApp {
             }
             if self.show_settings {
                 open.insert("panel-settings");
+            }
+            if self.show_caps {
+                open.insert("panel-caps");
             }
             PANEL_USER_POS.with(|u| {
                 u.borrow_mut().retain(|k, _| open.contains(k));
@@ -3994,59 +4227,6 @@ impl eframe::App for PlaApp {
                         }
                             },
                         );
-                        // ---- F2: CDP 能力(功能可用性一律由 features 表推导) ----
-                        let caps = self.cdp_caps.clone();
-                        settings_card(
-                            ui,
-                            "CDP CAPABILITIES",
-                            Some((
-                                "CDP 能力",
-                                vec![
-                                    info_text(
-                                        "连接 Plasticity 时逐项探测 pla-ui 依赖的内部结构。某项失效说明当前 Plasticity \
-                                         版本改了内部实现: 相关功能会被拦截并说明原因, 不会静默失败。",
-                                    ),
-                                    info_text("黄色 = 可用, 但部分子项缺失(例如视口状态里的渲染/网格设置)。"),
-                                    info_text("悬停某一行可看完整原因; 命令行 pla-app cdp-probe 输出完整探测结果。"),
-                                ],
-                            )),
-                            |ui| match &caps {
-                                None => value_row(ui, "状态", "CDP 未连接, 能力未知", COL_MUTED),
-                                Some(r) => {
-                                    let ed = if r.editor {
-                                        format!("已找到({})", r.finder.as_deref().unwrap_or("?"))
-                                    } else {
-                                        "未找到".into()
-                                    };
-                                    value_row(ui, "编辑器", &ed, if r.editor { COL_GREEN } else { COL_RED });
-                                    for f in Feature::ALL {
-                                        let (txt, col) = match pla_ui::features::availability(Some(r), *f) {
-                                            Availability::Ok => ("可用".to_string(), COL_GREEN),
-                                            Availability::Degraded(m) => {
-                                                (format!("部分可用(缺 {})", m.join(", ")), COL_YELLOW)
-                                            }
-                                            Availability::Blocked(why) => (why, COL_RED),
-                                        };
-                                        value_row(ui, f.label(), &txt, col);
-                                    }
-                                    if !r.alt_paths.is_empty() {
-                                        let list: Vec<String> =
-                                            r.alt_paths.iter().map(|(k, p)| format!("{k}→{p}")).collect();
-                                        value_row(ui, "备选路径", &list.join("; "), COL_YELLOW);
-                                    }
-                                    value_row(
-                                        ui,
-                                        "垫片",
-                                        &format!(
-                                            "api {} · rev {}",
-                                            pla_bridge::shim::API_VERSION,
-                                            r.rev.get(..8).unwrap_or(&r.rev)
-                                        ),
-                                        COL_MUTED,
-                                    );
-                                }
-                            },
-                        );
                         // ---- Q1: 方向键步进旋转(写 Plasticity 自己的 keymap/settings) ----
                         settings_card(ui, "ORBIT STEP", None, |ui| {
                         let mut bound = self.step_bound.unwrap_or(false);
@@ -4209,6 +4389,42 @@ impl eframe::App for PlaApp {
             }
         }
 
+        // ---- F2: CDP 能力面板(点工具栏状态点打开; 内容全部由 features 表 + 探测结果推导) ----
+        if self.show_caps {
+            let desired = next_pos(&mut stack_y, PANEL_CAPS[1]);
+            if let Some(desired) = desired {
+                let mut flag = self.show_caps;
+                let view = CapsView {
+                    caps: self.cdp_caps.clone(),
+                    age_s: self.cdp_caps_at.map(|t| t.elapsed().as_secs()),
+                    cdp_status: self.cdp_status.clone(),
+                    proxy_status: self.proxy.status.clone(),
+                };
+                let mut reprobe = false;
+                show_child_window(
+                    ctx,
+                    "panel-caps",
+                    "CDP 能力",
+                    desired,
+                    egui::vec2(PANEL_CAPS[0], PANEL_CAPS[1]),
+                    &mut flag,
+                    true,
+                    |ui| {
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.spacing_mut().item_spacing.y = 6.0;
+                                caps_panel_ui(ui, &view, &mut reprobe);
+                            });
+                    },
+                );
+                if reprobe {
+                    self.cdp.send(pla_bridge::cdp::CdpCmd::ProbeCaps);
+                }
+                self.show_caps = flag;
+            }
+        }
+
         // ---- R15: 设置项悬停三级面板(面板本帧登记, 本帧渲染; 不悬停即关闭) ----
         if let Some(h) = INFO_HINT.with(|x| x.borrow_mut().take()) {
             show_info_popup(ctx, h);
@@ -4222,10 +4438,8 @@ impl eframe::App for PlaApp {
             if let Some(tr) = tb_origin {
                 let hint = self.hovered_hint.clone();
                 let notice = self.notice.clone();
-                let size = egui::vec2(
-                    260.0,
-                    if hint.is_some() && notice.is_some() { 104.0 } else { 56.0 },
-                );
+                // F2: 高度按内容实测(多行提示 / 长通知不再被裁掉)。
+                let size = hud_size(ctx, &hint, &notice);
                 let desired = egui::pos2(tr.x + TOOLBAR_SIZE[0] + 8.0, tr.y + 2.0);
                 let mut hud = Some((hint, notice));
                 let mut open_flag = true; // notice 的 × 关闭经它传出
@@ -4254,16 +4468,22 @@ impl eframe::App for PlaApp {
                         }
                         let show_ui = |ui: &mut egui::Ui, open: &mut bool| {
                             if let Some((l1, l2)) = &hint {
-                                ui.label(
-                                    egui::RichText::new(l1)
-                                        .size(12.5)
-                                        .strong()
-                                        .color(egui::Color32::WHITE),
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(l1)
+                                            .size(12.5)
+                                            .strong()
+                                            .color(egui::Color32::WHITE),
+                                    )
+                                    .wrap(),
                                 );
-                                ui.label(
-                                    egui::RichText::new(l2)
-                                        .size(11.5)
-                                        .color(egui::Color32::from_rgb(0x9a, 0x9a, 0x9a)),
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(l2)
+                                            .size(11.5)
+                                            .color(egui::Color32::from_rgb(0x9a, 0x9a, 0x9a)),
+                                    )
+                                    .wrap(),
                                 );
                             }
                             if let Some((is_err, msg)) = &notice {
@@ -4296,9 +4516,12 @@ impl eframe::App for PlaApp {
                                         },
                                     );
                                 });
-                                ui.label(
-                                    egui::RichText::new(msg)
-                                        .color(if *is_err { COL_RED } else { COL_GREEN }),
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(msg)
+                                            .color(if *is_err { COL_RED } else { COL_GREEN }),
+                                    )
+                                    .wrap(),
                                 );
                             }
                         };

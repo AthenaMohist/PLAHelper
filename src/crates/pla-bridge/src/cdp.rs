@@ -36,6 +36,8 @@ pub enum CdpCmd {
     Key(KeySpec),
     /// 立即拉一次实体树。
     RefreshTree,
+    /// F2: 立即重新探测能力(结果无变化也上报, 供面板"重新探测")。
+    ProbeCaps,
     /// 通用 evaluate(R7-16): 尺寸驱动命令派发等自动化尝试。
     Eval(String),
     Shutdown,
@@ -330,6 +332,11 @@ async fn session_loop(
                         let _ = ev_tx.send(CdpEvent::EvalResult(format!("ERR: {e}")));
                     }
                 }
+            }
+            Ok(CdpCmd::ProbeCaps) => {
+                last_caps = None; // 强制上报
+                let caps = probe_caps(ws, &mut mid).await;
+                publish_caps(ev_tx, &mut last_caps, caps);
             }
             Ok(CdpCmd::RefreshTree) => {
                 let tree_raw = eval_roundtrip(ws, &mut mid, &shim::call_expr(shim::api::TREE_LIST, &Value::Null)).await?;

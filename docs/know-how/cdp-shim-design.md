@@ -60,7 +60,7 @@
 
 - 能力名：JS `CAPS` ↔ Rust `shim::cap`（契约测试对齐）。
 - 功能 → 能力：pla-ui `features.rs` 唯一一张表；`availability()` 给出 可用 / 降级（缺可选结构）/ 不可用（原因）。
-- 界面全部从这张表推导：动作入口 `require_feature()` 拦截并提示、设置卡片 CDP CAPABILITIES、工具栏外环。
+- 界面全部从这张表推导：动作入口 `require_feature()` 拦截并提示、CDP 能力面板（单击工具栏状态点，按 `Group` 分组）、工具栏外环。
   **禁止**在界面代码里另写 "CDP 连上没有 / 某字段在不在" 的判断。
 - 新功能上线 = 垫片加能力 → `shim::cap` 加常量 → `features.rs` 加一行 → 动作入口调 `require_feature()`。
 
