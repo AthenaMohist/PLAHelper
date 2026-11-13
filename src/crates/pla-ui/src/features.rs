@@ -38,14 +38,14 @@ pub fn cap_label(c: &str) -> &'static str {
     match c {
         cap::EDITOR => "定位 Plasticity 编辑器",
         cap::SEL_READ => "读取当前选择",
-        cap::SEL_WRITE => "按 id 选中 / 清空选择",
+        cap::SEL_WRITE => "取消活动命令",
         cap::HIST_READ => "读取撤销栈与几何版本",
         cap::CAM_READ => "读取相机与轨道控制器",
         cap::CAM_WRITE => "写入相机与轨道控制器",
         cap::CAM_NAV => "转到选择正视",
         cap::CAM_STEP => "改步进角(运行时)",
         cap::CAM_ROLL => "注册滚转命令",
-        cap::SCAN => "悬停扫描定位",
+        cap::SEL_APPLY => "按 id 恢复选择(经选择命令)",
         cap::VP_STATE => "视口显示状态(着色/剖面/构造面…)",
         cap::KEYMAP => "改按键绑定(运行时)",
         cap::CMD_DISPATCH => "注册 / 派发命令",
@@ -122,7 +122,7 @@ impl Feature {
         match self {
             Feature::SelMirror => &[cap::SEL_READ],
             Feature::SelSave => &[cap::SEL_READ, cap::CAM_READ],
-            Feature::SelApply => &[cap::SEL_WRITE, cap::SCAN, cap::CAM_WRITE, cap::CAM_NAV],
+            Feature::SelApply => &[cap::SEL_APPLY],
             Feature::VpSave => &[cap::VP_STATE, cap::CAM_READ],
             Feature::VpApply => &[cap::VP_STATE, cap::CAM_WRITE],
             Feature::OrbitStepLive => &[cap::CAM_STEP],
@@ -271,9 +271,9 @@ mod tests {
         assert_eq!(health(Some(&full)), Health::Full);
         assert_eq!(summary(Some(&full)), (0, 0));
 
-        let r = report(&[(cap::SEL_WRITE, &["ed.click.addById"])], &[(cap::VP_STATE, &["vp.settings.grid"])]);
+        let r = report(&[(cap::SEL_APPLY, &["ed.enqueue"])], &[(cap::VP_STATE, &["vp.settings.grid"])]);
         match availability(Some(&r), Feature::SelApply) {
-            Availability::Blocked(m) => assert!(m.contains("ed.click.addById"), "{m}"),
+            Availability::Blocked(m) => assert!(m.contains("ed.enqueue"), "{m}"),
             other => panic!("{other:?}"),
         }
         assert_eq!(availability(Some(&r), Feature::SelMirror), Availability::Ok);

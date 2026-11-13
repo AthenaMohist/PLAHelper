@@ -53,7 +53,11 @@
 9. 点击语义（ClickStrategy.topologicalItem）对合成命中同样生效：未介入实体上的面可能先选中实体 → 在同一命令内检查、
    需要时再 onClick 一次下钻（本轮 40 面实测 0 次下钻，保留为兜底）。
 
-## 落地方案（待用户确认后实施）
+## 落地方案（R22 已实施）
+
+真机（demo1）：`sel.apply` 60 个面 14 ms 全中、撤销 +1、下钻 10 次；F3 自检的选择回环通过。
+异步接口约定：`sel.apply` / `sel.clear` 返回 Promise，`__PLA__.call` 返回 Promise<JSON>（Rust 侧 Runtime.evaluate 用
+awaitPromise 取值）；这类接口用 `def(..., {async: true})` 标记，不许进 `batch`。
 
 - 垫片新增 `sel.apply({ items: [{kind, id}], replace })`：
   - 按 id 查视图对象（面/边 `lookupTopologyItemById`，实体 `lookupItemById`），查不到的列入 missing；

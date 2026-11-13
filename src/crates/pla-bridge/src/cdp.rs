@@ -350,413 +350,22 @@ async fn session_loop(
                 }
             }
             Ok(CdpCmd::ApplySel(entries)) => {
-                // v5(替换 v4 网格扫描): 累积式 hover spy + 零 per-point eval
-                // 快速网格 + 加密网格兜底 + CDP 真实点击(不变)。
-                // v4→v5 动因: v4 每点一次 eval 读 ed.selection.hits — 已实测该
-                // 数据源是 stale 点击会话(合成 onClick 也会写它), 禁用; 且 54 次
-                // eval 往返拖慢扫描(2~3s)。v5 spy 在页面侧自读 vp.lastPointerEvent
-                // 坐标累积进 window.__PLA_MAP__, Rust 只发 mouseMoved, 实测 1.7s 内。
-                // 点击管线保持: 真实 CDP 点击(ClickChangeSelectionCommand 完整
-                // 周期), 合成 onClick/memento 路线已证伪(MoveCommand 移交时清选择,
-                // 缺活跃实体上下文)。视角无关: hover 命中穿透(一射线多面), 目标面
-                // 转到背面也能被射线扫到时即可找到。
+                // R22: 按数据恢复选择 — 垫片 sel.apply 按 id 查对象, 在一个选择命令里逐项走
+                // changeSelection.onClick(与手点同一条链路, 一个撤销步), 不碰屏幕。
+                // 取代 R7-R21 的悬停扫网格 + 真实点击 + 遮挡补救 + 下钻补点(漏面、受遮挡/视角/后台节流影响)。
+                // 见 docs/know-how/selection-by-command.md。
                 if entries.is_empty() {
                     let _ = ev_tx.send(CdpEvent::Status("选择集应用: 成员为空".into()));
                     continue;
                 }
-                // R8(成功率): 按成员相机分组应用 — 多视角选择集(A 面视角1选中、
-                // B 面视角2选中)每组切到自己的保存视角再扫描点击, 避免单一视角
-                // 下大量面被遮挡/漏扫。分组键 = camera JSON 字符串(None 归一组,
-                // 走当前视角)。组顺序 = 首次出现顺序(稳定)。
-                let mut cam_groups: Vec<(Option<String>, Vec<ApplyEntry>)> = Vec::new();
-                for e in entries {
-                    let key = e.camera.clone().filter(|c| !c.is_empty());
-                    match cam_groups.iter_mut().find(|(k, _)| *k == key) {
-                        Some((_, v)) => v.push(e.clone()),
-                        None => cam_groups.push((key, vec![e.clone()])),
-                    }
-                }
-                let n_groups = cam_groups.len();
-                eprintln!(
-                    "[pla-cdp] R8: {n_groups} 个相机组, 成员分布 {:?}",
-                    cam_groups
-                        .iter()
-                        .map(|(_, v)| v.len())
-                        .collect::<Vec<_>>()
-                );
-                // 全流程汇总
-                let mut total_ok = 0usize;
-                let mut total_fail = 0usize;
-                let mut fail_parts: Vec<String> = Vec::new();
-                let mut total_rescued = 0usize;
-                // 用户相机只快照一次, 全部组结束后恢复
-                let mut user_cam: Option<String> = None;
-                let mut user_cam_taken = false;
-                'groups: for (gi, (group_cam, group_entries)) in
-                    cam_groups.into_iter().enumerate()
-                {
-                    let entries = group_entries;
-                    // v6(R7-31l) Phase 0: 还原该组保存视角(按图索骥)。
-                    if let Some(cam_json) = group_cam.as_ref() {
-                        if !user_cam_taken {
-                            user_cam_taken = true;
-                            match cam_get(ws, &mut mid).await {
-                                Ok(s) if !s.is_empty() => user_cam = Some(s),
-                                Ok(_) => eprintln!("[pla-cdp] v6: 用户相机快照为空(仍继续)"),
-                                Err(e) => {
-                                    eprintln!("[pla-cdp] v6: 用户相机快照失败(仍继续): {e:#}")
-                                }
-                            }
-                        }
-                        match cam_set(ws, &mut mid, cam_json).await {
-                            Ok(r) => {
-                                eprintln!("[pla-cdp] R8: 组 {gi} 已切换到保存视角: {r}");
-                            }
-                            other => {
-                                eprintln!("[pla-cdp] R8: 组 {gi} 视角切换异常: {other:?}")
-                            }
-                        }
-                        // 相机切换后渲染/命中管线需要一拍稳定
-                        tokio::time::sleep(Duration::from_millis(350)).await;
-                        // R10: 回读校验 —— 只写 camera 而 orbitControls 仍在旧
-                        // target/radius 上时, 下一帧会把相机拉回原位。以前这是
-                        // 静默失败(表现为"未扫到"), 现在如实报警。
-                        if let Ok(now) = cam_get(ws, &mut mid).await {
-                            match view_delta(cam_json, &now) {
-                                Ok(d) if d > 1e-3 => {
-                                    eprintln!(
-                                        "[pla-cdp] R8: 组 {gi} 视角切换未生效(回读偏差 {d:.4})"
-                                    );
-                                    let _ = ev_tx.send(CdpEvent::Status(format!(
-                                        "警告: 视角组 {gi} 切视角未生效(偏差 {d:.4}) — 该组目标大概率扫不到"
-                                    )));
-                                }
-                                Ok(_) => {}
-                                Err(e) => {
-                                    eprintln!("[pla-cdp] R8: 组 {gi} 视角回读校验失败: {e}")
-                                }
-                            }
-                        }
-                    }
-                // Phase A: 准备(垫片 scan.begin) — 取消活动命令(悬停管线在命令期间暂停)、
-                // 首组清选择(多相机组的第 2+ 组保留前面已点好的)、装扫描包装, 返回画布矩形 [x,y,w,h]。
-                let prep = shim_call(ws, &mut mid, shim::api::SCAN_BEGIN, serde_json::json!({ "keepSel": gi > 0 }))
-                    .await
-                    .and_then(|v| Ok(serde_json::from_value::<(i64, i64, i64, i64)>(v)?));
-                let rect: (i64, i64, i64, i64) = match prep {
-                    Ok(r) => r,
-                    Err(e) => {
-                        let _ = ev_tx.send(CdpEvent::Status(format!("选择集应用失败(准备阶段): {e}")));
-                        total_fail += entries.len();
-                        fail_parts.push(format!("准备失败: {e}"));
-                        continue 'groups;
-                    }
-                };
-                // Phase B(v5): 快速网格扫描 — spy 在页面侧自读坐标并累积进
-                // __PLA_MAP__, Rust 只发 mouseMoved(零 per-point eval), 每扫完
-                // 一行(9 点)一次进度 eval, 目标全中即提前退。54 点实测 1.7s 内。
-                let target_ids: std::collections::HashSet<String> =
-                    entries.iter().map(|e| e.id.clone()).collect();
-                let mut pos_map: std::collections::HashMap<String, (i64, i64)> =
-                    std::collections::HashMap::new();
-                let missing = |pm: &std::collections::HashMap<String, (i64, i64)>| -> usize {
-                    target_ids.iter().filter(|t| !pm.contains_key(*t)).count()
-                };
-                'scan: for gy in 0..SCAN_ROWS_COARSE {
-                    for gx in 0..SCAN_COLS_COARSE {
-                        let x = rect.0 + (rect.2 as f64 * (gx as f64 + 0.5)
-                            / SCAN_COLS_COARSE as f64) as i64;
-                        let y = rect.1 + (rect.3 as f64 * (gy as f64 + 0.5)
-                            / SCAN_ROWS_COARSE as f64) as i64;
-                        let _ = dispatch_mouse_move(ws, &mut mid, x, y).await;
-                        tokio::time::sleep(Duration::from_millis(SCAN_STEP_MS)).await;
-                    }
-                    match scan_read(ws, &mut mid).await {
-                        Ok(s) => absorb_map(&s, &mut pos_map),
-                        Err(e) => {
-                            eprintln!("[pla-cdp] map read(粗网格行级) 传输失败: {e:#}");
-                        }
-                    }
-                    if missing(&pos_map) == 0 {
-                        break 'scan;
-                    }
-                }
-                // 兜底: 仍缺的 id 再扫一轮 12x18 加密网格(只补缺失)。
-                let coarse_missing = missing(&pos_map);
-                if coarse_missing > 0 {
-                    'fine: for gy in 0..SCAN_ROWS_FINE {
-                        for gx in 0..SCAN_COLS_FINE {
-                            if missing(&pos_map) == 0 {
-                                break 'fine;
-                            }
-                            let x = rect.0 + (rect.2 as f64 * (gx as f64 + 0.5)
-                                / SCAN_COLS_FINE as f64) as i64;
-                            let y = rect.1 + (rect.3 as f64 * (gy as f64 + 0.5)
-                                / SCAN_ROWS_FINE as f64) as i64;
-                            let _ = dispatch_mouse_move(ws, &mut mid, x, y).await;
-                            tokio::time::sleep(Duration::from_millis(SCAN_STEP_MS)).await;
-                        }
-                        match scan_read(ws, &mut mid).await {
-                            Ok(s) => absorb_map(&s, &mut pos_map),
-                            Err(e) => {
-                                eprintln!("[pla-cdp] map read(细网格行级) 传输失败: {e:#}");
-                            }
-                        }
-                    }
-                }
-                let rescued = coarse_missing.saturating_sub(missing(&pos_map));
-                eprintln!(
-                    "[pla-cdp] scan(v5): {} 个 id 定位 / 目标 {} / 兜底补中 {rescued}",
-                    pos_map.len(),
-                    target_ids.len()
-                );
-                // Phase C(v5.1): 遮挡感知点击分组 — hover 穿透把同射线前后遮挡面
-                // 记到同一坐标, 但 shift+click 不穿透(只命中最前面的面)。同坐标
-                // 组只点一次(无论组内几个目标 id), 谁被选中交给点击后校验判定。
-                let mut located: Vec<(String, i64, i64)> = Vec::new();
-                let mut misses: Vec<String> = Vec::new();
-                for e in &entries {
-                    match pos_map.get(&e.id) {
-                        Some(&(px, py)) => located.push((e.id.clone(), px, py)),
-                        None => misses.push(e.id.clone()),
-                    }
-                }
-                if located.is_empty() {
-                    // R8: 相机绑定语义下"未扫到"= 该面在保存视角下不可见(极小面/
-                    // 边), 提示如实但不引导"旋转视角"(用户旋转会破坏组视角)。
-                    fail_parts.push(format!(
-                        "{} 项未扫到(保存视角下不可见)",
-                        misses.len()
-                    ));
-                    total_fail += misses.len();
-                    continue 'groups;
-                }
-                let click_points = plan_clicks(&located);
-                eprintln!(
-                    "[pla-cdp] click(v5.1): {} 个目标 → {} 次点击(同坐标组去重)",
-                    located.len(),
-                    click_points.len()
-                );
-                // 发送成功的组目标参与 Phase D 校验; 发送失败的整组直接计失败 —
-                // 点击丢失时其目标必然不在 faceIds, 若混进校验会被误标为遮挡。
-                let mut clicked: Vec<(String, i64, i64)> = Vec::new();
-                let mut click_failed: Vec<String> = Vec::new();
-                for (i, (px, py)) in click_points.iter().enumerate() {
-                    // R8: 首组第一击=普通点击(替换语义); 其余一律 shift 追加
-                    // (组内第 2+ 击 + 多相机组的全部后续组)。
-                    let shift = i > 0 || gi > 0;
-                    let sent = dispatch_mouse_click(ws, &mut mid, *px, *py, shift).await;
-                    let group = click_group(&located, *px, *py);
-                    match sent {
-                        Ok(()) => {
-                            for (id, lx, ly) in group {
-                                clicked.push((id.clone(), *lx, *ly));
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("[pla-cdp] click 发送失败 @({px},{py}): {e:#}");
-                            for (id, _lx, _ly) in group {
-                                click_failed.push(id.clone());
-                            }
-                        }
-                    }
-                }
-                // Phase D(v5.1): 校验 + 唤醒渲染。verify 回读 faceIds, 对每个
-                // 已定位目标 id 求交集 — 没进 faceIds 的即同坐标组里被遮挡的,
-                // 如实计失败(旋转视角分离是标准解法, 不尝试自动分离)。
-                // Phase C2(R21): 下钻 — 首次点到未选实体上的面只会选中整个实体, 在原坐标补点直到换成面。
-                let drilled = drill_passes(ws, &mut mid, &clicked).await;
-                if drilled > 0 {
-                    eprintln!("[pla-cdp] 下钻补点 {drilled} 次(实体 → 面)");
-                }
-                shim_fire(ws, &mut mid, shim::api::CAM_RENDER, Value::Null).await;
-                let verify_raw = sel_face_ids(ws, &mut mid).await;
-                if let Err(ref e) = verify_raw {
-                    eprintln!("[pla-cdp] verify eval 失败: {e:#}");
-                }
-                let faces_opt = match verify_raw {
-                    Ok(ref s) => extract_face_ids(s),
-                    Err(_) => None,
-                };
-                // 校验读取失败(通道异常/回包无法解析)时如实上报, 不谎报成败 —
-                // faceIds 区分不了"没选中"与"没读到", 不能当作遮挡计数。
-                let face_ids = match faces_opt {
-                    Some(f) => f,
-                    None => {
-                        total_ok += clicked.len();
-                        let _ = ev_tx.send(CdpEvent::Status(format!(
-                            "选择集应用: {} 项已点击, 但校验读取失败(可查看选择状态确认)",
-                            clicked.len()
-                        )));
-                        let _ = dispatch_mouse_move(
-                            ws,
-                            &mut mid,
-                            rect.0 + rect.2 / 2,
-                            rect.1 + rect.3 / 2,
-                        )
-                        .await;
-                        shim_fire(ws, &mut mid, shim::api::SCAN_END, Value::Null).await;
-                        continue 'groups;
-                    }
-                };
-                let mut tally = tally_occlusion(&clicked, &face_ids);
-                let mut misses = misses;
-                // Phase E(v5.2): 遮挡自动补救 — 快照相机 → addById 临时选中
-                // 被遮挡面 → navigateToSelection() 转到该面正视 → 扫描定位 →
-                // shift+click 补选 → 处理完恢复用户原相机。用户全程无感知。
-                if tally.occluded > 0 || !misses.is_empty() {
-                    let mut rescued_occ: Vec<String> = Vec::new();
-                    // 补救对象 = 被遮挡面 + 扫描未命中面(小面/背对面:
-                    // 当前视角射线扫不到 — 自动转到该面正视即可见, v5.4)
-                    let mut occluded_ids: Vec<String> = clicked
-                        .iter()
-                        .filter(|(id, _, _)| !face_ids.contains(id))
-                        .map(|(id, _, _)| id.clone())
-                        .collect();
-                    occluded_ids.extend(misses.iter().cloned());
-                    // 相机快照(position/quaternion 直写直读已验证; 不碰投影矩阵)
-                    let snap = cam_get(ws, &mut mid).await;
-                    let cam_saved = snap.unwrap_or_else(|e| {
-                        eprintln!("[pla-cdp] cam snapshot 失败(将跳过补救): {e:#}");
-                        String::new()
-                    });
-                    if !cam_saved.is_empty() {
-                        for occ_id in &occluded_ids {
-                            // v6.1: 若该成员自带保存相机, 先直达该视角(比
-                            // navigateToSelection 的单面取景更忠实于保存环境)
-                            if let Some(mc) = entries
-                                .iter()
-                                .find(|e| e.id == *occ_id)
-                                .and_then(|e| e.camera.clone())
-                            {
-                                let _ = cam_set(ws, &mut mid, &mc).await;
-                                tokio::time::sleep(Duration::from_millis(350)).await;
-                            }
-                            // 1) addById 临时选中该面(navigateToSelection 只读选择,
-                            //    不需要点击管线的活跃实体上下文)
-                            let pick = serde_json::json!({ "versionId": occ_id });
-                            if let Err(e) = shim_call(ws, &mut mid, shim::api::SEL_ADD_FACE_BY_ID, pick).await {
-                                eprintln!("[pla-cdp] 补救选择 {occ_id} 失败: {e:#}");
-                                continue;
-                            }
-                            // 2) 转到该面正视
-                            if let Err(e) = shim_call(ws, &mut mid, shim::api::CAM_NAVIGATE, Value::Null).await {
-                                eprintln!("[pla-cdp] navigateToSelection 失败: {e:#}");
-                                continue;
-                            }
-                            // 导航是动画, 等待相机稳定
-                            tokio::time::sleep(Duration::from_millis(700)).await;
-                            // 3) 重扫定位该面(粗网格即可, 正视下必在前排)
-                            let mut occ_pos: Option<(i64, i64)> = None;
-                            'occ_scan: for gy in 0..SCAN_ROWS_COARSE {
-                                for gx in 0..SCAN_COLS_COARSE {
-                                    let x = rect.0 + (rect.2 as f64 * (gx as f64 + 0.5) / SCAN_COLS_COARSE as f64) as i64;
-                                    let y = rect.1 + (rect.3 as f64 * (gy as f64 + 0.5) / SCAN_ROWS_COARSE as f64) as i64;
-                                    let _ = dispatch_mouse_move(ws, &mut mid, x, y).await;
-                                    tokio::time::sleep(Duration::from_millis(25)).await;
-                                }
-                                if let Ok(s) = scan_read(ws, &mut mid).await {
-                                    let mut m2 = std::collections::HashMap::new();
-                                    absorb_map(&s, &mut m2);
-                                    if let Some(&(px, py)) = m2.get(occ_id) {
-                                        occ_pos = Some((px, py));
-                                        break 'occ_scan;
-                                    }
-                                }
-                            }
-                            // 4) shift+click 补选 + 取消可能的自动命令
-                            if let Some((px, py)) = occ_pos {
-                                shim_fire(ws, &mut mid, shim::api::SCAN_CLEAR, Value::Null).await;
-                                if dispatch_mouse_click(ws, &mut mid, px, py, true).await.is_ok() {
-                                    shim_fire(ws, &mut mid, shim::api::SEL_CANCEL_COMMAND, Value::Null).await;
-                                    tokio::time::sleep(Duration::from_millis(250)).await;
-                                    // R21: 点中的可能只是整个实体 → 下钻补点
-                                    drill_passes(ws, &mut mid, &[(occ_id.clone(), px, py)]).await;
-                                    // 复核: 进 faceIds 才算救回
-                                    if let Ok(v) = sel_face_ids(ws, &mut mid).await {
-                                        if let Some(fs) = extract_face_ids(&v) {
-                                            if fs.contains(occ_id) {
-                                                rescued_occ.push(occ_id.clone());
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        // 5) 恢复用户相机
-                        if let Err(e) = cam_set(ws, &mut mid, &cam_saved).await {
-                            eprintln!("[pla-cdp] 相机恢复失败: {e:#}");
-                        }
-                        let _ = dispatch_mouse_move(ws, &mut mid, rect.0 + rect.2 / 2, rect.1 + rect.3 / 2).await;
-                        // 重算 tally: 救回的计入成功(从遮挡/缺失两侧移除)
-                        if !rescued_occ.is_empty() {
-                            // 归因: 救回目标原本来自"被遮挡"还是"未扫到"
-                            let occl_set: std::collections::HashSet<&String> = clicked
-                                .iter()
-                                .filter(|(id, _, _)| !face_ids.contains(id))
-                                .map(|(id, _, _)| id)
-                                .collect();
-                            let rescued_from_occ =
-                                rescued_occ.iter().filter(|r| occl_set.contains(*r)).count();
-                            let rescued_from_miss = rescued_occ.len().saturating_sub(rescued_from_occ);
-                            tally.confirmed += rescued_occ.len();
-                            tally.occluded = tally.occluded.saturating_sub(rescued_from_occ);
-                            misses.retain(|m| !rescued_occ.contains(m));
-                            let _ = ev_tx.send(CdpEvent::Status(format!(
-                                "自动转视角补救: {}/{} 项补选成功(遮挡 {} + 未扫到 {})",
-                                rescued_occ.len(),
-                                occluded_ids.len(),
-                                rescued_from_occ,
-                                rescued_from_miss
-                            )));
-                        }
-                    }
-                }
-                let ok = tally.confirmed;
-                let fail = misses.len() + tally.occluded + click_failed.len();
-                let _ = dispatch_mouse_move(ws, &mut mid, rect.0 + rect.2 / 2, rect.1 + rect.3 / 2).await;
-                // 收尾: 结束扫描(还原 onHover 包装、清累积表、唤醒重绘)。
-                shim_fire(ws, &mut mid, shim::api::SCAN_END, Value::Null).await;
-                // R8: 组结果并入汇总(不再逐组发 Status, 统一收尾一条)
-                total_ok += ok;
-                total_fail += fail;
-                total_rescued += rescued;
-                if fail > 0 {
-                    let mut parts: Vec<String> = Vec::new();
-                    if tally.occluded > 0 {
-                        parts.push(format!("{} 项被遮挡", tally.occluded));
-                    }
-                    if misses.len() > 0 {
-                        parts.push(format!("{} 项未扫到", misses.len()));
-                    }
-                    if !click_failed.is_empty() {
-                        parts.push(format!("{} 项点击发送失败", click_failed.len()));
-                    }
-                    fail_parts.push(parts.join(", "));
-                }
-                } // ---- 'groups 循环结束 ----
-                // 全部组完成: 恢复用户相机 + 统一上报
-                if let Some(uc) = user_cam.as_ref() {
-                    if let Err(e) = cam_set(ws, &mut mid, uc).await {
-                        eprintln!("[pla-cdp] v6: 用户相机恢复失败: {e:#}");
-                    }
-                }
-                let group_note = if n_groups > 1 {
-                    format!("({n_groups} 个视角组)")
-                } else {
-                    String::new()
-                };
-                let msg = if total_fail > 0 {
-                    let detail = fail_parts.join("; ");
-                    format!(
-                        "选择集应用: {total_ok} 项成功, {total_fail} 项失败({detail}){group_note}"
-                    )
-                } else if total_rescued > 0 {
-                    format!(
-                        "选择集已应用: {total_ok} 项成功({total_rescued} 项经加密扫描){group_note}"
-                    )
-                } else {
-                    format!("选择集已应用: {total_ok} 项成功(真实点击管线){group_note}")
+                let items: Vec<Value> = entries
+                    .iter()
+                    .map(|e| serde_json::json!({ "kind": e.kind, "id": e.id }))
+                    .collect();
+                let args = serde_json::json!({ "items": items, "replace": true });
+                let msg = match shim_call(ws, &mut mid, shim::api::SEL_APPLY, args).await {
+                    Ok(v) => sel_apply_message(entries.len(), &v),
+                    Err(e) => format!("选择集应用失败: {e}"),
                 };
                 let _ = ev_tx.send(CdpEvent::Status(msg));
             }
@@ -949,50 +558,30 @@ pub(crate) async fn shim_call(ws: &mut WsStream, mid: &mut u64, name: &str, args
     Ok(shim::parse_reply(&raw)?)
 }
 
-/// 选择集应用: 读扫描累积表(JSON {versionId: [x, y]}), 交给 `absorb_map`。
-async fn scan_read(ws: &mut WsStream, mid: &mut u64) -> anyhow::Result<String> {
-    Ok(shim_call(ws, mid, shim::api::SCAN_READ, Value::Null).await?.to_string())
-}
-
-/// 选择集应用: 读当前选中面的版本 id(JSON {selN, faces}), 交给 `extract_face_ids`。
-async fn sel_face_ids(ws: &mut WsStream, mid: &mut u64) -> anyhow::Result<String> {
-    Ok(shim_call(ws, mid, shim::api::SEL_FACE_IDS, Value::Null).await?.to_string())
-}
-
-/// 选择集应用的下钻补点(R21): Plasticity 点未选实体上的面会先选中**整个实体**, 再点一次才换成该面。
-/// 由垫片判定哪些目标"还没选中但所属实体已介入"(`sel.faceIds{targets}` 的 drill), 在原坐标再 shift+点一次;
-/// 最多 3 轮(同一实体上多个面时, 下钻一个会让实体从"选中"变成"已有面选中", 其余面下一轮直接点中)。
-/// 返回补点次数。
-async fn drill_passes(ws: &mut WsStream, mid: &mut u64, located: &[(String, i64, i64)]) -> usize {
-    let targets: Vec<&str> = located.iter().map(|(id, _, _)| id.as_str()).collect();
-    let mut clicks = 0;
-    for _ in 0..3 {
-        let v = match shim_call(ws, mid, shim::api::SEL_FACE_IDS, serde_json::json!({ "targets": targets })).await {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("[pla-cdp] 下钻判定失败: {e:#}");
-                break;
-            }
-        };
-        let drill: Vec<String> = v["drill"]
-            .as_array()
-            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
-            .unwrap_or_default();
-        if drill.is_empty() {
-            break;
-        }
-        let mut done: std::collections::HashSet<(i64, i64)> = std::collections::HashSet::new();
-        for id in &drill {
-            if let Some((_, x, y)) = located.iter().find(|(i, _, _)| i == id) {
-                if done.insert((*x, *y)) && dispatch_mouse_click(ws, mid, *x, *y, true).await.is_ok() {
-                    clicks += 1;
-                }
-            }
-        }
-        shim_fire(ws, mid, shim::api::SEL_CANCEL_COMMAND, Value::Null).await;
-        tokio::time::sleep(Duration::from_millis(250)).await;
+/// `sel.apply` 回包 → 状态栏文字(如实列出没选上 / 不支持的成员)。
+fn sel_apply_message(total: usize, v: &Value) -> String {
+    let list = |k: &str| -> Vec<String> {
+        v[k].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default()
+    };
+    let missing = list("missing");
+    let unsupported = list("unsupported");
+    let extra = list("extra");
+    let ok = total.saturating_sub(missing.len() + unsupported.len());
+    if missing.is_empty() && unsupported.is_empty() && extra.is_empty() {
+        return format!("选择集已应用: {ok} 项全部选中");
     }
-    clicks
+    let mut parts = Vec::new();
+    if !missing.is_empty() {
+        let head: Vec<&str> = missing.iter().take(3).map(String::as_str).collect();
+        parts.push(format!("{} 项找不到或没选上({}{})", missing.len(), head.join(", "), if missing.len() > 3 { "…" } else { "" }));
+    }
+    if !unsupported.is_empty() {
+        parts.push(format!("{} 项类型暂不支持", unsupported.len()));
+    }
+    if !extra.is_empty() {
+        parts.push(format!("多选了 {} 项", extra.len()));
+    }
+    format!("选择集应用: {ok}/{total} 项选中; {}", parts.join("; "))
 }
 
 /// 不关心结果的垫片调用(收尾/唤醒类): 失败只记日志。
@@ -1000,19 +589,6 @@ async fn shim_fire(ws: &mut WsStream, mid: &mut u64, name: &str, args: Value) {
     if let Err(e) = shim_call(ws, mid, name, args).await {
         eprintln!("[pla-cdp] {name} 失败: {e:#}");
     }
-}
-
-/// 读当前视角(垫片 `cam.get`), 返回 JSON 字符串 {px..qw, zoom?, fov?, orbit?}。
-async fn cam_get(ws: &mut WsStream, mid: &mut u64) -> anyhow::Result<String> {
-    Ok(shim_call(ws, mid, shim::api::CAM_GET, Value::Null).await?.to_string())
-}
-
-/// 切到给定视角(垫片 `cam.set`; 参数 = `cam_get` 的 JSON, 老存档可缺 orbit/zoom/fov)。
-async fn cam_set(ws: &mut WsStream, mid: &mut u64, view_json: &str) -> anyhow::Result<String> {
-    let view: Value = serde_json::from_str(view_json)
-        .map_err(|e| anyhow::anyhow!("视角 JSON 无法解析: {e}"))?;
-    let raw = eval_roundtrip(ws, mid, &shim::call_expr(shim::api::CAM_SET, &view)).await?;
-    Ok(shim::parse_reply(&raw)?.to_string())
 }
 
 /// F2: 能力探测(只读)。
@@ -1139,19 +715,6 @@ fn selection_from_batch(raw: &str) -> SelectionSnapshot {
 
 
 
-/// v5: 吸收 MAP_READ_JS 回包(JSON 对象字符串)进 pos_map。
-/// 回包异常时不吞错误 — 打日志供诊断, 已定位的不受影响。
-fn absorb_map(raw: &str, pos_map: &mut std::collections::HashMap<String, (i64, i64)>) {
-    match serde_json::from_str::<std::collections::HashMap<String, (i64, i64)>>(raw) {
-        Ok(m) => {
-            for (fid, xy) in m {
-                pos_map.entry(fid).or_insert(xy);
-            }
-        }
-        Err(e) => eprintln!("[pla-cdp] map read 解析失败: {e} (raw: {raw})"),
-    }
-}
-
 /// R10: 把 VPSTATE_RESTORE_JS_TMPL 的回包翻成人话。**不再谎报成功**: 只要
 /// failed 非空就明确说"部分失败", missing(存档里本来就没有)单独列出。
 ///
@@ -1228,100 +791,6 @@ pub(crate) fn view_delta(target_json: &str, actual_json: &str) -> anyhow::Result
     .abs()
     .min(1.0);
     Ok(dist / scale + 2.0 * dot.acos())
-}
-
-/// v5: 粗网格行×列(6x9=54 点, 实测 1.7s 内扫完)。
-const SCAN_ROWS_COARSE: i64 = 6;
-const SCAN_COLS_COARSE: i64 = 9;
-/// v5: 兜底加密网格行×列(12x18=216 点, 仅粗网格后仍缺目标时触发)。
-const SCAN_ROWS_FINE: i64 = 12;
-const SCAN_COLS_FINE: i64 = 18;
-/// v5: 扫描点间隔 — mouseMoved 后等 onHover 回调把命中写入累积表。
-const SCAN_STEP_MS: u64 = 25;
-
-/// v5.1: 点击计划 — 对已定位目标按 (px,py) 完全相同分组去重。
-/// hover 穿透把同射线前后遮挡面记到同一坐标, 而 shift+click 不穿透(只命中
-/// 最前面的面), 同坐标组点多次既无效又浪费一次完整点击周期(≤300ms/次)。
-/// 返回去重后的点击坐标序列(保持首次出现顺序, 首坐标=普通点击替换选择)。
-fn plan_clicks(located: &[(String, i64, i64)]) -> Vec<(i64, i64)> {
-    let mut seen: std::collections::HashSet<(i64, i64)> = std::collections::HashSet::new();
-    let mut out: Vec<(i64, i64)> = Vec::new();
-    for (_id, px, py) in located {
-        if seen.insert((*px, *py)) {
-            out.push((*px, *py));
-        }
-    }
-    out
-}
-
-/// v5.1(O2): 取点击计划中某坐标组的全部成员 — 发送失败时整组计失败,
-/// 发送成功时整组参与 Phase D 校验; 组划分保证每个 located 目标恰好落组一次。
-fn click_group<'a>(
-    located: &'a [(String, i64, i64)],
-    px: i64,
-    py: i64,
-) -> Vec<&'a (String, i64, i64)> {
-    located
-        .iter()
-        .filter(|(_, lx, ly)| (*lx, *ly) == (px, py))
-        .collect()
-}
-
-/// v5.1: 点击后校验结果。
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct OcclusionTally {
-    /// 确认进入 faceIds 的目标数。
-    confirmed: usize,
-    /// 已点击但未进入 faceIds 的目标数(同坐标组里被遮挡的)。
-    occluded: usize,
-}
-
-/// v5.1: 遮挡判定 — 把每个已定位目标 id 与点击后 faceIds 求交集。
-/// faceIds 无法区分“确实没选中”与“校验读取失败”, 故调用方在读取失败时
-/// 直接走校验异常分支, 不会把通道故障误报成遮挡。
-fn tally_occlusion(located: &[(String, i64, i64)], face_ids: &[String]) -> OcclusionTally {
-    let sel: std::collections::HashSet<&str> =
-        face_ids.iter().map(|s| s.as_str()).collect();
-    let mut confirmed = 0usize;
-    let mut occluded = 0usize;
-    for (id, _px, _py) in located {
-        if sel.contains(id.as_str()) {
-            confirmed += 1;
-        } else {
-            occluded += 1;
-        }
-    }
-    OcclusionTally { confirmed, occluded }
-}
-
-/// v5.1: 解析 Phase D verify 回包 → faceIds 列表。
-/// 回包应为 {selN, faces:[id,...]} JSON; 解析失败时如实返回 None(不吞错误),
-/// 由调用方走校验异常分支。
-fn extract_face_ids(raw: &str) -> Option<Vec<String>> {
-    let v: Value = serde_json::from_str(raw).ok()?;
-    let arr = v["faces"].as_array()?;
-    Some(
-        arr.iter()
-            .filter_map(|x| x.as_str().map(String::from))
-            .collect(),
-    )
-}
-
-/// R7-28: 解析 ApplySel JS 的 JSON 回包 → (ok, fail, errs 串)。
-fn parse_apply_result(res: &str) -> (i64, i64, String) {
-    let v: Value = serde_json::from_str(res).unwrap_or(Value::Null);
-    let ok = v["ok"].as_i64().unwrap_or(0);
-    let fail = v["fail"].as_i64().unwrap_or(0);
-    let errs = v["errs"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|x| x.as_str())
-                .collect::<Vec<_>>()
-                .join(" | ")
-        })
-        .unwrap_or_default();
-    (ok, fail, errs)
 }
 
 async fn ws_send(ws: &mut WsStream, v: Value) -> anyhow::Result<()> {
@@ -1419,71 +888,6 @@ async fn dispatch_key(ws: &mut WsStream, mid: &mut u64, spec: &KeySpec) -> anyho
         )
         .await?;
     }
-    Ok(())
-}
-
-/// R7-31d: 经 CDP Input 派发一次鼠标点击(mouseMoved→mousePressed→mouseReleased)。
-/// shift=true 时全部事件带 modifiers:8(实测变体2姿势, 无需前置 shift keyDown)。
-/// 这是**浏览器级输入注入**, 走 Plasticity 完整命中管线(ClickChangeSelectionCommand
-/// 真实命令周期 + 活跃实体上下文), 与用户真实点击等价 — 合成 onClick/memento 路线
-/// 已证伪(MoveCommand 移交时清选择, 因缺活跃实体上下文)。
-async fn dispatch_mouse_click(
-    ws: &mut WsStream,
-    mid: &mut u64,
-    x: i64,
-    y: i64,
-    shift: bool,
-) -> anyhow::Result<()> {
-    let m = *mid;
-    *mid += 2;
-    let mo = if shift { 8 } else { 0 };
-    ws_send(
-        ws,
-        serde_json::json!({"id": m, "method": "Input.dispatchMouseEvent", "params": {
-            "type": "mouseMoved", "x": x, "y": y, "button": "none", "buttons": 0,
-            "modifiers": mo, "pointerType": "mouse"
-        }}),
-    )
-    .await?;
-    tokio::time::sleep(Duration::from_millis(120)).await;
-    ws_send(
-        ws,
-        serde_json::json!({"id": m + 1, "method": "Input.dispatchMouseEvent", "params": {
-            "type": "mousePressed", "x": x, "y": y, "button": "left", "buttons": 1,
-            "clickCount": 1, "modifiers": mo, "pointerType": "mouse"
-        }}),
-    )
-    .await?;
-    tokio::time::sleep(Duration::from_millis(70)).await;
-    ws_send(
-        ws,
-        serde_json::json!({"id": m + 1, "method": "Input.dispatchMouseEvent", "params": {
-            "type": "mouseReleased", "x": x, "y": y, "button": "left", "buttons": 0,
-            "clickCount": 1, "modifiers": mo, "pointerType": "mouse"
-        }}),
-    )
-    .await?;
-    tokio::time::sleep(Duration::from_millis(320)).await;
-    Ok(())
-}
-
-/// R7-31d: 单次 mouseMoved(扫描/唤醒渲染用)。
-async fn dispatch_mouse_move(
-    ws: &mut WsStream,
-    mid: &mut u64,
-    x: i64,
-    y: i64,
-) -> anyhow::Result<()> {
-    let m = *mid;
-    *mid += 1;
-    ws_send(
-        ws,
-        serde_json::json!({"id": m, "method": "Input.dispatchMouseEvent", "params": {
-            "type": "mouseMoved", "x": x, "y": y, "button": "none", "buttons": 0,
-            "pointerType": "mouse"
-        }}),
-    )
-    .await?;
     Ok(())
 }
 
@@ -1660,145 +1064,6 @@ mod tests {
         let s = selection_from_batch(r#"{"sel.snapshot":{"ok":false,"err":"cap:editor","missing":["editor"]}}"#);
         assert_eq!((s.ok, s.state.as_str()), (false, "no-editor"));
         assert_eq!(selection_from_batch(r#"{"__noShim":true}"#).state, "no-shim");
-    }
-
-    #[test]
-    fn absorb_map_merges_and_keeps_first() {
-        let mut m = std::collections::HashMap::new();
-        absorb_map(r#"{"a":[10,20],"b":[30,40]}"#, &mut m);
-        assert_eq!(m.get("a"), Some(&(10, 20)));
-        assert_eq!(m.get("b"), Some(&(30, 40)));
-        // 首次坐标优先(or_insert): 后到的不覆盖
-        absorb_map(r#"{"a":[99,99],"c":[1,2]}"#, &mut m);
-        assert_eq!(m.get("a"), Some(&(10, 20)), "首次记录不可被覆盖");
-        assert_eq!(m.get("c"), Some(&(1, 2)));
-        // 坏回包不 panic、不清已有数据
-        absorb_map("not-json", &mut m);
-        absorb_map("{}", &mut m);
-        assert_eq!(m.len(), 3);
-    }
-
-    #[test]
-    fn scan_grid_geometry_covers_viewport() {
-        // 网格几何: 任意 rect 下, 粗/细网格列数行数均为正, 点位落在 rect 内
-        assert!(SCAN_COLS_COARSE > 0 && SCAN_ROWS_COARSE > 0);
-        assert!(SCAN_COLS_FINE > SCAN_COLS_COARSE && SCAN_ROWS_FINE > SCAN_ROWS_COARSE);
-        let rect = (100, 50, 900, 600);
-        for gx in 0..SCAN_COLS_COARSE {
-            let x = rect.0 + (rect.2 as f64 * (gx as f64 + 0.5) / SCAN_COLS_COARSE as f64) as i64;
-            assert!(x >= rect.0 && x < rect.0 + rect.2, "粗网格 x 越界: {x}");
-        }
-        for gy in 0..SCAN_ROWS_FINE {
-            let y = rect.1 + (rect.3 as f64 * (gy as f64 + 0.5) / SCAN_ROWS_FINE as f64) as i64;
-            assert!(y >= rect.1 && y < rect.1 + rect.3, "细网格 y 越界: {y}");
-        }
-    }
-
-    #[test]
-    fn plan_clicks_dedupes_same_coord_group() {
-        // 真机场景复刻: 4f718 与 17f3640 同坐标 (983,193)(同射线前后遮挡),
-        // 5f758 屏幕分离独立坐标 — 3 目标只应产生 2 次点击。
-        let located = vec![
-            ("4f718".to_string(), 983, 193),
-            ("17f3640".to_string(), 983, 193),
-            ("5f758".to_string(), 412, 507),
-        ];
-        let clicks = plan_clicks(&located);
-        assert_eq!(clicks, vec![(983, 193), (412, 507)], "同坐标组必须去重为一次点击");
-        // 首坐标 = 普通点击(替换选择), 后续 = shift 追加 — 顺序保持首现次序
-        assert_eq!(clicks.len(), located.len() - 1);
-        // 全独立坐标: 不去重
-        let solo = vec![
-            ("a".to_string(), 1, 1),
-            ("b".to_string(), 2, 2),
-        ];
-        assert_eq!(plan_clicks(&solo).len(), 2);
-        // 三面同坐标: 仍只点一次
-        let triple = vec![
-            ("a".to_string(), 5, 5),
-            ("b".to_string(), 5, 5),
-            ("c".to_string(), 5, 5),
-        ];
-        assert_eq!(plan_clicks(&triple).len(), 1);
-    }
-
-    #[test]
-    fn tally_occlusion_counts_confirmed_and_occluded() {
-        let located = vec![
-            ("4f718".to_string(), 983, 193),
-            ("17f3640".to_string(), 983, 193),
-            ("5f758".to_string(), 412, 507),
-        ];
-        // 点击后 faceIds 只剩最前面的 4f718 + 独立面 → 17f3640 被遮挡计失败
-        let faces = vec!["4f718".to_string(), "5f758".to_string()];
-        let t = tally_occlusion(&located, &faces);
-        assert_eq!(t, OcclusionTally { confirmed: 2, occluded: 1 });
-        // 全中
-        let all = vec!["4f718".to_string(), "17f3640".to_string(), "5f758".to_string()];
-        assert_eq!(
-            tally_occlusion(&located, &all),
-            OcclusionTally { confirmed: 3, occluded: 0 }
-        );
-        // 全被遮挡(faceIds 空)
-        assert_eq!(
-            tally_occlusion(&located, &[]),
-            OcclusionTally { confirmed: 0, occluded: 3 }
-        );
-    }
-
-    #[test]
-    fn extract_face_ids_parses_verify_payload() {
-        let raw = r#"{"selN":2,"faces":["4f718","5f758"]}"#;
-        assert_eq!(
-            extract_face_ids(raw),
-            Some(vec!["4f718".to_string(), "5f758".to_string()])
-        );
-        // faces 缺失 / 非 JSON → None(走校验异常分支, 不吞错误)
-        assert_eq!(extract_face_ids(r#"{"selN":-1}"#), None);
-        assert_eq!(extract_face_ids("not-json"), None);
-    }
-
-    #[test]
-    fn click_groups_partition_targets_exactly_once() {
-        // O2: 点击计划与坐标分组必须恰好划分全部 located 目标(无遗漏/无重复) —
-        // 这是 ok+fail=总数 恒成立的根。
-        let located = vec![
-            ("4f718".to_string(), 983, 193),
-            ("17f3640".to_string(), 983, 193),
-            ("5f758".to_string(), 412, 507),
-        ];
-        let plan = plan_clicks(&located);
-        let mut seen: Vec<&String> = Vec::new();
-        for (px, py) in &plan {
-            for (id, _lx, _ly) in click_group(&located, *px, *py) {
-                assert!(!seen.contains(&&id), "目标 {id} 被划入多个组");
-                seen.push(id);
-            }
-            // 组内成员坐标与组坐标一致
-            for (_id, lx, ly) in click_group(&located, *px, *py) {
-                assert_eq!((*lx, *ly), (*px, *py));
-            }
-        }
-        assert_eq!(seen.len(), located.len(), "每个目标必须恰好落组一次");
-        // 模拟一组发送失败: fail = misses + occluded + click_failed 保持总数恒等
-        let clicked: Vec<(String, i64, i64)> = click_group(&located, plan[0].0, plan[0].1)
-            .into_iter()
-            .cloned()
-            .collect();
-        let click_failed: Vec<String> = click_group(&located, plan[1].0, plan[1].1)
-            .into_iter()
-            .map(|(id, _, _)| id.clone())
-            .collect();
-        let misses: Vec<String> = Vec::new();
-        let faces = vec!["4f718".to_string()]; // 只有最前面那面真被选中
-        let tally = tally_occlusion(&clicked, &faces);
-        let ok = tally.confirmed;
-        let fail = misses.len() + tally.occluded + click_failed.len();
-        assert_eq!(ok + fail, located.len() + misses.len());
-        // 分组语义: 同坐标组(983,193) 2 员, 独立点(412,507) 1 员
-        assert_eq!(click_group(&located, 983, 193).len(), 2);
-        assert_eq!(click_group(&located, 412, 507).len(), 1);
-        assert_eq!(click_group(&located, 1, 1).len(), 0);
     }
 
     #[test]

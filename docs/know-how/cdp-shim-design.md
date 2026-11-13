@@ -51,8 +51,7 @@
 | tree | `tree.list` | tree | ✓ F1a |
 | cam | `cam.set` | cam.write | ✓ R20（cdp.rs 相机读写已全部改走垫片） |
 | cmd | `cmd.dispatch` `cmd.ping`（自检: 注册→派发→回调） | cmd.dispatch | ✓ R20 |
-| sel | `sel.faceIds` `sel.clear` `sel.addFaceById` `sel.cancelCommand` | sel.read / sel.write | ✓ R21 |
-| scan | `scan.begin` `scan.read` `scan.clear` `scan.end`（还原 onHover） | scan | ✓ R21 |
+| sel | `sel.apply`（按 id 恢复选择，经选择命令，异步）`sel.clear`（DeselectAllCommand，异步）`sel.cancelCommand` | sel.apply / sel.write | ✓ R22（取代 R21 的 `scan.*` / `sel.addFaceById` / `sel.faceIds`） |
 | cam | `cam.navigateToSelection` `cam.roll` `cam.setOrbitStep` `cam.vpRect` `cam.render` | cam.nav / cam.step / cam.roll / cam.read | ✓ R21 |
 | vp | `vp.save` `vp.restore`（R8-1 存档格式兼容） | vp.state | ✓ R21 |
 | keymap | `keymap.setBindings` | keymap | ✓ R21 |

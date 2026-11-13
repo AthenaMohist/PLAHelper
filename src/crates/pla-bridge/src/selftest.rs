@@ -106,7 +106,42 @@ async fn call(ws: &mut WsStream, mid: &mut u64, name: &str, args: &Value) -> Res
 async fn fingerprint(ws: &mut WsStream, mid: &mut u64) -> Option<(i64, i64, String)> {
     let h = call(ws, mid, api::HIST_STATE, &Value::Null).await.ok()?;
     let s = call(ws, mid, api::SEL_SNAPSHOT, &Value::Null).await.ok()?;
-    Some((h["undo"].as_i64()?, h["geoVer"].as_i64()?, s.to_string()))
+    Some((h["undo"].as_i64()?, h["geoVer"].as_i64()?, selection_key(&s).join(",")))
+}
+
+/// 选择快照 → 排好序的 "kind:id" 列表(与顺序无关地比较选择)。
+fn selection_key(snapshot: &Value) -> Vec<String> {
+    let mut v: Vec<String> = selection_items(snapshot)
+        .iter()
+        .map(|i| format!("{}:{}", i["kind"].as_str().unwrap_or(""), i["id"].as_str().unwrap_or("")))
+        .collect();
+    v.sort();
+    v
+}
+
+/// 选择快照 → sel.apply 的成员列表 [{kind, id}](元素为数值/字符串原样, 对象形取 id 或 versionId)。
+fn selection_items(snapshot: &Value) -> Vec<Value> {
+    snapshot["items"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|it| {
+                    let e = &it["e"];
+                    let id = match e {
+                        Value::String(s) => s.clone(),
+                        Value::Number(n) => n.to_string(),
+                        Value::Object(o) => o
+                            .get("versionId")
+                            .or_else(|| o.get("id"))
+                            .map(|x| x.as_str().map(String::from).unwrap_or_else(|| x.to_string()))
+                            .unwrap_or_default(),
+                        _ => String::new(),
+                    };
+                    json!({ "kind": it["kind"], "id": id })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// 去掉与状态无关、每次都可能变的字段(视口屏幕矩形、DPR、失败段说明)。
@@ -359,16 +394,46 @@ pub async fn run(cdp_port: u16, inspector_port: u16, hwnd: Option<isize>) -> Rep
         },
         Err(e) => r.add(S_ROUNDTRIP, "vp.restore ← vp.save", Level::Fail, e),
     }
-    r.add(S_ROUNDTRIP, "选择 写入", Level::Skip,
-        "选择写入走真实点击管线(会改变用户选择), 自检不做; 由契约测试覆盖接口");
+    // 选择回环: 把当前选择经 sel.apply 原样恢复(选择命令进撤销历史: 撤销栈 +1 属预期, 守护段扣除)。
+    let mut selection_commands = 0i64;
+    match call(ws, mid, api::SEL_SNAPSHOT, &Value::Null).await {
+        Ok(s0) => {
+            let items = selection_items(&s0);
+            if items.is_empty() {
+                r.add(S_ROUNDTRIP, "sel.apply ← sel.snapshot", Level::Skip, "当前没有选择(选中几个面后再跑可覆盖这一项)");
+            } else {
+                match call(ws, mid, api::SEL_APPLY, &json!({ "items": items, "replace": true })).await {
+                    Ok(res) => {
+                        selection_commands += 1;
+                        let after = call(ws, mid, api::SEL_SNAPSHOT, &Value::Null).await.unwrap_or(Value::Null);
+                        let same = selection_key(&s0) == selection_key(&after);
+                        let unsupported = res["unsupported"].as_array().map(|a| a.len()).unwrap_or(0);
+                        let level = if same { Level::Pass } else if unsupported > 0 { Level::Warn } else { Level::Fail };
+                        r.add(S_ROUNDTRIP, "sel.apply ← sel.snapshot", level, format!(
+                            "{} 项{}; 下钻 {} 次; 缺 {}; 不支持 {}",
+                            items.len(), if same { "原样恢复" } else { "恢复后不一致" },
+                            res["drills"], res["missing"], res["unsupported"]
+                        ));
+                    }
+                    Err(e) => r.add(S_ROUNDTRIP, "sel.apply ← sel.snapshot", Level::Fail, e),
+                }
+            }
+        }
+        Err(e) => r.add(S_ROUNDTRIP, "sel.apply ← sel.snapshot", Level::Fail, e),
+    }
 
     // ================= 守护: 文档绝不能被改动 =================
     let after = fingerprint(ws, mid).await;
     match (before, after) {
         (Some((u0, g0, s0)), Some((u1, g1, s1))) => {
-            let doc_same = u0 == u1 && g0 == g1;
+            // 几何版本必须不变; 撤销栈只允许多出本次执行的选择命令(选择进撤销历史, 不改几何)。
+            let doc_same = g0 == g1 && u1 == u0 + selection_commands;
             r.add(S_GUARD, "撤销栈 / 几何版本", if doc_same { Level::Pass } else { Level::Fail },
-                if doc_same { format!("未变({u0} 步 / 版本 {g0})") } else { format!("变了: {u0}→{u1} 步, 版本 {g0}→{g1} — 自检改动了文档!") });
+                if doc_same {
+                    format!("几何未变(版本 {g0}); 撤销栈 {u0}→{u1}(含 {selection_commands} 个选择命令)")
+                } else {
+                    format!("变了: {u0}→{u1} 步(预期 +{selection_commands}), 版本 {g0}→{g1} — 自检改动了文档!")
+                });
             r.add(S_GUARD, "选择", if s0 == s1 { Level::Pass } else { Level::Fail },
                 if s0 == s1 { "未变".to_string() } else { "选择被改变".to_string() });
         }

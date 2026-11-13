@@ -79,9 +79,12 @@
 
 先按「复现步骤 → 期望 → 实际」逐条登记到本节，再修。已知线索：
 
-- [~] **B1 选择集** —— 2026-11-13 结论：扫描 + 真实点击管线从根本上不可靠（用户实测 16 面成功 5、11 项未扫到）。
-      技术验证通过：按 id 查面 + 自建 `SelectionCommand` 子类经 `editor.enqueue` 执行，40 面 10 ms 全中、撤销 +1、Move 正常接手。
-      方案与实测见 `docs/know-how/selection-by-command.md`，**待用户确认后替换整条管线**。以下旧线索随之作废：
+- [~] **B1 选择集** —— R22 已整条替换为**按数据恢复**（待用户在界面上复测）：垫片 `sel.apply` 按 id 查对象，
+      在一个自建 `SelectionCommand` 子类里逐项 `changeSelection.onClick`（未选中则下钻一次），经 `editor.enqueue` 执行。
+      真机：60 面 14 ms 全中、撤销 +1、下钻 10 次；完整链路（选中 → G / Shift+Delete 真的改几何 → Ctrl+Z）已验证。
+      删除悬停扫描 / 真实点击 / 遮挡补救 / 下钻补点 / 相机分组整套（cdp.rs −805 行）与 `scan.*`、`sel.addFaceById`、`sel.faceIds`；
+      `sel.clear` 改为执行 `DeselectAllCommand`（`click.clear` 实测不清空）。F3 自检加了选择回环（撤销栈 +1 属预期，守护段扣除）。
+      保存时的相机仍随集存储（以后可做"应用后切到保存视角"）。依据见 `docs/know-how/selection-by-command.md`。以下旧线索作废：
       - 多视角分组还原（R8 相机分组 + R10 补全 zoom/orbit 存档，端到端未验证）；
       - 遮挡补救链（自身相机 → addById → navigateToSelection → 重扫）；
       - 应用后焦点交还 Plasticity、实时镜像与存档成员一致性。

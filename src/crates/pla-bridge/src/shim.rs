@@ -47,12 +47,7 @@ pub mod api {
     pub const TREE_LIST: &str = "tree.list";
     pub const SEL_CANCEL_COMMAND: &str = "sel.cancelCommand";
     pub const SEL_CLEAR: &str = "sel.clear";
-    pub const SEL_ADD_FACE_BY_ID: &str = "sel.addFaceById";
-    pub const SEL_FACE_IDS: &str = "sel.faceIds";
-    pub const SCAN_BEGIN: &str = "scan.begin";
-    pub const SCAN_READ: &str = "scan.read";
-    pub const SCAN_CLEAR: &str = "scan.clear";
-    pub const SCAN_END: &str = "scan.end";
+    pub const SEL_APPLY: &str = "sel.apply";
     pub const CAM_NAVIGATE: &str = "cam.navigateToSelection";
     pub const CAM_RENDER: &str = "cam.render";
     pub const CAM_VP_RECT: &str = "cam.vpRect";
@@ -65,8 +60,7 @@ pub mod api {
     /// 全部接口名（契约测试用）。
     pub const ALL: &[&str] = &[
         CORE_PROBE, CORE_HEALTH, CORE_APIS, SEL_SNAPSHOT, HIST_STATE, CAM_GET, CAM_SET, CMD_DISPATCH,
-        CMD_PING, ERR_LAST, TREE_LIST, SEL_CANCEL_COMMAND, SEL_CLEAR, SEL_ADD_FACE_BY_ID, SEL_FACE_IDS,
-        SCAN_BEGIN, SCAN_READ, SCAN_CLEAR, SCAN_END, CAM_NAVIGATE, CAM_RENDER, CAM_VP_RECT,
+        CMD_PING, ERR_LAST, TREE_LIST, SEL_CANCEL_COMMAND, SEL_CLEAR, SEL_APPLY, CAM_NAVIGATE, CAM_RENDER, CAM_VP_RECT,
         CAM_SET_ORBIT_STEP, CAM_ROLL, KEYMAP_SET_BINDINGS, VP_SAVE, VP_RESTORE,
     ];
 }
@@ -82,7 +76,7 @@ pub mod cap {
     pub const CAM_NAV: &str = "cam.nav";
     pub const CAM_STEP: &str = "cam.step";
     pub const CAM_ROLL: &str = "cam.roll";
-    pub const SCAN: &str = "scan";
+    pub const SEL_APPLY: &str = "sel.apply";
     pub const VP_STATE: &str = "vp.state";
     pub const KEYMAP: &str = "keymap";
     pub const CMD_DISPATCH: &str = "cmd.dispatch";
@@ -95,7 +89,7 @@ pub mod cap {
 
     /// 全部能力名（契约测试用）。
     pub const ALL: &[&str] = &[
-        EDITOR, SEL_READ, SEL_WRITE, HIST_READ, CAM_READ, CAM_WRITE, CAM_NAV, CAM_STEP, CAM_ROLL, SCAN,
+        EDITOR, SEL_READ, SEL_WRITE, HIST_READ, CAM_READ, CAM_WRITE, CAM_NAV, CAM_STEP, CAM_ROLL, SEL_APPLY,
         VP_STATE, KEYMAP, CMD_DISPATCH, ERR_HOOK, TREE, MAT_SET, CMD_EXEC, BOOL_RUN, ASSET_PLACE,
     ];
 }

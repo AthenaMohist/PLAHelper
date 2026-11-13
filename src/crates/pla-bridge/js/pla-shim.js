@@ -29,11 +29,15 @@
     'ed.selection':            ['ed', 'selection'],
     'ed.viewports':            ['ed', 'viewports'],
     'ed.activeViewport':       ['ed', '_activeViewport', 'activeViewport'],
-    'ed.click':                ['ed', 'click'],
-    'click.addById':           ['click', 'addById'],
-    'click.clear':             ['click', 'clear'],
     'ed.changeSelection':      ['ed', 'changeSelection'],
-    'cs.onHover':              ['cs', 'onHover'],
+    'cs.onClick':              ['cs', 'onClick'],
+    'ed.geo':                  ['ed', 'geo'],
+    'geo.lookupTopo':          ['geo', 'lookupTopologyItemById'],
+    'geo.lookupItem':          ['geo', 'lookupItemById'],
+    'ed.enqueue':              ['ed', 'enqueue'],
+    // 选择命令基类 SelectionCommand 的来源: 任一已注册的选择类命令(原生点击命令类只在闭包里)。
+    'cmd.selectionBaseHolder': ['ed', 'commands.DeselectAllCommand'],
+    'sig.commandEnded':        ['ed', 'selection.signals.commandEnded', 'signals.commandEnded'],
     'ed.executor':             ['ed', 'executor'],
     'exec.cancel':             ['exec', 'cancelActiveCommand'],
     'ed.undoStack':            ['ed', 'history._undoStack', 'history.undoStack'],
@@ -64,7 +68,6 @@
     'vp.container':            ['vp', 'container'],
     'vp.render':               ['vp', 'setNeedsRender'],
     'vp.navigate':             ['vp', 'navigateToSelection'],
-    'vp.pointer':              ['vp', 'lastPointerEvent'],
     'vp.cplane':               ['vp', '_constructionPlane'],
     'vp.settings.renderer':    ['vp', 'settings.Viewport.renderer'],
     'vp.settings.ao':          ['vp', 'settings.Viewport.ao'],
@@ -108,15 +111,16 @@
     vnodeScanLimit: 80000,
     // 命令进行中 Plasticity 挂在 <body> 上的属性(取消命令后要清掉, 否则悬停管线不恢复)。
     bodyBusyAttrs: ['gizmo', 'command'],
-    // 悬停命中项里携带拓扑对象的字段(按顺序取第一个存在的)与其版本 id 字段。
-    hitItemKeys: ['topologyItem', 'object'],
+    // 拓扑项的版本 id 字段。
     versionIdKey: 'versionId',
-    // click.addById 的面 id 前缀(实测: '2:<versionId>' 选中面)。
-    faceIdPrefix: '2:',
-    // 拓扑项版本 id 的格式 '<实体 id><类型字母><序号>'(如 '375f566465' = 实体 375 的面): 第 1 组 = 所属实体 id。
-    topoOwnerPattern: '^(\\d+)[a-z]\\d+$',
-    // 扫描累积表上限(防异常增长)。
-    scanMapLimit: 512,
+    // sel.apply: 支持的成员类型; 其中按拓扑项查(lookupTopologyItemById)的类型, 其余按物体查(lookupItemById)。
+    applyKinds: ['face', 'edge', 'solid', 'sheet', 'curve'],
+    topologyKinds: ['face', 'edge'],
+    // 几何库查找结果里视图对象的字段。
+    lookupViewKey: 'view',
+    // ChangeSelectionModifier(实测): 0 替换 / 1 追加 / 2 移除 / 3 切换。
+    modReplace: 0,
+    modAdd: 1,
     // three.js 相机字段。
     perspectiveFlag: 'isPerspectiveCamera',
     // 着色模式的标签字段与切换时需要的 prev 结构字段。
@@ -144,14 +148,15 @@
   var CAPS = {
     'editor':    { needs: [] },
     'sel.read':  { needs: ['sel.selected', 'sel.size'], optional: selKindKeys },
-    'sel.write': { needs: ['click.addById', 'click.clear', 'exec.cancel'] },
+    'sel.write': { needs: ['exec.cancel'] },
+    'sel.apply': { needs: ['ed.geo', 'geo.lookupTopo', 'geo.lookupItem', 'cs.onClick', 'ed.enqueue',
+                           'cmd.selectionBaseHolder', 'sig.commandEnded', 'exec.cancel', 'sel.selected'] },
     'hist.read': { needs: ['ed.undoStack', 'ed.geoVersion'] },
     'cam.read':  { needs: ['vp.camera'], optional: ['vp.orbit'].concat(orbitKeys) },
     'cam.write': { needs: ['vp.camera', 'vp.orbit', 'oc.quaternionEnd', 'oc.targetEnd', 'oc.radiusEnd', 'vp.render'] },
     'cam.nav':   { needs: ['vp.navigate'] },
     'cam.step':  { needs: ['oc.step'], optional: ['orbitSettings.step'] },
     'cam.roll':  { needs: ['reg.add', 'reg.listeners', 'oc.quaternionEnd', 'oc.step'], optional: ['oc.domElement'] },
-    'scan':      { needs: ['cs.onHover', 'vp.pointer', 'exec.cancel', 'click.clear'] },
     'vp.state':  { needs: ['vp.camera', 'vp.orbit', 'ed.shading.mode', 'ed.shading.changed', 'ed.sections'],
                    optional: ['ed.shading.section', 'vp.cplane', 'vp.settings.renderer', 'vp.settings.ao', 'vp.settings.grid', 'vp.container'] },
     'keymap':    { needs: ['km.add', 'km.bindings'], optional: ['kb.update'] },
@@ -169,7 +174,7 @@
   // =====================================================================
   var MISS = {};
   var state = { ed: null, finder: null, gen: 0, hooks: {}, lastError: null, hits: {}, pings: 0,
-                scan: null, disposables: [], lastMaintain: 0 };
+                selCmd: null, disposables: [], lastMaintain: 0 };
 
   function errMsg(e) { return e && e.message ? String(e.message) : String(e); }
 
@@ -197,7 +202,7 @@
       case 'vp': return viewport();
       case 'oc': return get('vp.orbit');
       case 'reg': return get('ed.registry');
-      case 'click': return get('ed.click');
+      case 'geo': return get('ed.geo');
       case 'cs': return get('ed.changeSelection');
       case 'exec': return get('ed.executor');
       case 'km': return get('ed.keymaps');
@@ -253,7 +258,7 @@
     try { obj.set.apply(obj, arr); return true; } catch (e) { return false; }
   }
 
-  // 调用方法类表键: this = 该表键所属的根对象(如 click.clear 的 this = ed.click)。缺失抛 CapError。
+  // 调用方法类表键: this = 该表键所属的根对象(如 exec.cancel 的 this = ed.executor)。缺失抛 CapError。
   function invokeOn(key, args, base) {
     var spec = LOC[key];
     var owner = base !== undefined ? base : rootOf(spec[0]);
@@ -417,7 +422,6 @@
   function disposeHooks() {
     Object.keys(state.hooks).forEach(function (k) { try { state.hooks[k](); } catch (e) {} });
     state.hooks = {};
-    try { endScan(); } catch (e) {}
     state.disposables.forEach(function (d) { try { d.dispose(); } catch (e) {} });
     state.disposables = [];
   }
@@ -426,7 +430,8 @@
   // 7. 接口表（对外唯一入口；名字与 Rust shim::api 一一对应）
   // =====================================================================
   var API = {};
-  function def(name, cap, fn) { API[name] = { cap: cap, fn: fn }; }
+  // opts.async: 接口返回 Promise(要等命令执行完); 这类接口不许进 batch(会产生副作用却拿不到结果)。
+  function def(name, cap, fn, opts) { API[name] = { cap: cap, fn: fn, async: !!(opts && opts.async) }; }
 
   function v3(v) { return v && typeof v.x === 'number' ? [v.x, v.y, v.z] : null; }
 
@@ -612,7 +617,8 @@
     return { registered: hasListener(name, el), fired: state.pings > before };
   });
 
-  // ---- 选择写入 / 取消命令 ----
+  // ---- 选择写入: 一律经 executor 执行选择命令(与手点同一条链路; selection-by-command.md) ----
+  // 不再用 click.addById(不产生命令、Move 一接手就丢选择, 还会写畸形条目)和屏幕扫描点击(漏面、受遮挡/视角/节流影响)。
   function clearBusyAttrs() {
     NAMES.bodyBusyAttrs.forEach(function (a) { try { document.body.removeAttribute(a); } catch (e) {} });
   }
@@ -622,17 +628,6 @@
     clearBusyAttrs();
     return true;
   });
-  def('sel.clear', 'sel.write', function () { invokeOn('click.clear'); return true; });
-  // 按版本 id 临时选中一个面(遮挡补救用: 只为 navigateToSelection 取景, 不走点击管线)。
-  def('sel.addFaceById', 'sel.write', function (a) {
-    if (!a || a.versionId === undefined) throw new Error('sel.addFaceById needs {versionId}');
-    invokeOn('click.addById', [NAMES.faceIdPrefix + a.versionId]);
-    return true;
-  });
-  function topoOwner(vid) {
-    var m = new RegExp(NAMES.topoOwnerPattern).exec(String(vid));
-    return m ? m[1] : null;
-  }
 
   function idList(s, kind) {
     var out = [];
@@ -644,93 +639,111 @@
     return out;
   }
 
-  // 当前选中的面 / 实体; 给了 targets(目标面版本 id)时再算 drill:
-  // 还没选中、但所属实体已"介入"(实体本身被选中, 或它的别的面已选中)的目标 —— 再点一次即可下钻到面。
-  // Plasticity 点击语义(R21 实测): 点未选实体上的面 → 选中整个实体; 再点一次 → 换成该面。
-  // 所属实体完全没介入的目标说明点到了别的东西(被遮挡), 不在 drill 里, 交给转视角补救。
-  def('sel.faceIds', 'sel.read', function (a) {
-    var s = need('sel.selected');
-    var faces = idList(s, 'face');
-    var solids = idList(s, 'solid');
-    var size = get('sel.size', s);
-    var out = { selN: typeof size === 'number' ? size : -1, faces: faces, solids: solids };
-    if (a && Array.isArray(a.targets)) {
-      var engaged = {};
-      solids.forEach(function (x) { engaged[x] = true; });
-      faces.forEach(function (f) { var o = topoOwner(f); if (o) engaged[o] = true; });
-      out.drill = a.targets.filter(function (t) {
-        var o = topoOwner(t);
-        return faces.indexOf(String(t)) < 0 && o !== null && engaged[o] === true;
-      });
-    }
-    return out;
-  });
+  // 按 (kind, id) 查视图对象: 拓扑项(面/边…)走 lookupTopologyItemById, 物体(实体/片体/曲线…)走 lookupItemById。
+  function firstView(v) { return v && typeof v.values === 'function' && !v.isObject3D ? v.values().next().value : v; }
 
-  // ---- 悬停扫描(选择集应用): 包装 changeSelection.onHover, 页面侧自读指针坐标累积 id → 坐标 ----
-  // 数据源铁律: 只信这张累积表; selection.hits 是陈旧的点击会话, 不可用(v4 教训)。
-  function hitVersionId(h) {
-    if (!h) return null;
-    for (var i = 0; i < NAMES.hitItemKeys.length; i++) {
-      var t = h[NAMES.hitItemKeys[i]];
-      if (t && t[NAMES.versionIdKey] !== undefined) return String(t[NAMES.versionIdKey]);
+  function viewOf(kind, id) {
+    var t = null;
+    if (NAMES.topologyKinds.indexOf(kind) >= 0) {
+      try { t = invokeOn('geo.lookupTopo', [String(id)]); } catch (e) { t = null; }
+    } else {
+      var n = Number(id);
+      try { t = invokeOn('geo.lookupItem', [isNaN(n) ? id : n]); } catch (e) { t = null; }
+      if (!t && !isNaN(n)) { try { t = invokeOn('geo.lookupItem', [String(id)]); } catch (e2) { t = null; } }
     }
-    return null;
+    return t ? firstView(t[NAMES.lookupViewKey]) : null;
   }
 
-  function endScan() {
-    var sc = state.scan;
-    state.scan = null;
-    if (sc && get('cs.onHover', sc.cs) === sc.wrapped) put('cs.onHover', sc.orig, sc.cs);
+  // 构造一个"命中"(与真实拾取结果同构, 实测 {distance, point, intersectable, object, distance2d})。
+  function hitFor(view) {
+    var point = null;
+    try {
+      var box = view.getBoundingBox();
+      point = new box.min.constructor();
+      box.getCenter(point);
+    } catch (e) {
+      var cam = get('vp.camera');
+      point = cam ? new cam.position.constructor() : { x: 0, y: 0, z: 0 };
+    }
+    return { distance: 1, point: point, intersectable: view, object: view, distance2d: 0 };
   }
 
-  def('scan.begin', 'scan', function (a) {
-    // 命令进行中悬停管线是暂停的 → 先取消活动命令、清 body 忙碌属性。
+  // 选择命令: 继承 Plasticity 的 SelectionCommand(从已注册的选择类命令原型链取基类, 原生点击命令类只在闭包里)。
+  // execute 里逐项走 changeSelection.onClick(与真实点击同一处理), 整个选择集只占一个撤销步。
+  function selectionCommandClass() {
+    var Ctor = need('cmd.selectionBaseHolder');
+    var Base = Object.getPrototypeOf(Ctor.prototype).constructor;
+    if (state.selCmd && state.selCmd.base === Base) return state.selCmd.cls;
+    class PlaApplySelection extends Base {
+      constructor(editor, entries, replace) { super(editor); this.plaEntries = entries; this.plaReplace = replace; this.plaReport = null; }
+      async execute() {
+        var cs = need('ed.changeSelection');
+        var onClick = need('cs.onClick');
+        var sel = need('sel.selected');
+        var drills = 0;
+        var self = this;
+        this.plaEntries.forEach(function (en, i) {
+          var hit = hitFor(en.view);
+          onClick.call(cs, [hit], i === 0 && self.plaReplace ? NAMES.modReplace : NAMES.modAdd, 0);
+          // 点击语义: 未介入实体上的面可能先选中整个实体 → 同一命令内再点一次下钻。
+          if (idList(sel, en.kind).indexOf(String(en.id)) < 0) { drills++; onClick.call(cs, [hit], NAMES.modAdd, 0); }
+        });
+        this.plaReport = { drills: drills };
+      }
+    }
+    state.selCmd = { base: Base, cls: PlaApplySelection };
+    return PlaApplySelection;
+  }
+
+  // 入队一个命令并等它结束。editor.enqueue 的 Promise 要等整条命令链结束(后续命令等输入就永不兑现) →
+  // 改为监听 commandEnded 认本命令; 入队前先取消活动命令(否则新命令排队不执行)。
+  function runCommand(cmd, timeoutMs) {
+    var sig = need('sig.commandEnded');
     try { invokeOn('exec.cancel'); } catch (e) {}
-    if (!a || !a.keepSel) { try { invokeOn('click.clear'); } catch (e2) {} }
-    clearBusyAttrs();
-    var canvas = document.querySelector(CFG.viewportSelector + ' canvas');
-    if (!canvas) throw new Error('no viewport canvas');
-    var cs = need('ed.changeSelection');
-    var cur = need('cs.onHover');
-    if (!state.scan || state.scan.cs !== cs || cur !== state.scan.wrapped) {
-      var orig = cur;
-      var wrapped = function () {
-        try {
-          var m = state.scan && state.scan.map;
-          var pe = get('vp.pointer');
-          var hits = arguments[0];
-          // onHover 自带的 x/y 参数恒为 0 → 自读视口最后一次指针事件(与 CDP Input 同一坐标系)。
-          if (m && pe && typeof pe.clientX === 'number' && hits && hits.length) {
-            var n = Object.keys(m).length;
-            for (var i = 0; i < hits.length && n < NAMES.scanMapLimit; i++) {
-              var vid = hitVersionId(hits[i]);
-              if (vid && !m[vid]) { m[vid] = [Math.round(pe.clientX), Math.round(pe.clientY)]; n++; }
-            }
-          }
-        } catch (e3) {}
-        return orig.apply(cs, arguments);
-      };
-      put('cs.onHover', wrapped, cs);
-      state.scan = { cs: cs, orig: orig, wrapped: wrapped, map: {} };
-    }
-    state.scan.map = {};
-    var r = canvas.getBoundingClientRect();
-    return [Math.round(r.x), Math.round(r.y), Math.round(r.width), Math.round(r.height)];
-  });
-  // 累积表: { versionId: [x, y] }(只记首次命中坐标)。
-  def('scan.read', 'scan', function () {
-    var m = state.scan && state.scan.map;
-    var o = {};
-    if (m) Object.keys(m).forEach(function (k) { o[k] = m[k]; });
-    return o;
-  });
-  def('scan.clear', 'scan', function () { if (state.scan) state.scan.map = {}; return true; });
-  // 结束扫描: 还原 onHover(不再常驻包装), 唤醒重绘。
-  def('scan.end', 'scan', function () {
-    endScan();
-    call0(viewport(), 'vp.render');
-    return true;
-  });
+    return new Promise(function (resolve) {
+      var done = false;
+      var timer = null;
+      var finish = function (how) { if (done) return; done = true; sig.remove(f); if (timer) clearTimeout(timer); resolve(how); };
+      var f = function (c) { if (c === cmd) finish('ended'); };
+      sig.add(f);
+      timer = setTimeout(function () { finish('timeout'); }, timeoutMs || 10000);
+      invokeOn('ed.enqueue', [cmd]);
+    });
+  }
+
+  // 恢复一组选择(选择集应用 / 自检回环)。args = { items: [{kind, id}], replace: 是否替换当前选择(默认 true) }。
+  // 返回 { selected, missing(查不到对象或没选上), unsupported(类型不支持), extra(多选的), drills, how }。
+  def('sel.apply', 'sel.apply', function (a) {
+    if (!a || !Array.isArray(a.items)) throw new Error('sel.apply needs {items: [{kind, id}]}');
+    var replace = a.replace !== false;
+    var entries = [], missing = [], unsupported = [];
+    a.items.forEach(function (it) {
+      var kind = String(it.kind), id = String(it.id);
+      if (NAMES.applyKinds.indexOf(kind) < 0) { unsupported.push(kind + ':' + id); return; }
+      var view = viewOf(kind, id);
+      if (view) entries.push({ kind: kind, id: id, view: view }); else missing.push(kind + ':' + id);
+    });
+    if (!entries.length) return { selected: 0, missing: missing, unsupported: unsupported, extra: [], drills: 0, how: 'nothing' };
+    var Cls = selectionCommandClass();
+    var cmd = new Cls(editor(), entries, replace);
+    return runCommand(cmd, 10000).then(function (how) {
+      var sel = need('sel.selected');
+      var wanted = {};
+      entries.forEach(function (en) { wanted[en.kind + ':' + en.id] = true; });
+      var have = {};
+      NAMES.applyKinds.forEach(function (k) { idList(sel, k).forEach(function (id) { have[k + ':' + id] = true; }); });
+      entries.forEach(function (en) { if (!have[en.kind + ':' + en.id]) missing.push(en.kind + ':' + en.id); });
+      var extra = replace ? Object.keys(have).filter(function (k) { return !wanted[k]; }) : [];
+      return { selected: entries.length - (missing.length - (a.items.length - entries.length - unsupported.length)),
+               missing: missing, unsupported: unsupported, extra: extra, drills: cmd.plaReport ? cmd.plaReport.drills : 0, how: how };
+    });
+  }, { async: true });
+
+  // 清空选择: 执行 Plasticity 自己的"全部取消选择"命令(click.clear 实测并不清空)。
+  def('sel.clear', 'sel.apply', function () {
+    var Ctor = need('cmd.selectionBaseHolder');
+    return runCommand(new Ctor(editor()), 5000).then(function (how) { return { how: how, size: get('sel.size') }; });
+  }, { async: true });
 
   // ---- 视角 / 视口杂项 ----
   def('cam.navigateToSelection', 'cam.nav', function () { invokeOn('vp.navigate', [], viewport()); return true; });
@@ -987,20 +1000,37 @@
         var c = capState(api.cap);
         if (!c.ok) return { ok: false, err: c.missing[0] === 'editor' ? 'cap:editor' : 'cap:' + api.cap, missing: c.missing, todo: c.todo };
       }
-      return { ok: true, v: api.fn(args || {}) };
+      var v = api.fn(args || {});
+      // 异步接口(如 sel.apply 要等命令执行完): 返回 Promise, call() 再整体序列化。
+      if (v && typeof v.then === 'function') {
+        return v.then(function (x) { return { ok: true, v: x }; }, function (e) { return failure(api, e); });
+      }
+      return { ok: true, v: v };
     } catch (e) {
-      if (e instanceof CapError) return { ok: false, err: 'cap:' + api.cap, missing: e.missing };
-      return { ok: false, err: 'exc:' + errMsg(e) };
+      return failure(api, e);
     }
+  }
+
+  function failure(api, e) {
+    if (e instanceof CapError) return { ok: false, err: 'cap:' + (api ? api.cap : '?'), missing: e.missing };
+    return { ok: false, err: 'exc:' + errMsg(e) };
   }
 
   var self = {
     api: API_VERSION,
     rev: CFG.rev,
-    call: function (name, args) { return JSON.stringify(invoke(name, args)); },
+    // 同步接口返回 JSON 字符串; 异步接口返回 Promise<JSON 字符串>(Runtime.evaluate 用 awaitPromise 取值)。
+    call: function (name, args) {
+      var r = invoke(name, args);
+      return r && typeof r.then === 'function' ? r.then(JSON.stringify) : JSON.stringify(r);
+    },
+    // 批量只用于同步的只读轮询; 混进异步接口如实报错。
     batch: function (list) {
       var out = {};
-      (list || []).forEach(function (it) { out[it[0]] = invoke(it[0], it[1]); });
+      (list || []).forEach(function (it) {
+        if (API[it[0]] && API[it[0]].async) { out[it[0]] = { ok: false, err: 'exc:async api in batch' }; return; }
+        out[it[0]] = invoke(it[0], it[1]);
+      });
       return JSON.stringify(out);
     },
     hasEditor: function () { return !!editor(); },
