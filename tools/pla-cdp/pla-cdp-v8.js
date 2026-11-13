@@ -37,6 +37,14 @@ const { spawn } = require('child_process');
 /** R14: the one editor-locate (heap snapshot) chain shared by all sessions. */
 let locateInFlight = null;
 
+/**
+ * R19: main-process JS helper — the decimal HWND of a BrowserWindow. Plasticity can
+ * have several windows in ONE process; every proxy session is bound to one window
+ * (ws path /hwnd/<n>) so each PLAhelper only drives the window it is attached to.
+ */
+const HWND_OF_JS = '(w) => { const b = w.getNativeWindowHandle();'
+  + ' return (b.length >= 8 ? b.readBigUInt64LE(0) : BigInt(b.readUInt32LE(0))).toString(); }';
+
 const INSPECTOR_PORT = 9334;
 const PROXY_PORT = 9333;
 const FUSE_SENTINEL = Buffer.from('dL7pKGdnNz796PbbjQWNKmHXBZaB9tsX');
@@ -243,12 +251,20 @@ async function proxySession(req, sock, head) {
   if (head && head.length) sock.emit('data', head);
 
   // Attach to renderer over the inspector, and bridge.
+  // R19: /hwnd/<n> selects the Plasticity window; plain / = first window (compat).
+  const m = /\/hwnd\/(\d+)/.exec(req.url || '');
   const io = await InspectorIO.connect();
-  const bridge = await RendererBridge.attach(io);
+  const bridge = await RendererBridge.attach(io, m ? m[1] : null);
   sock.on('data', (buf) => bridge.feedClient(buf));
   bridge.onServerMessage((obj) => sock.write(crypto.frameText(JSON.stringify(obj))));
   bridge.onEvent((obj) => sock.write(crypto.frameText(JSON.stringify(obj))));
-  const bye = () => { try { bridge.close(); } catch (e) {} try { sock.destroy(); } catch (e) {} };
+  // R19: remove the exit hook when the session ends (it used to pile up one listener
+  // per session -> MaxListenersExceededWarning in the proxy log).
+  const bye = () => {
+    process.removeListener('exit', bye);
+    try { bridge.close(); } catch (e) {}
+    try { sock.destroy(); } catch (e) {}
+  };
   sock.on('close', bye);
   sock.on('error', bye);
   process.on('exit', bye);
@@ -349,28 +365,36 @@ class InspectorIO {
 class RendererBridge {
   /**
    * @param {InspectorIO} io
+   * @param {?string} hwnd decimal HWND of the window to drive; null = first window.
    * @return {Promise<RendererBridge>}
    */
-  static async attach(io) {
+  static async attach(io, hwnd) {
     const attachJs = `(() => {
       const electron = process.mainModule.require('electron');
+      const hwndOf = ${HWND_OF_JS};
       const wins = electron.BrowserWindow.getAllWindows();
       if (!wins.length) return 'NO_WINDOW';
-      const wc = wins[0].webContents;
-      const dbg = wc.debugger;
+      const want = ${JSON.stringify(hwnd)};
+      const win = want ? wins.find((w) => hwndOf(w) === want) : wins[0];
+      if (!win) return 'NO_SUCH_WINDOW';
+      const dbg = win.webContents.debugger;
       // R14: attach only once. The debugger is shared by all proxy sessions;
       // detach+attach per session broke every other live session (pla-ui saw
       // "Connection reset without closing handshake" whenever another client connected).
       if (!dbg.isAttached()) dbg.attach('1.3');
-      globalThis.__PLA_PROXY_SEND = (m, p) => dbg.sendCommand(m, p);
-      globalThis.__PLA_PROXY_EMIT = null;
-      return 'OK';
+      // R19: one send function per window.
+      const key = hwndOf(win);
+      globalThis.__PLA_PROXY_SENDS = globalThis.__PLA_PROXY_SENDS || {};
+      globalThis.__PLA_PROXY_SENDS[key] = (m, p) => dbg.sendCommand(m, p);
+      return 'OK:' + key;
     })()`;
     const r = await io.call('Runtime.evaluate', { expression: attachJs, returnByValue: true, awaitPromise: true });
     const v = r.result && r.result.result && r.result.result.value;
-    if (v !== 'OK') throw new Error('attach failed: ' + JSON.stringify(r).slice(0, 200));
+    if (typeof v !== 'string' || !v.startsWith('OK:')) {
+      throw new Error('attach failed: ' + JSON.stringify(r).slice(0, 200));
+    }
 
-    const br = new RendererBridge(io);
+    const br = new RendererBridge(io, v.slice(3));
     // R14: single-flight — concurrent sessions must never take heap snapshots in
     // parallel (each is ~160 MB; parallel ones corrupted pla-heap.json and a burst of
     // them crashed Plasticity). Later sessions wait for the running locate, then hit
@@ -384,8 +408,12 @@ class RendererBridge {
       });
     return br;
   }
-  constructor(io) {
+  constructor(io, key) {
     this.io = io;
+    /** R19: decimal HWND of the window this session drives. */
+    this.key = key;
+    /** Main-process expression for this window's send function. */
+    this.sendRef = `__PLA_PROXY_SENDS[${JSON.stringify(key)}]`;
     this.serverMsgCb = null;
     this.eventCb = null;
     this.buffer = Buffer.alloc(0);
@@ -402,7 +430,7 @@ class RendererBridge {
     const os = require('os');
     const heapPath = path.join(os.tmpdir(), 'pla-heap.json');
     const SEND = (method, params) => this.io.call('Runtime.evaluate', {
-      expression: `__PLA_PROXY_SEND(${JSON.stringify(method)}, ${JSON.stringify(params || {})})`,
+      expression: `${this.sendRef}(${JSON.stringify(method)}, ${JSON.stringify(params || {})})`,
       returnByValue: true, awaitPromise: true,
     }).then((r) => {
       const v = r.result && r.result.result && r.result.result.value;
@@ -413,23 +441,33 @@ class RendererBridge {
     //    R14 fix: SEND returns the inner CDP reply ({ result: { type, value } }),
     //    never a bare `true` — the old `pre === true` check never matched, so EVERY
     //    new session took a fresh ~160 MB heap snapshot.
-    try {
-      const pre = await SEND('Runtime.evaluate', {
-        expression: '!!window.__PLA_EDITOR__', returnByValue: true,
-      });
-      const exposed = pre === true || (pre && pre.result && pre.result.value === true);
-      if (exposed) return 'OK: already';
-    } catch (e) { /* fall through to full locate */ }
+    //    R19: the PLAhelper shim (window.__PLA__) finds the editor itself via the
+    //    Preact tree on 26.2.3, and pla-bridge injects it right after connecting —
+    //    so check again after a short wait before paying for a heap snapshot.
+    const exposedNow = async () => {
+      try {
+        const pre = await SEND('Runtime.evaluate', {
+          expression: '!!window.__PLA_EDITOR__ || !!(window.__PLA__ && window.__PLA__.hasEditor())',
+          returnByValue: true,
+        });
+        return pre === true || (pre && pre.result && pre.result.value === true);
+      } catch (e) { return false; }
+    };
+    if (await exposedNow()) return 'OK: already';
+    await new Promise((r) => setTimeout(r, 6000));
+    if (await exposedNow()) return 'OK: shim';
     // 1) take heap snapshot, collect chunks in the renderer-side main world
     const SNAP_JS = '(async () => {'
       + ' const electron = process.mainModule.require("electron");'
-      + ' const w = electron.BrowserWindow.getAllWindows()[0];'
+      + ' const hwndOf = ' + HWND_OF_JS + ';'
+      + ' const w = electron.BrowserWindow.getAllWindows().find((x) => hwndOf(x) === ' + JSON.stringify(this.key) + ');'
+      + ' if (!w) return "NO_SUCH_WINDOW";'
       + ' const dbg = w.webContents.debugger;'
       + ' const chunks = [];'
       + ' const onMsg = (ev, method, params) => { if (method === "HeapProfiler.addHeapSnapshotChunk") chunks.push(params.chunk); };'
       + ' dbg.on("message", onMsg);'
-      + ' await __PLA_PROXY_SEND("HeapProfiler.enable", {});'
-      + ' await __PLA_PROXY_SEND("HeapProfiler.takeHeapSnapshot", { reportProgress: false });'
+      + ' await ' + this.sendRef + '("HeapProfiler.enable", {});'
+      + ' await ' + this.sendRef + '("HeapProfiler.takeHeapSnapshot", { reportProgress: false });'
       + ' await new Promise(r => setTimeout(r, 8000));'
       + ' dbg.removeListener("message", onMsg);'
       + ' const fs = process.mainModule.require("fs");'
@@ -450,9 +488,9 @@ class RendererBridge {
     const edId = String(foundId);
     // 3) revive + expose (same session)
     const REVIVE_JS = '(async () => {'
-      + ' const r = await __PLA_PROXY_SEND("HeapProfiler.getObjectByHeapObjectId", { objectId: "' + edId + '" });'
+      + ' const r = await ' + this.sendRef + '("HeapProfiler.getObjectByHeapObjectId", { objectId: "' + edId + '" });'
       + ' if (!r || !r.result) return "ERR: revive " + JSON.stringify(r).slice(0, 120);'
-      + ' const t = await __PLA_PROXY_SEND("Runtime.callFunctionOn", {'
+      + ' const t = await ' + this.sendRef + '("Runtime.callFunctionOn", {'
       + '   objectId: r.result.objectId,'
       + '   functionDeclaration: "function(){ window.__PLA_EDITOR__ = this; return (this.selection && this.shading && this.viewports) ? \'OK\' : \'MISSING_FEATS\'; }",'
       + '   returnByValue: true });'
@@ -471,7 +509,7 @@ class RendererBridge {
       consumed = frameEnd;
       let msg;
       try { msg = JSON.parse(text); } catch (e) { return; }
-      const forward = `__PLA_PROXY_SEND(${JSON.stringify(msg.method)}, ${JSON.stringify(msg.params || {})})`;
+      const forward = `${this.sendRef}(${JSON.stringify(msg.method)}, ${JSON.stringify(msg.params || {})})`;
       this.io.call('Runtime.evaluate', {
         expression: forward,
         returnByValue: true, awaitPromise: true,
@@ -493,6 +531,26 @@ class RendererBridge {
 }
 
 /**
+ * R19: lists Plasticity's BrowserWindows (decimal HWND + title) over a short-lived
+ * inspector session.
+ * @return {Promise<Array<{hwnd:string,title:string}>>}
+ */
+async function listWindows() {
+  const io = await InspectorIO.connect();
+  try {
+    const expr = `(() => { const { BrowserWindow } = process.mainModule.require('electron');
+      const hwndOf = ${HWND_OF_JS};
+      return JSON.stringify(BrowserWindow.getAllWindows().filter((w) => !w.isDestroyed())
+        .map((w) => ({ hwnd: hwndOf(w), title: w.getTitle() }))); })()`;
+    const r = await io.call('Runtime.evaluate', { expression: expr, returnByValue: true });
+    const v = r.result && r.result.result && r.result.result.value;
+    return v ? JSON.parse(v) : [];
+  } finally {
+    try { io.ws.close(); } catch (e) {}
+  }
+}
+
+/**
  * Runs the 9333 proxy: /json/version, /json/list, and ws upgrade.
  * @return {Promise<void>} resolves never (server loop).
  */
@@ -510,22 +568,30 @@ function runProxy() {
         return;
       }
       if (req.url === '/json/list') {
-        // Content-Length explicit: the Rust client does not speak chunked.
-        const body = JSON.stringify([{
-          description: 'PLA CDP proxy (renderer via inspector)',
-          devtoolsFrontendUrl: '',
-          id: 'pla-proxy-renderer',
-          title: 'Plasticity',
-          type: 'page',
-          url: 'file:///plasticity-renderer',
-          webSocketDebuggerUrl: `ws://127.0.0.1:${PROXY_PORT}/`,
-        }]);
-        const payload = Buffer.from(body);
-        res.writeHead(200, {
-          'Content-Type': 'application/json',
-          'Content-Length': payload.length,
-        });
-        res.end(payload);
+        // R19: one "page" per Plasticity window, with its HWND, so each PLAhelper
+        // connects to the window it is bound to (ws path /hwnd/<n>).
+        listWindows()
+          .then((wins) => {
+            const body = JSON.stringify(wins.map((w) => ({
+              description: 'PLA CDP proxy (renderer via inspector)',
+              devtoolsFrontendUrl: '',
+              id: 'pla-' + w.hwnd,
+              title: w.title || 'Plasticity',
+              type: 'page',
+              hwnd: w.hwnd,
+              url: 'file:///plasticity-renderer',
+              webSocketDebuggerUrl: `ws://127.0.0.1:${PROXY_PORT}/hwnd/${w.hwnd}`,
+            })));
+            // Content-Length explicit: the Rust client does not speak chunked.
+            const payload = Buffer.from(body);
+            res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Length': payload.length });
+            res.end(payload);
+          })
+          .catch((e) => {
+            const payload = Buffer.from('inspector unreachable: ' + e.message);
+            res.writeHead(502, { 'Content-Length': payload.length });
+            res.end(payload);
+          });
         return;
       }
       res.writeHead(404); res.end();

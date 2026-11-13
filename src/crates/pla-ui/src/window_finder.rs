@@ -1,22 +1,31 @@
-//! Win32 窗口发现 + 多实例绑定(吸附目标)。
+//! Win32 窗口发现 + 多实例绑定(吸附目标) + 置顶管理。
 //!
-//! 多实例策略(两方案择一): 采用「进程序号」方案 — 每个实例枚举所有 pla-ui.exe
-//! 顶层窗口得到实例 PID 列表, 按进程创建时间排序后取自身位置 N, 绑定「按 HWND
-//! 排序的第 N 个 Plasticity 窗口」。相比「占用电」方案无需任何进程间共享状态,
-//! 实现简单且结果确定; 占用电不持久、重启重排可接受(需求已认可)。
+//! R19 多实例策略 = 「认领」: 每个 pla-ui 把自己绑定的 Plasticity HWND 写在自己工具栏
+//! 窗口的属性 `PLA_BOUND_HWND` 上(SetPropW, 跨进程可读)。绑定一旦建立就**跟着 HWND 走**
+//! (换文档、改标题、最小化都不换绑), 只有该窗口关闭才重新认领。新认领时跳过别的实例
+//! 已认领的窗口: 优先前台的 Plasticity 窗口, 否则按 Z 序取最近用过的那个。
+//! 两个实例同时认领同一窗口时, 先启动的保留, 后启动的让出。
+//! (旧「进程序号 + 文档名」方案每次轮询都重算, 标题一变就可能换绑、两个助手抢同一窗口,
+//! 快照墙因此混进别的文件的快照 — pitfalls #31。)
+//!
+//! 置顶: 只在绑定的 Plasticity 窗口(或其弹出窗口、或助手自己)处于前台时置顶;
+//! 切到别的程序就取消置顶并贴在自己的 Plasticity 窗口正上方(Z 序), 被别的窗口正常盖住。
 #![allow(clippy::upper_case_acronyms)]
 
 #[cfg(windows)]
 mod imp {
-    use windows::core::PWSTR;
-    use windows::Win32::Foundation::{CloseHandle, BOOL, FILETIME, HWND, LPARAM, RECT};
+    use windows::core::{PCWSTR, PWSTR};
+    use windows::Win32::Foundation::{CloseHandle, BOOL, FILETIME, HANDLE, HWND, LPARAM, RECT};
     use windows::Win32::System::Threading::{
         AttachThreadInput, GetCurrentThreadId, GetProcessTimes, OpenProcess,
         QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetForegroundWindow, GetWindowTextW, GetWindowRect, GetWindowThreadProcessId,
-        IsWindowVisible, SetForegroundWindow,
+        EnumWindows, GetAncestor, GetForegroundWindow, GetPropW, GetWindow, GetWindowLongPtrW,
+        GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow,
+        IsWindowVisible, RemovePropW, SetForegroundWindow, SetPropW, SetWindowPos, GA_ROOTOWNER,
+        GWL_EXSTYLE, GW_HWNDPREV, HWND_BOTTOM, HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE,
+        SWP_NOMOVE, SWP_NOSIZE, WS_EX_TOPMOST,
     };
 
     /// 一个可吸附的目标窗口(Plasticity 主窗口)。
@@ -28,6 +37,8 @@ mod imp {
         pub top: i32,
         pub right: i32,
         pub bottom: i32,
+        /// 已最小化(矩形无意义, 不做吸附定位; 但绑定保留)。
+        pub minimized: bool,
     }
 
     impl TargetWindow {
@@ -116,7 +127,7 @@ mod imp {
             .map(std::path::PathBuf::from)
     }
 
-    /// 全部可见的 Plasticity 主窗口, 按 HWND 升序。
+    /// 全部可见、未最小化的 Plasticity 主窗口, 按 Z 序(最前 → 最后, 即最近用过的在前)。
     pub fn find_plasticity_windows() -> Vec<TargetWindow> {
         let mut out = Vec::new();
         for hwnd in all_top_level_windows() {
@@ -145,10 +156,10 @@ mod imp {
                     top: rect.top,
                     right: rect.right,
                     bottom: rect.bottom,
+                    minimized: false,
                 });
             }
         }
-        out.sort_by_key(|w| w.hwnd);
         out
     }
 
@@ -172,57 +183,201 @@ mod imp {
         }
     }
 
-    /// 当前实例序号: 所有 pla-ui.exe 可见顶层窗口对应 PID(去重)按创建时间
-    /// 排序后, 自身 PID 的位置。0 = 最早启动的实例。
-    pub fn instance_ordinal() -> usize {
+    // ===================== R19: 认领式绑定 =====================
+
+    /// 认领属性名(写在本实例工具栏窗口上, 值 = 绑定的 Plasticity HWND)。
+    fn claim_prop() -> Vec<u16> {
+        "PLA_BOUND_HWND\0".encode_utf16().collect()
+    }
+
+    unsafe fn window_pid(hwnd: HWND) -> u32 {
+        let mut pid: u32 = 0;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        pid
+    }
+
+    /// 本进程里标题为 `root_title` 的顶层窗口(工具栏根窗口)。
+    pub fn own_root_window(root_title: &str) -> Option<isize> {
         let my_pid = std::process::id();
-        let mut pids: Vec<u32> = Vec::new();
-        for hwnd in all_top_level_windows() {
+        all_top_level_windows()
+            .into_iter()
+            .find(|&h| unsafe { window_pid(h) == my_pid && window_title(h) == root_title })
+            .map(|h| h.0)
+    }
+
+    /// 把认领写到本实例工具栏上(None = 撤销认领)。
+    pub fn set_claim(root: isize, target: Option<isize>) {
+        let name = claim_prop();
+        unsafe {
+            match target {
+                Some(t) => {
+                    let _ = SetPropW(HWND(root), PCWSTR(name.as_ptr()), HANDLE(t));
+                }
+                None => {
+                    let _ = RemovePropW(HWND(root), PCWSTR(name.as_ptr()));
+                }
+            }
+        }
+    }
+
+    /// 其他 pla-ui 实例的认领: (认领的 HWND, 认领者进程创建时间)。
+    fn foreign_claims() -> Vec<(isize, u64)> {
+        let my_pid = std::process::id();
+        let name = claim_prop();
+        let mut out = Vec::new();
+        for h in all_top_level_windows() {
             unsafe {
-                if !IsWindowVisible(hwnd).as_bool() {
+                let pid = window_pid(h);
+                if pid == 0 || pid == my_pid {
                     continue;
                 }
-                let is_self_image = process_image_name(hwnd)
+                let v = GetPropW(h, PCWSTR(name.as_ptr()));
+                if v.0 == 0 {
+                    continue;
+                }
+                let is_helper = process_image_name(h)
                     .as_deref()
                     .map(|p| image_file_name(p).eq_ignore_ascii_case("pla-ui.exe"))
                     .unwrap_or(false);
-                if !is_self_image {
-                    continue;
-                }
-                let mut pid: u32 = 0;
-                GetWindowThreadProcessId(hwnd, Some(&mut pid));
-                if pid != 0 && !pids.contains(&pid) {
-                    pids.push(pid);
+                if is_helper {
+                    out.push((v.0, process_creation_key(pid)));
                 }
             }
         }
-        let mut keyed: Vec<(u64, u32)> =
-            pids.into_iter().map(|pid| (process_creation_key(pid), pid)).collect();
-        keyed.sort_unstable();
-        keyed
-            .iter()
-            .position(|(_, pid)| *pid == my_pid)
-            .unwrap_or(0)
+        out
     }
 
-    /// 获取本实例应绑定的 Plasticity 窗口(第 N 个); 不足 N 个则 None(未绑定)。
-    /// R7-6: 多窗口时代(快照墙会开新 Plasticity 窗口), 裸 HWND 序不稳定 —
-    /// 优先绑标题含「<doc_key>.plasticity」的窗口(带扩展名, 快照窗口的
-    /// "model1-snap-..." 不会误匹配裸 "model1"); 无命中才退回全局第 N 个。
-    pub fn acquire_target(doc_key: &str) -> Option<TargetWindow> {
-        let idx = instance_ordinal();
-        let all = find_plasticity_windows();
-        let key = format!("{}.plasticity", doc_key.trim().trim_end_matches(".plasticity"));
-        if doc_key.trim().len() > 3 {
-            let matched: Vec<_> = all
-                .iter()
-                .filter(|w| w.title.to_lowercase().contains(&key.to_lowercase()))
-                .collect();
-            if let Some(w) = matched.into_iter().nth(idx) {
-                return Some(w.clone());
+    /// 读取一个仍然存在的 Plasticity 窗口(最小化也算, 标记 minimized)。
+    fn target_info(hwnd: isize) -> Option<TargetWindow> {
+        unsafe {
+            let h = HWND(hwnd);
+            if hwnd == 0 || !IsWindow(h).as_bool() || !IsWindowVisible(h).as_bool() {
+                return None;
+            }
+            let title = window_title(h);
+            if !is_plasticity_window(h, &title) {
+                return None;
+            }
+            let minimized = IsIconic(h).as_bool();
+            let rect = window_rect(h).unwrap_or_default();
+            Some(TargetWindow {
+                hwnd,
+                title,
+                left: rect.left,
+                top: rect.top,
+                right: rect.right,
+                bottom: rect.bottom,
+                minimized,
+            })
+        }
+    }
+
+    /// 绑定决策(纯逻辑, 便于单测)。
+    /// `current` = 现绑定且仍存在的窗口; `windows` = 可认领候选(Z 序); `fg` = 前台窗口;
+    /// `claims` = 他人认领 (HWND, 认领者创建时间); `me` = 本进程创建时间。
+    pub fn decide_binding(
+        current: Option<isize>,
+        windows: &[isize],
+        fg: Option<isize>,
+        claims: &[(isize, u64)],
+        me: u64,
+    ) -> Option<isize> {
+        let claimed_by_older = |h: isize| claims.iter().any(|&(c, t)| c == h && t < me);
+        let claimed = |h: isize| claims.iter().any(|&(c, _)| c == h);
+        if let Some(cur) = current {
+            // 已绑定: 除非被更早启动的实例认领(同时认领的冲突), 否则一直保持。
+            if !claimed_by_older(cur) {
+                return Some(cur);
             }
         }
-        all.into_iter().nth(idx)
+        let free: Vec<isize> = windows.iter().copied().filter(|&h| !claimed(h)).collect();
+        if let Some(f) = fg.filter(|f| free.contains(f)) {
+            return Some(f);
+        }
+        free.first().copied()
+    }
+
+    /// 解析本实例应绑定的窗口并更新认领。`current` = 上一轮绑定的 HWND。
+    pub fn bind_target(current: Option<isize>, root: Option<isize>) -> Option<TargetWindow> {
+        let alive = current.and_then(target_info);
+        let windows: Vec<isize> = find_plasticity_windows().iter().map(|w| w.hwnd).collect();
+        let fg = unsafe {
+            let f = GetForegroundWindow();
+            let r = GetAncestor(f, GA_ROOTOWNER);
+            if r.0 != 0 { Some(r.0) } else if f.0 != 0 { Some(f.0) } else { None }
+        };
+        let me = process_creation_key(std::process::id());
+        let chosen = decide_binding(alive.as_ref().map(|w| w.hwnd), &windows, fg, &foreign_claims(), me);
+        if let Some(root) = root {
+            set_claim(root, chosen);
+        }
+        match chosen {
+            Some(h) if alive.as_ref().map(|w| w.hwnd) == Some(h) => alive,
+            Some(h) => target_info(h),
+            None => None,
+        }
+    }
+
+    // ===================== R19: 置顶管理 =====================
+
+    /// 绑定窗口是否"处于前台": 前台是它本身、它的弹出/被拥有窗口, 或助手自己的窗口。
+    pub fn target_is_active(target: isize) -> bool {
+        unsafe {
+            let fg = GetForegroundWindow();
+            if fg.0 == 0 {
+                return false;
+            }
+            if fg.0 == target || GetAncestor(fg, GA_ROOTOWNER).0 == target {
+                return true;
+            }
+            window_pid(fg) == std::process::id()
+        }
+    }
+
+    /// 本进程可见的顶层窗口(工具栏、面板、提示浮窗)。
+    fn own_windows() -> Vec<HWND> {
+        let my_pid = std::process::id();
+        all_top_level_windows()
+            .into_iter()
+            .filter(|&h| unsafe { window_pid(h) == my_pid && IsWindowVisible(h).as_bool() })
+            .collect()
+    }
+
+    /// 按需切换置顶。返回是否做了改动。
+    /// * `active` → 全部置顶;
+    /// * 否则 → 取消置顶, 并放到绑定窗口正上方(被别的程序正常遮挡); 绑定窗口最小化或
+    ///   未绑定时沉到底部(不在桌面上漂着)。
+    /// 只在 WS_EX_TOPMOST 与期望不符时动手(winit 改样式不碰置顶位, 不会来回打架)。
+    pub fn sync_topmost(target: Option<&TargetWindow>, active: bool) -> bool {
+        let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
+        let mut changed = false;
+        for h in own_windows() {
+            unsafe {
+                let topmost = GetWindowLongPtrW(h, GWL_EXSTYLE) & (WS_EX_TOPMOST.0 as isize) != 0;
+                if active == topmost {
+                    continue;
+                }
+                changed = true;
+                if active {
+                    let _ = SetWindowPos(h, HWND_TOPMOST, 0, 0, 0, 0, flags);
+                    continue;
+                }
+                let _ = SetWindowPos(h, HWND_NOTOPMOST, 0, 0, 0, 0, flags);
+                match target {
+                    Some(t) if !t.minimized => {
+                        // 插到"绑定窗口上面那个窗口"之后 = 紧贴绑定窗口之上。
+                        let prev = GetWindow(HWND(t.hwnd), GW_HWNDPREV);
+                        if prev.0 != 0 && prev != h {
+                            let _ = SetWindowPos(h, prev, 0, 0, 0, 0, flags);
+                        }
+                    }
+                    _ => {
+                        let _ = SetWindowPos(h, HWND_BOTTOM, 0, 0, 0, 0, flags);
+                    }
+                }
+            }
+        }
+        changed
     }
 
     /// 把前台焦点交还给定窗口(R7-26)。
@@ -259,23 +414,35 @@ mod imp {
     /// 非 Windows 平台占位: 永远未绑定(UI 仍可用, 只是没有吸附)。
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct TargetWindow {
+        pub hwnd: isize,
         pub title: String,
         pub left: i32,
         pub top: i32,
         pub right: i32,
         pub bottom: i32,
+        pub minimized: bool,
     }
 
     pub fn find_plasticity_windows() -> Vec<TargetWindow> {
         Vec::new()
     }
 
-    pub fn instance_ordinal() -> usize {
-        0
+    pub fn own_root_window(_root_title: &str) -> Option<isize> {
+        None
     }
 
-    pub fn acquire_target() -> Option<TargetWindow> {
+    pub fn set_claim(_root: isize, _target: Option<isize>) {}
+
+    pub fn bind_target(_current: Option<isize>, _root: Option<isize>) -> Option<TargetWindow> {
         None
+    }
+
+    pub fn target_is_active(_target: isize) -> bool {
+        false
+    }
+
+    pub fn sync_topmost(_target: Option<&TargetWindow>, _active: bool) -> bool {
+        false
     }
 
     /// 非 Windows 平台占位: 无焦点操作。
@@ -285,3 +452,27 @@ mod imp {
 }
 
 pub use imp::*;
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::decide_binding;
+
+    #[test]
+    fn binding_sticks_and_respects_claims() {
+        let me = 100;
+        // 已绑定 → 保持(即使不在前台、Z 序不在最前)
+        assert_eq!(decide_binding(Some(2), &[1, 2], Some(1), &[], me), Some(2));
+        // 首次: 优先未被认领的前台窗口
+        assert_eq!(decide_binding(None, &[1, 2, 3], Some(3), &[], me), Some(3));
+        // 前台窗口已被别人认领 → 取 Z 序最前的空闲窗口
+        assert_eq!(decide_binding(None, &[1, 2, 3], Some(3), &[(3, 50)], me), Some(1));
+        // 全被认领 → 不绑定
+        assert_eq!(decide_binding(None, &[1, 2], Some(1), &[(1, 50), (2, 200)], me), None);
+        // 同时认领冲突: 更早启动的实例(50 < 100)拿着同一窗口 → 我让出, 改认领空闲的
+        assert_eq!(decide_binding(Some(1), &[1, 2], Some(1), &[(1, 50)], me), Some(2));
+        // 更晚启动的实例(200)认领了我的窗口 → 我保留(它会让出)
+        assert_eq!(decide_binding(Some(1), &[1, 2], Some(1), &[(1, 200)], me), Some(1));
+        // 绑定窗口已关闭(current=None)→ 重新认领
+        assert_eq!(decide_binding(None, &[2], None, &[], me), Some(2));
+    }
+}

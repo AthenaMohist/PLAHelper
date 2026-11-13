@@ -170,6 +170,10 @@ struct PlaApp {
     cdp_caps: Option<pla_bridge::shim::CapsReport>,
     /// 最近一次收到能力探测的时刻。
     cdp_caps_at: Option<Instant>,
+    /// R19: 本实例工具栏根窗口 HWND(缓存)。
+    root_hwnd: Option<isize>,
+    /// R19: 上次置顶同步时刻。
+    last_topmost_sync: Instant,
     /// 实时选择快照 (kind, id, name, ctor)。
     live_sel: Vec<pla_bridge::cdp::SelItem>,
     /// R7-26: 上一次实时选择的 key 集合("kind:id"), 用于侦测选择变化。
@@ -1675,6 +1679,8 @@ impl PlaApp {
             cdp_status: "CDP 连接中…".into(),
             cdp_caps: None,
             cdp_caps_at: None,
+            root_hwnd: None,
+            last_topmost_sync: Instant::now(),
             live_sel: Vec::new(),
             live_sel_keys: Vec::new(),
             pending_focus: false,
@@ -2090,13 +2096,7 @@ impl PlaApp {
     /// Plasticity 收不到键盘事件 → 主程序任何操作都不生效(用户实测)。
     /// 应用完成后主动把焦点还回去, 用户的下一步(shift+D / E / G)可直接按。
     fn focus_plasticity(&mut self) {
-        let target = match self.snap_target.as_ref() {
-            Some(t) => t.clone(),
-            None => match window_finder::acquire_target(&self.doc_key) {
-                Some(t) => t,
-                None => return,
-            },
-        };
+        let Some(target) = self.snap_target.clone() else { return };
         if window_finder::focus_window(target.hwnd) {
             self.hovered_hint = Some((
                 "焦点已交还 Plasticity".into(),
@@ -2144,8 +2144,11 @@ impl PlaApp {
             return;
         }
         // R8-3: 用户拖动后停在拖动位置; 拖回默认锚点附近(SNAP_REENTER_X_PT/Y_PT)才恢复吸附。
+        // R19: 认领式绑定 — 跟着 HWND 走, 换文档/改标题/最小化都不换绑。
+        let root = self.own_root();
+        let bound = window_finder::bind_target(self.snap_target.as_ref().map(|t| t.hwnd), root);
         if self.toolbar_drag_pos.is_some() {
-            if let Some(target) = window_finder::acquire_target(&self.doc_key).clone() {
+            if let Some(target) = bound.clone().filter(|t| !t.minimized) {
                 let ppp = ctx.pixels_per_point();
                 let anchor = self.default_anchor(&target, ctx, ppp);
                 if let (Some(dp), Some(da)) = (self.toolbar_drag_pos, anchor) {
@@ -2156,6 +2159,7 @@ impl PlaApp {
                     } else {
                         // 保持拖动位置: 只更新绑定/探测, 不发 OuterPosition
                         self.snap_target = Some(target.clone());
+                        self.cdp.set_target(Some(target.hwnd));
                         if self.last_probe_poll.elapsed()
                             >= Duration::from_millis(PROBE_POLL_MS)
                             || self
@@ -2174,8 +2178,9 @@ impl PlaApp {
                 }
             }
         }
-        let new_target = window_finder::acquire_target(&self.doc_key);
-        self.snap_target = new_target;
+        self.snap_target = bound;
+        // R19: CDP 跟随绑定窗口(多窗口时每个助手只读写自己那扇窗口的 renderer)。
+        self.cdp.set_target(self.snap_target.as_ref().map(|t| t.hwnd));
         // R7-17: doc_key 跟随绑定窗口标题("model1.plasticity - Plasticity" →
         // "model1") — 多文档/多窗口时快照/选择集/实体缓存按文档隔离(PRD 验收)。
         if let Some(target) = self.snap_target.clone() {
@@ -2200,6 +2205,11 @@ impl PlaApp {
             self.probed_edge = None;
             return;
         };
+        // 最小化: 保持绑定, 不定位(矩形是 -32000); 置顶管理会把助手沉到底部。
+        if target.minimized {
+            self.last_snap_anchor = None;
+            return;
+        }
         // 文件名探测: 换绑定窗口立即探, 同窗口按 PROBE_POLL_MS 节流
         // (文件名长度随文档切换变化, 需周期性刷新)。
         if self.last_probe_poll.elapsed() >= Duration::from_millis(PROBE_POLL_MS)
@@ -2289,6 +2299,42 @@ impl PlaApp {
             },
             Err(_) => (true, format!("「{raw}」不是数字")),
         });
+    }
+
+    /// R19: Bridge 状态文本 — 连不上且 CDP 看到 Plasticity 的 Bridge 服务端已关闭时, 直接说清原因和恢复办法。
+    fn bridge_status_text(&self) -> String {
+        let closed = self
+            .cdp_caps
+            .as_ref()
+            .and_then(|c| c.bridge_server.as_ref())
+            .filter(|b| b.closed_while_enabled());
+        match closed {
+            Some(b) if !self.bridge_status.starts_with("已连接") => format!(
+                "Plasticity 的 Bridge 服务已停止(端口 {} 多半在启动时被占用)。到 Plasticity 偏好设置 → Network, \
+                 把 Server 关掉再打开即可恢复",
+                b.port.unwrap_or(8980)
+            ),
+            _ => self.bridge_status.clone(),
+        }
+    }
+
+    /// R19: 本实例工具栏根窗口(认领属性写在它上面); 找到后缓存。
+    fn own_root(&mut self) -> Option<isize> {
+        if self.root_hwnd.is_none() {
+            self.root_hwnd = window_finder::own_root_window(ROOT_TITLE);
+        }
+        self.root_hwnd
+    }
+
+    /// R19: 置顶只在绑定窗口(或其弹窗、或助手自己)处于前台时生效; 100ms 节流。
+    fn update_topmost(&mut self) {
+        if self.toolbar_dragging || self.last_topmost_sync.elapsed() < Duration::from_millis(100) {
+            return;
+        }
+        self.last_topmost_sync = Instant::now();
+        let target = self.snap_target.as_ref();
+        let active = target.map_or(false, |t| !t.minimized && window_finder::target_is_active(t.hwnd));
+        window_finder::sync_topmost(target, active);
     }
 
     /// CDP 通道是否已连上 Plasticity。
@@ -2606,6 +2652,7 @@ impl eframe::App for PlaApp {
         self.proxy.tick();
         self.poll_bridge();
         self.update_snap(ctx);
+        self.update_topmost();
         // R9-2: 一级面板拖动中(二级面板别据此误判"用户挪了我")。
         PRIMARY_DRAGGING.set(self.toolbar_dragging);
         // R13: 圆角 = Win11 DWM 系统圆角(抗锯齿, 不依赖窗口透明), 取代 SetWindowRgn
@@ -2707,7 +2754,7 @@ impl eframe::App for PlaApp {
                             format!(
                                 "{win}\n{}\nBridge(只读): {}\n单击: CDP 能力面板 · 双击: 归位",
                                 self.cdp_summary(),
-                                self.bridge_status
+                                self.bridge_status_text()
                             ),
                         ));
                     }
@@ -2815,7 +2862,7 @@ impl eframe::App for PlaApp {
                             self.toolbar_drag_pos,
                             self.snap_target
                                 .clone()
-                                .or_else(|| window_finder::acquire_target(&self.doc_key)),
+                                .filter(|t| !t.minimized),
                         ) {
                             let ppp = ctx.pixels_per_point();
                             if let Some(da) = self.default_anchor(&target, ctx, ppp) {
@@ -2840,7 +2887,7 @@ impl eframe::App for PlaApp {
                     if let Some(target) = self
                         .snap_target
                         .clone()
-                        .or_else(|| window_finder::acquire_target(&self.doc_key))
+                        .filter(|t| !t.minimized)
                     {
                         let ppp = ctx.pixels_per_point();
                         if let Some(da) = self.default_anchor(&target, ctx, ppp) {
@@ -4180,7 +4227,7 @@ impl eframe::App for PlaApp {
                                     None => "未绑定(等待 Plasticity…)".into(),
                                 };
                                 value_row(ui, "绑定窗口", &bind_text, COL_TEXT);
-                                value_row(ui, "状态", &self.bridge_status, status_color(&self.bridge_status));
+                                value_row(ui, "状态", &self.bridge_status_text(), status_color(&self.bridge_status));
                             },
                         );
                         // ---- F7: Plasticity 默认以 CDP 模式运行(pla-ui 托管代理) ----
@@ -4412,7 +4459,7 @@ impl eframe::App for PlaApp {
                     age_s: self.cdp_caps_at.map(|t| t.elapsed().as_secs()),
                     cdp_status: self.cdp_status.clone(),
                     proxy_status: self.proxy.status.clone(),
-                    bridge_status: self.bridge_status.clone(),
+                    bridge_status: self.bridge_status_text(),
                 };
                 let mut reprobe = false;
                 show_child_window(

@@ -94,6 +94,25 @@ pub struct CapsReport {
     pub caps: std::collections::BTreeMap<String, CapState>,
     /// 走了备选路径的表键 → 实际命中的路径（Plasticity 改过名的痕迹）。
     pub alt_paths: std::collections::BTreeMap<String, String>,
+    /// 官方 Bridge 服务端状态（环境诊断，不是能力）。
+    pub bridge_server: Option<BridgeServer>,
+}
+
+/// Plasticity 内置 Bridge（WebSocket 服务端）状态。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BridgeServer {
+    /// ws 库 `_state`：0 运行中 / 1 关闭中 / 2 已关闭；None = 读不到。
+    pub state: Option<i64>,
+    pub port: Option<i64>,
+    /// 偏好设置里 Server 开关。
+    pub enabled: bool,
+}
+
+impl BridgeServer {
+    /// 设置里开着、服务端却已关闭（典型：启动时端口被占用，监听失败）。
+    pub fn closed_while_enabled(&self) -> bool {
+        self.enabled && matches!(self.state, Some(1) | Some(2))
+    }
 }
 
 fn str_list(v: &Value) -> Vec<String> {
@@ -133,6 +152,11 @@ impl CapsReport {
             rev: v["rev"].as_str().unwrap_or("").to_string(),
             caps,
             alt_paths,
+            bridge_server: v["env"]["bridge"].as_object().map(|b| BridgeServer {
+                state: b.get("state").and_then(|x| x.as_i64()),
+                port: b.get("port").and_then(|x| x.as_i64()),
+                enabled: b.get("enabled").and_then(|x| x.as_bool()) == Some(true),
+            }),
         }
     }
 
@@ -354,9 +378,13 @@ mod tests {
                 "vp.state": {"ok": true, "missing": [], "optionalMissing": ["vp.settings.grid"]},
                 "mat.set": {"ok": false, "missing": [], "todo": "N1"}
             },
-            "altPaths": {"ed.undoStack": "history.undoStack"}
+            "altPaths": {"ed.undoStack": "history.undoStack"},
+            "env": {"bridge": {"state": 2, "port": 8980, "enabled": true}}
         });
         let r = CapsReport::from_probe(&v);
+        let b = r.bridge_server.clone().unwrap();
+        assert!(b.closed_while_enabled(), "设置开着但服务端已关闭");
+        assert_eq!(b.port, Some(8980));
         assert!(r.editor);
         assert_eq!(r.finder.as_deref(), Some("preact"));
         assert_eq!(r.failed_count(), 1, "todo 不计入失效");

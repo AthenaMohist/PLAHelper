@@ -134,6 +134,8 @@ pub struct CdpHandle {
     tx: std::sync::mpsc::Sender<CdpCmd>,
     rx: Receiver<CdpEvent>,
     pub port: u16,
+    /// R19: 要连接的 Plasticity 窗口 HWND(0 = 任意/第一个)。多窗口时每个助手只连自己那扇窗口。
+    target: std::sync::Arc<std::sync::atomic::AtomicIsize>,
 }
 
 impl CdpHandle {
@@ -141,11 +143,18 @@ impl CdpHandle {
     pub fn spawn(port: u16) -> Self {
         let (tx, rx) = std::sync::mpsc::channel::<CdpCmd>();
         let (ev_tx, ev_rx) = std::sync::mpsc::channel::<CdpEvent>();
+        let target = std::sync::Arc::new(std::sync::atomic::AtomicIsize::new(0));
+        let t2 = target.clone();
         std::thread::Builder::new()
             .name("pla-cdp".into())
-            .spawn(move || cdp_thread_main(port, rx, ev_tx))
+            .spawn(move || cdp_thread_main(port, t2, rx, ev_tx))
             .expect("spawn pla-cdp thread");
-        Self { tx, rx: ev_rx, port }
+        Self { tx, rx: ev_rx, port, target }
+    }
+
+    /// R19: 设置要连接的窗口; 与当前连接的不同时, CDP 线程会断开并重连到新窗口。
+    pub fn set_target(&self, hwnd: Option<isize>) {
+        self.target.store(hwnd.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn send(&self, cmd: CdpCmd) {
@@ -213,7 +222,13 @@ const ROLL_HOOK_JS: &str = r#"(function(){
   return 'ok:' + n;
 })()"#;
 
-fn cdp_thread_main(port: u16, cmd_rx: Receiver<CdpCmd>, ev_tx: std::sync::mpsc::Sender<CdpEvent>) {
+fn cdp_thread_main(
+    port: u16,
+    target: std::sync::Arc<std::sync::atomic::AtomicIsize>,
+    cmd_rx: Receiver<CdpCmd>,
+    ev_tx: std::sync::mpsc::Sender<CdpEvent>,
+) {
+    use std::sync::atomic::Ordering;
     let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
         Ok(rt) => rt,
         Err(e) => {
@@ -228,10 +243,11 @@ fn cdp_thread_main(port: u16, cmd_rx: Receiver<CdpCmd>, ev_tx: std::sync::mpsc::
             // 未就绪时 /json/list 或 WS 握手可能不响应, http_get/connect_async
             // 本身无超时, 线程会永久卡死且一个事件都发不出(UI 永远停在
             // 「CDP 连接中…」)。超时丢弃本次尝试, 下轮重试即恢复。
-            match tokio::time::timeout(Duration::from_secs(5), connect_page(port)).await {
+            let want = target.load(Ordering::Relaxed);
+            match tokio::time::timeout(Duration::from_secs(5), connect_page(port, want)).await {
                 Ok(Ok(mut ws)) => {
                     let _ = ev_tx.send(CdpEvent::Status("CDP 已连接".into()));
-                    if let Err(e) = session_loop(&mut ws, &cmd_rx, &ev_tx).await {
+                    if let Err(e) = session_loop(&mut ws, &cmd_rx, &ev_tx, &target, want).await {
                         eprintln!("[pla-cdp] session err: {e:#}");
                         let _ = ev_tx.send(CdpEvent::Status(format!("CDP 断开: {e}")));
                     }
@@ -263,6 +279,10 @@ fn cdp_thread_main(port: u16, cmd_rx: Receiver<CdpCmd>, ev_tx: std::sync::mpsc::
             if let Ok(CdpCmd::Shutdown) = cmd_rx.try_recv() {
                 return;
             }
+            // R19: 绑定窗口刚变 → 立即连新窗口, 不等冷却。
+            if target.load(Ordering::Relaxed) != want {
+                continue;
+            }
             tokio::time::sleep(Duration::from_millis(2000)).await;
         }
     });
@@ -272,18 +292,37 @@ type WsStream = tokio_tungstenite::WebSocketStream<
     tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
 >;
 
-/// 连 page target。
-async fn connect_page(port: u16) -> anyhow::Result<WsStream> {
+/// R19: 从 /json/list 里选目标。`want` = 绑定窗口 HWND(0 = 任意)。
+/// 代理(R19 起)给每个 Plasticity 窗口列一个 page, 带 `hwnd` 字段; 旧代理没有该字段 → 退回第一个。
+fn pick_page(list: &Value, want: isize) -> anyhow::Result<&Value> {
+    let pages: Vec<&Value> = list
+        .as_array()
+        .map(|a| a.iter().filter(|t| t["type"] == "page").collect())
+        .unwrap_or_default();
+    let first = || {
+        pages
+            .iter()
+            .copied()
+            .find(|t| t["title"].as_str().unwrap_or("").contains("Plasticity"))
+            .or_else(|| pages.first().copied())
+            .ok_or_else(|| anyhow::anyhow!("no page target"))
+    };
+    if want == 0 || !pages.iter().any(|t| t.get("hwnd").is_some()) {
+        return first();
+    }
+    let w = want.to_string();
+    pages
+        .iter()
+        .copied()
+        .find(|t| t["hwnd"].as_str() == Some(w.as_str()))
+        .ok_or_else(|| anyhow::anyhow!("绑定的 Plasticity 窗口(HWND {want})不在 CDP 目标列表里"))
+}
+
+/// 连 page target(`want` = 绑定窗口 HWND, 0 = 任意)。
+async fn connect_page(port: u16, want: isize) -> anyhow::Result<WsStream> {
     let body = http_get(port, "/json/list").await?;
     let v: Value = serde_json::from_str(&body)?;
-    let page = v
-        .as_array()
-        .and_then(|a| {
-            a.iter()
-                .find(|t| t["type"] == "page" && t["title"].as_str().unwrap_or("").contains("Plasticity"))
-        })
-        .or_else(|| v.as_array().and_then(|a| a.iter().find(|t| t["type"] == "page")))
-        .ok_or_else(|| anyhow::anyhow!("no page target"))?;
+    let page = pick_page(&v, want)?;
     let ws_url = page["webSocketDebuggerUrl"]
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("no ws url"))?
@@ -304,6 +343,8 @@ async fn session_loop(
     ws: &mut WsStream,
     cmd_rx: &Receiver<CdpCmd>,
     ev_tx: &std::sync::mpsc::Sender<CdpEvent>,
+    target: &std::sync::atomic::AtomicIsize,
+    connected_to: isize,
 ) -> anyhow::Result<()> {
     use futures_util::StreamExt;
     let mut mid: u64 = 10;
@@ -320,6 +361,10 @@ async fn session_loop(
     publish_caps(ev_tx, &mut last_caps, caps);
 
     loop {
+        // R19: 助手换绑了窗口 → 断开, 由外层立即重连到新窗口。
+        if target.load(std::sync::atomic::Ordering::Relaxed) != connected_to {
+            return Err(anyhow::anyhow!("绑定窗口已变更, 重新连接"));
+        }
         // --- UI 命令(非阻塞) ---
         match cmd_rx.try_recv() {
             Ok(CdpCmd::Shutdown) => return Err(anyhow::anyhow!("shutdown")),
@@ -2059,6 +2104,20 @@ mod tests {
         assert!(js.contains("changeSelection"), "缺少 onHover 信号包装");
         // v5 铁律: 不得读 stale 点击会话
         assert!(!js.contains("selection.hits"), "Phase A 禁用 stale hits 数据源");
+    }
+
+    #[test]
+    fn pick_page_follows_bound_window() {
+        let multi = serde_json::json!([
+            {"type":"page","title":"a.plasticity - Plasticity","hwnd":"111","webSocketDebuggerUrl":"ws://x/hwnd/111"},
+            {"type":"page","title":"b.plasticity - Plasticity","hwnd":"222","webSocketDebuggerUrl":"ws://x/hwnd/222"}
+        ]);
+        assert_eq!(pick_page(&multi, 222).unwrap()["hwnd"], "222");
+        assert_eq!(pick_page(&multi, 0).unwrap()["hwnd"], "111", "未绑定 → 第一个");
+        assert!(pick_page(&multi, 333).is_err(), "绑定窗口不在列表里必须报错, 不能连错窗口");
+        // 旧代理(无 hwnd 字段): 退回第一个
+        let old = serde_json::json!([{"type":"page","title":"Plasticity","webSocketDebuggerUrl":"ws://x/"}]);
+        assert_eq!(pick_page(&old, 222).unwrap()["title"], "Plasticity");
     }
 
     #[test]

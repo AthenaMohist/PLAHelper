@@ -31,6 +31,10 @@
 | 28 | 代理链路收不到 `Page.loadEventFired` | pla-cdp-v8 代理只回转发命令的回包, `eventCb` 从未调用; 假 target id 写死, 也看不到 target 变化 | F4 在主进程侧感知 renderer 重载(待做) |
 | 29 | 工具栏状态点的悬浮提示右侧、底部被裁 | HUD 视口固定 260×56, 提示文字不换行; 窗口标题一长或多一行就溢出 | HUD 高度按内容实测(`hud_size`, 用同一换行宽度 layout), Label 一律 `.wrap()`, 长标题截断(R18) |
 | 30 | CDP 已连接, 工具栏状态灯却是红色 | 状态点内点沿用 U7 时代的语义 = 官方 bridge(8980)状态; 路线改为 CDP 主通道后 bridge 只是只读冗余, 它断开不影响任何功能, 却占着最显眼的灯 | 内点 = CDP 连接状态, 外环 = 能力受损提示, bridge 只进悬停提示/能力面板(R18.1) |
+| 31 | 多开时助手绑错窗口 / 两个助手叠在同一窗口 / 快照墙混进别的文件 | 旧绑定每轮按「pla-ui 启动序号 + 标题含文档名」重算: 标题一变(开文件、切文档、快照窗口弹出)就可能换绑, doc_key 跟着跳 | 认领式绑定: HWND 写在自己工具栏的窗口属性上, 跟着 HWND 走, 跳过他人认领(R19) |
+| 32 | Bridge 连不上, 但 Plasticity 设置里 Server 开着、端口 8980 | 服务端(ws WebSocketServer)`_state=2` 已关闭: 启动时端口被占用(上一个 Plasticity 没退干净)→ 监听失败自行关闭, 设置开关不会反映 | 设置里关掉再打开 Server; pla-ui 经垫片读服务端状态, 识别后直接提示(R19) |
+| 33 | 两个 Plasticity 窗口时, 第二个窗口的助手读写的是第一个窗口 | 一个进程多个 BrowserWindow; 代理写死 `getAllWindows()[0]` | 代理按窗口列目标(带 hwnd, ws 路径 /hwnd/<n>), pla-bridge 按绑定 HWND 连接(R19) |
+| 34 | 助手在切到别的程序后仍压在最上面 | 所有视口固定 `AlwaysOnTop` | 前台判定后用 SetWindowPos 切换: 非前台时 NOTOPMOST 并插到绑定窗口正上方; 只在 WS_EX_TOPMOST 与期望不符时动手(winit 改样式不碰置顶位)(R19) |
 | 14 | 切换面板时旧面板滞留、新面板不出现、点击丢失 | R12 加深的文档定位(`find_latest_doc`)每次未命中都全盘深扫(热缓存 ~2s, 冷缓存 ~19s), 面板每帧取文档目录, 2s TTL 一过就在 UI 线程重扫 | 分阶段: leveldb + Recent 命中即返回; 深扫未命中负缓存 60s(R13) |
 
 ## 假按钮教训

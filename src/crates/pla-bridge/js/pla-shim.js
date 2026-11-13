@@ -43,6 +43,10 @@
     'ed.shading.section':      ['ed', 'shading._sectionMode'],
     'ed.shading.changed':      ['ed', 'shading.signals.shadingChanged'],
     'ed.sections':             ['ed', 'sections.sections'],
+    // 官方 Bridge(8980)服务端: ws 库 WebSocketServer, _state 0=运行 1=关闭中 2=已关闭。
+    'ed.bridge.state':         ['ed', 'websocket.server._state'],
+    'ed.bridge.port':          ['ed', 'websocket.server.options.port', 'settings.Server.port'],
+    'ed.bridge.enabled':       ['ed', 'settings.Server.enabled'],
     'sel.selected':            ['ed', 'selection.selected'],
     'sel.size':                ['sel', 'size'],
     'vp.camera':               ['vp', 'camera'],
@@ -282,10 +286,20 @@
     Object.keys(state.hits).forEach(function (k) {
       if (state.hits[k] !== LOC[k][1]) hits[k] = state.hits[k]; // 只报走了备选路径的键
     });
+    // 环境诊断(不属于能力): 官方 Bridge 服务端状态 — bridge 连不上时用来说清原因。
+    var env = {};
+    if (editor()) {
+      var bs = get('ed.bridge.state');
+      env.bridge = {
+        state: typeof bs === 'number' ? bs : null,
+        port: get('ed.bridge.port') || null,
+        enabled: get('ed.bridge.enabled') === true
+      };
+    }
     return {
       api: API_VERSION, rev: CFG.rev, plasticity: CFG.plasticityVersion || null,
       editor: { ok: !!editor(), finder: state.finder, gen: state.gen },
-      caps: caps, altPaths: hits
+      caps: caps, altPaths: hits, env: env
     };
   }
 
