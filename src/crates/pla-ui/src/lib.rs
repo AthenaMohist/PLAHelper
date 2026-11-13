@@ -5,6 +5,7 @@ pub mod features;
 pub mod formula;
 pub mod hotkey;
 pub mod notes;
+pub mod notes_table;
 pub mod notes_ui;
 pub mod plasticity_config;
 pub mod prefs;

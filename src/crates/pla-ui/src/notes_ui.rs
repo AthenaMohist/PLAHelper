@@ -38,6 +38,34 @@ const HANDLE_W: f32 = 14.0;
 const MARK_W: f32 = 22.0;
 const BODY_SIZE: f32 = 13.5;
 
+/// 文字色预设(深色 #181818 底上清晰可读)。
+const TEXT_COLORS: [([u8; 3], &str, &str); 8] = [
+    ([0xFF, 0x6B, 0x6B], "红", "Red"),
+    ([0xFF, 0xA9, 0x4D], "橙", "Orange"),
+    ([0xFF, 0xD4, 0x3B], "黄", "Yellow"),
+    ([0x69, 0xDB, 0x7C], "绿", "Green"),
+    ([0x3B, 0xC9, 0xDB], "青", "Cyan"),
+    ([0x4D, 0xAB, 0xF7], "蓝", "Blue"),
+    ([0xB1, 0x97, 0xFC], "紫", "Purple"),
+    ([0xAD, 0xB5, 0xBD], "灰", "Gray"),
+];
+
+/// 高亮(背景)色预设: 偏暗, 浅色字压在上面仍然清楚。
+const BG_COLORS: [([u8; 3], &str, &str); 8] = [
+    ([0x5C, 0x2B, 0x2B], "红", "Red"),
+    ([0x5C, 0x3D, 0x1E], "橙", "Orange"),
+    ([0x5C, 0x52, 0x17], "黄", "Yellow"),
+    ([0x23, 0x4D, 0x2C], "绿", "Green"),
+    ([0x1C, 0x4A, 0x50], "青", "Cyan"),
+    ([0x1E, 0x3A, 0x5F], "蓝", "Blue"),
+    ([0x3F, 0x2D, 0x63], "紫", "Purple"),
+    ([0x3A, 0x3D, 0x42], "灰", "Gray"),
+];
+
+fn rgb(c: [u8; 3]) -> Color32 {
+    Color32::from_rgb(c[0], c[1], c[2])
+}
+
 pub struct NotesPanel {
     doc_key: Option<String>,
     note: Note,
@@ -48,14 +76,20 @@ pub struct NotesPanel {
     pending_focus: Option<(u64, Option<usize>)>,
     /// 最近编辑过的块(面板工具条按钮作用对象 — 点按钮时编辑框已失焦)。
     last_focus: Option<u64>,
-    /// 正在编辑的单元格 (块 id, 行, 列) + 是否需要聚焦。
-    editing_cell: Option<(u64, usize, usize)>,
-    cell_focus_pending: bool,
+    /// R31: 表格交互状态(选区/编辑格/剪贴板…), 见 `notes_table.rs`。
+    table: crate::notes_table::TableState,
     /// 拖动重排: 被拖的块 id。
     dragging: Option<u64>,
     /// 上一帧各行矩形(悬停显示拖动柄、计算落点)。
     row_rects: HashMap<u64, Rect>,
     pub last_error: Option<String>,
+    /// 编辑中行的最近选区(块 id, 起, 止; 字符下标) — 点工具条颜色按钮时编辑框已失焦, 靠它定位。
+    last_sel: Option<(u64, usize, usize)>,
+    /// 下一帧聚焦时恢复的选区(配合 `pending_focus`)。
+    pending_sel: Option<(u64, usize, usize)>,
+    /// 最近用过的文字色 / 高亮色(工具条按钮上显示)。
+    last_color: [u8; 3],
+    last_bg: [u8; 3],
 }
 
 impl Default for NotesPanel {
@@ -91,11 +125,14 @@ impl NotesPanel {
             editing: None,
             pending_focus: None,
             last_focus: None,
-            editing_cell: None,
-            cell_focus_pending: false,
+            table: Default::default(),
             dragging: None,
             row_rects: HashMap::new(),
             last_error: None,
+            last_sel: None,
+            pending_sel: None,
+            last_color: TEXT_COLORS[0].0,
+            last_bg: BG_COLORS[2].0,
         }
     }
 
@@ -109,7 +146,7 @@ impl NotesPanel {
         self.doc_key = Some(doc_key.to_string());
         self.editing = None;
         self.pending_focus = None;
-        self.editing_cell = None;
+        self.table.clear();
         self.dragging = None;
         self.row_rects.clear();
     }
@@ -146,7 +183,7 @@ impl NotesPanel {
         self.editing = Some(id);
         self.last_focus = Some(id);
         self.pending_focus = Some((id, cursor));
-        self.editing_cell = None;
+        self.table.clear();
     }
 
     fn target_index(&self) -> Option<usize> {
@@ -184,6 +221,10 @@ impl NotesPanel {
             if btn(ui, "⊞", tr("插入表格(单元格支持 Excel 公式, 如 =SUM(A1:A3))", "Insert table (cells take Excel formulas, e.g. =SUM(A1:A3))")) {
                 self.insert_table();
             }
+            ui.add_space(4.0);
+            if let Some((kind, c)) = self.color_buttons(ui, th) {
+                self.apply_color(kind, c);
+            }
             if let Some(k) = convert {
                 match self.target_index() {
                     Some(i) if !matches!(self.note.blocks[i].kind, Kind::Table(_) | Kind::Divider) => {
@@ -206,11 +247,15 @@ impl NotesPanel {
                 ui.label(egui::RichText::new("?").size(12.0).color(th.muted)).on_hover_text(tr(
                     "Markdown: - 无序  1. 有序  [] 待办  # 标题  --- 分隔线\n\
                      **粗体**  *斜体*  `代码`  ~~删除线~~\n\
+                     Ctrl+B 粗体 · Ctrl+I 斜体(作用于选中文字, 再按一次取消)\n\
+                     A / ab 按钮: 文字颜色 / 高亮(作用于选中文字, 未选中则整行; \"清除\" 去掉颜色)\n\
                      以 = 开头的行直接计算, 如 =12*3+sqrt(2)\n\
                      Enter 新行 · Tab 缩进 · Ctrl+Enter 勾选待办 · 拖左侧柄排序 · 右键柄更多操作\n\
                      笔记跟着当前文档保存在 .pla/notes/ 下",
                     "Markdown: - bullets  1. numbers  [] to-do  # heading  --- divider\n\
                      **bold**  *italic*  `code`  ~~strike~~\n\
+                     Ctrl+B bold · Ctrl+I italic (on the selection; press again to remove)\n\
+                     A / ab buttons: text color / highlight (on the selection, or the whole line; \"Clear\" removes it)\n\
                      Lines starting with = are calculated, e.g. =12*3+sqrt(2)\n\
                      Enter new line · Tab indent · Ctrl+Enter check to-do · drag the left handle to reorder · right-click it for more\n\
                      Notes are saved with the current document under .pla/notes/",
@@ -219,14 +264,99 @@ impl NotesPanel {
         });
     }
 
+    /// 文字色 "A" + 高亮 "ab" 两个按钮及其色板弹窗。选了颜色 → Some((类型, Some(色))); 选 "清除" → Some((类型, None))。
+    fn color_buttons(&self, ui: &mut egui::Ui, th: &Theme) -> Option<(fmt::SpanKind, Option<[u8; 3]>)> {
+        let mut picked = None;
+        let style_btn = |text: egui::RichText| {
+            egui::Button::new(text.size(12.5)).fill(th.card).rounding(egui::Rounding::same(5.0)).min_size(egui::vec2(26.0, 22.0))
+        };
+        // 文字色: "A" 下面一条当前色的下划线
+        let a = ui
+            .add(style_btn(egui::RichText::new("A").strong().color(th.text)))
+            .on_hover_text(tr("文字颜色(作用于选中文字; 未选中则整行)", "Text color (applies to the selection, or the whole line)"));
+        let y = a.rect.bottom() - 4.5;
+        ui.painter().line_segment(
+            [egui::pos2(a.rect.left() + 7.0, y), egui::pos2(a.rect.right() - 7.0, y)],
+            Stroke::new(2.5f32, rgb(self.last_color)),
+        );
+        // 高亮: 当前高亮色做底的 "ab"
+        let h = ui
+            .add(style_btn(egui::RichText::new("ab").color(th.text).background_color(rgb(self.last_bg))))
+            .on_hover_text(tr("高亮背景色(作用于选中文字; 未选中则整行)", "Highlight color (applies to the selection, or the whole line)"));
+        for (resp, kind, palette) in [(&a, fmt::SpanKind::Color, &TEXT_COLORS), (&h, fmt::SpanKind::Bg, &BG_COLORS)] {
+            let pid = ui.make_persistent_id(("notes-color-popup", kind == fmt::SpanKind::Color));
+            if resp.clicked() {
+                ui.memory_mut(|m| m.toggle_popup(pid));
+            }
+            egui::popup_below_widget(ui, pid, resp, egui::PopupCloseBehavior::CloseOnClick, |ui| {
+                ui.set_min_width(8.0 * 22.0);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    for (c, zh, en) in palette.iter() {
+                        let (r, resp) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), Sense::click());
+                        let stroke = if resp.hovered() { Stroke::new(1.5f32, th.text) } else { Stroke::new(1.0f32, th.muted.gamma_multiply(0.5)) };
+                        if kind == fmt::SpanKind::Color {
+                            ui.painter().rect_filled(r, egui::Rounding::same(4.0), th.field);
+                            ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, "A", FontId::proportional(13.0), rgb(*c));
+                        } else {
+                            ui.painter().rect_filled(r, egui::Rounding::same(4.0), rgb(*c));
+                            ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, "a", FontId::proportional(12.0), th.text);
+                        }
+                        ui.painter().rect_stroke(r, egui::Rounding::same(4.0), stroke);
+                        if resp.on_hover_text(tr(zh, en)).clicked() {
+                            picked = Some((kind, Some(*c)));
+                        }
+                    }
+                });
+                if ui.button(tr("清除", "Clear")).clicked() {
+                    picked = Some((kind, None));
+                }
+            });
+        }
+        picked
+    }
+
+    /// 给最近编辑行的选区(无选区 → 整行)加 / 清除颜色 span, 然后带着选区重新聚焦该行。
+    fn apply_color(&mut self, kind: fmt::SpanKind, color: Option<[u8; 3]>) {
+        let sel = self.last_sel.filter(|(id, ..)| self.note.index_of(*id).is_some());
+        let (id, s, e) = match sel {
+            Some(x) => x,
+            None => match self.target_index() {
+                Some(i) => (self.note.blocks[i].id, 0, 0),
+                None => return,
+            },
+        };
+        let Some(i) = self.note.index_of(id) else { return };
+        if !is_texty(&self.note.blocks[i].kind) {
+            return;
+        }
+        let b = &mut self.note.blocks[i];
+        let n = b.text.chars().count();
+        let (s, e) = (s.min(n), e.min(n));
+        let (s, e) = if s == e { (0, n) } else { (s, e) };
+        let (text, s2, e2) = match color {
+            Some(c) => fmt::apply_span(&b.text, s, e, kind, c),
+            None => fmt::clear_spans(&b.text, s, e, kind),
+        };
+        let changed = text != b.text;
+        b.text = text;
+        if let Some(c) = color {
+            match kind {
+                fmt::SpanKind::Color => self.last_color = c,
+                fmt::SpanKind::Bg => self.last_bg = c,
+            }
+        }
+        self.focus(id, Some(e2));
+        self.pending_sel = Some((id, s2, e2));
+        self.last_sel = Some((id, s2, e2));
+        if changed {
+            self.mark_dirty();
+        }
+    }
+
     fn insert_table(&mut self) {
-        let rows = vec![
-            vec![String::new(), String::new(), String::new()],
-            vec![String::new(), String::new(), String::new()],
-            vec![String::new(), String::new(), String::new()],
-        ];
         let at = self.target_index().map_or(self.note.blocks.len(), |i| i + 1);
-        let tb = self.note.block(Kind::Table(rows), "", 0);
+        let tb = self.note.block(Kind::Table(notes::Table::new(3, 3)), "", 0);
         let tid = tb.id;
         self.note.blocks.insert(at, tb);
         // 表格后面总留一行正文, 方便继续往下写
@@ -235,8 +365,7 @@ impl NotesPanel {
             self.note.blocks.push(b);
         }
         self.editing = None;
-        self.editing_cell = Some((tid, 0, 0));
-        self.cell_focus_pending = true;
+        self.table.select(tid, 0, 0);
         self.mark_dirty();
     }
 
@@ -354,7 +483,7 @@ impl NotesPanel {
                 if let Some(y) = y {
                     let x0 = ui.min_rect().left();
                     let x1 = ui.min_rect().right();
-                    ui.painter().line_segment([egui::pos2(x0, y), egui::pos2(x1, y)], Stroke::new(2.0, th.accent));
+                    ui.painter().line_segment([egui::pos2(x0, y), egui::pos2(x1, y)], Stroke::new(2.0f32, th.accent));
                 }
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
                 if !ui.input(|i| i.pointer.primary_down()) {
@@ -399,14 +528,23 @@ impl NotesPanel {
                 let (r, resp) = ui.allocate_exact_size(egui::vec2(w, 14.0), Sense::click());
                 ui.painter().line_segment(
                     [egui::pos2(r.left(), r.center().y), egui::pos2(r.right(), r.center().y)],
-                    Stroke::new(1.0, th.muted),
+                    Stroke::new(1.0f32, th.muted),
                 );
                 if resp.clicked() {
                     ops.push(Op::InsertTextAfter(i));
                 }
                 false
             }
-            Kind::Table(_) => self.table_ui(ui, i, th),
+            Kind::Table(_) => {
+                let id = self.note.blocks[i].id;
+                let Kind::Table(t) = &mut self.note.blocks[i].kind else { return false };
+                let out = crate::notes_table::table_ui(ui, id, t, &mut self.table, th);
+                if out.activated {
+                    // 表格拿到焦点 → 退出文本行编辑
+                    self.editing = None;
+                }
+                out.changed
+            }
             _ => {
                 // 标记列
                 match kind {
@@ -433,11 +571,11 @@ impl NotesPanel {
                             let a = bx.left_center() + egui::vec2(2.5, 0.0);
                             let b = bx.center_bottom() + egui::vec2(-1.0, -3.0);
                             let c = bx.right_top() + egui::vec2(-2.5, 3.0);
-                            ui.painter().line_segment([a, b], Stroke::new(1.8, Color32::BLACK));
-                            ui.painter().line_segment([b, c], Stroke::new(1.8, Color32::BLACK));
+                            ui.painter().line_segment([a, b], Stroke::new(1.8f32, Color32::BLACK));
+                            ui.painter().line_segment([b, c], Stroke::new(1.8f32, Color32::BLACK));
                         } else {
                             let col = if resp.hovered() { th.text } else { th.muted };
-                            ui.painter().rect_stroke(bx, egui::Rounding::same(3.0), Stroke::new(1.3, col));
+                            ui.painter().rect_stroke(bx, egui::Rounding::same(3.0), Stroke::new(1.3f32, col));
                         }
                         if resp.clicked() {
                             ops.push(Op::ToggleTodo(i));
@@ -493,16 +631,39 @@ impl NotesPanel {
             .filter(|r| r.primary == r.secondary)
             .map(|r| r.primary.index);
         let has_focus_now = ui.memory(|m| m.has_focus(edit_id));
-        let text_len = self.note.blocks[i].text.chars().count();
+        let mut text_len = self.note.blocks[i].text.chars().count();
+        let mut fmt_changed = false;
         if has_focus_now {
-            // 先吃掉 Tab / Ctrl+Enter, 不让 TextEdit 处理
-            let (tab, shift_tab, ctrl_enter) = ui.input_mut(|inp| {
+            // 先吃掉 Tab / Ctrl+Enter / Ctrl+B / Ctrl+I, 不让 TextEdit 处理
+            let (tab, shift_tab, ctrl_enter, ctrl_b, ctrl_i) = ui.input_mut(|inp| {
                 (
                     inp.consume_key(Modifiers::NONE, Key::Tab),
                     inp.consume_key(Modifiers::SHIFT, Key::Tab),
                     inp.consume_key(Modifiers::COMMAND, Key::Enter),
+                    inp.consume_key(Modifiers::COMMAND, Key::B),
+                    inp.consume_key(Modifiers::COMMAND, Key::I),
                 )
             });
+            if ctrl_b || ctrl_i {
+                // 选区包上 / 去掉 ** 或 *, 然后把新选区写回 TextEdit 状态
+                if let Some(mut st) = egui::TextEdit::load_state(ui.ctx(), edit_id) {
+                    let (s, e) = st
+                        .cursor
+                        .char_range()
+                        .map(|r| {
+                            let (a, b) = (r.primary.index.min(text_len), r.secondary.index.min(text_len));
+                            (a.min(b), a.max(b))
+                        })
+                        .unwrap_or((text_len, text_len));
+                    let block = &mut self.note.blocks[i];
+                    let (t, s2, e2) = fmt::toggle_wrap(&block.text, s, e, if ctrl_b { "**" } else { "*" });
+                    block.text = t;
+                    text_len = block.text.chars().count();
+                    st.cursor.set_char_range(Some(CCursorRange::two(CCursor::new(s2), CCursor::new(e2))));
+                    st.store(ui.ctx(), edit_id);
+                    fmt_changed = true;
+                }
+            }
             if tab {
                 ops.push(Op::Indent(i, 1));
             }
@@ -527,6 +688,12 @@ impl NotesPanel {
         }
 
         let done = matches!(kind, Kind::Todo(true));
+        let thc = *th;
+        let layout_font = font.clone();
+        let mut layouter = |ui: &egui::Ui, s: &str, wrap_w: f32| {
+            let job = Self::edit_job(s, &layout_font, &thc, &kind, wrap_w);
+            ui.fonts(|f| f.layout_job(job))
+        };
         let block = &mut self.note.blocks[i];
         let out = egui::TextEdit::multiline(&mut block.text)
             .id(edit_id)
@@ -535,15 +702,20 @@ impl NotesPanel {
             .desired_width(w)
             .font(font)
             .text_color(if done { th.muted } else { th.text })
+            .layouter(&mut layouter)
             .hint_text(egui::RichText::new(tr("输入… (Markdown)", "Type… (Markdown)")).color(th.muted.gamma_multiply(0.6)))
             .show(ui);
 
         if let Some((pid, cur)) = self.pending_focus {
             if pid == id {
                 out.response.request_focus();
-                let n = cur.unwrap_or(text_len).min(text_len);
+                let len = self.note.blocks[i].text.chars().count();
+                let range = match self.pending_sel.take() {
+                    Some((sid, a, b)) if sid == id => CCursorRange::two(CCursor::new(a.min(len)), CCursor::new(b.min(len))),
+                    _ => CCursorRange::one(CCursor::new(cur.unwrap_or(len).min(len))),
+                };
                 if let Some(mut st) = egui::TextEdit::load_state(ui.ctx(), edit_id) {
-                    st.cursor.set_char_range(Some(CCursorRange::one(CCursor::new(n))));
+                    st.cursor.set_char_range(Some(range));
                     st.store(ui.ctx(), edit_id);
                 }
                 self.pending_focus = None;
@@ -553,8 +725,15 @@ impl NotesPanel {
                 self.editing = None;
             }
         }
+        // 记住选区: 点工具条颜色按钮时编辑框已失焦, 用这个定位要上色的文字
+        if out.response.has_focus() {
+            if let Some(r) = out.cursor_range {
+                let (a, b) = (r.primary.ccursor.index, r.secondary.ccursor.index);
+                self.last_sel = Some((id, a.min(b), a.max(b)));
+            }
+        }
 
-        let mut changed = false;
+        let mut changed = fmt_changed;
         if out.response.changed() {
             changed = true;
             let block = &mut self.note.blocks[i];
@@ -610,204 +789,53 @@ impl NotesPanel {
             }
         }
         for (s, st) in notes::inline_spans(&b.text) {
-            let mut f = TextFormat { font_id: font.clone(), color: base, ..Default::default() };
-            if st.bold {
-                f.color = if done { th.muted } else { Color32::WHITE };
-            }
-            if st.italic {
-                f.italics = true;
-            }
-            if st.code {
-                f.font_id = FontId::monospace(font.size - 1.0);
-                f.background = th.field;
-            }
-            if st.strike || done {
-                f.strikethrough = Stroke::new(1.0, if done { th.muted } else { base });
-            }
-            job.append(&s, 0.0, f);
+            job.append(&s, 0.0, Self::span_format(&st, font, th, base, done));
         }
         job
     }
 
-    // ---------------- 表格 ----------------
-
-    fn table_ui(&mut self, ui: &mut egui::Ui, i: usize, th: &Theme) -> bool {
-        let id = self.note.blocks[i].id;
-        // 渲染用快照(编辑中的单元格直接改 self.note, 不能同时借用)
-        let Kind::Table(rows) = self.note.blocks[i].kind.clone() else { return false };
-        let values = formula::eval_table(&rows);
-        let h = rows.len();
-        let w = rows.iter().map(|r| r.len()).max().unwrap_or(1).max(1);
-        let avail = ui.available_width();
-        let hdr_w = 22.0;
-        let cell_w = ((avail - hdr_w - 4.0) / w as f32 - 1.0).clamp(56.0, 160.0);
-        let cell_h = 22.0;
-
-        enum TOp {
-            InsRow(usize),
-            DelRow(usize),
-            InsCol(usize),
-            DelCol(usize),
+    /// 一段正文的格式(渲染态 / 编辑态共用)。完成的待办: 灰色 + 删除线优先于文字色。
+    fn span_format(st: &notes::Style, font: &FontId, th: &Theme, base: Color32, done: bool) -> TextFormat {
+        let mut f = TextFormat { font_id: font.clone(), color: base, ..Default::default() };
+        if st.bold {
+            f.color = if done { th.muted } else { Color32::WHITE };
         }
-        let mut top: Option<TOp> = None;
-        let mut changed = false;
-        let mut next_cell: Option<(usize, usize)> = None;
-        let mut stop_edit = false;
-
-        ui.vertical(|ui| {
-            egui::ScrollArea::horizontal().id_salt(("tbl-scroll", id)).show(ui, |ui| {
-                egui::Grid::new(("tbl", id)).spacing([1.0, 1.0]).show(ui, |ui| {
-                    ui.label("");
-                    for c in 0..w {
-                        let (r, resp) = ui.allocate_exact_size(egui::vec2(cell_w, 16.0), Sense::click());
-                        ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, formula::col_name(c), FontId::proportional(11.0), th.muted);
-                        resp.on_hover_text(tr("右键: 插入/删除列", "Right-click: insert/delete column")).context_menu(|ui| {
-                            if ui.button(tr("左侧插入列", "Insert column left")).clicked() {
-                                top = Some(TOp::InsCol(c));
-                                ui.close_menu();
-                            }
-                            if ui.button(tr("右侧插入列", "Insert column right")).clicked() {
-                                top = Some(TOp::InsCol(c + 1));
-                                ui.close_menu();
-                            }
-                            if w > 1 && ui.button(tr("删除此列", "Delete column")).clicked() {
-                                top = Some(TOp::DelCol(c));
-                                ui.close_menu();
-                            }
-                        });
-                    }
-                    ui.end_row();
-                    for r in 0..h {
-                        let (hr, hresp) = ui.allocate_exact_size(egui::vec2(hdr_w, cell_h), Sense::click());
-                        ui.painter().text(hr.center(), egui::Align2::CENTER_CENTER, format!("{}", r + 1), FontId::proportional(11.0), th.muted);
-                        hresp.on_hover_text(tr("右键: 插入/删除行", "Right-click: insert/delete row")).context_menu(|ui| {
-                            if ui.button(tr("上方插入行", "Insert row above")).clicked() {
-                                top = Some(TOp::InsRow(r));
-                                ui.close_menu();
-                            }
-                            if ui.button(tr("下方插入行", "Insert row below")).clicked() {
-                                top = Some(TOp::InsRow(r + 1));
-                                ui.close_menu();
-                            }
-                            if h > 1 && ui.button(tr("删除此行", "Delete row")).clicked() {
-                                top = Some(TOp::DelRow(r));
-                                ui.close_menu();
-                            }
-                        });
-                        for c in 0..w {
-                            let editing = self.editing_cell == Some((id, r, c));
-                            if editing {
-                                let cid = ui.make_persistent_id(("cell", id, r, c));
-                                let has_focus = ui.memory(|m| m.has_focus(cid));
-                                let (tab, shift_tab, enter) = if has_focus {
-                                    ui.input_mut(|inp| {
-                                        (
-                                            inp.consume_key(Modifiers::NONE, Key::Tab),
-                                            inp.consume_key(Modifiers::SHIFT, Key::Tab),
-                                            inp.consume_key(Modifiers::NONE, Key::Enter),
-                                        )
-                                    })
-                                } else {
-                                    (false, false, false)
-                                };
-                                let Kind::Table(rows) = &mut self.note.blocks[i].kind else { return };
-                                let cell = &mut rows[r][c];
-                                let resp = ui.add_sized(
-                                    [cell_w, cell_h],
-                                    egui::TextEdit::singleline(cell)
-                                        .id(cid)
-                                        .font(FontId::proportional(12.5))
-                                        .text_color(th.text),
-                                );
-                                if self.cell_focus_pending {
-                                    resp.request_focus();
-                                    self.cell_focus_pending = false;
-                                }
-                                if resp.changed() {
-                                    changed = true;
-                                }
-                                if tab {
-                                    next_cell = Some(if c + 1 < w { (r, c + 1) } else if r + 1 < h { (r + 1, 0) } else { (r, c) });
-                                } else if shift_tab {
-                                    next_cell = Some(if c > 0 { (r, c - 1) } else if r > 0 { (r - 1, w - 1) } else { (r, c) });
-                                } else if enter {
-                                    if r + 1 < h { next_cell = Some((r + 1, c)) } else { stop_edit = true }
-                                } else if resp.lost_focus() && !self.cell_focus_pending {
-                                    stop_edit = true;
-                                }
-                            } else {
-                                let raw = rows[r].get(c).cloned().unwrap_or_default();
-                                let v = values.get(r).and_then(|row| row.get(c)).cloned().unwrap_or(Value::Empty);
-                                let (rect, resp) = ui.allocate_exact_size(egui::vec2(cell_w, cell_h), Sense::click());
-                                let bg = if r == 0 { th.card.gamma_multiply(1.4) } else { th.field };
-                                ui.painter().rect_filled(rect, egui::Rounding::same(2.0), if resp.hovered() { bg.gamma_multiply(1.3) } else { bg });
-                                let (txt, col, right) = match &v {
-                                    Value::Num(_) => (v.display(), if raw.starts_with('=') { th.accent } else { th.text }, true),
-                                    Value::Error(_) => (v.display(), th.red, false),
-                                    Value::Bool(_) => (v.display(), th.text, true),
-                                    _ => (v.display(), if r == 0 { Color32::WHITE } else { th.text }, false),
-                                };
-                                let font = FontId::proportional(12.5);
-                                let shown = clip_text(ui, &txt, &font, cell_w - 8.0);
-                                let pos = if right { egui::pos2(rect.right() - 4.0, rect.center().y) } else { egui::pos2(rect.left() + 4.0, rect.center().y) };
-                                let align = if right { egui::Align2::RIGHT_CENTER } else { egui::Align2::LEFT_CENTER };
-                                ui.painter().with_clip_rect(rect).text(pos, align, shown, font, col);
-                                let resp = if raw.starts_with('=') { resp.on_hover_text(&raw) } else { resp };
-                                if resp.clicked() {
-                                    next_cell = Some((r, c));
-                                }
-                            }
-                        }
-                        ui.end_row();
-                    }
-                });
-            });
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 4.0;
-                if ui.small_button(tr("+ 行", "+ Row")).clicked() {
-                    top = Some(TOp::InsRow(h));
-                }
-                if ui.small_button(tr("+ 列", "+ Col")).clicked() {
-                    top = Some(TOp::InsCol(w));
-                }
-            });
-        });
-
-        if let Some((r, c)) = next_cell {
-            self.editing = None;
-            self.editing_cell = Some((id, r, c));
-            self.cell_focus_pending = true;
-        } else if stop_edit {
-            if matches!(self.editing_cell, Some((tid, _, _)) if tid == id) {
-                self.editing_cell = None;
-            }
+        if let (Some(c), false) = (st.color, done) {
+            f.color = rgb(c);
         }
-        if let Some(op) = top {
-            let Kind::Table(rows) = &mut self.note.blocks[i].kind else { return changed };
-            match op {
-                TOp::InsRow(at) => rows.insert(at.min(rows.len()), vec![String::new(); w]),
-                TOp::DelRow(at) => {
-                    if rows.len() > 1 {
-                        rows.remove(at);
-                    }
-                }
-                TOp::InsCol(at) => {
-                    for row in rows.iter_mut() {
-                        row.insert(at.min(row.len()), String::new());
-                    }
-                }
-                TOp::DelCol(at) => {
-                    for row in rows.iter_mut() {
-                        if row.len() > 1 && at < row.len() {
-                            row.remove(at);
-                        }
-                    }
-                }
-            }
-            self.editing_cell = None;
-            changed = true;
+        if st.italic {
+            f.italics = true;
         }
-        changed
+        if st.code {
+            f.font_id = FontId::monospace(font.size - 1.0);
+            f.background = th.field;
+        }
+        if let Some(c) = st.bg {
+            f.background = rgb(c);
+        }
+        if st.strike || done {
+            f.strikethrough = Stroke::new(1.0f32, if done { th.muted } else { f.color });
+        }
+        f
+    }
+
+    /// 编辑态 layouter 用: 原文一字不差, 标记(`**` `<span …>` 等)变暗, 正文按样式显示。
+    fn edit_job(text: &str, font: &FontId, th: &Theme, kind: &Kind, wrap_w: f32) -> LayoutJob {
+        let done = matches!(kind, Kind::Todo(true));
+        let base = if done { th.muted } else if matches!(kind, Kind::Heading(_)) { Color32::WHITE } else { th.text };
+        if text.is_empty() {
+            let mut job = LayoutJob::single_section(String::new(), TextFormat { font_id: font.clone(), color: base, ..Default::default() });
+            job.wrap.max_width = wrap_w;
+            return job;
+        }
+        let mut job = LayoutJob::default();
+        job.wrap.max_width = wrap_w;
+        let markup = TextFormat { font_id: font.clone(), color: th.muted.gamma_multiply(0.75), ..Default::default() };
+        for t in notes::inline_tokens(text) {
+            let f = if t.markup { markup.clone() } else { Self::span_format(&t.style, font, th, base, done) };
+            job.append(&t.text, 0.0, f);
+        }
+        job
     }
 
     // ---------------- 结构性改动 ----------------
@@ -896,7 +924,7 @@ impl NotesPanel {
             Op::Delete(i) => {
                 self.note.blocks.remove(i);
                 self.editing = None;
-                self.editing_cell = None;
+                self.table.clear();
                 self.note.ensure_nonempty();
             }
             Op::Duplicate(i) => {
@@ -933,16 +961,246 @@ fn is_texty(k: &Kind) -> bool {
     !matches!(k, Kind::Table(_) | Kind::Divider)
 }
 
-/// 单元格文字超宽 → 省略号(单元格不换行)。
-fn clip_text(ui: &egui::Ui, s: &str, font: &FontId, max_w: f32) -> String {
-    let width = |t: &str| ui.fonts(|f| f.layout_no_wrap(t.to_string(), font.clone(), Color32::WHITE).size().x);
-    if width(s) <= max_w {
-        return s.to_string();
+/// 行内格式的纯字符串编辑(按字符下标; 返回 (新文本, 新选区起, 新选区止))。
+mod fmt {
+    use crate::notes::{self, SpanTag};
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum SpanKind {
+        Color,
+        Bg,
     }
-    let chars: Vec<char> = s.chars().collect();
-    let mut n = chars.len();
-    while n > 1 && width(&format!("{}…", chars[..n].iter().collect::<String>())) > max_w {
-        n -= 1;
+
+    impl SpanKind {
+        fn get(self, t: &SpanTag) -> Option<[u8; 3]> {
+            match self {
+                SpanKind::Color => t.color,
+                SpanKind::Bg => t.bg,
+            }
+        }
     }
-    format!("{}…", chars[..n].iter().collect::<String>())
+
+    fn run_back(c: &[char], from: usize, ch: char, limit: usize) -> usize {
+        (0..from.saturating_sub(limit)).take_while(|k| c[from - 1 - k] == ch).count()
+    }
+
+    fn run_fwd(c: &[char], from: usize, ch: char, limit: usize) -> usize {
+        (from..limit).take_while(|&k| c[k] == ch).count()
+    }
+
+    /// Ctrl+B / Ctrl+I: 选区包上 `marker`(`**` / `*`); 已包着(标记紧贴选区外侧或在选区内侧边缘)则去掉。
+    /// 无选区: 插入一对标记, 光标放中间(光标正夹在一对标记中间时则去掉这对)。
+    /// 星号连写按 `***` = 粗+斜 判断: 斜体看星号个数是否为奇数, 粗体看是否 ≥ 2。
+    pub fn toggle_wrap(text: &str, s: usize, e: usize, marker: &str) -> (String, usize, usize) {
+        let c: Vec<char> = text.chars().collect();
+        let m: Vec<char> = marker.chars().collect();
+        let k = m.len();
+        let n = c.len();
+        let (mut s, mut e) = (s.min(n), e.min(n));
+        if s > e {
+            std::mem::swap(&mut s, &mut e);
+        }
+        let mc = m[0];
+        let present = |run: usize| if k == 1 { run % 2 == 1 } else { run >= k };
+        let join = |parts: &[&[char]]| parts.iter().flat_map(|p| p.iter()).collect::<String>();
+        // 标记在选区外侧
+        let (l, r) = (run_back(&c, s, mc, 0), run_fwd(&c, e, mc, n));
+        if present(l) && present(r) {
+            return (join(&[&c[..s - k], &c[s..e], &c[e + k..]]), s - k, e - k);
+        }
+        // 标记在选区内侧边缘
+        if e - s >= 2 * k {
+            let li = run_fwd(&c, s, mc, e);
+            let ri = run_back(&c, e, mc, s);
+            if li < e - s && present(li) && present(ri) {
+                return (join(&[&c[..s], &c[s + k..e - k], &c[e..]]), s, e - 2 * k);
+            }
+        }
+        // 包上(选区首尾的空格留在标记外, `** x**` 在 Markdown 里不算粗体)
+        if s < e && c[s..e].iter().any(|ch| !ch.is_whitespace()) {
+            while c[s].is_whitespace() {
+                s += 1;
+            }
+            while c[e - 1].is_whitespace() {
+                e -= 1;
+            }
+        }
+        (join(&[&c[..s], &m, &c[s..e], &m, &c[e..]]), s + k, e + k)
+    }
+
+    fn open_tag(color: Option<[u8; 3]>, bg: Option<[u8; 3]>) -> Option<String> {
+        let mut decl = Vec::new();
+        if let Some(c) = color {
+            decl.push(format!("color:{}", notes::hex_color(c)));
+        }
+        if let Some(c) = bg {
+            decl.push(format!("background:{}", notes::hex_color(c)));
+        }
+        (!decl.is_empty()).then(|| format!("<span style=\"{}\">", decl.join("; ")))
+    }
+
+    fn with_kind(t: &SpanTag, kind: SpanKind, v: Option<[u8; 3]>) -> (Option<[u8; 3]>, Option<[u8; 3]>) {
+        match kind {
+            SpanKind::Color => (v, t.bg),
+            SpanKind::Bg => (t.color, v),
+        }
+    }
+
+    /// 按非重叠的 (起, 止, 替换文本) 改写, 选区跟着平移(落在被删区间里的下标收到区间起点)。
+    fn apply_edits(c: &[char], mut edits: Vec<(usize, usize, String)>, s: usize, e: usize) -> (String, usize, usize) {
+        edits.sort_by_key(|x| x.0);
+        let map = |idx: usize| -> usize {
+            let mut d: isize = 0;
+            for (a, b, r) in &edits {
+                let rl = r.chars().count();
+                if idx >= *b {
+                    d += rl as isize - (b - a) as isize;
+                } else if idx > *a {
+                    return (*a as isize + d) as usize + (idx - a).min(rl);
+                }
+            }
+            (idx as isize + d) as usize
+        };
+        let mut out = String::new();
+        let mut pos = 0;
+        for (a, b, r) in &edits {
+            out.extend(&c[pos..*a]);
+            out.push_str(r);
+            pos = *b;
+        }
+        out.extend(&c[pos..]);
+        (out, map(s), map(e))
+    }
+
+    /// 选区加颜色 span。选区正好被一个 span 包着(标签紧贴外侧, 或标签在选区两端)→ 只改那个标签的颜色;
+    /// 否则新包一层 `<span style="…">…</span>`(里层颜色优先)。
+    pub fn apply_span(text: &str, s: usize, e: usize, kind: SpanKind, color: [u8; 3]) -> (String, usize, usize) {
+        let c: Vec<char> = text.chars().collect();
+        let n = c.len();
+        let (s, e) = (s.min(e).min(n), e.max(s).min(n));
+        for t in notes::span_tags(text) {
+            if (t.open.1 == s && t.close.0 == e) || (t.open.0 == s && t.close.1 == e) {
+                let (fc, fb) = with_kind(&t, kind, Some(color));
+                let tag = open_tag(fc, fb).unwrap_or_default();
+                return apply_edits(&c, vec![(t.open.0, t.open.1, tag)], s, e);
+            }
+        }
+        let (fc, fb) = match kind {
+            SpanKind::Color => (Some(color), None),
+            SpanKind::Bg => (None, Some(color)),
+        };
+        let open: Vec<char> = open_tag(fc, fb).unwrap_or_default().chars().collect();
+        let mut out: String = c[..s].iter().collect();
+        out.extend(&open);
+        out.extend(&c[s..e]);
+        out.push_str("</span>");
+        out.extend(&c[e..]);
+        (out, s + open.len(), e + open.len())
+    }
+
+    /// 去掉与选区相交的该类颜色(选区为空 → 整行)。标签另有一种颜色时只删这一项, 保留标签。
+    pub fn clear_spans(text: &str, s: usize, e: usize, kind: SpanKind) -> (String, usize, usize) {
+        let c: Vec<char> = text.chars().collect();
+        let n = c.len();
+        let (s, e) = (s.min(e).min(n), e.max(s).min(n));
+        let whole = s == e;
+        let mut edits = Vec::new();
+        for t in notes::span_tags(text) {
+            if kind.get(&t).is_none() || !(whole || (t.open.0 < e && s < t.close.1)) {
+                continue;
+            }
+            let (fc, fb) = with_kind(&t, kind, None);
+            match open_tag(fc, fb) {
+                Some(tag) => edits.push((t.open.0, t.open.1, tag)),
+                None => {
+                    edits.push((t.open.0, t.open.1, String::new()));
+                    edits.push((t.close.0, t.close.1, String::new()));
+                }
+            }
+        }
+        apply_edits(&c, edits, s, e)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        const RED: [u8; 3] = [0xFF, 0x6B, 0x6B];
+        const BLUE: [u8; 3] = [0x1E, 0x3A, 0x5F];
+
+        fn sel(t: &(String, usize, usize)) -> String {
+            t.0.chars().skip(t.1).take(t.2 - t.1).collect()
+        }
+
+        #[test]
+        fn wrap_selection_and_toggle_off() {
+            let r = toggle_wrap("a bc d", 2, 4, "**");
+            assert_eq!(r, ("a **bc** d".into(), 4, 6));
+            assert_eq!(sel(&r), "bc");
+            // 再按一次(选区还是 bc): 去掉外侧标记
+            assert_eq!(toggle_wrap(&r.0, r.1, r.2, "**"), ("a bc d".into(), 2, 4));
+            // 选区连标记一起选中: 去掉内侧标记
+            assert_eq!(toggle_wrap("a **bc** d", 2, 8, "**"), ("a bc d".into(), 2, 4));
+            // 斜体
+            assert_eq!(toggle_wrap("xy", 0, 2, "*"), ("*xy*".into(), 1, 3));
+            assert_eq!(toggle_wrap("*xy*", 1, 3, "*"), ("xy".into(), 0, 2));
+        }
+
+        #[test]
+        fn bold_and_italic_markers_do_not_confuse() {
+            // 粗体里按 Ctrl+I → 粗斜, 不会吃掉粗体的一个星号
+            assert_eq!(toggle_wrap("**b**", 2, 3, "*"), ("***b***".into(), 3, 4));
+            assert_eq!(toggle_wrap("***b***", 3, 4, "*"), ("**b**".into(), 2, 3));
+            assert_eq!(toggle_wrap("***b***", 3, 4, "**"), ("*b*".into(), 1, 2));
+            // 斜体里按 Ctrl+B
+            assert_eq!(toggle_wrap("*b*", 1, 2, "**"), ("***b***".into(), 3, 4));
+        }
+
+        #[test]
+        fn empty_selection_inserts_pair() {
+            assert_eq!(toggle_wrap("ab", 1, 1, "**"), ("a****b".into(), 3, 3));
+            assert_eq!(toggle_wrap("a****b", 3, 3, "**"), ("ab".into(), 1, 1), "再按一次撤掉空的一对");
+            assert_eq!(toggle_wrap("", 0, 0, "*"), ("**".into(), 1, 1));
+        }
+
+        #[test]
+        fn cjk_char_indices_and_space_trim() {
+            let r = toggle_wrap("中文粗体字", 2, 4, "**");
+            assert_eq!(r, ("中文**粗体**字".into(), 4, 6));
+            assert_eq!(sel(&r), "粗体");
+            assert_eq!(toggle_wrap("你 好 吗", 1, 4, "*"), ("你 *好* 吗".into(), 3, 4));
+        }
+
+        #[test]
+        fn apply_and_recolor_span() {
+            let r = apply_span("中文颜色", 2, 4, SpanKind::Color, RED);
+            assert_eq!(r.0, "中文<span style=\"color:#FF6B6B\">颜色</span>");
+            assert_eq!(sel(&r), "颜色");
+            // 同一选区换色: 改标签而不是再套一层
+            let r2 = apply_span(&r.0, r.1, r.2, SpanKind::Color, BLUE);
+            assert_eq!(r2.0, "中文<span style=\"color:#1E3A5F\">颜色</span>");
+            assert_eq!(sel(&r2), "颜色");
+            // 同一选区加高亮: 合到一个标签
+            let r3 = apply_span(&r2.0, r2.1, r2.2, SpanKind::Bg, BLUE);
+            assert_eq!(r3.0, "中文<span style=\"color:#1E3A5F; background:#1E3A5F\">颜色</span>");
+            let st = notes::inline_spans(&r3.0);
+            assert_eq!(st[1].1.color, Some(BLUE));
+            assert_eq!(st[1].1.bg, Some(BLUE));
+        }
+
+        #[test]
+        fn clear_spans_by_kind() {
+            let src = "a<span style=\"color:#FF6B6B; background:#1E3A5F\">b</span>c<span style=\"color:#FF6B6B\">d</span>";
+            // 整行清文字色: 第一个保留背景, 第二个整个去掉
+            let (t, ..) = clear_spans(src, 0, 0, SpanKind::Color);
+            assert_eq!(t, "a<span style=\"background:#1E3A5F\">b</span>cd");
+            // 只清与选区相交的(选中 "d")
+            let n = src.chars().count();
+            let r = clear_spans(src, n - 8, n - 7, SpanKind::Color);
+            assert_eq!(r.0, "a<span style=\"color:#FF6B6B; background:#1E3A5F\">b</span>cd");
+            assert_eq!(sel(&r), "d");
+            // 没有该类颜色 → 不变
+            assert_eq!(clear_spans("x<span style=\"color:#FF6B6B\">y</span>", 0, 0, SpanKind::Bg).0, "x<span style=\"color:#FF6B6B\">y</span>");
+        }
+    }
 }

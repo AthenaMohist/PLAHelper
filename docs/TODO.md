@@ -106,7 +106,12 @@
         共 40+ 函数，循环引用 #CIRC!，^ 左结合同 Excel），右键行/列号插入删除。
         模块：`notes.rs`（模型/解析/序列化）、`notes_ui.rs`（界面）、`formula.rs`（公式）。待用户验证。
         已知限制：插入/删除行列不会自动改写公式里的引用；表格公式只能引用本表。
-      - [ ] **R31 笔记面板改进（用户 2026-11-13 提出，排队待做）**
+      - [x] **R31 笔记面板改进（2026-11-14 实现，待用户验证）** —— 下列 N31-1..9 全部落地:
+        表格独立模块 `notes_table.rs`(手绘布局 + 自管指针: 选区/编辑分离、填充柄、复制粘贴、Ctrl+Enter、列宽行高、横向滚动、点选引用、
+        右键插删行列并改写公式); `formula.rs` 新增 `shift_formula/insert_rows/delete_rows/insert_cols/delete_cols/ref_name/parse_ref`
+        (`$` 锁定); `notes.rs` 的 `Table{cells,col_w,row_h}` + `<!-- pla:table -->` 尺寸注释 + 单元格换行存 `<br>`;
+        文本格式: Ctrl+B/I 切换、文字色/底色调色板(`<span style>`)、编辑态 layouter 淡化标记。
+        已知限制: 剪切后粘贴不会像 Excel 那样移动引用(当作复制+清空); 清除颜色按整段 span 清。
         - [ ] N31-1 粗体/斜体快捷键：编辑中 Ctrl+B / Ctrl+I 给选中文字包 `**…**` / `*…*`（无选区 = 插入成对标记、光标放中间；
           已包裹再按 = 去掉）。做法：TextEdit 前 `consume_key(COMMAND, B/I)`，读 `cursor.char_range()` 改文本后回写光标。
           渲染已支持（`inline_spans`）；粗体目前用"更亮的白色"模拟，若要真粗体需加载粗体字体（simhei 无粗体字重，考虑描边/双绘）。

@@ -354,11 +354,33 @@ enum Expr {
     BadName,
 }
 
-/// Parse "A1" / "$A$1" / "aa10" → (row, col), 0-based.
-fn parse_ref(s: &str) -> Option<(usize, usize)> {
+/// One parsed cell reference including its `$` lock markers.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct RefParts {
+    row: usize,
+    col: usize,
+    row_abs: bool,
+    col_abs: bool,
+}
+
+impl RefParts {
+    fn render(self) -> String {
+        format!(
+            "{}{}{}{}",
+            if self.col_abs { "$" } else { "" },
+            col_name(self.col),
+            if self.row_abs { "$" } else { "" },
+            self.row + 1
+        )
+    }
+}
+
+/// Parse "A1" / "$A$1" / "aa10" keeping the `$` flags.
+fn parse_ref_parts(s: &str) -> Option<RefParts> {
     let b = s.as_bytes();
     let mut i = 0;
-    if b.get(i) == Some(&b'$') {
+    let col_abs = b.get(i) == Some(&b'$');
+    if col_abs {
         i += 1;
     }
     let ls = i;
@@ -369,7 +391,8 @@ fn parse_ref(s: &str) -> Option<(usize, usize)> {
     if letters.is_empty() || letters.len() > 3 {
         return None;
     }
-    if b.get(i) == Some(&b'$') {
+    let row_abs = b.get(i) == Some(&b'$');
+    if row_abs {
         i += 1;
     }
     let digits = &s[i..];
@@ -383,7 +406,17 @@ fn parse_ref(s: &str) -> Option<(usize, usize)> {
     let col = letters
         .bytes()
         .fold(0usize, |n, ch| n * 26 + (ch.to_ascii_uppercase() - b'A' + 1) as usize);
-    Some((row - 1, col - 1))
+    Some(RefParts { row: row - 1, col: col - 1, row_abs, col_abs })
+}
+
+/// Parse a single cell ref like "B3" / "$B$3" (case-insensitive) → 0-based (row, col).
+pub fn parse_ref(s: &str) -> Option<(usize, usize)> {
+    parse_ref_parts(s).map(|p| (p.row, p.col))
+}
+
+/// "A1"-style name for 0-based (row, col): ref_name(0,0) == "A1", ref_name(9, 27) == "AB10".
+pub fn ref_name(row: usize, col: usize) -> String {
+    format!("{}{}", col_name(col), row + 1)
 }
 
 struct Parser {
@@ -1233,6 +1266,290 @@ pub fn eval_expr(src: &str) -> Value {
 }
 
 // ---------------------------------------------------------------------------
+// Reference rewriting (fill / copy / insert / delete)
+// ---------------------------------------------------------------------------
+
+/// Columns representable by `parse_ref` (up to "ZZZ").
+const MAX_COLS: usize = 26 + 26 * 26 + 26 * 26 * 26;
+
+/// A reference token: byte span within the formula body plus its parsed parts.
+#[derive(Debug, Clone, Copy)]
+struct RefTok {
+    start: usize,
+    end: usize,
+    parts: RefParts,
+}
+
+enum RefItem {
+    Single(RefTok),
+    Range(RefTok, RefTok),
+}
+
+enum LexItem {
+    Ref(RefTok),
+    Colon,
+    Other,
+}
+
+/// Find every cell reference / range in a formula body (text after '='), mirroring `lex`:
+/// string literals are skipped, numbers are consumed whole, and an identifier followed by
+/// `(` (e.g. `LOG10(`) is a function call, not a reference.
+fn scan_refs(body: &str) -> Vec<RefItem> {
+    let cs: Vec<(usize, char)> = body.char_indices().collect();
+    let at = |k: usize| cs.get(k).map(|&(_, c)| c);
+    let off = |k: usize| cs.get(k).map_or(body.len(), |&(b, _)| b);
+    let mut items = Vec::new();
+    let mut i = 0;
+    while i < cs.len() {
+        let ch = cs[i].1;
+        if ch.is_whitespace() {
+            i += 1;
+            continue;
+        }
+        if ch == '"' {
+            i += 1;
+            while i < cs.len() {
+                if cs[i].1 == '"' {
+                    if at(i + 1) == Some('"') {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            items.push(LexItem::Other);
+            continue;
+        }
+        let digit = |k: usize| at(k).is_some_and(|c| c.is_ascii_digit());
+        if ch.is_ascii_digit() || (ch == '.' && digit(i + 1)) {
+            while digit(i) {
+                i += 1;
+            }
+            if at(i) == Some('.') {
+                i += 1;
+                while digit(i) {
+                    i += 1;
+                }
+            }
+            if matches!(at(i), Some('e' | 'E')) {
+                let mut j = i + 1;
+                if matches!(at(j), Some('+' | '-')) {
+                    j += 1;
+                }
+                if digit(j) {
+                    while digit(j) {
+                        j += 1;
+                    }
+                    i = j;
+                }
+            }
+            items.push(LexItem::Other);
+            continue;
+        }
+        if ch.is_alphabetic() || ch == '$' || ch == '_' {
+            let start = i;
+            while at(i).is_some_and(|c| c.is_alphanumeric() || c == '$' || c == '_') {
+                i += 1;
+            }
+            let mut j = i;
+            while at(j).is_some_and(char::is_whitespace) {
+                j += 1;
+            }
+            let is_call = at(j) == Some('(');
+            let (s, e) = (off(start), off(i));
+            let parts = if is_call { None } else { parse_ref_parts(&body[s..e]) };
+            items.push(match parts {
+                Some(parts) => LexItem::Ref(RefTok { start: s, end: e, parts }),
+                None => LexItem::Other,
+            });
+            continue;
+        }
+        items.push(if ch == ':' { LexItem::Colon } else { LexItem::Other });
+        i += 1;
+    }
+    let mut out = Vec::new();
+    let mut k = 0;
+    while k < items.len() {
+        if let LexItem::Ref(a) = items[k] {
+            if let (Some(LexItem::Colon), Some(LexItem::Ref(b))) = (items.get(k + 1), items.get(k + 2)) {
+                out.push(RefItem::Range(a, *b));
+                k += 3;
+                continue;
+            }
+            out.push(RefItem::Single(a));
+        }
+        k += 1;
+    }
+    out
+}
+
+fn push_rep(reps: &mut Vec<(usize, usize, String)>, t: &RefTok, new: RefParts) {
+    if new != t.parts {
+        reps.push((t.start, t.end, new.render()));
+    }
+}
+
+/// Rewrite the reference tokens of a formula in place. `single` maps a lone ref and `range`
+/// maps both endpoints of a range; `None` turns the whole token (or whole range) into `#REF!`.
+/// Unchanged refs keep their original text (case included); non-formulas are returned as is.
+fn rewrite(
+    src: &str,
+    single: impl Fn(RefParts) -> Option<RefParts>,
+    range: impl Fn(RefParts, RefParts) -> Option<(RefParts, RefParts)>,
+) -> String {
+    let lead = src.len() - src.trim_start().len();
+    if !src[lead..].starts_with('=') {
+        return src.to_string();
+    }
+    let base = lead + 1;
+    let body = &src[base..];
+    let mut reps: Vec<(usize, usize, String)> = Vec::new();
+    for item in scan_refs(body) {
+        match item {
+            RefItem::Single(t) => match single(t.parts) {
+                Some(p) => push_rep(&mut reps, &t, p),
+                None => reps.push((t.start, t.end, E_REF.to_string())),
+            },
+            RefItem::Range(a, b) => match range(a.parts, b.parts) {
+                Some((pa, pb)) => {
+                    push_rep(&mut reps, &a, pa);
+                    push_rep(&mut reps, &b, pb);
+                }
+                None => reps.push((a.start, b.end, E_REF.to_string())),
+            },
+        }
+    }
+    let mut out = String::with_capacity(src.len() + 8);
+    out.push_str(&src[..base]);
+    let mut last = 0;
+    for (s, e, text) in reps {
+        out.push_str(&body[last..s]);
+        out.push_str(&text);
+        last = e;
+    }
+    out.push_str(&body[last..]);
+    out
+}
+
+fn offset(v: usize, d: i64, limit: usize) -> Option<usize> {
+    let n = i64::try_from(v).ok()?.checked_add(d)?;
+    let n = usize::try_from(n).ok()?;
+    (n < limit).then_some(n)
+}
+
+fn shift_ref(p: RefParts, d_row: i64, d_col: i64) -> Option<RefParts> {
+    Some(RefParts {
+        row: if p.row_abs { p.row } else { offset(p.row, d_row, MAX_ROWS)? },
+        col: if p.col_abs { p.col } else { offset(p.col, d_col, MAX_COLS)? },
+        ..p
+    })
+}
+
+/// Copy/fill semantics: move a formula by (d_row, d_col). Relative row/col parts shift, `$`-locked parts don't.
+/// Non-formula input (not starting with '=') is returned unchanged. A ref that would move to row<0 or col<0
+/// becomes `#REF!` in the text (a range with such an endpoint becomes a single `#REF!`). Everything else is
+/// preserved verbatim; only reference tokens are rewritten in place (string literals are never touched).
+pub fn shift_formula(src: &str, d_row: i64, d_col: i64) -> String {
+    let one = |p: RefParts| shift_ref(p, d_row, d_col);
+    rewrite(src, one, |a, b| Some((one(a)?, one(b)?)))
+}
+
+#[derive(Clone, Copy)]
+enum Axis {
+    Row,
+    Col,
+}
+
+impl Axis {
+    fn get(self, p: RefParts) -> usize {
+        match self {
+            Axis::Row => p.row,
+            Axis::Col => p.col,
+        }
+    }
+    fn with(self, p: RefParts, v: usize) -> RefParts {
+        match self {
+            Axis::Row => RefParts { row: v, ..p },
+            Axis::Col => RefParts { col: v, ..p },
+        }
+    }
+    fn limit(self) -> usize {
+        match self {
+            Axis::Row => MAX_ROWS,
+            Axis::Col => MAX_COLS,
+        }
+    }
+}
+
+fn insert_axis(src: &str, axis: Axis, at: usize, n: usize) -> String {
+    let mv = |p: RefParts| {
+        let v = axis.get(p);
+        if v < at {
+            return Some(p);
+        }
+        v.checked_add(n).filter(|&v| v < axis.limit()).map(|v| axis.with(p, v))
+    };
+    rewrite(src, mv, |a, b| Some((mv(a)?, mv(b)?)))
+}
+
+fn delete_axis(src: &str, axis: Axis, at: usize, n: usize) -> String {
+    let end = at.saturating_add(n);
+    let single = |p: RefParts| {
+        let v = axis.get(p);
+        if v < at {
+            Some(p)
+        } else if v < end {
+            None
+        } else {
+            Some(axis.with(p, v - n))
+        }
+    };
+    let range = |a: RefParts, b: RefParts| {
+        let (va, vb) = (axis.get(a), axis.get(b));
+        let (lo, hi) = (va.min(vb), va.max(vb));
+        if hi < at {
+            return Some((a, b));
+        }
+        if lo >= end {
+            return Some((axis.with(a, va - n), axis.with(b, vb - n)));
+        }
+        if lo >= at && hi < end {
+            return None;
+        }
+        // Partial overlap: clip to the surviving cells.
+        let nlo = lo.min(at);
+        let nhi = if hi >= end { hi - n } else { at - 1 };
+        let (na, nb) = if va <= vb { (nlo, nhi) } else { (nhi, nlo) };
+        Some((axis.with(a, na), axis.with(b, nb)))
+    };
+    rewrite(src, single, range)
+}
+
+/// Structural edits (Excel semantics: BOTH relative and absolute refs are adjusted, `$` markers preserved):
+/// inserting `n` rows before 0-based row `at` moves refs with row >= at down by n; ranges spanning the insertion point grow.
+pub fn insert_rows(src: &str, at: usize, n: usize) -> String {
+    insert_axis(src, Axis::Row, at, n)
+}
+
+/// Column counterpart of [`insert_rows`].
+pub fn insert_cols(src: &str, at: usize, n: usize) -> String {
+    insert_axis(src, Axis::Col, at, n)
+}
+
+/// Deleting rows at..at+n: refs below move up; a single ref inside the deleted band → `#REF!`;
+/// a range partially covering the band shrinks; a range entirely inside → `#REF!`.
+pub fn delete_rows(src: &str, at: usize, n: usize) -> String {
+    delete_axis(src, Axis::Row, at, n)
+}
+
+/// Column counterpart of [`delete_rows`].
+pub fn delete_cols(src: &str, at: usize, n: usize) -> String {
+    delete_axis(src, Axis::Col, at, n)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1554,5 +1871,141 @@ mod tests {
         for c in [0, 5, 25, 26, 100, 701, 702, 16383] {
             assert_eq!(parse_ref(&format!("{}1", col_name(c))), Some((0, c)));
         }
+    }
+
+    #[test]
+    fn ref_name_and_parse_ref() {
+        assert_eq!(ref_name(0, 0), "A1");
+        assert_eq!(ref_name(9, 27), "AB10");
+        assert_eq!(ref_name(0, 701), "ZZ1");
+        assert_eq!(ref_name(99, 702), "AAA100");
+        assert_eq!(parse_ref("B3"), Some((2, 1)));
+        assert_eq!(parse_ref("b3"), Some((2, 1)));
+        assert_eq!(parse_ref("$B$3"), Some((2, 1)));
+        assert_eq!(parse_ref("$B3"), Some((2, 1)));
+        assert_eq!(parse_ref("B$3"), Some((2, 1)));
+        assert_eq!(parse_ref("ab10"), Some((9, 27)));
+        assert_eq!(parse_ref("$AAA$100"), Some((99, 702)));
+        for bad in ["", "A", "1", "A0", "AAAA1", "A1B", "$$A1", "A$$1", "1A", "A-1", " A1", "LOG10x"] {
+            assert_eq!(parse_ref(bad), None, "{bad}");
+        }
+        for (r, c) in [(0, 0), (9, 27), (12345, 701), (MAX_ROWS - 1, MAX_COLS - 1)] {
+            assert_eq!(parse_ref(&ref_name(r, c)), Some((r, c)));
+        }
+    }
+
+    #[test]
+    fn shift_dollar_combos() {
+        assert_eq!(shift_formula("=B2", 1, 1), "=C3");
+        assert_eq!(shift_formula("=$B$2", 1, 1), "=$B$2");
+        assert_eq!(shift_formula("=$B2", 1, 1), "=$B3");
+        assert_eq!(shift_formula("=B$2", 1, 1), "=C$2");
+        assert_eq!(shift_formula("=B2+$B$2*$B2-B$2", 2, 3), "=E4+$B$2*$B4-E$2");
+        assert_eq!(shift_formula("=Z1", 0, 1), "=AA1");
+        assert_eq!(shift_formula("=AA1", 0, -1), "=Z1");
+        assert_eq!(shift_formula("=b2", 1, 0), "=B3", "rewritten refs are upper-cased");
+        assert_eq!(shift_formula("=b2+c3", 0, 0), "=b2+c3", "unchanged refs keep their text");
+    }
+
+    #[test]
+    fn shift_ranges_and_negative() {
+        assert_eq!(shift_formula("=SUM(A1:B3)", 1, 0), "=SUM(A2:B4)");
+        assert_eq!(shift_formula("=SUM($A$1:B3)", 1, 1), "=SUM($A$1:C4)");
+        assert_eq!(shift_formula("=SUM(A1 : B3)", 0, 2), "=SUM(C1 : D3)");
+        assert_eq!(shift_formula("=A1", -1, 0), "=#REF!");
+        assert_eq!(shift_formula("=A1", 0, -1), "=#REF!");
+        assert_eq!(shift_formula("=$A$1+A2", -1, -1), "=$A$1+#REF!");
+        assert_eq!(shift_formula("=A$1", -5, 0), "=A$1");
+        assert_eq!(shift_formula("=SUM(A1:B3)+1", -1, 0), "=SUM(#REF!)+1");
+        assert_eq!(shift_formula("=SUM(A2:B3)", -1, 0), "=SUM(A1:B2)");
+        assert_eq!(shift_formula("=A1", MAX_ROWS as i64, 0), "=#REF!");
+    }
+
+    #[test]
+    fn shift_preserves_everything_else() {
+        assert_eq!(
+            shift_formula("=IF(A1>0, \"A1 is \"\"B2\"\"\" & A1, sum( a2 ,3.5e2))", 1, 0),
+            "=IF(A2>0, \"A1 is \"\"B2\"\"\" & A2, sum( A3 ,3.5e2))"
+        );
+        assert_eq!(shift_formula("  = A1 ", 1, 0), "  = A2 ");
+        // Functions with digits in the name are calls, not refs (even with a space before '(').
+        assert_eq!(shift_formula("=LOG10(A1)+ATAN2(B1,C1)", 1, 0), "=LOG10(A2)+ATAN2(B2,C2)");
+        assert_eq!(shift_formula("=LOG10 (A1)", 1, 0), "=LOG10 (A2)");
+        assert_eq!(shift_formula("=AB10+LOG10", 1, 0), "=AB11+LOG11");
+        assert_eq!(shift_formula("=TRUE+foo+Sheet1", 1, 1), "=TRUE+foo+Sheet1");
+        assert_eq!(shift_formula("=1E3+2", 1, 1), "=1E3+2");
+        assert_eq!(shift_formula("=\"unterminated A1", 1, 1), "=\"unterminated A1");
+        assert_eq!(shift_formula("=#REF!+A1", 1, 0), "=#REF!+A2");
+        assert_eq!(shift_formula("=\"中文\"&A1", 1, 0), "=\"中文\"&A2");
+        // Non-formulas are untouched.
+        for s in ["A1", "hello A1", "", "  ", "12", "'=A1"] {
+            assert_eq!(shift_formula(s, 3, 3), s);
+        }
+    }
+
+    #[test]
+    fn shift_round_trip() {
+        for f in [
+            "=A2+$B$3*C$4-$D5",
+            "=SUM(B2:C9, $A$1:A2) & \"A1\"",
+            "=IF(LOG10(Z9)>1, AA10, ATAN2(B2, 3))",
+        ] {
+            let there = shift_formula(f, 1, 1);
+            assert_ne!(there, f);
+            assert_eq!(shift_formula(&there, -1, -1), f);
+            assert_eq!(shift_formula(&shift_formula(f, 0, 5), 0, -5), f);
+        }
+    }
+
+    #[test]
+    fn insert_rows_cols() {
+        assert_eq!(insert_rows("=A1+A2+A3", 1, 2), "=A1+A4+A5");
+        assert_eq!(insert_rows("=$A$2+A$3+$A1", 1, 1), "=$A$3+A$4+$A1", "absolute refs move too");
+        assert_eq!(insert_rows("=SUM(A1:A3)", 1, 1), "=SUM(A1:A4)", "spanning range grows");
+        assert_eq!(insert_rows("=SUM(A1:A3)", 0, 1), "=SUM(A2:A4)");
+        assert_eq!(insert_rows("=SUM(A1:A3)", 3, 1), "=SUM(A1:A3)", "insert just below: unchanged");
+        assert_eq!(insert_rows("=SUM(A3:A1)", 1, 1), "=SUM(A4:A1)");
+        assert_eq!(insert_rows("=B5", 4, 0), "=B5");
+        assert_eq!(insert_rows("=\"A5\"&A5", 0, 1), "=\"A5\"&A6");
+        assert_eq!(insert_rows("A5", 0, 1), "A5");
+        assert_eq!(insert_cols("=A1+B1+C1", 1, 1), "=A1+C1+D1");
+        assert_eq!(insert_cols("=$B$1+SUM($A1:$C1)", 1, 2), "=$D$1+SUM($A1:$E1)");
+        assert_eq!(insert_cols("=Z1", 25, 1), "=AA1");
+        assert_eq!(insert_cols("=LOG10(B1)", 0, 1), "=LOG10(C1)");
+    }
+
+    #[test]
+    fn delete_rows_cols() {
+        // Single refs.
+        assert_eq!(delete_rows("=A1+A2+A3+A5", 1, 2), "=A1+#REF!+#REF!+A3");
+        assert_eq!(delete_rows("=$A$5+A$1", 1, 2), "=$A$3+A$1");
+        assert_eq!(delete_rows("=A$2", 1, 1), "=#REF!");
+        // Ranges: entirely below / above / inside / partially overlapping / spanning.
+        assert_eq!(delete_rows("=SUM(A5:B6)", 1, 2), "=SUM(A3:B4)");
+        assert_eq!(delete_rows("=SUM(A1:B1)", 1, 2), "=SUM(A1:B1)");
+        assert_eq!(delete_rows("=SUM(A2:B3)+1", 1, 2), "=SUM(#REF!)+1");
+        assert_eq!(delete_rows("=SUM(A1:A3)", 1, 5), "=SUM(A1:A1)", "tail overlap shrinks");
+        assert_eq!(delete_rows("=SUM(A2:A6)", 0, 3), "=SUM(A1:A3)", "head overlap shrinks");
+        assert_eq!(delete_rows("=SUM(A1:A10)", 2, 3), "=SUM(A1:A7)", "spanning range shrinks");
+        assert_eq!(delete_rows("=SUM($A$1:$A$10)", 2, 3), "=SUM($A$1:$A$7)");
+        assert_eq!(delete_rows("=SUM(A6:A2)", 0, 3), "=SUM(A3:A1)", "reversed endpoints");
+        assert_eq!(delete_rows("=SUM(A1:A3)", 1, 0), "=SUM(A1:A3)");
+        // Columns.
+        assert_eq!(delete_cols("=A1+B1+C1+D1", 1, 2), "=A1+#REF!+#REF!+B1");
+        assert_eq!(delete_cols("=SUM(A1:E1)", 1, 2), "=SUM(A1:C1)");
+        assert_eq!(delete_cols("=SUM($B$1:C9)*2", 1, 2), "=SUM(#REF!)*2");
+        assert_eq!(delete_cols("=SUM(C1:F1)", 0, 3), "=SUM(A1:C1)");
+        assert_eq!(delete_cols("=\"B1\"&ATAN2(B1,C1)", 0, 1), "=\"B1\"&ATAN2(A1,B1)");
+        assert_eq!(delete_cols("B1", 0, 1), "B1");
+    }
+
+    #[test]
+    fn rewritten_formulas_still_evaluate() {
+        let src = "=SUM(A1:B2)+$A$1";
+        let moved = shift_formula(src, 1, 0);
+        assert_eq!(moved, "=SUM(A2:B3)+$A$1");
+        let v = tshow(&[&["1", "2"], &["3", "4"], &["5", "6"], &["", "", src, moved.as_str()]]);
+        assert_eq!(v[3][2], "11");
+        assert_eq!(v[3][3], "19");
     }
 }
