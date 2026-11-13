@@ -120,8 +120,14 @@ fn main() -> eframe::Result<()> {
     pla_ui::diag::log("start");
     // R25: 界面语言(偏好文件; 默认简体中文)。
     pla_bridge::i18n::set(pla_ui::prefs::load_lang());
+    // R28: 窗口图标(任务栏显示的是窗口图标; exe 资源里的同一张图由 build.rs 嵌入, 供资源管理器/开始菜单用)。
+    let mut root = egui::ViewportBuilder::default();
+    match eframe::icon_data::from_png_bytes(include_bytes!("../assets/pla-helper.png")) {
+        Ok(icon) => root = root.with_icon(std::sync::Arc::new(icon)),
+        Err(e) => pla_ui::diag::log(&format!("icon decode failed: {e}")),
+    }
     let opts = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
+        viewport: root
             .with_inner_size(TOOLBAR_SIZE)
             .with_title(ROOT_TITLE)
             .with_resizable(false)
@@ -261,6 +267,9 @@ struct PlaApp {
     sel_pngs: std::collections::HashMap<String, std::sync::Arc<[u8]>>,
     sel_manage: bool,
     sel_selected: std::collections::HashSet<String>,
+    /// R28: 视口状态面板自己的管理模式/勾选集(以前借用 sel_manage, 两个面板会一起进管理模式)。
+    vp_manage: bool,
+    vp_selected: std::collections::HashSet<String>,
     sel_save_pending: Option<(String, Vec<(String, String, String, Option<String>, Option<String>)>, Option<String>)>,
     sel_shot_path: Option<String>,
     /// 正在改名的快照名 + 编辑缓冲。
@@ -698,6 +707,31 @@ fn select_all_invert_buttons(
             all.iter().filter(|n| !selected.contains(*n)).cloned().collect();
         *selected = next;
     }
+}
+
+/// R28: 管理模式操作条 —— 快照墙 / 选择集 / 视口状态三处共用(位置都在列表顶部, 样式一致):
+/// 「已选 N」+ 全选/反选 + 红色删除 + 完成。返回 (点了删除且有勾选, 点了完成), 删除动作由调用方执行。
+fn manage_bar(
+    ui: &mut egui::Ui,
+    all: &[String],
+    selected: &mut std::collections::HashSet<String>,
+    delete_tip: &str,
+) -> (bool, bool) {
+    let mut out = (false, false);
+    ui.horizontal_wrapped(|ui| {
+        ui.label(egui::RichText::new(t!("已选 {}", "{} selected", selected.len())).small().color(COL_MUTED));
+        select_all_invert_buttons(ui, all, selected);
+        let del = ui
+            .add(
+                egui::Button::new(egui::RichText::new(tr("删除所选", "Delete")).small().color(egui::Color32::WHITE))
+                    .fill(egui::Color32::from_rgb(150, 45, 45)),
+            )
+            .on_hover_text(delete_tip);
+        out.0 = del.clicked() && !selected.is_empty();
+        out.1 = ui.small_button(tr("完成", "Done")).clicked();
+    });
+    ui.separator();
+    out
 }
 
 #[cfg(test)]
@@ -1898,6 +1932,8 @@ impl PlaApp {
             sel_pngs: std::collections::HashMap::new(),
             sel_manage: false,
             sel_selected: std::collections::HashSet::new(),
+            vp_manage: false,
+            vp_selected: std::collections::HashSet::new(),
             sel_save_pending: None,
             sel_shot_path: None,
             rename_edit: None,
@@ -2375,6 +2411,7 @@ impl PlaApp {
         self.vp_states.clear();
         self.vp_states_loaded = false;
         self.vp_pngs.clear();
+        self.vp_selected.clear();
         self.vp_pending_state = None;
         self.vp_delete_confirm = None;
         self.vp_rename = None;
@@ -3311,53 +3348,33 @@ impl eframe::App for PlaApp {
 
                         // ---- 管理模式操作条(删除立即执行, 列表随后按新数据渲染) ----
                         if self.snap_manage {
-                            ui.horizontal_wrapped(|ui| {
-                                ui.label(
-                                    egui::RichText::new(t!("已选 {}", "{} selected", self.snap_selected.len()))
-                                        .small()
-                                        .color(COL_MUTED),
-                                );
-                                let all = self.snapshots.clone();
-                                select_all_invert_buttons(ui, &all, &mut self.snap_selected);
-                                let del = ui.add(
-                                    egui::Button::new(
-                                        egui::RichText::new(tr("删除所选", "Delete"))
-                                            .small()
-                                            .color(egui::Color32::WHITE),
-                                    )
-                                    .fill(egui::Color32::from_rgb(150, 45, 45)),
-                                );
-                                let del = del.on_hover_text(tr(
-                                    "删除勾选的快照(含截图), 不可恢复",
-                                    "Delete checked snapshots (with images), cannot be undone",
-                                ));
-                                if del.clicked() && !self.snap_selected.is_empty() {
-                                    let names: Vec<String> =
-                                        self.snap_selected.iter().cloned().collect();
-                                    match pla_ui::snapshot::delete_snapshots(&self.doc_key, &names)
-                                    {
-                                        Ok(n) => {
-                                            self.snapshots =
-                                                pla_ui::snapshot::list_snapshots(&self.doc_key);
-                                            self.snap_infos = pla_ui::snapshot::load_meta_infos(
-                                                &self.doc_key,
-                                            );
-                                            for n in &names {
-                                                self.snap_pngs.remove(n);
-                                                self.snap_selected.remove(n);
-                                                self.snap_favs.remove(n);
-                                            }
-                                            self.set_notice((false, t!("已删除 {n} 个快照", "Deleted {n} snapshots")));
+                            let all = self.snapshots.clone();
+                            let (del, done) = manage_bar(
+                                ui,
+                                &all,
+                                &mut self.snap_selected,
+                                tr("删除勾选的快照(含截图), 不可恢复", "Delete checked snapshots (with images), cannot be undone"),
+                            );
+                            if del {
+                                let names: Vec<String> = self.snap_selected.iter().cloned().collect();
+                                match pla_ui::snapshot::delete_snapshots(&self.doc_key, &names) {
+                                    Ok(n) => {
+                                        self.snapshots = pla_ui::snapshot::list_snapshots(&self.doc_key);
+                                        self.snap_infos = pla_ui::snapshot::load_meta_infos(&self.doc_key);
+                                        for n in &names {
+                                            self.snap_pngs.remove(n);
+                                            self.snap_selected.remove(n);
+                                            self.snap_favs.remove(n);
                                         }
-                                        Err(e) => self.set_notice((true, e)),
+                                        self.set_notice((false, t!("已删除 {n} 个快照", "Deleted {n} snapshots")));
                                     }
+                                    Err(e) => self.set_notice((true, e)),
                                 }
-                                if ui.small_button(tr("完成", "Done")).clicked() {
-                                    self.snap_manage = false;
-                                    self.snap_selected.clear();
-                                }
-                            });
-                            ui.separator();
+                            }
+                            if done {
+                                self.snap_manage = false;
+                                self.snap_selected.clear();
+                            }
                         }
 
                         // 收藏置顶(小图 3 列), 其余一行一个(大图撑满)
@@ -3765,6 +3782,33 @@ impl eframe::App for PlaApp {
                             self.sel_saved = pla_ui::selection::list_cdp_selections_meta(&self.doc_key);
                             self.sel_saved_loaded = true;
                         }
+                        // R28: 管理模式操作条放列表顶部(与快照墙一致)
+                        if self.sel_manage {
+                            let all: Vec<String> = self.sel_saved.iter().map(|m| m.name.clone()).collect();
+                            let (del, done) = manage_bar(
+                                ui,
+                                &all,
+                                &mut self.sel_selected,
+                                tr("删除勾选的选择集(含截图), 不可恢复", "Delete checked selection sets (with images), cannot be undone"),
+                            );
+                            if del {
+                                let names: Vec<String> = self.sel_selected.iter().cloned().collect();
+                                match pla_ui::selection::delete_cdp_selections_batch(&self.doc_key, &names) {
+                                    Ok(n) => {
+                                        self.sel_saved_loaded = false;
+                                        self.sel_saved.retain(|m| !names.contains(&m.name));
+                                        for nm in &names { self.sel_pngs.remove(nm); }
+                                        self.sel_selected.clear();
+                                        self.set_notice((false, t!("已删除 {n} 个选择集", "Deleted {n} selection sets")));
+                                    }
+                                    Err(e) => self.set_notice((true, e)),
+                                }
+                            }
+                            if done {
+                                self.sel_manage = false;
+                                self.sel_selected.clear();
+                            }
+                        }
                         // 截图缓存填充
                         let sel_dir = pla_ui::selection::cdp_selections_dir(&self.doc_key);
                         for meta in self.sel_saved.clone() {
@@ -3797,7 +3841,7 @@ impl eframe::App for PlaApp {
                         // 实现手段: ScrollArea max_height(预估值) — egui 无法先量后限,
                         // 用"行数×行高"估算内容高, 上限 = 屏高/3。
                         // R23: 存档墙占满剩余高度(以前封顶屏高 1/3 → 收藏区挤得放不下一个); 管理模式给下方操作条留高度。
-                        let content_h = (ui.available_height() - if self.sel_manage { 40.0 } else { 0.0 }).max(72.0);
+                        let content_h = ui.available_height().max(72.0); // R28: 操作条已移到列表上方
                         egui::ScrollArea::vertical()
                             .id_salt("sel-saved-wall")
                             .max_height(content_h)
@@ -3960,31 +4004,6 @@ impl eframe::App for PlaApp {
                         if let Some(n) = delete_ask {
                             self.sel_delete_confirm = Some(n);
                         }
-                        // 管理模式操作条
-                        if self.sel_manage {
-                            ui.horizontal_wrapped(|ui| {
-                                ui.label(egui::RichText::new(t!("已选 {}", "{} selected", self.sel_selected.len())).small().color(COL_MUTED));
-                                let all: Vec<String> = self.sel_saved.iter().map(|m| m.name.clone()).collect();
-                                select_all_invert_buttons(ui, &all, &mut self.sel_selected);
-                                if ui.small_button(tr("删除所选", "Delete")).clicked() && !self.sel_selected.is_empty() {
-                                    let names: Vec<String> = self.sel_selected.iter().cloned().collect();
-                                    match pla_ui::selection::delete_cdp_selections_batch(&self.doc_key, &names) {
-                                        Ok(n) => {
-                                            self.sel_saved_loaded = false;
-                                            for nm in &names { self.sel_pngs.remove(nm); }
-                                            self.sel_selected.clear();
-                                            self.set_notice((false, t!("已删除 {n} 个选择集", "Deleted {n} selection sets")));
-                                        }
-                                        Err(e) => self.set_notice((true, e)),
-                                    }
-                                }
-                                if ui.small_button(tr("完成", "Done")).clicked() {
-                                    self.sel_manage = false;
-                                    self.sel_selected.clear();
-                                }
-                            });
-                            ui.separator();
-                        }
 
                         // ---- 统一执行动作(借用结束) ----
                         if let Some((name, fav)) = fav_toggle {
@@ -4124,6 +4143,33 @@ impl eframe::App for PlaApp {
                             self.vp_states = pla_ui::vpstate::list_vpstates(&self.doc_key);
                             self.vp_states_loaded = true;
                         }
+                        // R28: 管理模式操作条放列表顶部(与快照墙一致; 独立的 vp_manage/vp_selected, 不再借用选择集的)
+                        if self.vp_manage {
+                            let all: Vec<String> = self.vp_states.iter().map(|m| m.name.clone()).collect();
+                            let (del, done) = manage_bar(
+                                ui,
+                                &all,
+                                &mut self.vp_selected,
+                                tr("删除勾选的视口状态(含截图), 不可恢复", "Delete checked view states (with images), cannot be undone"),
+                            );
+                            if del {
+                                let names: Vec<String> = self.vp_selected.iter().cloned().collect();
+                                match pla_ui::vpstate::delete_vpstates(&self.doc_key, &names) {
+                                    Ok(n) => {
+                                        self.vp_states_loaded = false;
+                                        self.vp_states.retain(|m| !names.contains(&m.name));
+                                        for nm in &names { self.vp_pngs.remove(nm); }
+                                        self.vp_selected.clear();
+                                        self.set_notice((false, t!("已删除 {n} 个视口状态", "Deleted {n} view states")));
+                                    }
+                                    Err(e) => self.set_notice((true, e)),
+                                }
+                            }
+                            if done {
+                                self.vp_manage = false;
+                                self.vp_selected.clear();
+                            }
+                        }
                         // PNG 缓存
                         let vdir = pla_ui::vpstate::vpstate_dir(&self.doc_key);
                         for m in self.vp_states.clone() {
@@ -4175,7 +4221,7 @@ impl eframe::App for PlaApp {
                             }
                         };
                         // R23: 存档墙占满剩余高度(以前封顶屏高 1/3 → 收藏区挤得放不下一个); 管理模式给下方操作条留高度。
-                        let content_h = (ui.available_height() - if self.sel_manage { 40.0 } else { 0.0 }).max(72.0);
+                        let content_h = ui.available_height().max(72.0);
                         egui::ScrollArea::vertical()
                             .id_salt("vp-wall")
                             .max_height(content_h)
@@ -4225,8 +4271,11 @@ impl eframe::App for PlaApp {
                                                 apply_now = Some(meta.name.clone());
                                             }
                                             ui.horizontal(|ui| {
-                                                if self.sel_manage {
-                                                    // 视口状态面板复用 sel_manage 勾选集? 不, 用独立 vp 管理标记 = sel_manage 同一按钮
+                                                if self.vp_manage {
+                                                    let mut on = self.vp_selected.contains(&meta.name);
+                                                    if ui.checkbox(&mut on, "").changed() {
+                                                        if on { self.vp_selected.insert(meta.name.clone()); } else { self.vp_selected.remove(&meta.name); }
+                                                    }
                                                 }
                                                 if self.vp_rename.as_deref() == Some(meta.name.as_str()) {
                                                     ui.add_sized(egui::vec2((w - 60.0).max(30.0), 16.0), egui::TextEdit::singleline(&mut self.vp_rename_buf)).request_focus();
@@ -4235,7 +4284,7 @@ impl eframe::App for PlaApp {
                                                     if esc { rename_cancel = true; }
                                                 } else {
                                                     // R8d: 名称独占一行
-                                                    let name_w = w.max(30.0);
+                                                    let name_w = (w - if self.vp_manage { 16.0 + sp } else { 0.0 }).max(30.0);
                                                     let nr = ui.allocate_ui_with_layout(
                                                         egui::vec2(name_w, 14.0),
                                                         egui::Layout::left_to_right(egui::Align::Center),
@@ -4323,31 +4372,6 @@ impl eframe::App for PlaApp {
                         if let Some(n) = delete_ask {
                             self.vp_delete_confirm = Some(n);
                         }
-                        // 管理条
-                        if self.sel_manage && self.show_vpstate {
-                            ui.horizontal_wrapped(|ui| {
-                                ui.label(egui::RichText::new(t!("已选 {}", "{} selected", self.sel_selected.len())).small().color(COL_MUTED));
-                                let all: Vec<String> = self.vp_states.iter().map(|m| m.name.clone()).collect();
-                                select_all_invert_buttons(ui, &all, &mut self.sel_selected);
-                                if ui.small_button(tr("删除所选", "Delete")).clicked() && !self.sel_selected.is_empty() {
-                                    let names: Vec<String> = self.sel_selected.iter().cloned().collect();
-                                    match pla_ui::vpstate::delete_vpstates(&self.doc_key, &names) {
-                                        Ok(n) => {
-                                            self.vp_states_loaded = false;
-                                            for nm in &names { self.vp_pngs.remove(nm); }
-                                            self.sel_selected.clear();
-                                            self.set_notice((false, t!("已删除 {n} 个视口状态", "Deleted {n} view states")));
-                                        }
-                                        Err(e) => self.set_notice((true, e)),
-                                    }
-                                }
-                                if ui.small_button(tr("完成", "Done")).clicked() {
-                                    self.sel_manage = false;
-                                    self.sel_selected.clear();
-                                }
-                            });
-                            ui.separator();
-                        }
                         // 动作执行
                         if let Some((name, fav)) = fav_toggle {
                             let _ = pla_ui::vpstate::set_fav(&self.doc_key, &name, fav);
@@ -4411,8 +4435,9 @@ impl eframe::App for PlaApp {
                     }
                 }
                 if do_manage.get() {
-                    self.sel_manage = !self.sel_manage;
-                    self.sel_selected.clear();
+                    self.vp_manage = !self.vp_manage;
+                    self.vp_selected.clear();
+                    self.vp_rename = None;
                 }
                 self.show_vpstate = flag;
             }

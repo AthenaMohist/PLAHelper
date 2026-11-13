@@ -92,6 +92,11 @@
       - R27 英文界面排版 + BRIDGE 卡迁移：设置行标签按剩余宽度缩字号（12.5→10.5）再省略号（`fit_text`，截断时悬停看全文），
         value_row 标签与值分宽；管理条/快捷键行/尺寸面板改 `horizontal_wrapped`，英文按钮改短（All/None/Invert/Delete）。
         设置里 BRIDGE 卡删除：绑定窗口移到能力面板 OVERVIEW 首行，Bridge 状态/地址成为能力面板单独的 BRIDGE 卡。待用户验证。
+      - R28 管理条统一 + 程序图标：快照墙/选择集/视口状态共用 `manage_bar()`（列表顶部、红色删除、全选/反选/完成）；
+        视口状态面板改用自己的 `vp_manage/vp_selected`（以前借用选择集的，两个面板一起进管理模式，且没有勾选框）。
+        图标 PH（白色几何 P 同 Plasticity 风格 + H 琥珀横梁，深色圆角底）：`tools/icon/make-icon.ps1` 生成
+        `assets/pla-helper.ico/.png`；`build.rs` 手写只含 .rsrc 的 COFF 目标文件嵌进 exe（本机 GNU 工具链无 windres/rc）；
+        任务栏用 `with_icon` 设窗口图标。待用户验证。
 - [x] **U6 提示浮窗标题为 "egui window"**：随 U8 一起解决（被拥有窗口不进任务栏，也不进 Alt+Tab）。
 - [x] **U7 连接指示灯跟随主题色变黄**（R13）：R12 把强调色改黄后，"已连接"也变黄，和"连接中"无法区分。
       状态语义色改为固定色、不跟主题：灰 = 未绑定 / 黄 = 连接中 / 绿 = 已连接、成功 / 红 = 失败。

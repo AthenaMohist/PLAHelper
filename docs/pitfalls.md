@@ -48,6 +48,7 @@
 | 45 | 自动化截全屏 / 模拟鼠标点到了用户正在用的别的程序(截到私人聊天窗口) | 用户在用电脑时切了窗口; 助手按 R19 只在 Plasticity 前台时置顶, 工具栏已不在原位, 屏幕坐标点击落到别的窗口 | 用户在场时**不做桌面级截图/鼠标模拟**; 验证 Plasticity 用 CDP `Page.captureScreenshot`(只截渲染进程), 验证助手界面请用户目测(R23) |
 | 46 | 选择集面板一律"无截图" | R9 把存档挪到文档同级, 但保存/列表/读取/取名仍写 exe 同级, 只有截图/收藏/改名/删除用新目录; 迁移只在新目录不存在时复制一次 | 全部经唯一入口 `cdp_selections_dir()`; 迁移改为每进程一次"补齐缺失或更新的文件"(R23) |
 | 47 | 同窗口换文件后快照/选择集截图仍是旧文件的(文件和恢复都对) | egui 按 URI 缓存解码纹理, URI 只用名字 `bytes://SS001`; 清自己的字节缓存不会清 egui 的。另: 拖动模式提前 return 不更新 doc_key; 文档切换只重置部分缓存 | URI 带内容指纹 `png_uri()`; 切文档 `forget_all_images()`; `sync_doc_key()` 两条路径都调, `reset_doc_scoped()` 为按文档状态唯一清单(R26) |
+| 48 | 想给 exe 嵌图标, 但 embed-resource/winresource 都要 windres 或 rc.exe | 本机 Rust 是 x86_64-pc-windows-gnu, 没装 binutils/Windows SDK | `build.rs` 自己生成只含 `.rsrc` 节的 COFF(.o)(资源树 + ADDR32NB 重定位), `rustc-link-arg-bins` 交给 ld 合并; 用 `ExtractAssociatedIcon` 验证(R28) |
 | 14 | 切换面板时旧面板滞留、新面板不出现、点击丢失 | R12 加深的文档定位(`find_latest_doc`)每次未命中都全盘深扫(热缓存 ~2s, 冷缓存 ~19s), 面板每帧取文档目录, 2s TTL 一过就在 UI 线程重扫 | 分阶段: leveldb + Recent 命中即返回; 深扫未命中负缓存 60s(R13) |
 
 ## 假按钮教训
