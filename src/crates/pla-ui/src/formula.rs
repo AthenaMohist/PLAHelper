@@ -1549,6 +1549,51 @@ pub fn delete_cols(src: &str, at: usize, n: usize) -> String {
     delete_axis(src, Axis::Col, at, n)
 }
 
+/// R31b: index after moving the block `from..from+n` so it sits before original index `to`
+/// (`to <= from` = move up/left, `to >= from + n` = move down/right; anything else = no-op).
+pub fn move_index(v: usize, from: usize, n: usize, to: usize) -> usize {
+    let end = from + n;
+    if to <= from {
+        if v >= from && v < end {
+            to + (v - from)
+        } else if v >= to && v < from {
+            v + n
+        } else {
+            v
+        }
+    } else if to >= end {
+        if v >= from && v < end {
+            to - n + (v - from)
+        } else if v >= end && v < to {
+            v - n
+        } else {
+            v
+        }
+    } else {
+        v
+    }
+}
+
+fn move_axis(src: &str, axis: Axis, from: usize, n: usize, to: usize) -> String {
+    let m = |p: RefParts| Some(axis.with(p, move_index(axis.get(p), from, n, to)));
+    rewrite(src, m, |a, b| {
+        let (ma, mb) = (m(a)?, m(b)?);
+        let (va, vb) = (axis.get(ma), axis.get(mb));
+        // keep the range in lo..hi order (each endpoint keeps its own `$` flags)
+        Some(if va <= vb { (ma, mb) } else { (axis.with(ma, vb), axis.with(mb, va)) })
+    })
+}
+
+/// Moving rows (drag to reorder): refs follow the moved cells (both relative and absolute, as in Excel).
+pub fn move_rows(src: &str, from: usize, n: usize, to: usize) -> String {
+    move_axis(src, Axis::Row, from, n, to)
+}
+
+/// Column counterpart of [`move_rows`].
+pub fn move_cols(src: &str, from: usize, n: usize, to: usize) -> String {
+    move_axis(src, Axis::Col, from, n, to)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1559,6 +1604,19 @@ mod tests {
 
     fn e(s: &str) -> String {
         eval_expr(s).display()
+    }
+
+    #[test]
+    fn move_rows_and_cols_follow_cells() {
+        // 第 2 行移到最上面
+        assert_eq!(move_rows("=A2+A1", 1, 1, 0), "=A1+A2");
+        // 第 1..2 行移到第 4 行之前(下移)
+        assert_eq!(move_rows("=A1*A3", 0, 2, 3), "=A2*A1");
+        assert_eq!(move_rows("=SUM(A1:A2)", 0, 2, 3), "=SUM(A2:A3)");
+        assert_eq!(move_rows("=$A$2", 1, 1, 0), "=$A$1", "绝对引用也跟着走");
+        // B 列移到 A 列前面
+        assert_eq!(move_cols("=A1-B1", 1, 1, 0), "=B1-A1");
+        assert_eq!(move_index(5, 1, 2, 3), 5, "块内插入点 = 不动");
     }
 
     fn table(rows: &[&[&str]]) -> Vec<Vec<Value>> {

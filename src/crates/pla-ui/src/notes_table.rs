@@ -63,6 +63,10 @@ enum DragMode {
     RowResize { start_h: f32, start_y: f32 },
     /// 编辑公式时拖选引用: 插入位置(字符下标) + 当前插入文本长度 + 起点格。
     RefPick { at: usize, len: usize, start: (usize, usize) },
+    /// R31b: 在行号/列号上拖动 = 多选整行/整列。
+    HeaderSelect { rows: bool },
+    /// R31b: 拖已选中整行/整列的行号/列号 = 调换顺序。`to` = 当前落点(原坐标下的插入位置)。
+    MoveBand { rows: bool, from: usize, n: usize, to: Option<usize> },
 }
 
 #[derive(Default)]
@@ -80,6 +84,8 @@ pub struct TableState {
     second_click: bool,
     /// 右键菜单对应的位置。
     menu_hit: Option<Hit>,
+    /// R31b: 右键菜单"添加 [x] 行/列"的 x(默认 1)。
+    menu_count: usize,
 }
 
 #[derive(Default)]
@@ -107,6 +113,18 @@ impl TableState {
         let (r0, r1) = (self.anchor.0.min(self.cursor.0), self.anchor.0.max(self.cursor.0));
         let (c0, c1) = (self.anchor.1.min(self.cursor.1), self.anchor.1.max(self.cursor.1));
         (r0, c0, r1, c1)
+    }
+
+    /// 选区是整行(覆盖所有列) → (起行, 行数)。
+    fn full_rows(&self, t: &Table) -> Option<(usize, usize)> {
+        let (r0, c0, r1, c1) = self.sel_rect();
+        (c0 == 0 && c1 + 1 == t.cols()).then_some((r0, r1 - r0 + 1))
+    }
+
+    /// 选区是整列(覆盖所有行) → (起列, 列数)。
+    fn full_cols(&self, t: &Table) -> Option<(usize, usize)> {
+        let (r0, c0, r1, c1) = self.sel_rect();
+        (r0 == 0 && r1 + 1 == t.rows()).then_some((c0, c1 - c0 + 1))
     }
 
     fn in_sel(&self, r: usize, c: usize) -> bool {
@@ -527,11 +545,19 @@ pub fn table_ui(ui: &mut egui::Ui, id: u64, t: &mut Table, st: &mut TableState, 
                         commit_edit(t, st, false);
                         out.changed = true;
                     }
+                    let band = st.full_cols(t).filter(|(c0, n)| c >= *c0 && c < c0 + n);
                     if mods.shift {
+                        // Shift+点列号 = 从锚点列扩到这一列(整列)
+                        st.anchor = (0, st.anchor.1);
                         st.cursor = (t.rows() - 1, c);
+                    } else if let (Some((c0, n)), true) = (band, is_active) {
+                        // 按在已选中的整列上 → 拖动调换列顺序(没拖动则松手时变成单选这一列)
+                        st.drag = Some(DragMode::MoveBand { rows: false, from: c0, n, to: None });
+                        st.fill_to = Some((0, c));
                     } else {
                         st.anchor = (0, c);
                         st.cursor = (t.rows() - 1, c);
+                        st.drag = Some(DragMode::HeaderSelect { rows: false });
                     }
                 }
                 Some(Hit::RowHeader(r)) => {
@@ -539,11 +565,17 @@ pub fn table_ui(ui: &mut egui::Ui, id: u64, t: &mut Table, st: &mut TableState, 
                         commit_edit(t, st, false);
                         out.changed = true;
                     }
+                    let band = st.full_rows(t).filter(|(r0, n)| r >= *r0 && r < r0 + n);
                     if mods.shift {
+                        st.anchor = (st.anchor.0, 0);
                         st.cursor = (r, t.cols() - 1);
+                    } else if let (Some((r0, n)), true) = (band, is_active) {
+                        st.drag = Some(DragMode::MoveBand { rows: true, from: r0, n, to: None });
+                        st.fill_to = Some((r, 0));
                     } else {
                         st.anchor = (r, 0);
                         st.cursor = (r, t.cols() - 1);
+                        st.drag = Some(DragMode::HeaderSelect { rows: true });
                     }
                 }
                 Some(Hit::Corner) => {
@@ -566,6 +598,39 @@ pub fn table_ui(ui: &mut egui::Ui, id: u64, t: &mut Table, st: &mut TableState, 
                 }
             }
             DragMode::Fill => st.fill_to = Some(lay.nearest_cell(lp)),
+            DragMode::HeaderSelect { rows } => {
+                let (r, c) = lay.nearest_cell(lp);
+                st.cursor = if rows { (r, t.cols() - 1) } else { (t.rows() - 1, c) };
+            }
+            DragMode::MoveBand { rows, from, n, .. } => {
+                // 落点 = 离指针最近的行/列边界(原坐标); 落在被拖的块内部 = 不动
+                let to = if rows {
+                    let y = lp.y - lay.origin.y - HDR_H;
+                    ((y / lay.row_h).round().max(0.0) as usize).min(t.rows())
+                } else {
+                    let x = lp.x - lay.origin.x;
+                    let mut best = 0;
+                    for (i, cx) in lay.col_x.iter().enumerate() {
+                        if (x - cx).abs() < (x - lay.col_x[best]).abs() {
+                            best = i;
+                        }
+                    }
+                    best.min(t.cols())
+                };
+                let to = (to <= from || to >= from + n).then_some(to);
+                st.drag = Some(DragMode::MoveBand { rows, from, n, to });
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                if let Some(to) = to {
+                    let p = ui.painter();
+                    if rows {
+                        let y = lay.origin.y + HDR_H + to as f32 * lay.row_h;
+                        p.line_segment([egui::pos2(lay.origin.x, y), egui::pos2(lay.origin.x + lay.total_w, y)], Stroke::new(2.5f32, th.accent));
+                    } else {
+                        let x = lay.origin.x + lay.col_x[to];
+                        p.line_segment([egui::pos2(x, lay.origin.y), egui::pos2(x, lay.origin.y + lay.total_h())], Stroke::new(2.5f32, th.accent));
+                    }
+                }
+            }
             DragMode::ColResize { c, start_w, start_x } => {
                 let w = (start_w + lp.x - start_x).max(Table::MIN_COL_W);
                 if (t.col_w[c] - w).abs() > 0.5 {
@@ -604,6 +669,7 @@ pub fn table_ui(ui: &mut egui::Ui, id: u64, t: &mut Table, st: &mut TableState, 
             }
         }
         if released || !ui.input(|i| i.pointer.primary_down()) {
+            let mode = st.drag.unwrap_or(mode); // 用本帧更新过的状态(拖动落点等)
             match mode {
                 DragMode::Fill => {
                     if let Some(to) = st.fill_to.take() {
@@ -622,8 +688,35 @@ pub fn table_ui(ui: &mut egui::Ui, id: u64, t: &mut Table, st: &mut TableState, 
                         e.focus_pending = true;
                     }
                 }
+                DragMode::MoveBand { rows, from, n, to } => match to {
+                    Some(to) => {
+                        let dst = if rows { move_rows(t, from, n, to) } else { move_cols(t, from, n, to) };
+                        // 选区跟着移动后的块
+                        if rows {
+                            st.anchor = (dst, 0);
+                            st.cursor = (dst + n - 1, t.cols() - 1);
+                        } else {
+                            st.anchor = (0, dst);
+                            st.cursor = (t.rows() - 1, dst + n - 1);
+                        }
+                        out.changed = true;
+                    }
+                    None => {
+                        // 没拖动: 单击已选中的行号/列号 = 只选这一行/列
+                        if let Some((r, c)) = st.fill_to {
+                            if rows {
+                                st.anchor = (r, 0);
+                                st.cursor = (r, t.cols() - 1);
+                            } else {
+                                st.anchor = (0, c);
+                                st.cursor = (t.rows() - 1, c);
+                            }
+                        }
+                    }
+                },
                 _ => {}
             }
+            st.fill_to = None;
             st.second_click = false;
             st.drag = None;
         }
@@ -639,10 +732,18 @@ pub fn table_ui(ui: &mut egui::Ui, id: u64, t: &mut Table, st: &mut TableState, 
     // ---------------- 右键菜单: 插入/删除行列 ----------------
     if resp.secondary_clicked() {
         st.menu_hit = latest.and_then(|lp| lay.hit(lp, None));
-        if let Some(Hit::Cell(r, c)) = st.menu_hit {
-            if !st.in_sel(r, c) || st.active != Some(id) {
-                st.select(id, r, c);
+        match st.menu_hit {
+            Some(Hit::Cell(r, c)) if !st.in_sel(r, c) || st.active != Some(id) => st.select(id, r, c),
+            // 右键没选中的行号/列号 → 先选中那一整行/列(同 Excel)
+            Some(Hit::RowHeader(r)) if st.active != Some(id) || !(st.full_rows(t).map_or(false, |(r0, n)| r >= r0 && r < r0 + n)) => {
+                st.select(id, r, 0);
+                st.cursor = (r, t.cols() - 1);
             }
+            Some(Hit::ColHeader(c)) if st.active != Some(id) || !(st.full_cols(t).map_or(false, |(c0, n)| c >= c0 && c < c0 + n)) => {
+                st.select(id, 0, c);
+                st.cursor = (t.rows() - 1, c);
+            }
+            _ => {}
         }
         out.activated = true;
     }
@@ -654,34 +755,50 @@ pub fn table_ui(ui: &mut egui::Ui, id: u64, t: &mut Table, st: &mut TableState, 
             _ => (Some(st.cursor.0), Some(st.cursor.1)),
         };
         let mut done = false;
-        if let Some(r) = r {
-            if ui.button(tr("上方插入行", "Insert row above")).clicked() {
-                insert_rows(t, r, 1);
+        // R31b: "添加 [x] 行/列" — x 默认 1, 可改
+        if st.menu_count == 0 {
+            st.menu_count = 1;
+        }
+        ui.horizontal(|ui| {
+            ui.label(tr("数量", "Count"));
+            ui.add(egui::DragValue::new(&mut st.menu_count).range(1..=500).speed(0.2));
+        });
+        let k = st.menu_count.max(1);
+        // 右键点在选区内 → 作用于整个选区的行/列范围; 否则只作用于点到的那一行/列
+        let (sr0, sc0, sr1, sc1) = st.sel_rect();
+        let row_band = r.map(|r| if r >= sr0 && r <= sr1 { (sr0, sr1) } else { (r, r) });
+        let col_band = c.map(|c| if c >= sc0 && c <= sc1 { (sc0, sc1) } else { (c, c) });
+        ui.separator();
+        if let Some((r0, r1)) = row_band {
+            if ui.button(pla_bridge::t!("上方添加 {k} 行", "Add {k} row(s) above")).clicked() {
+                insert_rows(t, r0, k);
                 done = true;
             }
-            if ui.button(tr("下方插入行", "Insert row below")).clicked() {
-                insert_rows(t, r + 1, 1);
+            if ui.button(pla_bridge::t!("下方添加 {k} 行", "Add {k} row(s) below")).clicked() {
+                insert_rows(t, r1 + 1, k);
                 done = true;
             }
-            if t.rows() > 1 && ui.button(tr("删除行", "Delete row")).clicked() {
-                delete_rows(t, r, 1);
+            let n = r1 - r0 + 1;
+            if n < t.rows() && ui.button(pla_bridge::t!("删除 {n} 行", "Delete {n} row(s)")).clicked() {
+                delete_rows(t, r0, n);
                 done = true;
             }
         }
-        if r.is_some() && c.is_some() {
+        if row_band.is_some() && col_band.is_some() {
             ui.separator();
         }
-        if let Some(c) = c {
-            if ui.button(tr("左侧插入列", "Insert column left")).clicked() {
-                insert_cols(t, c, 1);
+        if let Some((c0, c1)) = col_band {
+            if ui.button(pla_bridge::t!("左侧添加 {k} 列", "Add {k} column(s) left")).clicked() {
+                insert_cols(t, c0, k);
                 done = true;
             }
-            if ui.button(tr("右侧插入列", "Insert column right")).clicked() {
-                insert_cols(t, c + 1, 1);
+            if ui.button(pla_bridge::t!("右侧添加 {k} 列", "Add {k} column(s) right")).clicked() {
+                insert_cols(t, c1 + 1, k);
                 done = true;
             }
-            if t.cols() > 1 && ui.button(tr("删除列", "Delete column")).clicked() {
-                delete_cols(t, c, 1);
+            let n = c1 - c0 + 1;
+            if n < t.cols() && ui.button(pla_bridge::t!("删除 {n} 列", "Delete {n} column(s)")).clicked() {
+                delete_cols(t, c0, n);
                 done = true;
             }
         }
@@ -835,6 +952,40 @@ fn delete_rows(t: &mut Table, at: usize, n: usize) {
     }
     rewrite_all(t, |s| formula::delete_rows(s, at, n));
     t.normalize();
+}
+
+/// R31b: 把第 from..from+n 行移到原坐标第 `to` 行之前(公式引用跟着走)。返回移动后块的起始行。
+fn move_rows(t: &mut Table, from: usize, n: usize, to: usize) -> usize {
+    if n == 0 || (to > from && to < from + n) || from + n > t.rows() {
+        return from;
+    }
+    rewrite_all(t, |s| formula::move_rows(s, from, n, to));
+    let block: Vec<Vec<String>> = t.cells.drain(from..from + n).collect();
+    let dst = if to > from { to - n } else { to };
+    for (i, row) in block.into_iter().enumerate() {
+        t.cells.insert(dst + i, row);
+    }
+    dst
+}
+
+/// 列版 [`move_rows`](列宽一起移动)。
+fn move_cols(t: &mut Table, from: usize, n: usize, to: usize) -> usize {
+    if n == 0 || (to > from && to < from + n) || from + n > t.cols() {
+        return from;
+    }
+    rewrite_all(t, |s| formula::move_cols(s, from, n, to));
+    let dst = if to > from { to - n } else { to };
+    for row in t.cells.iter_mut() {
+        let block: Vec<String> = row.drain(from..from + n).collect();
+        for (i, v) in block.into_iter().enumerate() {
+            row.insert(dst + i, v);
+        }
+    }
+    let wb: Vec<f32> = t.col_w.drain(from..from + n).collect();
+    for (i, w) in wb.into_iter().enumerate() {
+        t.col_w.insert(dst + i, w);
+    }
+    dst
 }
 
 fn insert_cols(t: &mut Table, at: usize, n: usize) {
@@ -1090,6 +1241,41 @@ mod tests {
         assert_eq!(t.col_w.len(), 3);
         delete_cols(&mut t, 0, 1);
         assert_eq!(t.cells[1][1], "=A3");
+    }
+
+    #[test]
+    fn move_rows_and_cols_reorder_and_rewrite() {
+        let mut t = tbl(&[&["a", "=A3"], &["b", ""], &["c", ""]]);
+        // 第 3 行(c) 拖到最上面
+        let dst = move_rows(&mut t, 2, 1, 0);
+        assert_eq!(dst, 0);
+        assert_eq!(t.cells.iter().map(|r| r[0].as_str()).collect::<Vec<_>>(), ["c", "a", "b"]);
+        assert_eq!(t.cells[1][1], "=A1", "引用跟着 c 走");
+        // 前两行一起下移到末尾
+        let dst = move_rows(&mut t, 0, 2, 3);
+        assert_eq!(dst, 1);
+        assert_eq!(t.cells.iter().map(|r| r[0].as_str()).collect::<Vec<_>>(), ["b", "c", "a"]);
+        // 列: B 列移到 A 前, 列宽一起走
+        let mut t2 = tbl(&[&["1", "2"]]);
+        t2.col_w = vec![50.0, 90.0];
+        move_cols(&mut t2, 1, 1, 0);
+        assert_eq!(t2.cells[0], ["2", "1"]);
+        assert_eq!(t2.col_w, [90.0, 50.0]);
+        // 落在块内部 = 不动
+        assert_eq!(move_rows(&mut t, 0, 2, 1), 0);
+    }
+
+    #[test]
+    fn full_row_and_col_bands() {
+        let t = tbl(&[&["", ""], &["", ""], &["", ""]]);
+        let mut st = TableState::default();
+        st.select(1, 1, 0);
+        st.cursor = (2, 1);
+        assert_eq!(st.full_rows(&t), Some((1, 2)));
+        assert_eq!(st.full_cols(&t), None);
+        st.anchor = (0, 1);
+        st.cursor = (2, 1);
+        assert_eq!(st.full_cols(&t), Some((1, 1)));
     }
 
     #[test]

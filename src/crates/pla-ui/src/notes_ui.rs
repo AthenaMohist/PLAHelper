@@ -90,6 +90,73 @@ pub struct NotesPanel {
     /// 最近用过的文字色 / 高亮色(工具条按钮上显示)。
     last_color: [u8; 3],
     last_bg: [u8; 3],
+    /// R31b: 撤销/重做历史(整篇笔记快照)。
+    history: History,
+}
+
+/// R31b: 撤销/重做 —— 存整篇块列表快照(笔记很小, 克隆便宜)。
+/// 连续打字合并: 同一行、上次改动 1.2s 内 → 不新增撤销点(一次 Ctrl+Z 撤掉一段输入, 而不是一个字)。
+#[derive(Default)]
+struct History {
+    undo: Vec<Vec<Block>>,
+    redo: Vec<Vec<Block>>,
+    last_change: Option<(u64, Instant)>,
+}
+
+impl History {
+    const LIMIT: usize = 200;
+    const GROUP: Duration = Duration::from_millis(1200);
+
+    /// 一帧结束发现内容变了: before = 变化前快照。
+    fn record(&mut self, before: Vec<Block>, after: &[Block]) {
+        let single = single_changed_block(&before, after);
+        let now = Instant::now();
+        let merge = matches!((single, self.last_change), (Some(id), Some((lid, t))) if id == lid && now.duration_since(t) < Self::GROUP)
+            && !self.undo.is_empty();
+        if !merge {
+            self.undo.push(before);
+            if self.undo.len() > Self::LIMIT {
+                self.undo.remove(0);
+            }
+        }
+        self.redo.clear();
+        self.last_change = single.map(|id| (id, now));
+    }
+
+    fn undo(&mut self, cur: Vec<Block>) -> Option<Vec<Block>> {
+        let prev = self.undo.pop()?;
+        self.redo.push(cur);
+        self.last_change = None;
+        Some(prev)
+    }
+
+    fn redo(&mut self, cur: Vec<Block>) -> Option<Vec<Block>> {
+        let next = self.redo.pop()?;
+        self.undo.push(cur);
+        self.last_change = None;
+        Some(next)
+    }
+
+    fn clear(&mut self) {
+        *self = History::default();
+    }
+}
+
+/// 只有一个块的文字变了(长度、顺序、类型都没变) → 该块 id; 否则(结构性改动) None。
+fn single_changed_block(a: &[Block], b: &[Block]) -> Option<u64> {
+    if a.len() != b.len() {
+        return None;
+    }
+    let mut found = None;
+    for (x, y) in a.iter().zip(b) {
+        if x != y {
+            if x.id != y.id || x.kind != y.kind || x.indent != y.indent || found.is_some() {
+                return None;
+            }
+            found = Some(x.id);
+        }
+    }
+    found
 }
 
 impl Default for NotesPanel {
@@ -133,6 +200,7 @@ impl NotesPanel {
             pending_sel: None,
             last_color: TEXT_COLORS[0].0,
             last_bg: BG_COLORS[2].0,
+            history: History::default(),
         }
     }
 
@@ -149,6 +217,7 @@ impl NotesPanel {
         self.table.clear();
         self.dragging = None;
         self.row_rects.clear();
+        self.history.clear(); // 撤销历史只属于当前文档
     }
 
     pub fn doc_key(&self) -> Option<&str> {
@@ -371,7 +440,42 @@ impl NotesPanel {
 
     // ---------------- 主体 ----------------
 
+    /// R31b: 面板入口 = 撤销/重做包装 + 主体。
+    /// Ctrl+Z 撤销, Ctrl+Y / Ctrl+Shift+Z 重做; 先于任何控件吃掉按键(行内 TextEdit 自己的撤销不再生效,
+    /// 统一走整篇笔记的历史, 文字、表格、排序、格式都能撤)。
     pub fn ui(&mut self, ui: &mut egui::Ui, th: &Theme) {
+        let (redo, undo) = ui.input_mut(|i| {
+            let redo = i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z) || i.consume_key(Modifiers::COMMAND, Key::Y);
+            let undo = i.consume_key(Modifiers::COMMAND, Key::Z);
+            (redo, undo)
+        });
+        if undo {
+            self.undo_redo(true);
+        } else if redo {
+            self.undo_redo(false);
+        }
+        let before = self.note.blocks.clone();
+        self.ui_body(ui, th);
+        if self.note.blocks != before {
+            self.history.record(before, &self.note.blocks);
+        }
+    }
+
+    fn undo_redo(&mut self, undo: bool) {
+        let cur = self.note.blocks.clone();
+        let restored = if undo { self.history.undo(cur) } else { self.history.redo(cur) };
+        if let Some(blocks) = restored {
+            self.note.blocks = blocks;
+            self.note.ensure_nonempty();
+            self.editing = None;
+            self.pending_focus = None;
+            self.pending_sel = None;
+            self.table.clear();
+            self.mark_dirty();
+        }
+    }
+
+    fn ui_body(&mut self, ui: &mut egui::Ui, th: &Theme) {
         self.toolbar(ui, th);
         ui.add_space(2.0);
         ui.separator();
@@ -1202,5 +1306,36 @@ mod fmt {
             // 没有该类颜色 → 不变
             assert_eq!(clear_spans("x<span style=\"color:#FF6B6B\">y</span>", 0, 0, SpanKind::Bg).0, "x<span style=\"color:#FF6B6B\">y</span>");
         }
+    }
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+
+    fn blk(id: u64, text: &str) -> Block {
+        Block { id, kind: Kind::Text, text: text.into(), indent: 0 }
+    }
+
+    #[test]
+    fn typing_groups_structure_splits_and_redo_works() {
+        let mut h = History::default();
+        let v0 = vec![blk(1, "")];
+        let v1 = vec![blk(1, "a")];
+        let v2 = vec![blk(1, "ab")];
+        h.record(v0.clone(), &v1);
+        h.record(v1.clone(), &v2); // 同一行连续输入 → 合并
+        assert_eq!(h.undo.len(), 1);
+        let v3 = vec![blk(1, "ab"), blk(2, "")];
+        h.record(v2.clone(), &v3); // 新起一行 = 结构性改动 → 新撤销点
+        assert_eq!(h.undo.len(), 2);
+        let back = h.undo(v3.clone()).unwrap();
+        assert_eq!(back, v2);
+        let back2 = h.undo(back).unwrap();
+        assert_eq!(back2, v0, "一次撤销撤掉整段输入");
+        let fwd = h.redo(back2).unwrap();
+        assert_eq!(fwd, v2);
+        assert!(single_changed_block(&v2, &v3).is_none());
+        assert_eq!(single_changed_block(&v1, &v2), Some(1));
     }
 }
