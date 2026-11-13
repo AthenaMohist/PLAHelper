@@ -100,11 +100,12 @@ const TOOLBAR_ACTIONS: [Action; 5] = [
 ];
 
 /// R8-1: 视口状态面板尺寸(同快照墙)。
-const PANEL_VPSTATE: [f32; 2] = [232.0, 480.0];
+const PANEL_VPSTATE: [f32; 2] = [PANEL_SNAPSHOTS[0], PANEL_SNAPSHOTS[1]];
 
 /// 面板逻辑尺寸 (宽, 高) — 子视口 OS 窗口大小。
 /// R7-6: 快照墙改窄加高(232x480) — 一行一个快照, 缩略图撑满内容宽。
-const PANEL_SNAPSHOTS: [f32; 2] = [232.0, 480.0];
+/// R29: 宽 232 → 280, 管理条(已选 N · 全选 · 反选 · 删除 · 完成)中英文都能一行放下。
+const PANEL_SNAPSHOTS: [f32; 2] = [280.0, 480.0];
 /// R7-20: 加高放选择集墙(96 滚动区)。
 /// R23: 选择集面板 = 左列选择集墙(约 280) + 右列 ENTITIES(SEL_ENTITIES_COL_W)。
 const PANEL_ENTITIES: [f32; 2] = [520.0, 560.0];
