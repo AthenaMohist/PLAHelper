@@ -3,6 +3,9 @@
 //! 「应用」需要 PUT_SOME 组创建语义(PLA-004 G4), 当前仅本地保存(诚实提示)。
 use std::path::PathBuf;
 
+use pla_bridge::i18n::tr;
+use pla_bridge::t;
+
 /// 选择集存档目录(按 doc_key 归档)。
 pub fn selections_dir(doc_key: &str) -> PathBuf {
     let exe = std::env::current_exe()
@@ -31,10 +34,10 @@ fn sanitize(name: &str) -> String {
 pub fn save_selection(doc_key: &str, name: &str, members: &[String]) -> Result<String, String> {
     let name = name.trim();
     if name.is_empty() {
-        return Err("选择集名称为空 — 请先在名称框输入".into());
+        return Err(tr("选择集名称为空 — 请先在名称框输入", "Selection set name is empty — enter a name first").into());
     }
     if members.is_empty() {
-        return Err("选择集没有勾选任何成员".into());
+        return Err(tr("选择集没有勾选任何成员", "No members checked in the selection set").into());
     }
     let json = serde_json::json!({
         "doc_key": doc_key,
@@ -43,7 +46,7 @@ pub fn save_selection(doc_key: &str, name: &str, members: &[String]) -> Result<S
     });
     let path = selections_dir(doc_key).join(format!("{}.json", sanitize(name)));
     std::fs::write(&path, serde_json::to_string_pretty(&json).map_err(|e| e.to_string())?)
-        .map_err(|e| format!("写入失败: {e}"))?;
+        .map_err(|e| t!("写入失败: {e}", "Write failed: {e}"))?;
     Ok(path.display().to_string())
 }
 
@@ -131,13 +134,13 @@ pub fn save_cdp_selection_with_camera(
 ) -> Result<String, String> {
     let name = name.trim();
     if name.is_empty() {
-        return Err("选择集名称为空 — 请先在名称框输入".into());
+        return Err(tr("选择集名称为空 — 请先在名称框输入", "Selection set name is empty — enter a name first").into());
     }
     if members.is_empty() {
-        return Err("实时选择勾选为空".into());
+        return Err(tr("实时选择勾选为空", "Nothing checked in the live selection").into());
     }
     let dir = cdp_selections_dir(doc_key);
-    std::fs::create_dir_all(&dir).map_err(|e| format!("创建目录失败: {e}"))?;
+    std::fs::create_dir_all(&dir).map_err(|e| t!("创建目录失败: {e}", "Failed to create directory: {e}"))?;
     let items: Vec<CdpMember> = members
         .iter()
         .map(|(k, i, n, key, member_cam)| CdpMember {
@@ -157,7 +160,7 @@ pub fn save_cdp_selection_with_camera(
     });
     let path = dir.join(format!("{}.json", sanitize(name)));
     std::fs::write(&path, serde_json::to_string_pretty(&json).map_err(|e| e.to_string())?)
-        .map_err(|e| format!("写文件失败: {e}"))?;
+        .map_err(|e| t!("写文件失败: {e}", "Failed to write file: {e}"))?;
     // R8-1: 截图覆盖保存(有则写, 无则删旧 — 保持与集内容一致)
     let png_path = dir.join(format!("{}.png", sanitize(name)));
     if let Some(bytes) = png {
@@ -262,7 +265,7 @@ pub fn open_cdp_selections_dir(doc_key: &str) -> Result<(), String> {
         .arg(dir.as_os_str())
         .spawn()
         .map(|_| ())
-        .map_err(|e| format!("打开失败: {e}"))
+        .map_err(|e| t!("打开失败: {e}", "Failed to open: {e}"))
 }
 
 /// R8-1: 批量删除选择集(含截图)。返回删除数。
@@ -294,13 +297,13 @@ pub fn save_cdp_selection(
 ) -> Result<String, String> {
     let name = name.trim();
     if name.is_empty() {
-        return Err("选择集名称为空 — 请先在名称框输入".into());
+        return Err(tr("选择集名称为空 — 请先在名称框输入", "Selection set name is empty — enter a name first").into());
     }
     if members.is_empty() {
-        return Err("实时选择勾选为空".into());
+        return Err(tr("实时选择勾选为空", "Nothing checked in the live selection").into());
     }
     let dir = cdp_selections_dir(doc_key);
-    std::fs::create_dir_all(&dir).map_err(|e| format!("创建目录失败: {e}"))?;
+    std::fs::create_dir_all(&dir).map_err(|e| t!("创建目录失败: {e}", "Failed to create directory: {e}"))?;
     let items: Vec<CdpMember> = members
         .iter()
         .map(|(k, i, n, key)| CdpMember {
@@ -319,7 +322,7 @@ pub fn save_cdp_selection(
     });
     let path = dir.join(format!("{}.json", sanitize(name)));
     std::fs::write(&path, serde_json::to_string_pretty(&json).map_err(|e| e.to_string())?)
-        .map_err(|e| format!("写文件失败: {e}"))?;
+        .map_err(|e| t!("写文件失败: {e}", "Failed to write file: {e}"))?;
     Ok(path.display().to_string())
 }
 
@@ -384,25 +387,25 @@ pub fn cdp_sel_meta(doc_key: &str, name: &str) -> Option<CdpSelMeta> {
 /// 写回单个选择集的 fav 标记(其余字段原样保留)。
 pub fn set_cdp_selection_fav(doc_key: &str, name: &str, fav: bool) -> Result<(), String> {
     let path = cdp_sel_path(doc_key, name);
-    let data = std::fs::read_to_string(&path).map_err(|e| format!("读取失败: {e}"))?;
+    let data = std::fs::read_to_string(&path).map_err(|e| t!("读取失败: {e}", "Read failed: {e}"))?;
     let mut v: serde_json::Value =
-        serde_json::from_str(&data).map_err(|e| format!("解析失败: {e}"))?;
+        serde_json::from_str(&data).map_err(|e| t!("解析失败: {e}", "Parse failed: {e}"))?;
     v["fav"] = serde_json::Value::Bool(fav);
     std::fs::write(&path, serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?)
-        .map_err(|e| format!("写文件失败: {e}"))
+        .map_err(|e| t!("写文件失败: {e}", "Failed to write file: {e}"))
 }
 
 /// 删除选择集文件。
 pub fn delete_cdp_selection(doc_key: &str, name: &str) -> Result<(), String> {
     let path = cdp_sel_path(doc_key, name);
-    std::fs::remove_file(&path).map_err(|e| format!("删除失败: {e}"))
+    std::fs::remove_file(&path).map_err(|e| t!("删除失败: {e}", "Delete failed: {e}"))
 }
 
 /// 改名: 校验新名 → 更新 json 内 name 字段 → 移动文件。
 pub fn rename_cdp_selection(doc_key: &str, old: &str, new: &str) -> Result<(), String> {
     let new = new.trim();
     if new.is_empty() {
-        return Err("新名称为空".into());
+        return Err(tr("新名称为空", "New name is empty").into());
     }
     if new == old {
         return Ok(());
@@ -410,15 +413,15 @@ pub fn rename_cdp_selection(doc_key: &str, old: &str, new: &str) -> Result<(), S
     let old_path = cdp_sel_path(doc_key, old);
     let new_path = cdp_sel_path(doc_key, new);
     if new_path.exists() {
-        return Err(format!("「{new}」已存在"));
+        return Err(t!("「{new}」已存在", "\"{new}\" already exists"));
     }
-    let data = std::fs::read_to_string(&old_path).map_err(|e| format!("读取失败: {e}"))?;
+    let data = std::fs::read_to_string(&old_path).map_err(|e| t!("读取失败: {e}", "Read failed: {e}"))?;
     let mut v: serde_json::Value =
-        serde_json::from_str(&data).map_err(|e| format!("解析失败: {e}"))?;
+        serde_json::from_str(&data).map_err(|e| t!("解析失败: {e}", "Parse failed: {e}"))?;
     v["name"] = serde_json::Value::String(new.to_string());
     std::fs::write(&new_path, serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?)
-        .map_err(|e| format!("写文件失败: {e}"))?;
-    std::fs::remove_file(&old_path).map_err(|e| format!("移除旧文件失败: {e}"))?;
+        .map_err(|e| t!("写文件失败: {e}", "Failed to write file: {e}"))?;
+    std::fs::remove_file(&old_path).map_err(|e| t!("移除旧文件失败: {e}", "Failed to remove old file: {e}"))?;
     // R8-1: 截图跟随改名
     let old_png = old_path.with_extension("png");
     let new_png = new_path.with_extension("png");

@@ -13,6 +13,9 @@
 
 use std::time::{Duration, Instant};
 
+use pla_bridge::i18n::tr;
+use pla_bridge::t;
+
 use pla_ui::bridge_thread::{BridgeCmd, BridgeEvent, BridgeHandle};
 use pla_ui::features::{Availability, Feature, Health};
 use pla_ui::hotkey::{Action, Hotkey, HotkeyMap};
@@ -448,20 +451,23 @@ struct CapsView {
 
 fn avail_style(a: &Availability) -> (&'static str, egui::Color32) {
     match a {
-        Availability::Ok => ("可用", COL_GREEN),
-        Availability::Degraded(_) => ("部分可用", COL_YELLOW),
-        Availability::Blocked(_) => ("不可用", COL_RED),
+        Availability::Ok => (tr("可用", "OK"), COL_GREEN),
+        Availability::Degraded(_) => (tr("部分可用", "Partial"), COL_YELLOW),
+        Availability::Blocked(_) => (tr("不可用", "Unavailable"), COL_RED),
     }
 }
 
 /// 能力明细行: 色点 + 能力名 + 中文说明; 有缺失时下一行列出缺的内部结构(垫片 LOC 表键)。
 fn cap_line(ui: &mut egui::Ui, name: &str, st: Option<&pla_bridge::shim::CapState>) {
     let (col, extra) = match st {
-        None => (COL_MUTED, Some("垫片未提供该能力".to_string())),
-        Some(s) if s.todo.is_some() => (COL_MUTED, Some(format!("路线图预留({}), 尚未实现", s.todo.as_deref().unwrap_or("")))),
-        Some(s) if !s.ok => (COL_RED, Some(format!("缺: {}", s.missing.join(", ")))),
+        None => (COL_MUTED, Some(tr("垫片未提供该能力", "Shim does not provide this capability").to_string())),
+        Some(s) if s.todo.is_some() => (
+            COL_MUTED,
+            Some(t!("路线图预留({}), 尚未实现", "Roadmap ({}), not implemented yet", s.todo.as_deref().unwrap_or(""))),
+        ),
+        Some(s) if !s.ok => (COL_RED, Some(t!("缺: {}", "Missing: {}", s.missing.join(", ")))),
         Some(s) if !s.optional_missing.is_empty() => {
-            (COL_YELLOW, Some(format!("缺可选: {}", s.optional_missing.join(", "))))
+            (COL_YELLOW, Some(t!("缺可选: {}", "Missing optional: {}", s.optional_missing.join(", "))))
         }
         Some(_) => (COL_GREEN, None),
     };
@@ -494,48 +500,69 @@ fn caps_panel_ui(ui: &mut egui::Ui, v: &CapsView, reprobe: &mut bool) {
         ui,
         "OVERVIEW",
         Some((
-            "CDP 能力",
+            tr("CDP 能力", "CDP capabilities"),
             vec![
-                info_text(
+                info_text(tr(
                     "连接 Plasticity 时逐项探测 pla-ui 依赖的内部结构。某项失效说明当前 Plasticity 版本改了内部实现: \
                      相关功能会被拦截并说明原因, 不会静默失败。",
-                ),
-                info_text("绿 = 可用; 黄 = 可用但缺可选子项; 红 = 不可用; 灰 = 预留 / 未知。"),
-                info_text("缺失项写的是垫片内部结构表的键; Plasticity 升级后在垫片表里补备选路径即可恢复。"),
-                info_text("工具栏状态点外环与本面板同源; 命令行 pla-app cdp-probe 输出原始探测结果。"),
+                    "On connecting to Plasticity, each internal structure pla-ui relies on is probed. A failure means this \
+                     Plasticity version changed its internals: affected features are blocked with a reason, never failing silently.",
+                )),
+                info_text(tr(
+                    "绿 = 可用; 黄 = 可用但缺可选子项; 红 = 不可用; 灰 = 预留 / 未知。",
+                    "Green = OK; yellow = OK but optional parts missing; red = unavailable; gray = reserved / unknown.",
+                )),
+                info_text(tr(
+                    "缺失项写的是垫片内部结构表的键; Plasticity 升级后在垫片表里补备选路径即可恢复。",
+                    "Missing items are keys of the shim's structure table; after a Plasticity upgrade, add fallback paths there to restore them.",
+                )),
+                info_text(tr(
+                    "工具栏状态点外环与本面板同源; 命令行 pla-app cdp-probe 输出原始探测结果。",
+                    "The toolbar status dot's outer ring uses the same data; `pla-app cdp-probe` prints the raw probe result.",
+                )),
             ],
         )),
         |ui| {
-            value_row(ui, "连接", &v.cdp_conn.text(), cdp_conn_color(&v.cdp_conn));
-            value_row(ui, "代理", &v.proxy_status, COL_TEXT);
+            value_row(ui, tr("连接", "Connection"), &v.cdp_conn.text(), cdp_conn_color(&v.cdp_conn));
+            value_row(ui, tr("代理", "Proxy"), &v.proxy_status, COL_TEXT);
             // Bridge 是只读冗余通道(实体网格), 与 CDP 能力无关; 断开不影响本面板任何功能。
-            value_row(ui, "Bridge(只读)", &v.bridge_status, status_color(&v.bridge_status));
+            value_row(ui, tr("Bridge(只读)", "Bridge (read-only)"), &v.bridge_status, status_color(&v.bridge_status));
             match caps {
-                None => value_row(ui, "能力", "CDP 未连接, 能力未知", COL_MUTED),
+                None => value_row(
+                    ui,
+                    tr("能力", "Capabilities"),
+                    tr("CDP 未连接, 能力未知", "CDP not connected, unknown"),
+                    COL_MUTED,
+                ),
                 Some(r) => {
                     let ed = if r.editor {
-                        format!("已找到(经 {})", r.finder.as_deref().unwrap_or("?"))
+                        t!("已找到(经 {})", "Found (via {})", r.finder.as_deref().unwrap_or("?"))
                     } else {
-                        "未找到".into()
+                        tr("未找到", "Not found").into()
                     };
-                    value_row(ui, "编辑器", &ed, if r.editor { COL_GREEN } else { COL_RED });
+                    value_row(ui, tr("编辑器", "Editor"), &ed, if r.editor { COL_GREEN } else { COL_RED });
                     let (b, d) = pla_ui::features::summary(caps);
                     let ok = Feature::ALL.len() - b - d;
                     let col = if b > 0 { COL_RED } else if d > 0 { COL_YELLOW } else { COL_GREEN };
-                    value_row(ui, "功能", &format!("{ok} 可用 · {d} 部分 · {b} 不可用"), col);
                     value_row(
                         ui,
-                        "垫片",
+                        tr("功能", "Features"),
+                        &t!("{ok} 可用 · {d} 部分 · {b} 不可用", "{ok} OK · {d} partial · {b} unavailable"),
+                        col,
+                    );
+                    value_row(
+                        ui,
+                        tr("垫片", "Shim"),
                         &format!("api {} · rev {}", pla_bridge::shim::API_VERSION, r.rev.get(..8).unwrap_or(&r.rev)),
                         COL_MUTED,
                     );
                 }
             }
             if let Some(s) = v.age_s {
-                value_row(ui, "上次探测", &format!("{s} 秒前"), COL_MUTED);
+                value_row(ui, tr("上次探测", "Last probe"), &t!("{s} 秒前", "{s}s ago"), COL_MUTED);
             }
             ui.add_space(2.0);
-            let btn = egui::Button::new(egui::RichText::new("重新探测").size(12.0).color(egui::Color32::WHITE))
+            let btn = egui::Button::new(egui::RichText::new(tr("重新探测", "Re-probe")).size(12.0).color(egui::Color32::WHITE))
                 .rounding(egui::Rounding::same(6.0))
                 .fill(COL_BTN)
                 .min_size(egui::vec2(ui.available_width(), 24.0));
@@ -569,7 +596,10 @@ fn caps_panel_ui(ui: &mut egui::Ui, v: &CapsView, reprobe: &mut bool) {
     let Some(r) = caps else { return };
     // ---- 路线图预留 ----
     settings_card(ui, "ROADMAP", None, |ui| {
-        ui.label(egui::RichText::new("后续功能所需能力(垫片已登记, 尚未实现)").size(10.5).color(COL_MUTED));
+        ui.label(egui::RichText::new(tr(
+            "后续功能所需能力(垫片已登记, 尚未实现)",
+            "Capabilities for upcoming features (registered in shim, not implemented yet)",
+        )).size(10.5).color(COL_MUTED));
         for c in ROADMAP_CAPS {
             cap_line(ui, c, r.caps.get(*c));
         }
@@ -591,7 +621,10 @@ fn caps_panel_ui(ui: &mut egui::Ui, v: &CapsView, reprobe: &mut bool) {
     // ---- 备选路径: Plasticity 改过名、垫片靠备选路径兜住的结构 ----
     if !r.alt_paths.is_empty() {
         settings_card(ui, "ALT PATHS", None, |ui| {
-            ui.label(egui::RichText::new("这些结构走了垫片表里的备选路径(说明 Plasticity 改过名)").size(10.5).color(COL_MUTED));
+            ui.label(egui::RichText::new(tr(
+                "这些结构走了垫片表里的备选路径(说明 Plasticity 改过名)",
+                "These structures resolved via fallback paths in the shim table (Plasticity renamed them)",
+            )).size(10.5).color(COL_MUTED));
             for (k, p) in &r.alt_paths {
                 ui.add(egui::Label::new(egui::RichText::new(format!("{k} → {p}")).size(11.0).color(COL_YELLOW)).wrap());
             }
@@ -608,8 +641,8 @@ fn select_all_invert_buttons(
 ) {
     let everything = !all.is_empty() && all.iter().all(|n| selected.contains(n));
     if ui
-        .small_button(if everything { "取消全选" } else { "全选" })
-        .on_hover_text("选中全部; 已全部选中时再按 = 全部取消")
+        .small_button(if everything { tr("取消全选", "Select none") } else { tr("全选", "Select all") })
+        .on_hover_text(tr("选中全部; 已全部选中时再按 = 全部取消", "Select all; press again when all selected = clear"))
         .clicked()
     {
         if everything {
@@ -618,7 +651,11 @@ fn select_all_invert_buttons(
             selected.extend(all.iter().cloned());
         }
     }
-    if ui.small_button("反选").on_hover_text("选中的取消、没选中的选中").clicked() {
+    if ui
+        .small_button(tr("反选", "Invert"))
+        .on_hover_text(tr("选中的取消、没选中的选中", "Selected become unselected and vice versa"))
+        .clicked()
+    {
         let next: std::collections::HashSet<String> =
             all.iter().filter(|n| !selected.contains(*n)).cloned().collect();
         *selected = next;
@@ -659,11 +696,16 @@ fn cdp_conn_color(c: &pla_bridge::cdp::ConnState) -> egui::Color32 {
     }
 }
 
+/// bridge 状态文本是否为「已连接」(兼容中英文状态文本 — 文本由 bridge 线程按当时语言生成)。
+fn bridge_is_connected(status: &str) -> bool {
+    status.starts_with("已连接") || status.starts_with("Connected")
+}
+
 /// bridge 状态文本 → 圆点颜色。
 fn status_color(status: &str) -> egui::Color32 {
-    if status.starts_with("已连接") {
+    if bridge_is_connected(status) {
         COL_GREEN
-    } else if status.starts_with("连接中") {
+    } else if status.starts_with("连接中") || status.starts_with("Connecting") {
         COL_YELLOW
     } else {
         COL_RED
@@ -923,7 +965,7 @@ fn stepper_row(
             .horizontal_align(egui::Align::Center)
             .font(egui::FontId::proportional(13.0))
             .text_color(egui::Color32::WHITE)
-            .hint_text("默认"),
+            .hint_text(tr("默认", "Default")),
     );
     if !suffix.is_empty() {
         ui.painter().text(
@@ -1289,7 +1331,7 @@ fn snap_image(
             ui.add_sized(
                 egui::vec2(iw, ih),
                 egui::Label::new(
-                    egui::RichText::new("无截图").small().color(COL_MUTED),
+                    egui::RichText::new(tr("无截图", "No image")).small().color(COL_MUTED),
                 )
                 .sense(egui::Sense::click()),
             )
@@ -1425,7 +1467,7 @@ fn snap_item(
                             },
                         )
                         .inner;
-                    nr.on_hover_text(if manage { &stem } else { "点击在新窗口打开快照" })
+                    nr.on_hover_text(if manage { &stem } else { tr("点击在新窗口打开快照", "Click to open snapshot in a new window") })
                 };
                 if name_resp.clicked() && !manage {
                     a.open = true;
@@ -1466,7 +1508,7 @@ fn draw_item_buttons(ui: &mut egui::Ui, is_fav: bool, a: &mut SnapItemActions) {
         star_col,
     );
     if sresp
-        .on_hover_text(if is_fav { "取消收藏" } else { "收藏(置顶小图)" })
+        .on_hover_text(if is_fav { tr("取消收藏", "Unfavorite") } else { tr("收藏(置顶小图)", "Favorite (pin to top)") })
         .clicked()
     {
         a.fav_toggle = true;
@@ -1487,7 +1529,7 @@ fn draw_item_buttons(ui: &mut egui::Ui, is_fav: bool, a: &mut SnapItemActions) {
         pcol,
         egui::Stroke::NONE,
     ));
-    if presp.on_hover_text("改名").clicked() {
+    if presp.on_hover_text(tr("改名", "Rename")).clicked() {
         a.rename_start = true;
     }
     // 删除垃圾桶(11px, 线稿缩放 11/14)
@@ -1503,7 +1545,7 @@ fn draw_item_buttons(ui: &mut egui::Ui, is_fav: bool, a: &mut SnapItemActions) {
     ui.painter().line_segment([p(4.0, 4.0), p(5.0, 12.0)], st);
     ui.painter().line_segment([p(10.0, 4.0), p(9.0, 12.0)], st);
     ui.painter().line_segment([p(5.0, 12.0), p(9.0, 12.0)], st);
-    if dresp.on_hover_text("删除(需确认)").clicked() {
+    if dresp.on_hover_text(tr("删除(需确认)", "Delete (confirm)")).clicked() {
         a.delete = true;
     }
 }
@@ -1609,10 +1651,10 @@ fn confirm_popup(
                         egui::RichText::new(text).small().color(COL_RED),
                     );
                     ui.horizontal(|ui| {
-                        if ui.button("确认删除").clicked() {
+                        if ui.button(tr("确认删除", "Delete")).clicked() {
                             result = Some(true);
                         }
-                        if ui.button("取消").clicked() {
+                        if ui.button(tr("取消", "Cancel")).clicked() {
                             result = Some(false);
                         }
                     });
@@ -1702,7 +1744,7 @@ impl PlaApp {
         let doc_key = "model1".to_string();
         Self {
             bridge: BridgeHandle::spawn(),
-            bridge_status: "连接中…".into(),
+            bridge_status: tr("连接中…", "Connecting…").into(),
             snap_target: None,
             last_snap_anchor: None,
             last_snap_poll: Instant::now() - Duration::from_millis(SNAP_POLL_MS),
@@ -1841,7 +1883,7 @@ impl PlaApp {
                         if self.cdp_err_msg.as_deref() != Some(msg.as_str()) {
                             self.cdp_err_msg = Some(msg.clone());
                             self.cdp_err_stack = stack.clone();
-                            self.set_notice((true, format!("Plasticity 报错: {msg}")));
+                            self.set_notice((true, t!("Plasticity 报错: {msg}", "Plasticity error: {msg}")));
                         }
                     }
                     if snap.ok {
@@ -1892,7 +1934,7 @@ impl PlaApp {
                 pla_bridge::cdp::CdpEvent::CallResult { name, result } => match result {
                     // 即时生效类调用成功时不打扰(面板上已显示"立即生效"); 失败如实提示。
                     Ok(v) => pla_ui::diag::log(&format!("CDP {name} ok: {v}")),
-                    Err(e) => self.set_notice((true, format!("即时生效失败({name}): {e}"))),
+                    Err(e) => self.set_notice((true, t!("即时生效失败({name}): {e}", "Live apply failed ({name}): {e}"))),
                 },
                 // R8-1: 视口状态采集回包 → 暂存并立即补发截图命令(串行化,
                 // 避免 VpStateSave/CaptureViewport 回包交错导致 pending 空)。
@@ -1923,7 +1965,7 @@ impl PlaApp {
                             Ok(stem) => {
                                 self.vp_states_loaded = false;
                                 self.vp_pngs.clear();
-                                self.set_notice((false, format!("视口状态已保存: {stem}")));
+                                self.set_notice((false, t!("视口状态已保存: {stem}", "View state saved: {stem}")));
                             }
                             Err(e) => self.set_notice((true, e)),
                         }
@@ -1934,7 +1976,10 @@ impl PlaApp {
                                 self.vp_states_loaded = false;
                                 self.set_notice((
                                     false,
-                                    format!("视口状态已保存: {stem}(截图失败, 无缩略图)"),
+                                    t!(
+                                        "视口状态已保存: {stem}(截图失败, 无缩略图)",
+                                        "View state saved: {stem} (capture failed, no thumbnail)"
+                                    ),
                                 ));
                             }
                             Err(e) => self.set_notice((true, e)),
@@ -1959,7 +2004,7 @@ impl PlaApp {
                                 self.sel_pngs.clear();
                                 self.set_notice((
                                     false,
-                                    format!("已保存 {} ({} 项, 含截图)", name, members.len()),
+                                    t!("已保存 {} ({} 项, 含截图)", "Saved {} ({} items, with image)", name, members.len()),
                                 ));
                             }
                             Err(e) => self.set_notice((true, e)),
@@ -2045,28 +2090,49 @@ impl PlaApp {
                         self.snap_pngs.clear(); // 新快照可能有新 PNG, 下次进面板重读
                         self.snap_infos = pla_ui::snapshot::load_meta_infos(&self.doc_key);
                         self.run_snapshot_cleanup();
-                        self.notice = Some((false, format!("快照已保存: {name}")));
+                        self.notice = Some((false, t!("快照已保存: {name}", "Snapshot saved: {name}")));
                     }
                     Err(e) => self.notice = Some((true, e)),
                 }
             }
             Action::SnapshotRestore => {
-                self.notice = Some((true, "切换快照未接线: 恢复写入需要 PLA-004 G4 闭环".into()));
+                self.notice = Some((
+                    true,
+                    tr(
+                        "切换快照未接线: 恢复写入需要 PLA-004 G4 闭环",
+                        "Snapshot switching not wired: restore needs the PLA-004 G4 loop",
+                    )
+                    .into(),
+                ));
             }
             Action::SelSave => {
                 let doc = self.doc_key.clone();
                 let name = self.sel_name.clone();
                 let members = self.sel_members.clone();
                 match pla_ui::selection::save_selection(&doc, &name, &members) {
-                    Ok(path) => self.notice = Some((false, format!("选择集已保存: {path}"))),
+                    Ok(path) => self.notice = Some((false, t!("选择集已保存: {path}", "Selection set saved: {path}"))),
                     Err(e) => self.notice = Some((true, e)),
                 }
             }
             Action::SelApply => {
-                self.notice = Some((true, "应用选择集需要 PUT_SOME 组创建语义(PLA-004 G4), 未接线".into()));
+                self.notice = Some((
+                    true,
+                    tr(
+                        "应用选择集需要 PUT_SOME 组创建语义(PLA-004 G4), 未接线",
+                        "Applying selection sets needs PUT_SOME group semantics (PLA-004 G4), not wired",
+                    )
+                    .into(),
+                ));
             }
             Action::DimApply => {
-                self.notice = Some((true, "尺寸驱动需要 facet 读写闭环(PLA-004 G4 后), 未接线".into()));
+                self.notice = Some((
+                    true,
+                    tr(
+                        "尺寸驱动需要 facet 读写闭环(PLA-004 G4 后), 未接线",
+                        "Dimension drive needs facet read/write loop (after PLA-004 G4), not wired",
+                    )
+                    .into(),
+                ));
             }
             Action::ToggleSnapshots => {
                 self.show_snapshots = !self.show_snapshots;
@@ -2160,8 +2226,8 @@ impl PlaApp {
         let Some(target) = self.snap_target.clone() else { return };
         if window_finder::focus_window(target.hwnd) {
             self.hovered_hint = Some((
-                "焦点已交还 Plasticity".into(),
-                format!("已聚焦: {}", target.title),
+                tr("焦点已交还 Plasticity", "Focus returned to Plasticity").into(),
+                t!("已聚焦: {}", "Focused: {}", target.title),
             ));
         }
     }
@@ -2347,17 +2413,21 @@ impl PlaApp {
                         None => {
                             let (name, args) = pla_ui::plasticity_config::live_step_call(d);
                             self.cdp.send(pla_bridge::cdp::CdpCmd::Call { name, args });
-                            (false, format!("已设为每次 {}°(立即生效)", fmt_deg(d)))
+                            (false, t!("已设为每次 {}°(立即生效)", "Set to {}° per step (applied now)", fmt_deg(d)))
                         }
                         Some(why) => (
                             false,
-                            format!("已设为每次 {}°(重启 Plasticity 后生效; 即时生效不可用: {why})", fmt_deg(d)),
+                            t!(
+                                "已设为每次 {}°(重启 Plasticity 后生效; 即时生效不可用: {why})",
+                                "Set to {}° per step (takes effect after restarting Plasticity; live apply unavailable: {why})",
+                                fmt_deg(d)
+                            ),
                         ),
                     }
                 }
                 Err(e) => (true, e),
             },
-            Err(_) => (true, format!("「{raw}」不是数字")),
+            Err(_) => (true, t!("「{raw}」不是数字", "\"{raw}\" is not a number")),
         });
     }
 
@@ -2369,9 +2439,11 @@ impl PlaApp {
             .and_then(|c| c.bridge_server.as_ref())
             .filter(|b| b.closed_while_enabled());
         match closed {
-            Some(b) if !self.bridge_status.starts_with("已连接") => format!(
+            Some(b) if !bridge_is_connected(&self.bridge_status) => t!(
                 "这个窗口的 Bridge 服务已停止: 端口 {} 被占用 — 多窗口时只有一个窗口能占用它; \
                  单窗口时多半是上次没退干净, 到偏好设置 → Network 把 Server 关掉再打开即可",
+                "This window's Bridge server stopped: port {} is in use — only one window can hold it; \
+                 with a single window it's likely a stale instance: in Preferences → Network turn Server off and on again",
                 b.port.unwrap_or(8980)
             ),
             _ => self.bridge_status.clone(),
@@ -2433,15 +2505,15 @@ impl PlaApp {
     fn cdp_summary(&self) -> String {
         let caps = self.cdp_caps.as_ref();
         match pla_ui::features::health(caps) {
-            Health::Unknown => "CDP: 未连接".into(),
-            Health::NoEditor => "CDP: 已连接, 但未找到 Plasticity 编辑器".into(),
-            Health::Full => "CDP: 全部功能可用".into(),
+            Health::Unknown => tr("CDP: 未连接", "CDP: not connected").into(),
+            Health::NoEditor => tr("CDP: 已连接, 但未找到 Plasticity 编辑器", "CDP: connected, but no Plasticity editor found").into(),
+            Health::Full => tr("CDP: 全部功能可用", "CDP: all features OK").into(),
             Health::Partial => {
                 let (b, d) = pla_ui::features::summary(caps);
                 match (b, d) {
-                    (0, d) => format!("CDP: {d} 项功能部分可用"),
-                    (b, 0) => format!("CDP: {b} 项功能不可用"),
-                    (b, d) => format!("CDP: {b} 项不可用, {d} 项部分可用"),
+                    (0, d) => t!("CDP: {d} 项功能部分可用", "CDP: {d} features partial"),
+                    (b, 0) => t!("CDP: {b} 项功能不可用", "CDP: {b} features unavailable"),
+                    (b, d) => t!("CDP: {b} 项不可用, {d} 项部分可用", "CDP: {b} unavailable, {d} partial"),
                 }
             }
         }
@@ -2452,7 +2524,7 @@ impl PlaApp {
         match self.feature_block(f) {
             None => true,
             Some(why) => {
-                self.set_notice((true, format!("「{}」不可用: {why}", f.label())));
+                self.set_notice((true, t!("「{}」不可用: {why}", "\"{}\" unavailable: {why}", f.label())));
                 false
             }
         }
@@ -2563,6 +2635,7 @@ fn header_extra_and_show(
                 // 回退: 后端不支持多视口时嵌进当前视口。
                 egui::ViewportClass::Embedded | egui::ViewportClass::Root | egui::ViewportClass::Deferred => {
                     egui::Window::new(title)
+                        .id(egui::Id::new(id)) // 标题随语言变, 窗口 id 固定
                         .open(&mut flag)
                         .resizable(false)
                         .collapsible(false)
@@ -2825,13 +2898,14 @@ impl eframe::App for PlaApp {
                     if dot_resp.hovered() {
                         // 一行一项, 长标题截断 — HUD 按内容高度自适应(见 hud_size)。
                         let win = match &self.snap_target {
-                            Some(t) => format!("窗口: {}", truncate_chars(&t.title, 20)),
-                            None => "窗口: 未绑定, 等待 Plasticity…".into(),
+                            Some(t) => t!("窗口: {}", "Window: {}", truncate_chars(&t.title, 20)),
+                            None => tr("窗口: 未绑定, 等待 Plasticity…", "Window: unbound, waiting for Plasticity…").into(),
                         };
                         hovered = Some((
-                            "PLA 助手".into(),
-                            format!(
+                            tr("PLA 助手", "PLA Helper").into(),
+                            t!(
                                 "{win}\n{}\nBridge(只读): {}\n单击: CDP 能力面板 · 双击: 归位",
+                                "{win}\n{}\nBridge (read-only): {}\nClick: CDP capabilities · Double-click: re-dock",
                                 self.cdp_summary(),
                                 self.bridge_status_text()
                             ),
@@ -2853,7 +2927,7 @@ impl eframe::App for PlaApp {
                             .binds
                             .get(&format!("{a:?}"))
                             .map(|h| h.display())
-                            .unwrap_or_else(|| "未绑定".into());
+                            .unwrap_or_else(|| tr("未绑定", "Unbound").into());
                         // 关键: 每个功能只构建一次按钮。
                         // (旧代码 clicked / secondary_clicked 各 add 一个 → 屏幕上渲染两份)
                         let btn = egui::Button::new(
@@ -2868,7 +2942,7 @@ impl eframe::App for PlaApp {
                         if resp.hovered() {
                             hovered = Some((
                                 format!("{} {}", a.icon(), a.label()),
-                                format!("快捷键: {hk} / 右键设置"),
+                                t!("快捷键: {hk} / 右键设置", "Hotkey: {hk} / right-click to set"),
                             ));
                         }
                         if resp.clicked() {
@@ -2891,7 +2965,7 @@ impl eframe::App for PlaApp {
                     .fill(COL_BTN);
                     let close_resp = ui.add(close_btn);
                     if close_resp.hovered() {
-                        hovered = Some(("关闭".into(), "退出 PLA 助手工具栏".into()));
+                        hovered = Some((tr("关闭", "Close").into(), tr("退出 PLA 助手工具栏", "Quit the PLA Helper toolbar").into()));
                     }
                     if close_resp.clicked() {
                         pla_ui::diag::log("工具栏 × 被点击");
@@ -3099,12 +3173,12 @@ impl eframe::App for PlaApp {
                         }
                     };
                     // right_to_left: 视觉顺序(右→左) = 🗑 📂 📷 ×
-                    vbtn(ui, IconKind::Trash, "管理 — 多选删除", &dm, &ts);
-                    vbtn(ui, IconKind::Folder, "打开快照文件夹", &dod, &ts);
+                    vbtn(ui, IconKind::Trash, tr("管理 — 多选删除", "Manage — multi-delete"), &dm, &ts);
+                    vbtn(ui, IconKind::Folder, tr("打开快照文件夹", "Open snapshot folder"), &dod, &ts);
                     vbtn(
                         ui,
                         IconKind::Camera,
-                        "手动快照 — 保存文档副本 + 截图当前画面",
+                        tr("手动快照 — 保存文档副本 + 截图当前画面", "Snapshot now — save a doc copy + screenshot"),
                         &ds,
                         &ts,
                     );
@@ -3112,7 +3186,7 @@ impl eframe::App for PlaApp {
                 header_extra_and_show(
                     ctx,
                     "panel-snapshots",
-                    "快照墙",
+                    tr("快照墙", "Snapshot wall"),
                     desired,
                     egui::vec2(PANEL_SNAPSHOTS[0], PANEL_SNAPSHOTS[1]),
                     &mut flag,
@@ -3126,7 +3200,7 @@ impl eframe::App for PlaApp {
                         if self.snap_manage {
                             ui.horizontal(|ui| {
                                 ui.label(
-                                    egui::RichText::new(format!("已选 {}", self.snap_selected.len()))
+                                    egui::RichText::new(t!("已选 {}", "{} selected", self.snap_selected.len()))
                                         .small()
                                         .color(COL_MUTED),
                                 );
@@ -3134,13 +3208,16 @@ impl eframe::App for PlaApp {
                                 select_all_invert_buttons(ui, &all, &mut self.snap_selected);
                                 let del = ui.add(
                                     egui::Button::new(
-                                        egui::RichText::new("删除所选")
+                                        egui::RichText::new(tr("删除所选", "Delete selected"))
                                             .small()
                                             .color(egui::Color32::WHITE),
                                     )
                                     .fill(egui::Color32::from_rgb(150, 45, 45)),
                                 );
-                                let del = del.on_hover_text("删除勾选的快照(含截图), 不可恢复");
+                                let del = del.on_hover_text(tr(
+                                    "删除勾选的快照(含截图), 不可恢复",
+                                    "Delete checked snapshots (with images), cannot be undone",
+                                ));
                                 if del.clicked() && !self.snap_selected.is_empty() {
                                     let names: Vec<String> =
                                         self.snap_selected.iter().cloned().collect();
@@ -3157,12 +3234,12 @@ impl eframe::App for PlaApp {
                                                 self.snap_selected.remove(n);
                                                 self.snap_favs.remove(n);
                                             }
-                                            self.set_notice((false, format!("已删除 {n} 个快照")));
+                                            self.set_notice((false, t!("已删除 {n} 个快照", "Deleted {n} snapshots")));
                                         }
                                         Err(e) => self.set_notice((true, e)),
                                     }
                                 }
-                                if ui.small_button("完成").clicked() {
+                                if ui.small_button(tr("完成", "Done")).clicked() {
                                     self.snap_manage = false;
                                     self.snap_selected.clear();
                                 }
@@ -3201,22 +3278,26 @@ impl eframe::App for PlaApp {
                                 match self.snap_infos.get(s) {
                                     Some((doc, created)) => Some((
                                         format!("{stem} — {doc}"),
-                                        format!("拍摄于 {created} · 点击在新窗口打开"),
+                                        t!("拍摄于 {created} · 点击在新窗口打开", "Taken {created} · click to open in new window"),
                                     )),
                                     None => Some((
                                         stem.to_string(),
-                                        "点击在新窗口打开".to_string(),
+                                        tr("点击在新窗口打开", "Click to open in new window").to_string(),
                                     )),
                                 }
                             };
                             if self.snapshots.is_empty() {
                                 ui.label(
-                                    egui::RichText::new("(暂无快照 — 点右上相机图标拍摄)").color(COL_MUTED),
+                                    egui::RichText::new(tr(
+                                        "(暂无快照 — 点右上相机图标拍摄)",
+                                        "(No snapshots — click the camera icon at top right)",
+                                    ))
+                                    .color(COL_MUTED),
                                 );
                             }
                             if !fav_list.is_empty() {
                                 ui.label(
-                                    egui::RichText::new("★ 收藏").small().strong().color(COL_MUTED),
+                                    egui::RichText::new(tr("★ 收藏", "★ Favorites")).small().strong().color(COL_MUTED),
                                 );
                                 // R7-10: 收藏行显式矩形定位(allocate_exact_size + UiBuilder
                                 // .max_rect), 列宽/行高完全确定 — 不依赖 horizontal 累进,
@@ -3282,7 +3363,7 @@ impl eframe::App for PlaApp {
                                 }
                                 ui.separator();
                                 ui.label(
-                                    egui::RichText::new("全部").small().strong().color(COL_MUTED),
+                                    egui::RichText::new(tr("全部", "All")).small().strong().color(COL_MUTED),
                                 );
                             }
                             for s in &other_list {
@@ -3328,8 +3409,9 @@ impl eframe::App for PlaApp {
                         }
                         // R8b: 单删确认 — 弹层(行内条会被滚动区推出可视区, 实测不可见)
                         if let Some(name) = self.snap_delete_confirm.clone() {
-                            let text = format!(
+                            let text = t!(
                                 "删除「{}」? 含截图, 不可恢复",
+                                "Delete \"{}\"? Includes image, cannot be undone",
                                 name.trim_end_matches(".plasticity")
                             );
                             match confirm_popup(ui.ctx(), "snap-del", &text) {
@@ -3348,7 +3430,7 @@ impl eframe::App for PlaApp {
                                             self.snap_pngs.remove(&name);
                                             self.snap_favs.remove(&name);
                                             self.snap_selected.remove(&name);
-                                            self.set_notice((false, format!("已删除「{name}」")));
+                                            self.set_notice((false, t!("已删除「{name}」", "Deleted \"{name}\"")));
                                         }
                                         Err(e) => self.set_notice((true, e)),
                                     }
@@ -3405,7 +3487,7 @@ impl eframe::App for PlaApp {
                                         if self.rename_edit.as_deref() == Some(old.as_str()) {
                                             self.rename_edit = None;
                                         }
-                                        self.set_notice((false, format!("已改名: {new_name}")));
+                                        self.set_notice((false, t!("已改名: {new_name}", "Renamed: {new_name}")));
                                     }
                                     Err(e) => self.set_notice((true, e)),
                                 }
@@ -3466,14 +3548,20 @@ impl eframe::App for PlaApp {
                             hit.set(true);
                         }
                     };
-                    vbtn(ui, IconKind::Trash, "批量删除", &dmv, &tsv);
-                    vbtn(ui, IconKind::Folder, "打开选择集文件夹", &dodv, &tsv);
-                    vbtn(ui, IconKind::Save, "保存当前选择(SG 自动命名 + 截图)", &dsv, &tsv);
+                    vbtn(ui, IconKind::Trash, tr("批量删除", "Batch delete"), &dmv, &tsv);
+                    vbtn(ui, IconKind::Folder, tr("打开选择集文件夹", "Open selection set folder"), &dodv, &tsv);
+                    vbtn(
+                        ui,
+                        IconKind::Save,
+                        tr("保存当前选择(SG 自动命名 + 截图)", "Save current selection (auto SG name + image)"),
+                        &dsv,
+                        &tsv,
+                    );
                 });
                 header_extra_and_show(
                     ctx,
                     "panel-entities",
-                    "选择集",
+                    tr("选择集", "Selection sets"),
                     desired,
                     egui::vec2(PANEL_ENTITIES[0], PANEL_ENTITIES[1]),
                     &mut flag,
@@ -3490,7 +3578,12 @@ impl eframe::App for PlaApp {
                             .show_inside(ui, |ui| {
                         section_header(ui, "ENTITIES");
                         ui.label(
-                            egui::RichText::new(format!("实时选择({} 项): {}", self.sel_cdp_members.len(), self.cdp_conn.text()))
+                            egui::RichText::new(t!(
+                                "实时选择({} 项): {}",
+                                "Live selection ({} items): {}",
+                                self.sel_cdp_members.len(),
+                                self.cdp_conn.text()
+                            ))
                                 .small()
                                 .color(COL_MUTED),
                         );
@@ -3525,7 +3618,14 @@ impl eframe::App for PlaApp {
                                     }
                                 });
                         } else {
-                            ui.label(egui::RichText::new("(空 — 在 Plasticity 视口/树里选择实体)").small().color(COL_MUTED));
+                            ui.label(
+                                egui::RichText::new(tr(
+                                    "(空 — 在 Plasticity 视口/树里选择实体)",
+                                    "(Empty — select entities in the Plasticity viewport/tree)",
+                                ))
+                                .small()
+                                .color(COL_MUTED),
+                            );
                         }
                         // R8-1(需求7): 报错信息溢出修复 — 包 ScrollArea + 换行
                         if let Some(err) = self.cdp_err_msg.clone() {
@@ -3565,7 +3665,14 @@ impl eframe::App for PlaApp {
                         let (fav_list, other_list): (Vec<_>, Vec<_>) =
                             self.sel_saved.iter().cloned().partition(|m| m.fav);
                         if self.sel_saved.is_empty() {
-                            ui.label(egui::RichText::new("(空 — 视口选中后点右上软盘图标保存)").small().color(COL_MUTED));
+                            ui.label(
+                                egui::RichText::new(tr(
+                                    "(空 — 视口选中后点右上软盘图标保存)",
+                                    "(Empty — select in viewport, then click the disk icon at top right)",
+                                ))
+                                .small()
+                                .color(COL_MUTED),
+                            );
                         }
                         let mut delete_ask: Option<String> = None;
                         let mut apply_now: Option<String> = None;
@@ -3616,13 +3723,17 @@ impl eframe::App for PlaApp {
                                                 }
                                                 _ => ui.add_sized(
                                                     egui::vec2(w, img_h),
-                                                    egui::Label::new(egui::RichText::new("无截图").small().color(COL_MUTED)).sense(egui::Sense::click()),
+                                                    egui::Label::new(egui::RichText::new(tr("无截图", "No image")).small().color(COL_MUTED)).sense(egui::Sense::click()),
                                                 ),
                                             };
                                             if img_resp.hovered() {
                                                 *inner_tip.borrow_mut() = Some((
-                                                    format!("{} — {} 项", meta.name, meta.n_members),
-                                                    format!("保存于 {} · 点击应用回 Plasticity", if meta.created.is_empty() { "-" } else { &meta.created }),
+                                                    t!("{} — {} 项", "{} — {} items", meta.name, meta.n_members),
+                                                    t!(
+                                                        "保存于 {} · 点击应用回 Plasticity",
+                                                        "Saved {} · click to apply in Plasticity",
+                                                        if meta.created.is_empty() { "-" } else { &meta.created }
+                                                    ),
                                                 ));
                                             }
                                             if img_resp.clicked() {
@@ -3658,8 +3769,8 @@ impl eframe::App for PlaApp {
                                             ui.horizontal(|ui| {
                                                 let (srect, sresp) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::click());
                                                 ui.painter().text(srect.center(), egui::Align2::CENTER_CENTER, if meta.fav { "★" } else { "☆" }, egui::FontId::proportional(13.0), if meta.fav { egui::Color32::from_rgb(255,200,60) } else { COL_MUTED });
-                                                if sresp.on_hover_text(if meta.fav { "取消收藏" } else { "收藏(置顶)" }).clicked() { fav = true; }
-                                                if pencil_button(ui).on_hover_text("改名").clicked() { rn = true; }
+                                                if sresp.on_hover_text(if meta.fav { tr("取消收藏", "Unfavorite") } else { tr("收藏(置顶)", "Favorite (pin to top)") }).clicked() { fav = true; }
+                                                if pencil_button(ui).on_hover_text(tr("改名", "Rename")).clicked() { rn = true; }
                                                 let (drect, dresp) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::click());
                                                 let dcol = if dresp.hovered() { COL_RED } else { COL_MUTED };
                                                 let p = |x: f32, y: f32| egui::pos2(drect.left() + x, drect.top() + y);
@@ -3670,7 +3781,7 @@ impl eframe::App for PlaApp {
                                                 ui.painter().line_segment([p(4.0,4.0), p(5.0,12.0)], egui::Stroke::new(1.2, dcol));
                                                 ui.painter().line_segment([p(10.0,4.0), p(9.0,12.0)], egui::Stroke::new(1.2, dcol));
                                                 ui.painter().line_segment([p(5.0,12.0), p(9.0,12.0)], egui::Stroke::new(1.2, dcol));
-                                                if dresp.on_hover_text("删除(需确认)").clicked() { del = true; }
+                                                if dresp.on_hover_text(tr("删除(需确认)", "Delete (confirm)")).clicked() { del = true; }
                                             });
                                         },
                                     );
@@ -3678,7 +3789,7 @@ impl eframe::App for PlaApp {
                                 };
                                 // 收藏行(3列, 定位同快照墙)
                                 if !fav_list.is_empty() {
-                                    ui.label(egui::RichText::new("★ 收藏").small().strong().color(COL_MUTED));
+                                    ui.label(egui::RichText::new(tr("★ 收藏", "★ Favorites")).small().strong().color(COL_MUTED));
                                     let fav_img_h = 56.0;
                                     let fav_row_h = fav_img_h + 26.0; // R8e: 图+名称+紧凑按钮行
                                     for trio in fav_list.chunks(3) {
@@ -3699,7 +3810,7 @@ impl eframe::App for PlaApp {
                                 // 全部区(一行一个, 大图)
                                 if !other_list.is_empty() || fav_list.is_empty() {
                                     if !other_list.is_empty() {
-                                        ui.label(egui::RichText::new("全部").small().strong().color(COL_MUTED));
+                                        ui.label(egui::RichText::new(tr("全部", "All")).small().strong().color(COL_MUTED));
                                     }
                                     for meta in &other_list {
                                         let (del, fav, rn) = item(ui, meta, avail_w, 96.0);
@@ -3712,7 +3823,7 @@ impl eframe::App for PlaApp {
                             });
                         // 删除确认(R8b: 弹层)
                         if let Some(name) = self.sel_delete_confirm.clone() {
-                            let text = format!("删除「{name}」? 含截图, 不可恢复");
+                            let text = t!("删除「{name}」? 含截图, 不可恢复", "Delete \"{name}\"? Includes image, cannot be undone");
                             match confirm_popup(ui.ctx(), "sel-del", &text) {
                                 Some(true) => {
                                     match pla_ui::selection::delete_cdp_selections_batch(
@@ -3723,7 +3834,7 @@ impl eframe::App for PlaApp {
                                             self.sel_saved_loaded = false;
                                             self.sel_pngs.remove(&name);
                                             self.sel_selected.remove(&name);
-                                            self.set_notice((false, format!("已删除「{name}」")));
+                                            self.set_notice((false, t!("已删除「{name}」", "Deleted \"{name}\"")));
                                         }
                                         Err(e) => self.set_notice((true, e)),
                                     }
@@ -3739,22 +3850,22 @@ impl eframe::App for PlaApp {
                         // 管理模式操作条
                         if self.sel_manage {
                             ui.horizontal(|ui| {
-                                ui.label(egui::RichText::new(format!("已选 {}", self.sel_selected.len())).small().color(COL_MUTED));
+                                ui.label(egui::RichText::new(t!("已选 {}", "{} selected", self.sel_selected.len())).small().color(COL_MUTED));
                                 let all: Vec<String> = self.sel_saved.iter().map(|m| m.name.clone()).collect();
                                 select_all_invert_buttons(ui, &all, &mut self.sel_selected);
-                                if ui.small_button("删除所选").clicked() && !self.sel_selected.is_empty() {
+                                if ui.small_button(tr("删除所选", "Delete selected")).clicked() && !self.sel_selected.is_empty() {
                                     let names: Vec<String> = self.sel_selected.iter().cloned().collect();
                                     match pla_ui::selection::delete_cdp_selections_batch(&self.doc_key, &names) {
                                         Ok(n) => {
                                             self.sel_saved_loaded = false;
                                             for nm in &names { self.sel_pngs.remove(nm); }
                                             self.sel_selected.clear();
-                                            self.set_notice((false, format!("已删除 {n} 个选择集")));
+                                            self.set_notice((false, t!("已删除 {n} 个选择集", "Deleted {n} selection sets")));
                                         }
                                         Err(e) => self.set_notice((true, e)),
                                     }
                                 }
-                                if ui.small_button("完成").clicked() {
+                                if ui.small_button(tr("完成", "Done")).clicked() {
                                     self.sel_manage = false;
                                     self.sel_selected.clear();
                                 }
@@ -3780,7 +3891,7 @@ impl eframe::App for PlaApp {
                                     Ok(_) => {
                                         self.sel_saved_loaded = false;
                                         self.sel_pngs.remove(&old);
-                                        self.set_notice((false, format!("已改名: {old} → {}", self.sel_rename_buf.trim())));
+                                        self.set_notice((false, t!("已改名: {old} → {}", "Renamed: {old} → {}", self.sel_rename_buf.trim())));
                                     }
                                     Err(e) => self.set_notice((true, e)),
                                 }
@@ -3800,15 +3911,15 @@ impl eframe::App for PlaApp {
                                         })
                                         .collect();
                                     if entries.is_empty() {
-                                        self.set_notice((true, "该选择集没有成员".into()));
+                                        self.set_notice((true, tr("该选择集没有成员", "This selection set has no members").into()));
                                     } else {
                                         let n = entries.len();
                                         self.send_apply(entries);
                                         self.pending_focus = true;
-                                        self.set_notice((false, format!("正在应用「{name}」{n} 项…")));
+                                        self.set_notice((false, t!("正在应用「{name}」{n} 项…", "Applying \"{name}\" ({n} items)…")));
                                     }
                                 }
-                                None => self.set_notice((true, "读取失败".into())),
+                                None => self.set_notice((true, tr("读取失败", "Failed to read").into())),
                             }
                         }
                         if let Some(e) = open_err {
@@ -3827,7 +3938,10 @@ impl eframe::App for PlaApp {
                 // 💾 保存: SG 自动命名 + 截图 → (pending 流程: 截图回包后落盘)
                 if do_save.get() && self.require_feature(Feature::SelSave) {
                     if self.sel_cdp_members.is_empty() {
-                        self.set_notice((true, "实时选择为空 — 请先在视口里选中目标".into()));
+                        self.set_notice((
+                            true,
+                            tr("实时选择为空 — 请先在视口里选中目标", "Live selection is empty — select something in the viewport first").into(),
+                        ));
                     } else {
                         let name = pla_ui::selection::next_sg_name(&self.doc_key);
                         let members = self.sel_cdp_members.clone();
@@ -3839,7 +3953,7 @@ impl eframe::App for PlaApp {
                         self.sel_shot_path = Some(tmp_str.clone());
                         self.sel_save_pending = Some((name.clone(), members, cam));
                         self.cdp.send(pla_bridge::cdp::CdpCmd::CaptureViewport(tmp_str));
-                        self.set_notice((false, format!("正在保存选择集 {name}(截图中)…")));
+                        self.set_notice((false, t!("正在保存选择集 {name}(截图中)…", "Saving selection set {name} (capturing)…")));
                     }
                 }
                 if do_open_dir.get() {
@@ -3873,14 +3987,20 @@ impl eframe::App for PlaApp {
                             hit.set(true);
                         }
                     };
-                    vbtn(ui, IconKind::Trash, "批量删除", &dmv, &tsv);
-                    vbtn(ui, IconKind::Folder, "打开视口状态文件夹", &dodv, &tsv);
-                    vbtn(ui, IconKind::Save, "保存当前视口状态(VS 自动命名 + 截图)", &dsv, &tsv);
+                    vbtn(ui, IconKind::Trash, tr("批量删除", "Batch delete"), &dmv, &tsv);
+                    vbtn(ui, IconKind::Folder, tr("打开视口状态文件夹", "Open view state folder"), &dodv, &tsv);
+                    vbtn(
+                        ui,
+                        IconKind::Save,
+                        tr("保存当前视口状态(VS 自动命名 + 截图)", "Save current view state (auto VS name + image)"),
+                        &dsv,
+                        &tsv,
+                    );
                 });
                 header_extra_and_show(
                     ctx,
                     "panel-vpstate",
-                    "视口状态",
+                    tr("视口状态", "View states"),
                     desired,
                     egui::vec2(PANEL_VPSTATE[0], PANEL_VPSTATE[1]),
                     &mut flag,
@@ -3903,7 +4023,14 @@ impl eframe::App for PlaApp {
                         let (fav_list, other_list): (Vec<_>, Vec<_>) =
                             self.vp_states.iter().cloned().partition(|m| m.fav);
                         if self.vp_states.is_empty() {
-                            ui.label(egui::RichText::new("(空 — 点右上软盘图标保存当前视口)").small().color(COL_MUTED));
+                            ui.label(
+                                egui::RichText::new(tr(
+                                    "(空 — 点右上软盘图标保存当前视口)",
+                                    "(Empty — click the disk icon at top right to save the view)",
+                                ))
+                                .small()
+                                .color(COL_MUTED),
+                            );
                         }
                         let mut delete_ask: Option<String> = None;
                         let mut apply_now: Option<String> = None;
@@ -3921,16 +4048,17 @@ impl eframe::App for PlaApp {
                                         let nsec = v["sections"].as_array().map(|a| a.len()).unwrap_or(0);
                                         let zoom = v["orbit"]["zoom"].as_f64();
                                         let fov = v["cam"]["fov"].as_f64();
-                                        format!(
+                                        t!(
                                             "显示: {mode} / 剖面模式: {sec}({nsec}) / {} / zoom {}",
-                                            if fov == Some(0.0) { "正交" } else { "透视" },
+                                            "Shading: {mode} / Section: {sec} ({nsec}) / {} / zoom {}",
+                                            if fov == Some(0.0) { tr("正交", "Ortho") } else { tr("透视", "Persp") },
                                             zoom.map(|z| format!("{z:.1}")).unwrap_or("-".into()),
                                         )
                                     } else {
-                                        "状态数据无法解析".into()
+                                        tr("状态数据无法解析", "State data unparsable").into()
                                     }
                                 }
-                                None => "状态数据缺失".into(),
+                                None => tr("状态数据缺失", "State data missing").into(),
                             }
                         };
                         // R23: 存档墙占满剩余高度(以前封顶屏高 1/3 → 收藏区挤得放不下一个); 管理模式给下方操作条留高度。
@@ -3967,13 +4095,17 @@ impl eframe::App for PlaApp {
                                                 }
                                                 _ => ui.add_sized(
                                                     egui::vec2(w, img_h),
-                                                    egui::Label::new(egui::RichText::new("无截图").small().color(COL_MUTED)).sense(egui::Sense::click()),
+                                                    egui::Label::new(egui::RichText::new(tr("无截图", "No image")).small().color(COL_MUTED)).sense(egui::Sense::click()),
                                                 ),
                                             };
                                             if img_resp.hovered() {
                                                 *inner_tip.borrow_mut() = Some((
-                                                    format!("{} — 视口状态", meta.name),
-                                                    format!("{brief} · 保存于 {} · 点击恢复", if meta.created.is_empty() { "-" } else { &meta.created }),
+                                                    t!("{} — 视口状态", "{} — view state", meta.name),
+                                                    t!(
+                                                        "{brief} · 保存于 {} · 点击恢复",
+                                                        "{brief} · saved {} · click to restore",
+                                                        if meta.created.is_empty() { "-" } else { &meta.created }
+                                                    ),
                                                 ));
                                             }
                                             if img_resp.clicked() {
@@ -4005,8 +4137,8 @@ impl eframe::App for PlaApp {
                                             ui.horizontal(|ui| {
                                                 let (srect, sresp) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::click());
                                                 ui.painter().text(srect.center(), egui::Align2::CENTER_CENTER, if meta.fav { "★" } else { "☆" }, egui::FontId::proportional(13.0), if meta.fav { egui::Color32::from_rgb(255,200,60) } else { COL_MUTED });
-                                                if sresp.on_hover_text(if meta.fav { "取消收藏" } else { "收藏(置顶)" }).clicked() { fav = true; }
-                                                if pencil_button(ui).on_hover_text("改名").clicked() { rn = true; }
+                                                if sresp.on_hover_text(if meta.fav { tr("取消收藏", "Unfavorite") } else { tr("收藏(置顶)", "Favorite (pin to top)") }).clicked() { fav = true; }
+                                                if pencil_button(ui).on_hover_text(tr("改名", "Rename")).clicked() { rn = true; }
                                                 let (drect, dresp) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::click());
                                                 let dcol = if dresp.hovered() { COL_RED } else { COL_MUTED };
                                                 let p = |x: f32, y: f32| egui::pos2(drect.left() + x, drect.top() + y);
@@ -4017,14 +4149,14 @@ impl eframe::App for PlaApp {
                                                 ui.painter().line_segment([p(4.0,4.0), p(5.0,12.0)], egui::Stroke::new(1.2, dcol));
                                                 ui.painter().line_segment([p(10.0,4.0), p(9.0,12.0)], egui::Stroke::new(1.2, dcol));
                                                 ui.painter().line_segment([p(5.0,12.0), p(9.0,12.0)], egui::Stroke::new(1.2, dcol));
-                                                if dresp.on_hover_text("删除(需确认)").clicked() { del = true; }
+                                                if dresp.on_hover_text(tr("删除(需确认)", "Delete (confirm)")).clicked() { del = true; }
                                             });
                                         },
                                     );
                                     (del, fav, rn)
                                 };
                                 if !fav_list.is_empty() {
-                                    ui.label(egui::RichText::new("★ 收藏").small().strong().color(COL_MUTED));
+                                    ui.label(egui::RichText::new(tr("★ 收藏", "★ Favorites")).small().strong().color(COL_MUTED));
                                     let fav_img_h = 56.0;
                                     let fav_row_h = fav_img_h + 26.0; // R8e: 图+名称+紧凑按钮行
                                     for trio in fav_list.chunks(3) {
@@ -4043,7 +4175,7 @@ impl eframe::App for PlaApp {
                                     ui.separator();
                                 }
                                 if !other_list.is_empty() {
-                                    ui.label(egui::RichText::new("全部").small().strong().color(COL_MUTED));
+                                    ui.label(egui::RichText::new(tr("全部", "All")).small().strong().color(COL_MUTED));
                                     for meta in &other_list {
                                         let (del, fav, rn) = item(ui, meta, avail_w, 96.0);
                                         ui.add_space(4.0);
@@ -4055,7 +4187,7 @@ impl eframe::App for PlaApp {
                             });
                         // 删除确认(R8b: 弹层)
                         if let Some(name) = self.vp_delete_confirm.clone() {
-                            let text = format!("删除「{name}」? 不可恢复");
+                            let text = t!("删除「{name}」? 不可恢复", "Delete \"{name}\"? Cannot be undone");
                             match confirm_popup(ui.ctx(), "vp-del", &text) {
                                 Some(true) => {
                                     match pla_ui::vpstate::delete_vpstates(
@@ -4065,7 +4197,7 @@ impl eframe::App for PlaApp {
                                         Ok(_) => {
                                             self.vp_states_loaded = false;
                                             self.vp_pngs.remove(&name);
-                                            self.set_notice((false, format!("已删除「{name}」")));
+                                            self.set_notice((false, t!("已删除「{name}」", "Deleted \"{name}\"")));
                                         }
                                         Err(e) => self.set_notice((true, e)),
                                     }
@@ -4081,22 +4213,22 @@ impl eframe::App for PlaApp {
                         // 管理条
                         if self.sel_manage && self.show_vpstate {
                             ui.horizontal(|ui| {
-                                ui.label(egui::RichText::new(format!("已选 {}", self.sel_selected.len())).small().color(COL_MUTED));
+                                ui.label(egui::RichText::new(t!("已选 {}", "{} selected", self.sel_selected.len())).small().color(COL_MUTED));
                                 let all: Vec<String> = self.vp_states.iter().map(|m| m.name.clone()).collect();
                                 select_all_invert_buttons(ui, &all, &mut self.sel_selected);
-                                if ui.small_button("删除所选").clicked() && !self.sel_selected.is_empty() {
+                                if ui.small_button(tr("删除所选", "Delete selected")).clicked() && !self.sel_selected.is_empty() {
                                     let names: Vec<String> = self.sel_selected.iter().cloned().collect();
                                     match pla_ui::vpstate::delete_vpstates(&self.doc_key, &names) {
                                         Ok(n) => {
                                             self.vp_states_loaded = false;
                                             for nm in &names { self.vp_pngs.remove(nm); }
                                             self.sel_selected.clear();
-                                            self.set_notice((false, format!("已删除 {n} 个视口状态")));
+                                            self.set_notice((false, t!("已删除 {n} 个视口状态", "Deleted {n} view states")));
                                         }
                                         Err(e) => self.set_notice((true, e)),
                                     }
                                 }
-                                if ui.small_button("完成").clicked() {
+                                if ui.small_button(tr("完成", "Done")).clicked() {
                                     self.sel_manage = false;
                                     self.sel_selected.clear();
                                 }
@@ -4121,7 +4253,7 @@ impl eframe::App for PlaApp {
                                     Ok(_) => {
                                         self.vp_states_loaded = false;
                                         self.vp_pngs.remove(&old);
-                                        self.set_notice((false, format!("已改名: {old} → {}", self.vp_rename_buf.trim())));
+                                        self.set_notice((false, t!("已改名: {old} → {}", "Renamed: {old} → {}", self.vp_rename_buf.trim())));
                                     }
                                     Err(e) => self.set_notice((true, e)),
                                 }
@@ -4133,9 +4265,9 @@ impl eframe::App for PlaApp {
                                 Some(state) => {
                                     self.cdp.send(pla_bridge::cdp::CdpCmd::VpStateApply(state));
                                     self.pending_focus = true;
-                                    self.set_notice((false, format!("正在恢复视口状态「{name}」…")));
+                                    self.set_notice((false, t!("正在恢复视口状态「{name}」…", "Restoring view state \"{name}\"…")));
                                 }
-                                None => self.set_notice((true, "状态数据缺失".into())),
+                                None => self.set_notice((true, tr("状态数据缺失", "State data missing").into())),
                             }
                         }
                         if let Some(t) = inner_tip.into_inner() {
@@ -4158,7 +4290,7 @@ impl eframe::App for PlaApp {
                     self.vp_shot_path = Some(tmp.display().to_string());
                     self.vp_pending_state = None;
                     self.cdp.send(pla_bridge::cdp::CdpCmd::VpStateSave);
-                    self.set_notice((false, "正在采集视口状态…".into()));
+                    self.set_notice((false, tr("正在采集视口状态…", "Capturing view state…").into()));
                 }
                 if do_open_dir.get() {
                     if let Err(e) = pla_ui::vpstate::open_dir(&self.doc_key) {
@@ -4180,7 +4312,7 @@ impl eframe::App for PlaApp {
                 show_child_window(
                     ctx,
                     "panel-dim",
-                    "尺寸驱动",
+                    tr("尺寸驱动", "Dimension drive"),
                     desired,
                     egui::vec2(PANEL_DIM[0], PANEL_DIM[1]),
                     &mut flag,
@@ -4194,12 +4326,12 @@ impl eframe::App for PlaApp {
                             self.dim_loaded = true;
                         }
                         ui.horizontal(|ui| {
-                            ui.label("关联选择集:");
+                            ui.label(tr("关联选择集:", "Linked set:"));
                             let cur = self
                                 .dim_sets
                                 .get(self.dim_set_sel)
                                 .map(|s| s.as_str())
-                                .unwrap_or("(无)");
+                                .unwrap_or(tr("(无)", "(none)"));
                             egui::ComboBox::from_id_salt("dim-set")
                                 .selected_text(cur)
                                 .show_ui(ui, |ui| {
@@ -4207,23 +4339,30 @@ impl eframe::App for PlaApp {
                                         ui.selectable_value(&mut self.dim_set_sel, i, s);
                                     }
                                 });
-                            if ui.small_button("刷新").clicked() {
+                            if ui.small_button(tr("刷新", "Refresh")).clicked() {
                                 self.dim_sets =
                                     pla_ui::selection::list_cdp_selections(&self.doc_key);
                             }
                         });
                         ui.horizontal(|ui| {
-                            ui.label("方向:");
+                            ui.label(tr("方向:", "Axis:"));
                             for (i, ax) in ["X", "Y", "Z"].iter().enumerate() {
                                 ui.selectable_value(&mut self.dim_axis, i, *ax);
                             }
-                            ui.label("数值(毫米):");
+                            ui.label(tr("数值(毫米):", "Value (mm):"));
                             ui.add(egui::DragValue::new(&mut self.dim_value).speed(0.1));
                         });
                         ui.horizontal(|ui| {
-                            if ui.button("① 选中关联实体").clicked() {
+                            if ui.button(tr("① 选中关联实体", "① Select linked entities")).clicked() {
                                 let Some(name) = self.dim_sets.get(self.dim_set_sel).cloned() else {
-                                    self.set_notice((true, "没有已保存的选择集 — 先在选择集窗口保存".into()));
+                                    self.set_notice((
+                                        true,
+                                        tr(
+                                            "没有已保存的选择集 — 先在选择集窗口保存",
+                                            "No saved selection sets — save one in the Selection sets panel first",
+                                        )
+                                        .into(),
+                                    ));
                                     return;
                                 };
                                 match pla_ui::selection::load_cdp_selection(&self.doc_key, &name) {
@@ -4238,7 +4377,7 @@ impl eframe::App for PlaApp {
                                             })
                                             .collect();
                                         if entries.is_empty() {
-                                            self.set_notice((true, "选择集没有成员".into()));
+                                            self.set_notice((true, tr("选择集没有成员", "Selection set has no members").into()));
                                         } else {
                                             let n = entries.len();
                                             self.send_apply(entries);
@@ -4246,18 +4385,18 @@ impl eframe::App for PlaApp {
                                             self.pending_focus = true;
                                             self.set_notice((
                                                 false,
-                                                format!("正在选中 {n} 项 ({name})…"),
+                                                t!("正在选中 {n} 项 ({name})…", "Selecting {n} items ({name})…"),
                                             ));
                                         }
                                     }
                                     None => {
-                                        self.set_notice((true, format!("选择集 {name} 读取失败")))
+                                        self.set_notice((true, t!("选择集 {name} 读取失败", "Failed to read selection set {name}")))
                                     }
                                 }
                             }
-                            if ui.button("保存关联").clicked() {
+                            if ui.button(tr("保存关联", "Save link")).clicked() {
                                 let Some(name) = self.dim_sets.get(self.dim_set_sel).cloned() else {
-                                    self.set_notice((true, "没有关联的选择集".into()));
+                                    self.set_notice((true, tr("没有关联的选择集", "No linked selection set").into()));
                                     return;
                                 };
                                 let axis = ["X", "Y", "Z"][self.dim_axis.min(2)];
@@ -4272,16 +4411,17 @@ impl eframe::App for PlaApp {
                                 ) {
                                     Ok(_) => self.set_notice((
                                         false,
-                                        format!("尺寸关联已保存: {name} {axis}={}", self.dim_value),
+                                        t!("尺寸关联已保存: {name} {axis}={}", "Dimension link saved: {name} {axis}={}", self.dim_value),
                                     )),
-                                    Err(e) => self.set_notice((true, format!("保存失败: {e}"))),
+                                    Err(e) => self.set_notice((true, t!("保存失败: {e}", "Save failed: {e}"))),
                                 }
                             }
                         });
                         ui.label(
-                            egui::RichText::new(
+                            egui::RichText::new(tr(
                                 "② 应用平移: 命令参数化(move-item 交互状态机)待活体逆向 — ① 已可用",
-                            )
+                                "② Apply move: command parameterization (move-item state machine) pending live RE — ① works",
+                            ))
                             .small()
                             .color(COL_MUTED),
                         );
@@ -4298,7 +4438,7 @@ impl eframe::App for PlaApp {
                 show_child_window(
                     ctx,
                     "panel-settings",
-                    "设置",
+                    tr("设置", "Settings"),
                     desired,
                     egui::vec2(PANEL_SETTINGS[0], PANEL_SETTINGS[1]),
                     &mut flag,
@@ -4342,20 +4482,22 @@ impl eframe::App for PlaApp {
                             ui,
                             "BRIDGE",
                             Some((
-                                "官方 Bridge",
-                                vec![info_text(
+                                tr("官方 Bridge", "Official Bridge"),
+                                vec![info_text(tr(
                                     "Plasticity 自带的 WebSocket 服务(偏好设置 → Server, 端口 8980)。\
                                      pla-ui 用它读取实体网格; 只读, 不能修改模型。",
-                                )],
+                                    "Plasticity's built-in WebSocket server (Preferences → Server, port 8980). \
+                                     pla-ui reads entity meshes through it; read-only, cannot modify the model.",
+                                ))],
                             )),
                             |ui| {
-                                value_row(ui, "地址", &self.bridge.url, COL_TEXT);
+                                value_row(ui, tr("地址", "Address"), &self.bridge.url, COL_TEXT);
                                 let bind_text = match &self.snap_target {
                                     Some(t) => t.title.clone(),
-                                    None => "未绑定(等待 Plasticity…)".into(),
+                                    None => tr("未绑定(等待 Plasticity…)", "Unbound (waiting for Plasticity…)").into(),
                                 };
-                                value_row(ui, "绑定窗口", &bind_text, COL_TEXT);
-                                value_row(ui, "状态", &self.bridge_status_text(), status_color(&self.bridge_status));
+                                value_row(ui, tr("绑定窗口", "Bound window"), &bind_text, COL_TEXT);
+                                value_row(ui, tr("状态", "Status"), &self.bridge_status_text(), status_color(&self.bridge_status));
                             },
                         );
                         // ---- F7: Plasticity 默认以 CDP 模式运行(pla-ui 托管代理) ----
@@ -4363,33 +4505,46 @@ impl eframe::App for PlaApp {
                             ui,
                             "CDP MODE",
                             Some((
-                                "CDP 通道",
+                                tr("CDP 通道", "CDP channel"),
                                 vec![
-                                    info_text(
+                                    info_text(tr(
                                         "pla-ui 经 CDP 读写 Plasticity 的运行时状态: 选择集、视口状态、\
                                          角度即时生效、Alt+←/→ 绕屏幕轴旋转都依赖它。",
-                                    ),
-                                    info_text("代理(9333)由 pla-ui 在 Plasticity 带调试端口启动时自动拉起(需要 node)。"),
+                                        "pla-ui reads/writes Plasticity's runtime state via CDP: selection sets, view states, \
+                                         live angle changes and Alt+←/→ screen-axis orbit all rely on it.",
+                                    )),
+                                    info_text(tr(
+                                        "代理(9333)由 pla-ui 在 Plasticity 带调试端口启动时自动拉起(需要 node)。",
+                                        "The proxy (9333) is started by pla-ui when Plasticity runs with a debug port (requires node).",
+                                    )),
                                 ],
                             )),
                             |ui| {
                                 let cdp_col = if self.cdp_connected() { COL_GREEN } else { COL_MUTED };
                                 value_row(ui, "CDP", &self.cdp_conn.text(), cdp_col);
-                                value_row(ui, "代理", &self.proxy.status, COL_TEXT);
+                                value_row(ui, tr("代理", "Proxy"), &self.proxy.status, COL_TEXT);
                         let mut cdp_on = self.cdp_startup.unwrap_or(false);
                         if toggle_row(
                             ui,
-                            "默认以 CDP 模式启动",
+                            tr("默认以 CDP 模式启动", "Launch in CDP mode by default"),
                             &mut cdp_on,
                             Some((
-                                "Plasticity 默认以 CDP 模式启动",
+                                tr("Plasticity 默认以 CDP 模式启动", "Launch Plasticity in CDP mode by default"),
                                 vec![
-                                    info_text(
+                                    info_text(tr(
                                         "开启: 任务栏 / 开始菜单快捷方式与 .plasticity 双击打开, 改为带调试端口 9334 \
                                          启动已打补丁的 Plasticity。下次启动 Plasticity 生效; 关闭即恢复原样。",
-                                    ),
-                                    info_text("调试端口只监听本机(局域网不可达), 但本机程序可借此控制 Plasticity。"),
-                                    info_text("公用桌面快捷方式需管理员权限, 不会修改。"),
+                                        "On: taskbar / Start menu shortcuts and double-clicking .plasticity files launch the \
+                                         patched Plasticity with debug port 9334. Applies on next launch; turn off to restore.",
+                                    )),
+                                    info_text(tr(
+                                        "调试端口只监听本机(局域网不可达), 但本机程序可借此控制 Plasticity。",
+                                        "The debug port listens on localhost only (not reachable from LAN), but local programs could use it to control Plasticity.",
+                                    )),
+                                    info_text(tr(
+                                        "公用桌面快捷方式需管理员权限, 不会修改。",
+                                        "Public desktop shortcuts need admin rights and are left unchanged.",
+                                    )),
                                 ],
                             )),
                         )
@@ -4399,7 +4554,8 @@ impl eframe::App for PlaApp {
                                 match pla_ui::cdp_mode::set_cdp_startup(cdp_on) {
                                     Ok(lines) => {
                                         self.cdp_startup = Some(cdp_on);
-                                        let failed = lines.iter().any(|l| l.contains("失败"));
+                                        // 结果行由 cdp_mode 按当时语言生成 → 中英文失败标记都认。
+                                        let failed = lines.iter().any(|l| l.contains("失败") || l.contains("failed"));
                                         (failed, lines.join("\n"))
                                     }
                                     Err(e) => (true, e),
@@ -4420,19 +4576,21 @@ impl eframe::App for PlaApp {
                         let mut bound = self.step_bound.unwrap_or(false);
                         if toggle_row(
                             ui,
-                            "方向键步进旋转视角",
+                            tr("方向键步进旋转视角", "Arrow keys orbit the view"),
                             &mut bound,
                             Some((
-                                "方向键步进旋转视角",
+                                tr("方向键步进旋转视角", "Arrow keys orbit the view"),
                                 vec![
-                                    info_key("←  /  →", "左右旋转"),
-                                    info_key("↑  /  ↓", "上下旋转"),
-                                    info_key("Alt+←  /  Alt+→", "绕屏幕轴旋转(需 CDP)"),
-                                    info_text("每按一下转动的角度见下一项。"),
-                                    info_text(
+                                    info_key("←  /  →", tr("左右旋转", "Orbit left/right")),
+                                    info_key("↑  /  ↓", tr("上下旋转", "Orbit up/down")),
+                                    info_key("Alt+←  /  Alt+→", tr("绕屏幕轴旋转(需 CDP)", "Roll around screen axis (needs CDP)")),
+                                    info_text(tr("每按一下转动的角度见下一项。", "The angle per press is set below.")),
+                                    info_text(tr(
                                         "按键写入 ~/.plasticity/config/v2/keymap.json, Plasticity 自动加载。\
                                          视口立方体右键的旋转按钮固定 90°, 不受此设置影响。",
-                                    ),
+                                        "Keys are written to ~/.plasticity/config/v2/keymap.json and auto-loaded by Plasticity. \
+                                         The view cube's right-click rotate buttons stay at 90° regardless.",
+                                    )),
                                 ],
                             )),
                         )
@@ -4452,9 +4610,9 @@ impl eframe::App for PlaApp {
                                         (
                                             false,
                                             if bound {
-                                                "已绑定 ←→↑↓ 与 Alt+←/→".into()
+                                                tr("已绑定 ←→↑↓ 与 Alt+←/→", "Bound ←→↑↓ and Alt+←/→").into()
                                             } else {
-                                                "已解除方向键绑定".into()
+                                                tr("已解除方向键绑定", "Arrow key bindings removed").into()
                                             },
                                         )
                                     }
@@ -4464,17 +4622,22 @@ impl eframe::App for PlaApp {
                         }
                         let (mut commit_step, step) = stepper_row(
                             ui,
-                            "每按一下转动",
+                            tr("每按一下转动", "Angle per press"),
                             &mut self.step_deg_buf,
                             "°",
                             Some((
-                                "每按一下转动的角度",
+                                tr("每按一下转动的角度", "Rotation angle per key press"),
                                 vec![
-                                    info_text("单位 °, 范围 0.1–180; 直接输入后回车, 或点两侧 − / + 按 5° 调整。"),
-                                    info_text(
+                                    info_text(tr(
+                                        "单位 °, 范围 0.1–180; 直接输入后回车, 或点两侧 − / + 按 5° 调整。",
+                                        "In degrees, 0.1–180; type and press Enter, or use − / + to step by 5°.",
+                                    )),
+                                    info_text(tr(
                                         "写入 Plasticity 的 settings.json。CDP 已连接时立即生效, \
                                          否则重启 Plasticity 后生效。Alt+←/→ 的旋转也用这个角度。",
-                                    ),
+                                        "Written to Plasticity's settings.json. Applies immediately when CDP is connected, \
+                                         otherwise after restarting Plasticity. Alt+←/→ uses the same angle.",
+                                    )),
                                 ],
                             )),
                         );
@@ -4507,34 +4670,58 @@ impl eframe::App for PlaApp {
                         settings_card(ui, "AUTO SNAPSHOT", None, |ui| {
                             toggle_row(
                                 ui,
-                                "启用自动快照",
+                                tr("启用自动快照", "Enable auto snapshots"),
                                 &mut self.auto_snap_enabled,
                                 Some((
-                                    "自动快照",
+                                    tr("自动快照", "Auto snapshots"),
                                     vec![
-                                        info_text("需 CDP 已连接。按「定时」或「定步数」(撤销栈步数增加)触发。"),
-                                        info_text("快照 = 文档同级 snapshot/ 下的副本; 文档未保存新内容时自动跳过。"),
-                                        info_text(format!("当前步数: {steps_now}")),
+                                        info_text(tr(
+                                            "需 CDP 已连接。按「定时」或「定步数」(撤销栈步数增加)触发。",
+                                            "Requires CDP. Triggered by \"Interval\" or \"Every N steps\" (undo stack growth).",
+                                        )),
+                                        info_text(tr(
+                                            "快照 = 文档同级 snapshot/ 下的副本; 文档未保存新内容时自动跳过。",
+                                            "A snapshot is a copy in snapshot/ next to the document; skipped when nothing new was saved.",
+                                        )),
+                                        info_text(t!("当前步数: {steps_now}", "Current steps: {steps_now}")),
                                     ],
                                 )),
                             );
-                            drag_row(ui, "定时(分钟)", &mut self.auto_interval_min, 0..=1440,
-                                Some(("定时(分钟)", vec![info_text("每隔多少分钟拍一张; 0 = 不按时间触发。")])));
-                            drag_row(ui, "定步数", &mut self.auto_steps, 0..=1000,
-                                Some(("定步数", vec![info_text("撤销栈每增加多少步拍一张; 0 = 不按步数触发。")])));
-                            drag_row(ui, "数量上限", &mut self.snap_max_count, 0..=500,
-                                Some(("数量上限", vec![info_text("每个文档最多保留多少张快照(收藏的除外), 超出删最旧的; 0 = 不限。")])));
-                            drag_row(ui, "保留天数", &mut self.snap_max_age_days, 0..=365,
-                                Some(("保留天数", vec![info_text("超过多少天的快照会被清理(收藏的除外); 0 = 不限。")])));
+                            drag_row(ui, tr("定时(分钟)", "Interval (min)"), &mut self.auto_interval_min, 0..=1440,
+                                Some((tr("定时(分钟)", "Interval (min)"), vec![info_text(tr(
+                                    "每隔多少分钟拍一张; 0 = 不按时间触发。",
+                                    "Take one every N minutes; 0 = no time trigger.",
+                                ))])));
+                            drag_row(ui, tr("定步数", "Every N steps"), &mut self.auto_steps, 0..=1000,
+                                Some((tr("定步数", "Every N steps"), vec![info_text(tr(
+                                    "撤销栈每增加多少步拍一张; 0 = 不按步数触发。",
+                                    "Take one every N undo steps; 0 = no step trigger.",
+                                ))])));
+                            drag_row(ui, tr("数量上限", "Max count"), &mut self.snap_max_count, 0..=500,
+                                Some((tr("数量上限", "Max count"), vec![info_text(tr(
+                                    "每个文档最多保留多少张快照(收藏的除外), 超出删最旧的; 0 = 不限。",
+                                    "Max snapshots kept per document (favorites excluded); oldest deleted first; 0 = unlimited.",
+                                ))])));
+                            drag_row(ui, tr("保留天数", "Keep days"), &mut self.snap_max_age_days, 0..=365,
+                                Some((tr("保留天数", "Keep days"), vec![info_text(tr(
+                                    "超过多少天的快照会被清理(收藏的除外); 0 = 不限。",
+                                    "Snapshots older than N days are removed (favorites excluded); 0 = unlimited.",
+                                ))])));
                         });
                         settings_card(
                             ui,
                             "HOTKEYS",
                             Some((
-                                "快捷键",
+                                tr("快捷键", "Hotkeys"),
                                 vec![
-                                    info_text("点「绑定」后按下组合键完成录制; 也可以右键工具栏按钮直接开始录制。"),
-                                    info_text("快捷键是全局的(Plasticity 在前台时也有效), 保存在 pla-ui 同级的 hotkeys.json。"),
+                                    info_text(tr(
+                                        "点「绑定」后按下组合键完成录制; 也可以右键工具栏按钮直接开始录制。",
+                                        "Click \"Bind\" then press a key combo; or right-click a toolbar button to start recording.",
+                                    )),
+                                    info_text(tr(
+                                        "快捷键是全局的(Plasticity 在前台时也有效), 保存在 pla-ui 同级的 hotkeys.json。",
+                                        "Hotkeys are global (work while Plasticity is focused), saved in hotkeys.json next to pla-ui.",
+                                    )),
                                 ],
                             )),
                             |ui| {
@@ -4550,12 +4737,12 @@ impl eframe::App for PlaApp {
                                         .map(|h| h.display())
                                         .unwrap_or_else(|| "-".into());
                                     ui.monospace(cur);
-                                    if ui.small_button("绑定").clicked() {
+                                    if ui.small_button(tr("绑定", "Bind")).clicked() {
                                         self.recording = Some(key.clone());
                                         self.notice = None;
                                     }
                                     if self.hotkeys.binds.contains_key(&key)
-                                        && ui.small_button("清除").clicked()
+                                        && ui.small_button(tr("清除", "Clear")).clicked()
                                     {
                                         self.hotkeys.binds.remove(&key);
                                         pla_ui::hotkey::save_binds(&self.hotkeys);
@@ -4565,7 +4752,7 @@ impl eframe::App for PlaApp {
                             let conflicts = self.hotkeys.conflicts();
                             if !conflicts.is_empty() {
                                 for (k, acts) in &conflicts {
-                                    ui.colored_label(COL_RED, format!("! 冲突: {k} → {acts:?}"));
+                                    ui.colored_label(COL_RED, t!("! 冲突: {k} → {acts:?}", "! Conflict: {k} → {acts:?}"));
                                 }
                             }
                             },
@@ -4593,7 +4780,7 @@ impl eframe::App for PlaApp {
                 show_child_window(
                     ctx,
                     "panel-caps",
-                    "CDP 能力",
+                    tr("CDP 能力", "CDP capabilities"),
                     desired,
                     egui::vec2(PANEL_CAPS[0], PANEL_CAPS[1]),
                     &mut flag,
@@ -4624,12 +4811,12 @@ impl eframe::App for PlaApp {
         // 本帧渲染, 且不会被下一帧工具栏的帧首覆盖抢先清掉。
         if self.hovered_hint.is_some() || self.notice.is_some() {
             // R9: 同面板 — 用权威锚点(拖动中不滞后)
-            if let Some(tr) = tb_origin {
+            if let Some(tb) = tb_origin {
                 let hint = self.hovered_hint.clone();
                 let notice = self.notice.clone();
                 // F2: 高度按内容实测(多行提示 / 长通知不再被裁掉)。
                 let size = hud_size(ctx, &hint, &notice);
-                let desired = egui::pos2(self.hud_left(tr.x), tr.y + 2.0);
+                let desired = egui::pos2(self.hud_left(tb.x), tb.y + 2.0);
                 let mut hud = Some((hint, notice));
                 let mut open_flag = true; // notice 的 × 关闭经它传出
                 let (hud_hide, hud_reveal) = viewport_reveal(ctx, "hud-popup");
@@ -4681,7 +4868,7 @@ impl eframe::App for PlaApp {
                                 }
                                 ui.horizontal(|ui| {
                                     ui.label(
-                                        egui::RichText::new(if *is_err { "! 提示" } else { "√ 完成" })
+                                        egui::RichText::new(if *is_err { tr("! 提示", "! Notice") } else { tr("√ 完成", "√ Done") })
                                             .size(12.5)
                                             .strong()
                                             .color(if *is_err { COL_RED } else { COL_GREEN }),
@@ -4718,7 +4905,9 @@ impl eframe::App for PlaApp {
                             egui::ViewportClass::Embedded
                             | egui::ViewportClass::Root
                             | egui::ViewportClass::Deferred => {
-                                egui::Window::new("提示")
+                                // 标题随语言变, 窗口 id 固定(不随标题文本变化)。
+                                egui::Window::new(tr("提示", "Notice"))
+                                    .id(egui::Id::new("hud-notice-window"))
                                     .resizable(false)
                                     .collapsible(false)
                                     .show(hctx, |ui| show_ui(ui, &mut open_flag));
@@ -4779,7 +4968,7 @@ impl eframe::App for PlaApp {
                             Err(others) => {
                                 self.set_notice((
                                     true,
-                                    format!("{} 已被 {:?} 占用", hk.display(), others),
+                                    t!("{} 已被 {:?} 占用", "{} is already used by {:?}", hk.display(), others),
                                 ));
                             }
                         }

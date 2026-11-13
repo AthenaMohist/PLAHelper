@@ -4,6 +4,7 @@
 //! 「CDP 能力」卡片、工具栏状态环都从这张表推导，不在各处另写判断。
 //! 新功能（材质方案、打孔……）上线时只在这里加一行。
 
+use pla_bridge::i18n::tr;
 use pla_bridge::shim::{cap, CapsReport};
 
 /// 功能分组（CDP 能力面板按组显示）。
@@ -21,10 +22,10 @@ impl Group {
     /// 卡片标题（大写英文，与设置面板卡片风格一致）+ 中文副标题。
     pub fn title(self) -> (&'static str, &'static str) {
         match self {
-            Group::Selection => ("SELECTION", "选择与选择集"),
-            Group::View => ("VIEW", "视角与视口状态"),
-            Group::Input => ("INPUT", "按键与命令"),
-            Group::Document => ("DOCUMENT", "文档、历史与诊断"),
+            Group::Selection => ("SELECTION", tr("选择与选择集", "Selection & selection sets")),
+            Group::View => ("VIEW", tr("视角与视口状态", "View & viewport state")),
+            Group::Input => ("INPUT", tr("按键与命令", "Keys & commands")),
+            Group::Document => ("DOCUMENT", tr("文档、历史与诊断", "Document, history & diagnostics")),
         }
     }
 
@@ -36,25 +37,25 @@ impl Group {
 /// 能力的中文说明（面板显示用；能力名本身来自 `shim::cap`）。
 pub fn cap_label(c: &str) -> &'static str {
     match c {
-        cap::EDITOR => "定位 Plasticity 编辑器",
-        cap::SEL_READ => "读取当前选择",
-        cap::SEL_WRITE => "取消活动命令",
-        cap::HIST_READ => "读取撤销栈与几何版本",
-        cap::CAM_READ => "读取相机与轨道控制器",
-        cap::CAM_WRITE => "写入相机与轨道控制器",
-        cap::CAM_NAV => "转到选择正视",
-        cap::CAM_STEP => "改步进角(运行时)",
-        cap::CAM_ROLL => "注册滚转命令",
-        cap::SEL_APPLY => "按 id 恢复选择(经选择命令)",
-        cap::VP_STATE => "视口显示状态(着色/剖面/构造面…)",
-        cap::KEYMAP => "改按键绑定(运行时)",
-        cap::CMD_DISPATCH => "注册 / 派发命令",
-        cap::ERR_HOOK => "捕获命令报错",
-        cap::TREE => "读取实体树(Outliner)",
-        cap::MAT_SET => "材质方案",
-        cap::CMD_EXEC => "带参数执行命令",
-        cap::BOOL_RUN => "布尔运算",
-        cap::ASSET_PLACE => "放置常用件",
+        cap::EDITOR => tr("定位 Plasticity 编辑器", "Locate Plasticity editor"),
+        cap::SEL_READ => tr("读取当前选择", "Read current selection"),
+        cap::SEL_WRITE => tr("取消活动命令", "Cancel active command"),
+        cap::HIST_READ => tr("读取撤销栈与几何版本", "Read undo stack & geometry version"),
+        cap::CAM_READ => tr("读取相机与轨道控制器", "Read camera & orbit controls"),
+        cap::CAM_WRITE => tr("写入相机与轨道控制器", "Write camera & orbit controls"),
+        cap::CAM_NAV => tr("转到选择正视", "Face-on view of selection"),
+        cap::CAM_STEP => tr("改步进角(运行时)", "Change step angle (runtime)"),
+        cap::CAM_ROLL => tr("注册滚转命令", "Register roll commands"),
+        cap::SEL_APPLY => tr("按 id 恢复选择(经选择命令)", "Restore selection by id (via select command)"),
+        cap::VP_STATE => tr("视口显示状态(着色/剖面/构造面…)", "Viewport display state (shading/section/cplane…)"),
+        cap::KEYMAP => tr("改按键绑定(运行时)", "Change keybindings (runtime)"),
+        cap::CMD_DISPATCH => tr("注册 / 派发命令", "Register / dispatch commands"),
+        cap::ERR_HOOK => tr("捕获命令报错", "Capture command errors"),
+        cap::TREE => tr("读取实体树(Outliner)", "Read entity tree (Outliner)"),
+        cap::MAT_SET => tr("材质方案", "Material schemes"),
+        cap::CMD_EXEC => tr("带参数执行命令", "Execute commands with parameters"),
+        cap::BOOL_RUN => tr("布尔运算", "Boolean operations"),
+        cap::ASSET_PLACE => tr("放置常用件", "Place common parts"),
         _ => "",
     }
 }
@@ -94,17 +95,17 @@ impl Feature {
 
     pub fn label(self) -> &'static str {
         match self {
-            Feature::SelMirror => "实时选择",
-            Feature::SelSave => "保存选择集",
-            Feature::SelApply => "应用选择集",
-            Feature::VpSave => "保存视口状态",
-            Feature::VpApply => "恢复视口状态",
-            Feature::OrbitStepLive => "步进角即时生效",
-            Feature::ArrowKeysLive => "方向键绑定即时生效",
-            Feature::Roll => "Alt+←/→ 滚转",
-            Feature::AutoSnapSteps => "自动快照(定步数)",
-            Feature::ErrorDisplay => "Plasticity 报错显示",
-            Feature::EntityTree => "实体树",
+            Feature::SelMirror => tr("实时选择", "Live selection"),
+            Feature::SelSave => tr("保存选择集", "Save selection set"),
+            Feature::SelApply => tr("应用选择集", "Apply selection set"),
+            Feature::VpSave => tr("保存视口状态", "Save viewport state"),
+            Feature::VpApply => tr("恢复视口状态", "Restore viewport state"),
+            Feature::OrbitStepLive => tr("步进角即时生效", "Live step angle"),
+            Feature::ArrowKeysLive => tr("方向键绑定即时生效", "Live arrow-key bindings"),
+            Feature::Roll => tr("Alt+←/→ 滚转", "Alt+←/→ roll"),
+            Feature::AutoSnapSteps => tr("自动快照(定步数)", "Auto snapshot (every N steps)"),
+            Feature::ErrorDisplay => tr("Plasticity 报错显示", "Plasticity error display"),
+            Feature::EntityTree => tr("实体树", "Entity tree"),
         }
     }
 
@@ -148,18 +149,18 @@ pub enum Availability {
 /// 判定功能可用性。caps = None 表示 CDP 未连接 / 尚未探测。
 pub fn availability(caps: Option<&CapsReport>, f: Feature) -> Availability {
     let Some(r) = caps else {
-        return Availability::Blocked("CDP 未连接".into());
+        return Availability::Blocked(tr("CDP 未连接", "CDP not connected").into());
     };
     if !r.editor {
-        return Availability::Blocked("未找到 Plasticity 编辑器".into());
+        return Availability::Blocked(tr("未找到 Plasticity 编辑器", "Plasticity editor not found").into());
     }
     let blocked = r.blocked(f.caps());
     if !blocked.is_empty() {
         let detail: Vec<String> = blocked
             .iter()
-            .map(|(c, miss)| format!("{c}(缺 {})", miss.join(", ")))
+            .map(|(c, miss)| pla_bridge::t!("{c}(缺 {})", "{c} (missing {})", miss.join(", ")))
             .collect();
-        return Availability::Blocked(format!("当前 Plasticity 版本不支持: {}", detail.join("; ")));
+        return Availability::Blocked(pla_bridge::t!("当前 Plasticity 版本不支持: {}", "Not supported by this Plasticity version: {}", detail.join("; ")));
     }
     let mut opt: Vec<String> = f
         .caps()

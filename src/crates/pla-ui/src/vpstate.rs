@@ -6,6 +6,9 @@
 
 use std::path::PathBuf;
 
+use pla_bridge::i18n::tr;
+use pla_bridge::t;
+
 /// 旧存档位置(exe 同级 viewstates/<doc_key>) — R9 起仅作迁移来源/兜底。
 fn legacy_vpstate_dir(doc_key: &str) -> PathBuf {
     let exe = std::env::current_exe()
@@ -57,10 +60,10 @@ pub struct VpStateMeta {
 /// 保存一条视口状态(state = CDP 采集 JSON)。返回 stem。
 pub fn save_vpstate(doc_key: &str, state: &str, png: Option<&[u8]>) -> Result<String, String> {
     if state.trim().is_empty() {
-        return Err("视口状态为空".into());
+        return Err(tr("视口状态为空", "Viewport state is empty").into());
     }
     let dir = vpstate_dir(doc_key);
-    std::fs::create_dir_all(&dir).map_err(|e| format!("创建目录失败: {e}"))?;
+    std::fs::create_dir_all(&dir).map_err(|e| t!("创建目录失败: {e}", "Failed to create directory: {e}"))?;
     let stem = next_stem(doc_key);
     let json = serde_json::json!({
         "doc_key": doc_key,
@@ -72,9 +75,9 @@ pub fn save_vpstate(doc_key: &str, state: &str, png: Option<&[u8]>) -> Result<St
     let path = dir.join(format!("{stem}.json"));
     std::fs::write(
         &path,
-        serde_json::to_vec_pretty(&json).map_err(|e| format!("序列化失败: {e}"))?,
+        serde_json::to_vec_pretty(&json).map_err(|e| t!("序列化失败: {e}", "Serialization failed: {e}"))?,
     )
-    .map_err(|e| format!("写文件失败: {e}"))?;
+    .map_err(|e| t!("写文件失败: {e}", "Failed to write file: {e}"))?;
     if let Some(bytes) = png {
         let _ = std::fs::write(dir.join(format!("{stem}.png")), bytes);
     }
@@ -114,22 +117,22 @@ pub fn list_vpstates(doc_key: &str) -> Vec<VpStateMeta> {
 /// 收藏/取消收藏。
 pub fn set_fav(doc_key: &str, name: &str, fav: bool) -> Result<(), String> {
     let path = vpstate_dir(doc_key).join(format!("{name}.json"));
-    let data = std::fs::read_to_string(&path).map_err(|e| format!("读取失败: {e}"))?;
+    let data = std::fs::read_to_string(&path).map_err(|e| t!("读取失败: {e}", "Read failed: {e}"))?;
     let mut v: serde_json::Value =
-        serde_json::from_str(&data).map_err(|e| format!("解析失败: {e}"))?;
+        serde_json::from_str(&data).map_err(|e| t!("解析失败: {e}", "Parse failed: {e}"))?;
     v["fav"] = serde_json::Value::Bool(fav);
     std::fs::write(
         &path,
-        serde_json::to_vec_pretty(&v).map_err(|e| format!("序列化失败: {e}"))?,
+        serde_json::to_vec_pretty(&v).map_err(|e| t!("序列化失败: {e}", "Serialization failed: {e}"))?,
     )
-    .map_err(|e| format!("写文件失败: {e}"))
+    .map_err(|e| t!("写文件失败: {e}", "Failed to write file: {e}"))
 }
 
 /// 改名。
 pub fn rename_vpstate(doc_key: &str, old: &str, new: &str) -> Result<(), String> {
     let new = new.trim();
     if new.is_empty() {
-        return Err("新名称为空".into());
+        return Err(tr("新名称为空", "New name is empty").into());
     }
     if new == old {
         return Ok(());
@@ -138,19 +141,19 @@ pub fn rename_vpstate(doc_key: &str, old: &str, new: &str) -> Result<(), String>
     let pj = dir.join(format!("{old}.json"));
     let nj = dir.join(format!("{new}.json"));
     if nj.exists() {
-        return Err(format!("「{new}」已存在"));
+        return Err(t!("「{new}」已存在", "\"{new}\" already exists"));
     }
-    let data = std::fs::read_to_string(&pj).map_err(|e| format!("读取失败: {e}"))?;
+    let data = std::fs::read_to_string(&pj).map_err(|e| t!("读取失败: {e}", "Read failed: {e}"))?;
     let mut v: serde_json::Value =
-        serde_json::from_str(&data).map_err(|e| format!("解析失败: {e}"))?;
+        serde_json::from_str(&data).map_err(|e| t!("解析失败: {e}", "Parse failed: {e}"))?;
     v["name"] = serde_json::Value::String(new.to_string());
     std::fs::write(&nj, serde_json::to_vec_pretty(&v).unwrap_or_default())
-        .map_err(|e| format!("写文件失败: {e}"))?;
-    std::fs::remove_file(&pj).map_err(|e| format!("移除旧文件失败: {e}"))?;
+        .map_err(|e| t!("写文件失败: {e}", "Failed to write file: {e}"))?;
+    std::fs::remove_file(&pj).map_err(|e| t!("移除旧文件失败: {e}", "Failed to remove old file: {e}"))?;
     let pp = dir.join(format!("{old}.png"));
     if pp.exists() {
         let np = dir.join(format!("{new}.png"));
-        std::fs::rename(&pp, &np).map_err(|e| format!("改名截图失败: {e}"))?;
+        std::fs::rename(&pp, &np).map_err(|e| t!("改名截图失败: {e}", "Failed to rename screenshot: {e}"))?;
     }
     Ok(())
 }
@@ -178,12 +181,12 @@ pub fn delete_vpstates(doc_key: &str, names: &[String]) -> Result<usize, String>
 /// 打开目录(explorer)。
 pub fn open_dir(doc_key: &str) -> Result<(), String> {
     let dir = vpstate_dir(doc_key);
-    std::fs::create_dir_all(&dir).map_err(|e| format!("创建目录失败: {e}"))?;
+    std::fs::create_dir_all(&dir).map_err(|e| t!("创建目录失败: {e}", "Failed to create directory: {e}"))?;
     std::process::Command::new("explorer")
         .arg(dir.as_os_str())
         .spawn()
         .map(|_| ())
-        .map_err(|e| format!("打开失败: {e}"))
+        .map_err(|e| t!("打开失败: {e}", "Failed to open: {e}"))
 }
 
 #[cfg(test)]

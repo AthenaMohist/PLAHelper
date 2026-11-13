@@ -2,6 +2,9 @@
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use pla_bridge::i18n::tr;
+use pla_bridge::t;
+
 /// 快照目录策略(R7-4): 跟随文档 — 文档同级的 snapshot/ 文件夹, 每个文档的快照各归其位。
 /// doc 为 None(尚未定位到文档)时退回 exe 同级 snapshots/(旧行为兜底)。
 pub fn snapshot_dir_for(doc: Option<&PathBuf>) -> PathBuf {
@@ -101,9 +104,12 @@ pub fn sanitize_filename(name: &str) -> String {
 /// doc_key 是软过滤: 命中则取命中集合里最新的, 全体为空时回退全局最新(不再因硬过滤报"找不到")。
 pub fn take_manual_snapshot(doc_key: &str, plasticity_hwnd: Option<isize>) -> Result<String, String> {
     let src = find_latest_doc(doc_key).ok_or_else(|| {
-        format!(
+        t!(
             "未找到最近修改的 .plasticity 文档 — 已扫 Windows Recent 记录 + 已知文件夹(文档/桌面/下载), \
-             关键字 '{doc_key}' 无命中且无任何 .plasticity 候选。请先在 Plasticity 中 Ctrl+S 保存一次。"
+             关键字 '{doc_key}' 无命中且无任何 .plasticity 候选。请先在 Plasticity 中 Ctrl+S 保存一次。",
+            "No recently modified .plasticity document found — scanned Windows Recent + known folders \
+             (Documents/Desktop/Downloads); key '{doc_key}' had no match and no .plasticity candidates. \
+             Press Ctrl+S in Plasticity once first."
         )
     })?;
     let dir = snapshot_dir_for(Some(&src));
@@ -112,7 +118,7 @@ pub fn take_manual_snapshot(doc_key: &str, plasticity_hwnd: Option<isize>) -> Re
     // 不再拼进文件名。
     let stem = next_snapshot_stem(&dir);
     let dst = dir.join(format!("{stem}.plasticity"));
-    std::fs::copy(&src, &dst).map_err(|e| format!("复制失败: {e}"))?;
+    std::fs::copy(&src, &dst).map_err(|e| t!("复制失败: {e}", "Copy failed: {e}"))?;
     // 缩略图: PrintWindow 抓 Plasticity 主窗口 → 同名 .png
     if let Some(hwnd) = plasticity_hwnd {
         let png = dir.join(format!("{stem}.png"));
@@ -256,7 +262,7 @@ fn save_meta2(
     let mut root = serde_json::Map::new();
     root.insert(
         "favs".into(),
-        serde_json::to_value(favs).map_err(|e| format!("序列化 favs: {e}"))?,
+        serde_json::to_value(favs).map_err(|e| t!("序列化 favs: {e}", "Serialize favs: {e}"))?,
     );
     let mut info_obj = serde_json::Map::new();
     for (k, (d, c)) in info {
@@ -269,9 +275,9 @@ fn save_meta2(
     std::fs::write(
         meta_path(&dir),
         serde_json::to_vec_pretty(&serde_json::Value::Object(root))
-            .map_err(|e| format!("序列化 meta: {e}"))?,
+            .map_err(|e| t!("序列化 meta: {e}", "Serialize meta: {e}"))?,
     )
-    .map_err(|e| format!("写 meta: {e}"))
+    .map_err(|e| t!("写 meta: {e}", "Write meta: {e}"))
 }
 
 /// 快照富信息(源文档, 拍摄时间)。快照墙打开时整表读一次, 悬浮显示用。
@@ -332,7 +338,7 @@ pub fn delete_snapshots(doc_key: &str, names: &[String]) -> Result<usize, String
         save_meta2(doc_key, &favs, &info)?;
     }
     if !errs.is_empty() {
-        return Err(format!("部分删除失败: {}", errs.join("; ")));
+        return Err(t!("部分删除失败: {}", "Some deletions failed: {}", errs.join("; ")));
     }
     Ok(removed)
 }
@@ -342,7 +348,7 @@ pub fn rename_snapshot(doc_key: &str, old_name: &str, new_stem: &str) -> Result<
     let old_stem = old_name.trim_end_matches(".plasticity");
     let new_stem = sanitize_filename(new_stem);
     if new_stem.is_empty() {
-        return Err("新名称无效".into());
+        return Err(tr("新名称无效", "Invalid new name").into());
     }
     let dir = snapshot_dir_of(doc_key);
     for (a, b) in [
@@ -353,9 +359,9 @@ pub fn rename_snapshot(doc_key: &str, old_name: &str, new_stem: &str) -> Result<
         let pb = dir.join(sanitize_filename(&b));
         if pa.exists() {
             if pb.exists() {
-                return Err(format!("目标已存在: {}", pb.display()));
+                return Err(t!("目标已存在: {}", "Target already exists: {}", pb.display()));
             }
-            std::fs::rename(&pa, &pb).map_err(|e| format!("重命名 {} 失败: {e}", pa.display()))?;
+            std::fs::rename(&pa, &pb).map_err(|e| t!("重命名 {} 失败: {e}", "Failed to rename {}: {e}", pa.display()))?;
         }
     }
     let (mut favs, mut info) = load_meta2(doc_key);
@@ -379,29 +385,29 @@ pub fn open_in_plasticity(snapshot_name: &str, doc_key: &str) -> Result<(), Stri
     let dir = snapshot_dir_of(doc_key);
     let path = dir.join(sanitize_filename(snapshot_name));
     if !path.is_file() {
-        return Err(format!("快照文件不存在: {}", path.display()));
+        return Err(t!("快照文件不存在: {}", "Snapshot file does not exist: {}", path.display()));
     }
     let exe = crate::window_finder::plasticity_exe_path()
-        .ok_or_else(|| "未找到 Plasticity 进程 — 请先打开 Plasticity".to_string())?;
+        .ok_or_else(|| tr("未找到 Plasticity 进程 — 请先打开 Plasticity", "Plasticity process not found — open Plasticity first").to_string())?;
     std::process::Command::new(&exe)
         .arg(&path)
         .spawn()
-        .map_err(|e| format!("启动 Plasticity 失败: {e}"))?;
+        .map_err(|e| t!("启动 Plasticity 失败: {e}", "Failed to launch Plasticity: {e}"))?;
     Ok(())
 }
 
 /// 打开当前文档的快照文件夹(explorer); 目录不存在则先创建。
 pub fn open_snapshot_dir(doc_key: &str) -> Result<(), String> {
     let doc = find_latest_doc(doc_key).ok_or_else(|| {
-        format!("未找到当前文档 '{doc_key}.plasticity' 的保存位置，请先在 Plasticity 中 Ctrl+S 保存一次")
+        t!("未找到当前文档 '{doc_key}.plasticity' 的保存位置，请先在 Plasticity 中 Ctrl+S 保存一次", "Save location of current document '{doc_key}.plasticity' not found — press Ctrl+S in Plasticity once first")
     })?;
     let dir = snapshot_dir_for(Some(&doc));
-    std::fs::create_dir_all(&dir).map_err(|e| format!("创建快照目录失败: {e}"))?;
+    std::fs::create_dir_all(&dir).map_err(|e| t!("创建快照目录失败: {e}", "Failed to create snapshot directory: {e}"))?;
     std::process::Command::new("explorer")
         .arg(dir.as_os_str())
         .spawn()
         .map(|_| ())
-        .map_err(|e| format!("打开失败: {e}"))
+        .map_err(|e| t!("打开失败: {e}", "Failed to open: {e}"))
 }
 
 /// 列出当前文档的现有快照(原 TODO G2-2): 文档同级 snapshot/*.plasticity, 文件名新→旧。

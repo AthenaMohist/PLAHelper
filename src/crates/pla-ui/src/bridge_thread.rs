@@ -7,6 +7,8 @@
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::Duration;
 
+use pla_bridge::i18n::tr;
+use pla_bridge::t;
 use serde_json::Value;
 
 /// UI → bridge 线程命令。
@@ -50,7 +52,7 @@ impl BridgeHandle {
             .spawn(move || bridge_thread_main(thread_url, cmd_rx, ev_tx_thread));
         if spawned.is_err() {
             // 线程启动失败: 不 panic, UI 显示断线原因。
-            let _ = ev_tx.send(BridgeEvent::Status("断线:bridge 线程启动失败".into()));
+            let _ = ev_tx.send(BridgeEvent::Status(tr("断线:bridge 线程启动失败", "Disconnected: failed to start bridge thread").into()));
         }
         Self {
             tx: cmd_tx,
@@ -90,7 +92,7 @@ fn bridge_thread_main(
     {
         Ok(rt) => rt,
         Err(e) => {
-            let _ = ev_tx.send(BridgeEvent::Status(format!("断线:runtime 初始化失败({e})")));
+            let _ = ev_tx.send(BridgeEvent::Status(t!("断线:runtime 初始化失败({e})", "Disconnected: runtime init failed ({e})")));
             return;
         }
     };
@@ -108,18 +110,18 @@ fn bridge_thread_main(
         let client = match pla_bridge::BridgeClient::connect_with_config(&url, cfg) {
             Ok(c) => c,
             Err(e) => {
-                let _ = ev_tx.send(BridgeEvent::Status(format!("断线:连接失败({e})")));
+                let _ = ev_tx.send(BridgeEvent::Status(t!("断线:连接失败({e})", "Disconnected: connect failed ({e})")));
                 return;
             }
         };
-        let _ = ev_tx.send(BridgeEvent::Status("连接中…".into()));
+        let _ = ev_tx.send(BridgeEvent::Status(tr("连接中…", "Connecting…").into()));
         // 首次握手等待(超时不致命, supervisor 会继续重试; 但必须回报状态,
         // 否则 UI 永远停在「连接中…」— QA Bug B)。
         if client.wait_alive(Duration::from_secs(10)).await.is_ok() {
-            let _ = ev_tx.send(BridgeEvent::Status("已连接".into()));
+            let _ = ev_tx.send(BridgeEvent::Status(tr("已连接", "Connected").into()));
         } else {
             let _ = ev_tx.send(BridgeEvent::Status(
-                "断线:连接超时(10s) — bridge 服务未启动?".into(),
+                tr("断线:连接超时(10s) — bridge 服务未启动?", "Disconnected: connect timeout (10s) — bridge service not running?").into(),
             ));
         }
 
@@ -150,16 +152,16 @@ fn bridge_thread_main(
                                 let _ = ev_tx.send(BridgeEvent::Entities(list));
                             }
                             Ok(Err(e)) => {
-                                let _ = ev_tx.send(BridgeEvent::Error(format!("拉取实体失败: {e}")));
+                                let _ = ev_tx.send(BridgeEvent::Error(t!("拉取实体失败: {e}", "Failed to fetch entities: {e}")));
                             }
                             Err(_) => {
                                 let _ = ev_tx.send(
-                                    BridgeEvent::Error("刷新超时(30s) — 文档过大?".into()),
+                                    BridgeEvent::Error(tr("刷新超时(30s) — 文档过大?", "Refresh timed out (30s) — document too large?").into()),
                                 );
                             }
                         }
                     } else {
-                        let _ = ev_tx.send(BridgeEvent::Error("bridge 未连接, 无法拉取实体".into()));
+                        let _ = ev_tx.send(BridgeEvent::Error(tr("bridge 未连接, 无法拉取实体", "Bridge not connected; cannot fetch entities").into()));
                     }
                 }
                 Err(TryRecvError::Disconnected) => {
@@ -174,9 +176,9 @@ fn bridge_thread_main(
             if alive != was_alive {
                 was_alive = alive;
                 let _ = ev_tx.send(BridgeEvent::Status(if alive {
-                    "已连接".into()
+                    tr("已连接", "Connected").into()
                 } else {
-                    "断线:等待重连…".into()
+                    tr("断线:等待重连…", "Disconnected: waiting to reconnect…").into()
                 }));
             }
             tokio::time::sleep(Duration::from_millis(200)).await;

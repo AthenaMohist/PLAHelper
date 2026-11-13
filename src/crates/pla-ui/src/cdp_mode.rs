@@ -20,6 +20,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use pla_bridge::i18n::tr;
+use pla_bridge::t;
+
 pub const INSPECT_PORT: u16 = 9334;
 pub const PROXY_PORT: u16 = 9333;
 pub const INSPECT_ARG: &str = "--inspect=127.0.0.1:9334";
@@ -155,14 +158,14 @@ pub fn find_proxy_script() -> Option<PathBuf> {
 
 /// 拉起代理(无窗口, 追加写日志)。
 fn spawn_proxy() -> Result<Child, String> {
-    let script = find_proxy_script().ok_or("未找到 tools/pla-cdp/pla-cdp-v8.js")?;
+    let script = find_proxy_script().ok_or(tr("未找到 tools/pla-cdp/pla-cdp-v8.js", "tools/pla-cdp/pla-cdp-v8.js not found"))?;
     let log = std::env::temp_dir().join("pla-cdp-proxy.log");
     let out = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&log)
-        .map_err(|e| format!("打开代理日志失败: {e}"))?;
-    let err = out.try_clone().map_err(|e| format!("打开代理日志失败: {e}"))?;
+        .map_err(|e| t!("打开代理日志失败: {e}", "Failed to open proxy log: {e}"))?;
+    let err = out.try_clone().map_err(|e| t!("打开代理日志失败: {e}", "Failed to open proxy log: {e}"))?;
     let mut cmd = Command::new("node");
     cmd.arg(&script)
         .arg("proxy")
@@ -179,7 +182,7 @@ fn spawn_proxy() -> Result<Child, String> {
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
     cmd.spawn()
-        .map_err(|e| format!("启动 CDP 代理失败(需要 node 在 PATH 中): {e}"))
+        .map_err(|e| t!("启动 CDP 代理失败(需要 node 在 PATH 中): {e}", "Failed to start CDP proxy (node must be on PATH): {e}"))
 }
 
 /// 代理守护: 每 3s 看一次端口, 需要时拉起代理。
@@ -193,7 +196,7 @@ pub struct ProxyManager {
 
 impl Default for ProxyManager {
     fn default() -> Self {
-        Self { child: None, last_tick: None, last_spawn: None, status: "检测中…".into() }
+        Self { child: None, last_tick: None, last_spawn: None, status: tr("检测中…", "Checking…").into() }
     }
 }
 
@@ -206,19 +209,19 @@ impl ProxyManager {
         if let Some(c) = &mut self.child {
             if let Ok(Some(st)) = c.try_wait() {
                 self.child = None;
-                self.status = format!("代理已退出({st}), 日志见 %TEMP%\\pla-cdp-proxy.log");
+                self.status = t!("代理已退出({st}), 日志见 %TEMP%\\pla-cdp-proxy.log", "Proxy exited ({st}), see %TEMP%\\pla-cdp-proxy.log");
             }
         }
         if port_open(PROXY_PORT) {
             self.status = if self.child.is_some() {
-                "代理运行中(由 pla-ui 启动)".into()
+                tr("代理运行中(由 pla-ui 启动)", "Proxy running (started by pla-ui)").into()
             } else {
-                "代理运行中".into()
+                tr("代理运行中", "Proxy running").into()
             };
             return;
         }
         if !port_open(INSPECT_PORT) {
-            self.status = "Plasticity 未以 CDP 模式运行".into();
+            self.status = tr("Plasticity 未以 CDP 模式运行", "Plasticity is not running in CDP mode").into();
             return;
         }
         // 刚拉起的代理需要时间监听端口, 15s 内不重复拉起。
@@ -229,7 +232,7 @@ impl ProxyManager {
         match spawn_proxy() {
             Ok(c) => {
                 self.child = Some(c);
-                self.status = "已自动启动 CDP 代理…".into();
+                self.status = tr("已自动启动 CDP 代理…", "CDP proxy started automatically…").into();
             }
             Err(e) => self.status = e,
         }
@@ -268,11 +271,11 @@ pub fn public_shortcuts() -> Vec<PathBuf> {
 fn shortcut_label(p: &Path) -> &'static str {
     let s = p.to_string_lossy().to_lowercase();
     if s.contains("taskbar") {
-        "任务栏"
+        tr("任务栏", "Taskbar")
     } else if s.contains("start menu") {
-        "开始菜单"
+        tr("开始菜单", "Start menu")
     } else {
-        "桌面"
+        tr("桌面", "Desktop")
     }
 }
 
@@ -298,19 +301,26 @@ pub fn cdp_startup_enabled() -> bool {
         .any(|i| i.args.contains("--inspect"))
 }
 
+fn done_word(enable: bool) -> &'static str {
+    if enable { tr("改为 CDP 模式", "switched to CDP mode") } else { tr("恢复", "restored") }
+}
+
 /// 启用/停用 CDP 模式启动。返回逐项结果(给设置面板显示)。
 pub fn set_cdp_startup(enable: bool) -> Result<Vec<String>, String> {
     let mut report = Vec::new();
     let exe = if enable {
         Some(find_patched_exe().ok_or(
-            "未找到已打补丁的 Plasticity.exe(先运行 node tools/pla-cdp/pla-cdp-v8.js fuse)",
+            tr(
+                "未找到已打补丁的 Plasticity.exe(先运行 node tools/pla-cdp/pla-cdp-v8.js fuse)",
+                "Patched Plasticity.exe not found (run node tools/pla-cdp/pla-cdp-v8.js fuse first)",
+            ),
         )?)
     } else {
         None
     };
     let lnks = user_shortcuts();
     if lnks.is_empty() {
-        report.push("没有用户级 Plasticity 快捷方式".into());
+        report.push(tr("没有用户级 Plasticity 快捷方式", "No user-level Plasticity shortcuts").into());
     }
     for lnk in &lnks {
         let label = shortcut_label(lnk);
@@ -319,16 +329,22 @@ pub fn set_cdp_startup(enable: bool) -> Result<Vec<String>, String> {
             write_lnk(lnk, exe.as_deref(), &args)
         });
         report.push(match res {
-            Ok(()) => format!("{label}快捷方式: 已{}", if enable { "改为 CDP 模式" } else { "恢复" }),
-            Err(e) => format!("{label}快捷方式: 失败 {e}"),
+            Ok(()) => t!("{label}快捷方式: 已{}", "{label} shortcut: {}", done_word(enable)),
+            Err(e) => t!("{label}快捷方式: 失败 {e}", "{label} shortcut: failed {e}"),
         });
     }
     report.push(match set_file_association(exe.as_deref()) {
-        Ok(()) => format!(".plasticity 双击打开: 已{}", if enable { "改为 CDP 模式" } else { "恢复" }),
-        Err(e) => format!(".plasticity 双击打开: 失败 {e}"),
+        Ok(()) => t!(".plasticity 双击打开: 已{}", ".plasticity double-click: {}", done_word(enable)),
+        Err(e) => t!(".plasticity 双击打开: 失败 {e}", ".plasticity double-click: failed {e}"),
     });
     if enable && !public_shortcuts().is_empty() {
-        report.push("公用桌面/全体开始菜单快捷方式需管理员权限, 未改动(仍为普通模式)".into());
+        report.push(
+            tr(
+                "公用桌面/全体开始菜单快捷方式需管理员权限, 未改动(仍为普通模式)",
+                "Public desktop / all-users Start menu shortcuts need admin rights; left unchanged (normal mode)",
+            )
+            .into(),
+        );
     }
     Ok(report)
 }
@@ -376,7 +392,7 @@ pub fn read_lnk(path: &Path) -> Result<LnkInfo, String> {
     let (sl, pf) = shell_link()?;
     unsafe {
         let p = wide(&path.to_string_lossy());
-        pf.Load(PCWSTR(p.as_ptr()), STGM_READ).map_err(|e| format!("读取 {}: {e}", path.display()))?;
+        pf.Load(PCWSTR(p.as_ptr()), STGM_READ).map_err(|e| t!("读取 {}: {e}", "Read {}: {e}", path.display()))?;
         let mut t = [0u16; 1024];
         sl.GetPath(&mut t, std::ptr::null_mut(), 0).map_err(|e| format!("GetPath: {e}"))?;
         let mut a = [0u16; 2048];
@@ -393,7 +409,7 @@ fn write_lnk(path: &Path, target: Option<&Path>, args: &str) -> Result<(), Strin
     let (sl, pf) = shell_link()?;
     unsafe {
         let p = wide(&path.to_string_lossy());
-        pf.Load(PCWSTR(p.as_ptr()), STGM_READWRITE).map_err(|e| format!("打开: {e}"))?;
+        pf.Load(PCWSTR(p.as_ptr()), STGM_READWRITE).map_err(|e| t!("打开: {e}", "Open: {e}"))?;
         if let Some(t) = target {
             let tw = wide(&t.to_string_lossy());
             sl.SetPath(PCWSTR(tw.as_ptr())).map_err(|e| format!("SetPath: {e}"))?;
@@ -404,7 +420,7 @@ fn write_lnk(path: &Path, target: Option<&Path>, args: &str) -> Result<(), Strin
         }
         let aw = wide(args);
         sl.SetArguments(PCWSTR(aw.as_ptr())).map_err(|e| format!("SetArguments: {e}"))?;
-        pf.Save(PCWSTR::null(), true).map_err(|e| format!("保存: {e}"))?;
+        pf.Save(PCWSTR::null(), true).map_err(|e| t!("保存: {e}", "Save: {e}"))?;
     }
     Ok(())
 }
@@ -475,7 +491,7 @@ fn set_file_association(exe: Option<&Path>) -> Result<(), String> {
         REG_OPTION_NON_VOLATILE, REG_SZ,
     };
     use windows::Win32::UI::Shell::{SHChangeNotify, SHCNE_ASSOCCHANGED, SHCNF_IDLIST};
-    let progid = plasticity_progid().ok_or("系统里没有 .plasticity 文件关联")?;
+    let progid = plasticity_progid().ok_or(tr("系统里没有 .plasticity 文件关联", "No .plasticity file association on this system"))?;
     let base = format!(r"Software\Classes\{progid}");
     let cmd_path = format!(r"{base}\shell\open\command");
     let prev_cmd = hkcu_get_sz(&cmd_path, None);
@@ -492,7 +508,7 @@ fn set_file_association(exe: Option<&Path>) -> Result<(), String> {
                 Some(bytes),
             )
         }
-        .map_err(|e| format!("写注册表: {e}"))
+        .map_err(|e| t!("写注册表: {e}", "Write registry: {e}"))
     };
     unsafe {
         match exe {
@@ -505,7 +521,7 @@ fn set_file_association(exe: Option<&Path>) -> Result<(), String> {
                     HKEY_CURRENT_USER, PCWSTR(bw.as_ptr()), 0, PCWSTR::null(),
                     REG_OPTION_NON_VOLATILE, KEY_WRITE, None, &mut root, Some(&mut disp),
                 )
-                .map_err(|e| format!("建注册表键: {e}"))?;
+                .map_err(|e| t!("建注册表键: {e}", "Create registry key: {e}"))?;
                 let mut r = if disp == REG_CREATED_NEW_KEY { set_sz(root, Some(PLA_MARKER), "1") } else { Ok(()) };
                 // 备份原有命令(只备份一次, 且不备份我们自己写的带调试参数的版本)
                 if r.is_ok() && hkcu_get_sz(&base, Some(PLA_PREV)).is_none() {
@@ -521,7 +537,7 @@ fn set_file_association(exe: Option<&Path>) -> Result<(), String> {
                     HKEY_CURRENT_USER, PCWSTR(cw.as_ptr()), 0, PCWSTR::null(),
                     REG_OPTION_NON_VOLATILE, KEY_WRITE, None, &mut cmd, None,
                 )
-                .map_err(|e| format!("建注册表键: {e}"))?;
+                .map_err(|e| t!("建注册表键: {e}", "Create registry key: {e}"))?;
                 let r = set_sz(cmd, None, &format!("\"{}\" {INSPECT_ARG} \"%1\"", exe.display()));
                 let _ = RegCloseKey(cmd);
                 r?;
@@ -539,7 +555,7 @@ fn set_file_association(exe: Option<&Path>) -> Result<(), String> {
                         HKEY_CURRENT_USER, PCWSTR(cw.as_ptr()), 0, PCWSTR::null(),
                         REG_OPTION_NON_VOLATILE, KEY_WRITE, None, &mut cmd, None,
                     )
-                    .map_err(|e| format!("打开注册表键: {e}"))?;
+                    .map_err(|e| t!("打开注册表键: {e}", "Open registry key: {e}"))?;
                     let r = set_sz(cmd, None, &prev);
                     let _ = RegCloseKey(cmd);
                     r?;
@@ -560,15 +576,15 @@ fn set_file_association(exe: Option<&Path>) -> Result<(), String> {
 
 #[cfg(not(windows))]
 pub fn read_lnk(_path: &Path) -> Result<LnkInfo, String> {
-    Err("仅 Windows".into())
+    Err(tr("仅 Windows", "Windows only").into())
 }
 #[cfg(not(windows))]
 fn write_lnk(_path: &Path, _target: Option<&Path>, _args: &str) -> Result<(), String> {
-    Err("仅 Windows".into())
+    Err(tr("仅 Windows", "Windows only").into())
 }
 #[cfg(not(windows))]
 fn set_file_association(_exe: Option<&Path>) -> Result<(), String> {
-    Err("仅 Windows".into())
+    Err(tr("仅 Windows", "Windows only").into())
 }
 
 #[cfg(test)]

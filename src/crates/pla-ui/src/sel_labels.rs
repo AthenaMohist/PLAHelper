@@ -5,36 +5,37 @@
 //! 中文名称表只在这里一份。
 
 use pla_bridge::cdp::SelItem;
+use pla_bridge::i18n::tr;
 
 /// 选择项类型 → 中文。
 pub fn kind_label(kind: &str) -> &'static str {
     match kind {
-        "face" => "面",
-        "edge" => "边",
-        "solid" => "实体",
-        "sheet" => "片体",
-        "curve" => "曲线",
-        "segment" => "线段",
-        "curveVertex" => "曲线顶点",
-        "group" => "组",
-        "plane" => "基准面",
-        _ => "其他",
+        "face" => tr("面", "face"),
+        "edge" => tr("边", "edge"),
+        "solid" => tr("实体", "solid"),
+        "sheet" => tr("片体", "sheet"),
+        "curve" => tr("曲线", "curve"),
+        "segment" => tr("线段", "segment"),
+        "curveVertex" => tr("曲线顶点", "curve vertex"),
+        "group" => tr("组", "group"),
+        "plane" => tr("基准面", "plane"),
+        _ => tr("其他", "other"),
     }
 }
 
 /// 曲面类型原名(垫片给的构造函数名)→ 中文; 未知的原样显示。
 pub fn surface_label(raw: &str) -> String {
     match raw {
-        "Plane" => "平面".into(),
-        "Cylinder" => "圆柱面".into(),
-        "Cone" => "圆锥面".into(),
-        "Sphere" => "球面".into(),
-        "Torus" => "圆环面".into(),
-        "BlendSurf" => "过渡面".into(),
-        "Spun" | "SpunSurf" => "旋转面".into(),
-        "Swept" | "SweptSurf" => "扫掠面".into(),
-        "Offset" | "OffsetSurf" => "偏置面".into(),
-        "BSurf" | "BSplineSurface" | "Bsurf" => "自由曲面".into(),
+        "Plane" => tr("平面", "Plane").into(),
+        "Cylinder" => tr("圆柱面", "Cylinder").into(),
+        "Cone" => tr("圆锥面", "Cone").into(),
+        "Sphere" => tr("球面", "Sphere").into(),
+        "Torus" => tr("圆环面", "Torus").into(),
+        "BlendSurf" => tr("过渡面", "Blend").into(),
+        "Spun" | "SpunSurf" => tr("旋转面", "Revolved").into(),
+        "Swept" | "SweptSurf" => tr("扫掠面", "Swept").into(),
+        "Offset" | "OffsetSurf" => tr("偏置面", "Offset").into(),
+        "BSurf" | "BSplineSurface" | "Bsurf" => tr("自由曲面", "Freeform").into(),
         other => other.to_string(),
     }
 }
@@ -52,7 +53,7 @@ pub fn short_id(id: &str) -> String {
 pub fn row_label(it: &SelItem) -> String {
     match it.kind.as_str() {
         "face" => {
-            let s = if it.surface.is_empty() { "面".to_string() } else { surface_label(&it.surface) };
+            let s = if it.surface.is_empty() { tr("面", "Face").to_string() } else { surface_label(&it.surface) };
             format!("{s} {}", short_id(&it.id))
         }
         "edge" | "segment" | "curveVertex" => format!("{} {}", kind_label(&it.kind), short_id(&it.id)),
@@ -70,9 +71,9 @@ pub fn row_label(it: &SelItem) -> String {
 fn group_key(it: &SelItem) -> String {
     match it.kind.as_str() {
         "face" | "edge" | "segment" | "curveVertex" => {
-            if it.owner.is_empty() { "(未知物体)".into() } else { it.owner.clone() }
+            if it.owner.is_empty() { tr("(未知物体)", "(unknown object)").into() } else { it.owner.clone() }
         }
-        _ => "物体".into(),
+        _ => tr("物体", "Objects").into(),
     }
 }
 

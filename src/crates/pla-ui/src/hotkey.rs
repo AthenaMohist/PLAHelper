@@ -1,5 +1,6 @@
 //! [PLA-000 P0] 快捷键管理 — 绑定 + 冲突检测。
 //! 按钮/动作可绑定全局快捷键; 绑定时即时检测冲突(同键多动作 = 冲突, 高亮告警)。
+use pla_bridge::i18n::tr;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -40,17 +41,17 @@ pub enum Action {
 impl Action {
     pub fn label(&self) -> &'static str {
         match self {
-            Action::SnapshotManual => "手动快照",
-            Action::SnapshotRestore => "切换快照",
-            Action::SelSave => "保存选择集",
-            Action::SelApply => "应用选择集",
-            Action::DimApply => "应用尺寸",
-            Action::EntitiesRefresh => "刷新实体",
-            Action::ToggleSnapshots => "快照墙面板",
-            Action::ToggleEntities => "实体树面板",
-            Action::ToggleDim => "尺寸驱动面板",
-            Action::ToggleSettings => "设置面板",
-            Action::ToggleVpState => "视口状态面板",
+            Action::SnapshotManual => tr("手动快照", "Manual snapshot"),
+            Action::SnapshotRestore => tr("切换快照", "Switch snapshot"),
+            Action::SelSave => tr("保存选择集", "Save selection set"),
+            Action::SelApply => tr("应用选择集", "Apply selection set"),
+            Action::DimApply => tr("应用尺寸", "Apply dimensions"),
+            Action::EntitiesRefresh => tr("刷新实体", "Refresh entities"),
+            Action::ToggleSnapshots => tr("快照墙面板", "Snapshot wall panel"),
+            Action::ToggleEntities => tr("实体树面板", "Entity tree panel"),
+            Action::ToggleDim => tr("尺寸驱动面板", "Dimension panel"),
+            Action::ToggleSettings => tr("设置面板", "Settings panel"),
+            Action::ToggleVpState => tr("视口状态面板", "Viewport state panel"),
         }
     }
     /// 图标 (emoji, 随 CJK 字体渲染)。

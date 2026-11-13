@@ -11,6 +11,9 @@
 
 use std::path::{Path, PathBuf};
 
+use pla_bridge::i18n::tr;
+use pla_bridge::t;
+
 /// 方向键绑定所在的选择器 — 必须是**真实存在的 DOM 元素**。
 ///
 /// R14 实测(CDP): `orbit:rotate:*` 的监听器挂在 `<plasticity-viewport>` 元素上
@@ -83,13 +86,13 @@ pub fn config_dir() -> Option<PathBuf> {
 fn settings_path() -> Result<PathBuf, String> {
     config_dir()
         .map(|d| d.join("settings.json"))
-        .ok_or_else(|| "找不到用户目录(USERPROFILE)".into())
+        .ok_or_else(|| tr("找不到用户目录(USERPROFILE)", "User profile directory (USERPROFILE) not found").into())
 }
 
 fn keymap_path() -> Result<PathBuf, String> {
     config_dir()
         .map(|d| d.join("keymap.json"))
-        .ok_or_else(|| "找不到用户目录(USERPROFILE)".into())
+        .ok_or_else(|| tr("找不到用户目录(USERPROFILE)", "User profile directory (USERPROFILE) not found").into())
 }
 
 /// 读文件; 不存在视为空对象(Plasticity 未写过该文件时)。
@@ -97,7 +100,7 @@ fn read_text(path: &Path) -> Result<String, String> {
     match std::fs::read_to_string(path) {
         Ok(t) => Ok(t),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok("{\n}\n".into()),
-        Err(e) => Err(format!("读取 {} 失败: {e}", path.display())),
+        Err(e) => Err(t!("读取 {} 失败: {e}", "Failed to read {}: {e}", path.display())),
     }
 }
 
@@ -107,12 +110,12 @@ fn write_text(path: &Path, text: &str) -> Result<(), String> {
         let bak = path.with_extension("json.pla-bak");
         if !bak.exists() {
             std::fs::copy(path, &bak)
-                .map_err(|e| format!("备份 {} 失败: {e}", path.display()))?;
+                .map_err(|e| t!("备份 {} 失败: {e}", "Failed to back up {}: {e}", path.display()))?;
         }
     } else if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| format!("创建 {} 失败: {e}", dir.display()))?;
+        std::fs::create_dir_all(dir).map_err(|e| t!("创建 {} 失败: {e}", "Failed to create {}: {e}", dir.display()))?;
     }
-    std::fs::write(path, text).map_err(|e| format!("写入 {} 失败: {e}", path.display()))
+    std::fs::write(path, text).map_err(|e| t!("写入 {} 失败: {e}", "Failed to write {}: {e}", path.display()))
 }
 
 /// 当前步进角(度)。文件里没有该项时返回 None(Plasticity 用其内置默认值)。
@@ -124,7 +127,7 @@ pub fn read_step_deg() -> Result<Option<f64>, String> {
 /// 写入步进角(度), 范围 [STEP_DEG_MIN, STEP_DEG_MAX]。
 pub fn write_step_deg(deg: f64) -> Result<(), String> {
     if !deg.is_finite() || !(STEP_DEG_MIN..=STEP_DEG_MAX).contains(&deg) {
-        return Err(format!("角度需在 {STEP_DEG_MIN}°–{STEP_DEG_MAX}° 之间"));
+        return Err(t!("角度需在 {STEP_DEG_MIN}°–{STEP_DEG_MAX}° 之间", "Angle must be between {STEP_DEG_MIN}° and {STEP_DEG_MAX}°"));
     }
     let path = settings_path()?;
     let text = read_text(&path)?;
@@ -313,7 +316,7 @@ pub fn set_step_rad(text: &str, rad: f64) -> Result<String, String> {
         return Ok(out);
     }
     if let Some(v) = find_key_value(text, ORBIT_CATEGORY) {
-        let open = v + text[v..].find('{').ok_or("OrbitControls 不是对象")?;
+        let open = v + text[v..].find('{').ok_or(tr("OrbitControls 不是对象", "OrbitControls is not an object"))?;
         let indent = format!("{}    ", line_indent(text, open));
         let mut out = String::new();
         out.push_str(&text[..=open]);

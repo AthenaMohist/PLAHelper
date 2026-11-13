@@ -84,6 +84,7 @@ fn adler32(data: &[u8]) -> u32 {
 /// PrintWindow 抓取整窗内容 → PNG 落盘。
 #[cfg(windows)]
 pub fn capture_window_png(hwnd: isize, out: &std::path::Path) -> Result<(), String> {
+    use pla_bridge::i18n::tr;
     use windows::Win32::Foundation::{HWND, RECT};
     use windows::Win32::Graphics::Gdi::{
         CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits,
@@ -95,35 +96,35 @@ pub fn capture_window_png(hwnd: isize, out: &std::path::Path) -> Result<(), Stri
     unsafe {
         let hwnd = HWND(hwnd);
         if !IsWindow(hwnd).as_bool() {
-            return Err("Plasticity 窗口已关闭".into());
+            return Err(tr("Plasticity 窗口已关闭", "Plasticity window is closed").into());
         }
         let mut rc = RECT::default();
         GetClientRect(hwnd, &mut rc)
             .ok()
-            .ok_or_else(|| "GetClientRect 失败".to_string())?;
+            .ok_or_else(|| tr("GetClientRect 失败", "GetClientRect failed").to_string())?;
         let w = (rc.right - rc.left).max(1);
         let h = (rc.bottom - rc.top).max(1);
 
         let hdc_screen = GetDC(None);
         if hdc_screen.is_invalid() {
-            return Err("GetDC 失败".into());
+            return Err(tr("GetDC 失败", "GetDC failed").into());
         }
         let result = (|| {
             let mem = CreateCompatibleDC(hdc_screen);
             if mem.is_invalid() {
-                return Err("CreateCompatibleDC 失败".into());
+                return Err(tr("CreateCompatibleDC 失败", "CreateCompatibleDC failed").into());
             }
             let captured = (|| {
                 let bmp = CreateCompatibleBitmap(hdc_screen, w, h);
                 if bmp.is_invalid() {
-                    return Err("CreateCompatibleBitmap 失败".into());
+                    return Err(tr("CreateCompatibleBitmap 失败", "CreateCompatibleBitmap failed").into());
                 }
                 let old = SelectObject(mem, bmp);
                 let r = (|| {
                     let printed =
                         PrintWindow(hwnd, mem, PRINT_WINDOW_FLAGS(PW_RENDERFULLCONTENT)).as_bool();
                     if !printed {
-                        return Err("PrintWindow 失败".into());
+                        return Err(tr("PrintWindow 失败", "PrintWindow failed").into());
                     }
                     let mut bmi = BITMAPINFO::default();
                     bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
@@ -144,7 +145,7 @@ pub fn capture_window_png(hwnd: isize, out: &std::path::Path) -> Result<(), Stri
                         DIB_RGB_COLORS,
                     );
                     if ok == 0 {
-                        return Err("GetDIBits 失败".into());
+                        return Err(tr("GetDIBits 失败", "GetDIBits failed").into());
                     }
                     // BGRA → RGBA, alpha 拍实(PrintWindow 的 alpha 通道不可靠)
                     for px in buf.chunks_exact_mut(4) {
@@ -152,7 +153,7 @@ pub fn capture_window_png(hwnd: isize, out: &std::path::Path) -> Result<(), Stri
                         px[3] = 255;
                     }
                     let png = encode_png_rgba(w as u32, h as u32, &buf);
-                    std::fs::write(out, png).map_err(|e| format!("写 PNG: {e}"))?;
+                    std::fs::write(out, png).map_err(|e| pla_bridge::t!("写 PNG: {e}", "Write PNG: {e}"))?;
                     Ok(())
                 })();
                 SelectObject(mem, old);
@@ -169,7 +170,7 @@ pub fn capture_window_png(hwnd: isize, out: &std::path::Path) -> Result<(), Stri
 
 #[cfg(not(windows))]
 pub fn capture_window_png(_hwnd: isize, _out: &std::path::Path) -> Result<(), String> {
-    Err("仅支持 Windows".into())
+    Err(pla_bridge::i18n::tr("仅支持 Windows", "Windows only").into())
 }
 
 #[cfg(test)]
