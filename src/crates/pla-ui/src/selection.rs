@@ -152,13 +152,15 @@ pub fn save_cdp_selection_with_camera(
             camera: member_cam.clone().or_else(|| camera.map(|c| c.to_string())),
         })
         .collect();
+    let path = dir.join(format!("{}.json", sanitize(name)));
+    // R35: 覆盖已有的(更新按钮)时保留收藏
+    let fav = cdp_sel_meta(doc_key, name).map_or(false, |m| m.fav);
     let json = serde_json::json!({
         "doc_key": doc_key,
         "name": name,
-        "fav": false,
+        "fav": fav,
         "members": items,
     });
-    let path = dir.join(format!("{}.json", sanitize(name)));
     std::fs::write(&path, serde_json::to_string_pretty(&json).map_err(|e| e.to_string())?)
         .map_err(|e| t!("写文件失败: {e}", "Failed to write file: {e}"))?;
     // R8-1: 截图覆盖保存(有则写, 无则删旧 — 保持与集内容一致)

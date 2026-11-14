@@ -269,6 +269,11 @@ struct PlaApp {
     snap_delete_confirm: Option<String>,
     /// R8-1: 选择集单项删除确认中。
     sel_delete_confirm: Option<String>,
+    /// R35: 三个面板的"更新"确认中(项名) + 视口状态更新的目标(采集回包后覆盖它, 而不是新建)。
+    snap_update_confirm: Option<String>,
+    sel_update_confirm: Option<String>,
+    vp_update_confirm: Option<String>,
+    vp_update_target: Option<String>,
     /// R8-1: 视口状态面板数据。
     vp_states: Vec<pla_ui::vpstate::VpStateMeta>,
     vp_states_loaded: bool,
@@ -1370,6 +1375,38 @@ struct SnapItemActions {
     rename_cancel: bool,
     /// R8-2: 删除按钮被点(单删, 带确认)。
     delete: bool,
+    /// R35: 更新按钮被点(用当前状态覆盖, 带确认)。
+    update: bool,
+}
+
+/// R35: 更新按钮(旋转箭头圆圈, 矢量绘制): 3/4 圆弧 + 箭头。
+fn refresh_button(ui: &mut egui::Ui, size: f32) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::click());
+    let col = if resp.hovered() { COL_ACCENT } else { COL_MUTED };
+    let c = rect.center();
+    let r = size * 0.36;
+    let st = egui::Stroke::new((size / 11.0).max(1.0), col);
+    // 从 -60° 顺时针画到 230°(留一个口给箭头)
+    let (a0, a1) = (-60.0f32.to_radians(), 230.0f32.to_radians());
+    let n = 18;
+    let pts: Vec<egui::Pos2> = (0..=n)
+        .map(|i| {
+            let a = a0 + (a1 - a0) * i as f32 / n as f32;
+            egui::pos2(c.x + r * a.cos(), c.y + r * a.sin())
+        })
+        .collect();
+    ui.painter().add(egui::Shape::line(pts, st));
+    // 箭头: 在起点(-60°)处, 沿切线方向
+    let tip = egui::pos2(c.x + r * a0.cos(), c.y + r * a0.sin());
+    let t = egui::vec2(-a0.sin(), a0.cos()); // 顺时针切线
+    let nrm = egui::vec2(a0.cos(), a0.sin());
+    let h = size * 0.28;
+    ui.painter().add(egui::Shape::convex_polygon(
+        vec![tip - t * h * 0.15, tip - t * h + nrm * h * 0.6, tip - t * h - nrm * h * 0.6],
+        col,
+        egui::Stroke::NONE,
+    ));
+    resp
 }
 
 /// R26: 截图纹理 URI —— egui 按 URI 缓存解码后的纹理, 只用名字(SS001/SG001…)做 URI 时,
@@ -1665,6 +1702,13 @@ fn draw_item_buttons(ui: &mut egui::Ui, is_fav: bool, a: &mut SnapItemActions) {
     if presp.on_hover_text(tr("改名", "Rename")).clicked() {
         a.rename_start = true;
     }
+    // R35: 更新(用当前状态覆盖)
+    if refresh_button(ui, 11.0)
+        .on_hover_text(tr("更新: 用当前文档覆盖这个快照(需确认)", "Update: overwrite this snapshot with the current document (confirm)"))
+        .clicked()
+    {
+        a.update = true;
+    }
     // 删除垃圾桶(11px, 线稿缩放 11/14)
     let (drect, dresp) = ui.allocate_exact_size(egui::vec2(11.0, 11.0), egui::Sense::click());
     let dcol = if dresp.hovered() { COL_RED } else { COL_MUTED };
@@ -1957,6 +2001,10 @@ impl PlaApp {
             snap_selected: std::collections::HashSet::new(),
             snap_delete_confirm: None,
             sel_delete_confirm: None,
+            snap_update_confirm: None,
+            sel_update_confirm: None,
+            vp_update_confirm: None,
+            vp_update_target: None,
             vp_states: Vec::new(),
             vp_states_loaded: false,
             vp_pending_state: None,
@@ -2095,6 +2143,19 @@ impl PlaApp {
                     } else {
                         None
                     };
+                    // R35: 更新已有项(覆盖, 名字/收藏保留)
+                    if let (Some(target), Some(state)) = (self.vp_update_target.clone(), self.vp_pending_state.clone()) {
+                        self.vp_update_target = None;
+                        self.vp_pending_state = None;
+                        match pla_ui::vpstate::update_vpstate(&self.doc_key, &target, &state, png_bytes.as_deref()) {
+                            Ok(()) => {
+                                self.vp_states_loaded = false;
+                                self.vp_pngs.clear();
+                                self.set_notice((false, t!("视口状态已更新: {target}", "View state updated: {target}")));
+                            }
+                            Err(e) => self.set_notice((true, e)),
+                        }
+                    }
                     // 视口状态存档
                     if let (Some(state), Some(png)) =
                         (self.vp_pending_state.take(), png_bytes.as_deref())
@@ -2668,6 +2729,10 @@ impl PlaApp {
         self.vp_pending_state = None;
         self.vp_delete_confirm = None;
         self.vp_rename = None;
+        self.snap_update_confirm = None;
+        self.sel_update_confirm = None;
+        self.vp_update_confirm = None;
+        self.vp_update_target = None;
         // 尺寸驱动(关联选择集)
         self.dim_sets.clear();
         self.dim_set_sel = 0;
@@ -3746,7 +3811,7 @@ impl eframe::App for PlaApp {
                         let mut rename_commit = false;
                         let mut rename_cancel = false;
                         let mut refresh = false;
-                        let mut delete_ask: Option<String> = None;
+                        let mut delete_ask: Option<String> = None; let mut update_ask: Option<String> = None;
 
                         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                             // R7-10: 宽度必须在 ScrollArea 内部测 — 竖向滚动条出现后
@@ -3842,6 +3907,9 @@ impl eframe::App for PlaApp {
                                         }
                                         rename_commit |= act.rename_commit;
                                         rename_cancel |= act.rename_cancel;
+                                        if act.update {
+                                            update_ask = Some(s.clone());
+                                        }
                                         if act.delete {
                                             delete_ask = Some(s.clone());
                                         }
@@ -3884,6 +3952,9 @@ impl eframe::App for PlaApp {
                                 }
                                 rename_commit |= act.rename_commit;
                                 rename_cancel |= act.rename_cancel;
+                                if act.update {
+                                    update_ask = Some(s.clone());
+                                }
                                 if act.delete {
                                     delete_ask = Some(s.clone());
                                 }
@@ -3928,6 +3999,34 @@ impl eframe::App for PlaApp {
                         }
                         if let Some(n) = delete_ask {
                             self.snap_delete_confirm = Some(n);
+                        }
+                        // R35: 更新确认 — 用当前(已保存的)文档覆盖这个快照
+                        if let Some(name) = self.snap_update_confirm.clone() {
+                            let stem = name.trim_end_matches(".plasticity").to_string();
+                            let text = t!(
+                                "用当前文档覆盖「{stem}」? 原内容不可恢复(取的是最近一次 Ctrl+S 保存的文件)",
+                                "Overwrite \"{stem}\" with the current document? The old content cannot be recovered (uses the last Ctrl+S save)"
+                            );
+                            match confirm_popup(ui.ctx(), "snap-upd", &text) {
+                                Some(true) => {
+                                    let hwnd = self.snap_target.as_ref().map(|t| t.hwnd);
+                                    match pla_ui::snapshot::update_snapshot(&self.doc_key, &name, hwnd) {
+                                        Ok(s) => {
+                                            self.snapshots = pla_ui::snapshot::list_snapshots(&self.doc_key);
+                                            self.snap_infos = pla_ui::snapshot::load_meta_infos(&self.doc_key);
+                                            self.snap_pngs.remove(&name);
+                                            self.set_notice((false, t!("已更新「{s}」", "Updated \"{s}\"")));
+                                        }
+                                        Err(e) => self.set_notice((true, e)),
+                                    }
+                                    self.snap_update_confirm = None;
+                                }
+                                Some(false) => self.snap_update_confirm = None,
+                                None => {}
+                            }
+                        }
+                        if let Some(n) = update_ask {
+                            self.snap_update_confirm = Some(n);
                         }
 
                         // ---- 统一执行采集到的动作(此时列表借用已结束) ----
@@ -4187,7 +4286,7 @@ impl eframe::App for PlaApp {
                                 .color(COL_MUTED),
                             );
                         }
-                        let mut delete_ask: Option<String> = None;
+                        let mut delete_ask: Option<String> = None; let mut update_ask: Option<String> = None;
                         let mut apply_now: Option<String> = None;
                         let mut fav_toggle: Option<(String, bool)> = None;
                         let mut rename_start: Option<String> = None;
@@ -4211,6 +4310,7 @@ impl eframe::App for PlaApp {
                                     let mut del = false;
                                     let mut fav = false;
                                     let mut rn = false;
+                                    let mut upd = false;
                                     ui.allocate_ui_with_layout(
                                         egui::vec2(w, img_h + 38.0),
                                         egui::Layout::top_down(egui::Align::LEFT),
@@ -4298,7 +4398,7 @@ impl eframe::App for PlaApp {
                                             });
                                         },
                                     );
-                                    (del, fav, rn)
+                                    (del, fav, rn, upd)
                                 };
                                 // 收藏行(3列, 定位同快照墙)
                                 if !fav_list.is_empty() {
@@ -4312,7 +4412,7 @@ impl eframe::App for PlaApp {
                                                 egui::pos2(row_rect.left() + ci as f32 * (cell_w + sp), row_rect.top()),
                                                 egui::vec2(cell_w, fav_row_h),
                                             );
-                                            let (del, fav, rn) = ui.allocate_new_ui(egui::UiBuilder::new().max_rect(cell), |ui| item(ui, meta, cell_w, fav_img_h)).inner;
+                                            let (del, fav, rn, upd) = ui.allocate_new_ui(egui::UiBuilder::new().max_rect(cell), |ui| item(ui, meta, cell_w, fav_img_h)).inner;
                                             if del { delete_ask = Some(meta.name.clone()); }
                                             if fav { fav_toggle = Some((meta.name.clone(), !meta.fav)); }
                                             if rn { rename_start = Some(meta.name.clone()); }
@@ -4326,7 +4426,7 @@ impl eframe::App for PlaApp {
                                         ui.label(egui::RichText::new(tr("全部", "All")).small().strong().color(COL_MUTED));
                                     }
                                     for meta in &other_list {
-                                        let (del, fav, rn) = item(ui, meta, avail_w, big_img_h_for(avail_w));
+                                        let (del, fav, rn, upd) = item(ui, meta, avail_w, big_img_h_for(avail_w));
                                         ui.add_space(4.0);
                                         if del { delete_ask = Some(meta.name.clone()); }
                                         if fav { fav_toggle = Some((meta.name.clone(), !meta.fav)); }
@@ -4359,6 +4459,33 @@ impl eframe::App for PlaApp {
                         }
                         if let Some(n) = delete_ask {
                             self.sel_delete_confirm = Some(n);
+                        }
+                        // R35: 更新确认 — 用当前选择(+ 相机 + 截图)覆盖这个选择集, 名字与收藏保留
+                        if let Some(name) = self.sel_update_confirm.clone() {
+                            let text = t!("用当前选择覆盖「{name}」? 原内容不可恢复", "Overwrite \"{name}\" with the current selection? The old content cannot be recovered");
+                            match confirm_popup(ui.ctx(), "sel-upd", &text) {
+                                Some(true) => {
+                                    if self.sel_cdp_members.is_empty() {
+                                        self.set_notice((true, tr("实时选择为空 — 请先在视口里选中目标", "Live selection is empty — select something in the viewport first").into()));
+                                    } else {
+                                        let members = self.sel_cdp_members.clone();
+                                        let cam = self.sel_camera.clone();
+                                        let tmp = pla_ui::selection::cdp_selections_dir(&self.doc_key).join("__shot_tmp.png");
+                                        let tmp_str = tmp.display().to_string();
+                                        self.sel_shot_path = Some(tmp_str.clone());
+                                        self.sel_save_pending = Some((name.clone(), members, cam));
+                                        self.cdp.send(pla_bridge::cdp::CdpCmd::CaptureViewport(tmp_str));
+                                        self.sel_pngs.remove(&name);
+                                        self.set_notice((false, t!("正在更新选择集 {name}(截图中)…", "Updating selection set {name} (capturing)…")));
+                                    }
+                                    self.sel_update_confirm = None;
+                                }
+                                Some(false) => self.sel_update_confirm = None,
+                                None => {}
+                            }
+                        }
+                        if let Some(n) = update_ask {
+                            self.sel_update_confirm = Some(n);
                         }
 
                         // ---- 统一执行动作(借用结束) ----
@@ -4547,7 +4674,7 @@ impl eframe::App for PlaApp {
                                 .color(COL_MUTED),
                             );
                         }
-                        let mut delete_ask: Option<String> = None;
+                        let mut delete_ask: Option<String> = None; let mut update_ask: Option<String> = None;
                         let mut apply_now: Option<String> = None;
                         let mut fav_toggle: Option<(String, bool)> = None;
                         let mut rename_start: Option<String> = None;
@@ -4587,7 +4714,7 @@ impl eframe::App for PlaApp {
                                 let sp = ui.spacing().item_spacing.x;
                                 let cell_w = ((avail_w - sp * 2.0) / 3.0).max(40.0);
                                 let mut item = |ui: &mut egui::Ui, meta: &pla_ui::vpstate::VpStateMeta, w: f32, img_h: f32| {
-                                    let mut del = false; let mut fav = false; let mut rn = false;
+                                    let mut del = false; let mut fav = false; let mut rn = false; let mut upd = false;
                                     ui.allocate_ui_with_layout(
                                         egui::vec2(w, img_h + 38.0),
                                         egui::Layout::top_down(egui::Align::LEFT),
@@ -4671,7 +4798,7 @@ impl eframe::App for PlaApp {
                                             });
                                         },
                                     );
-                                    (del, fav, rn)
+                                    (del, fav, rn, upd)
                                 };
                                 if !fav_list.is_empty() {
                                     ui.label(egui::RichText::new(tr("★ 收藏", "★ Favorites")).small().strong().color(COL_MUTED));
@@ -4684,7 +4811,7 @@ impl eframe::App for PlaApp {
                                                 egui::pos2(row_rect.left() + ci as f32 * (cell_w + sp), row_rect.top()),
                                                 egui::vec2(cell_w, fav_row_h),
                                             );
-                                            let (del, fav, rn) = ui.allocate_new_ui(egui::UiBuilder::new().max_rect(cell), |ui| item(ui, meta, cell_w, fav_img_h)).inner;
+                                            let (del, fav, rn, upd) = ui.allocate_new_ui(egui::UiBuilder::new().max_rect(cell), |ui| item(ui, meta, cell_w, fav_img_h)).inner;
                                             if del { delete_ask = Some(meta.name.clone()); }
                                             if fav { fav_toggle = Some((meta.name.clone(), !meta.fav)); }
                                             if rn { rename_start = Some(meta.name.clone()); }
@@ -4695,7 +4822,7 @@ impl eframe::App for PlaApp {
                                 if !other_list.is_empty() {
                                     ui.label(egui::RichText::new(tr("全部", "All")).small().strong().color(COL_MUTED));
                                     for meta in &other_list {
-                                        let (del, fav, rn) = item(ui, meta, avail_w, big_img_h_for(avail_w));
+                                        let (del, fav, rn, upd) = item(ui, meta, avail_w, big_img_h_for(avail_w));
                                         ui.add_space(4.0);
                                         if del { delete_ask = Some(meta.name.clone()); }
                                         if fav { fav_toggle = Some((meta.name.clone(), !meta.fav)); }
@@ -4727,6 +4854,28 @@ impl eframe::App for PlaApp {
                         }
                         if let Some(n) = delete_ask {
                             self.vp_delete_confirm = Some(n);
+                        }
+                        // R35: 更新确认 — 采集当前视口状态 + 缩略图, 覆盖这一项(名字与收藏保留)
+                        if let Some(name) = self.vp_update_confirm.clone() {
+                            let text = t!("用当前视口状态覆盖「{name}」? 原内容不可恢复", "Overwrite \"{name}\" with the current view state? The old content cannot be recovered");
+                            match confirm_popup(ui.ctx(), "vp-upd", &text) {
+                                Some(true) => {
+                                    let tmp = pla_ui::vpstate::vpstate_dir(&self.doc_key).join("__shot_tmp.png");
+                                    let _ = std::fs::create_dir_all(tmp.parent().unwrap_or(std::path::Path::new(".")));
+                                    self.vp_shot_path = Some(tmp.display().to_string());
+                                    self.vp_pending_state = None;
+                                    self.vp_update_target = Some(name.clone());
+                                    self.vp_pngs.remove(&name);
+                                    self.cdp.send(pla_bridge::cdp::CdpCmd::VpStateSave);
+                                    self.set_notice((false, t!("正在更新视口状态 {name}…", "Updating view state {name}…")));
+                                    self.vp_update_confirm = None;
+                                }
+                                Some(false) => self.vp_update_confirm = None,
+                                None => {}
+                            }
+                        }
+                        if let Some(n) = update_ask {
+                            self.vp_update_confirm = Some(n);
                         }
                         // 动作执行
                         if let Some((name, fav)) = fav_toggle {

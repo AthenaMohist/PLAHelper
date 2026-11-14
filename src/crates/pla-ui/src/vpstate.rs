@@ -84,6 +84,36 @@ pub fn save_vpstate(doc_key: &str, state: &str, png: Option<&[u8]>) -> Result<St
     Ok(stem)
 }
 
+/// R35: 用当前状态覆盖已有的一条(名字、收藏保留; 时间改为现在; 有新截图则替换)。
+pub fn update_vpstate(doc_key: &str, name: &str, state: &str, png: Option<&[u8]>) -> Result<(), String> {
+    if state.trim().is_empty() {
+        return Err(tr("视口状态为空", "Viewport state is empty").into());
+    }
+    let dir = vpstate_dir(doc_key);
+    let path = dir.join(format!("{name}.json"));
+    let fav = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|d| serde_json::from_str::<serde_json::Value>(&d).ok())
+        .and_then(|v| v["fav"].as_bool())
+        .unwrap_or(false);
+    let json = serde_json::json!({
+        "doc_key": doc_key,
+        "name": name,
+        "fav": fav,
+        "created": super::snapshot::now_local_display(),
+        "state": state,
+    });
+    std::fs::write(
+        &path,
+        serde_json::to_vec_pretty(&json).map_err(|e| t!("序列化失败: {e}", "Serialization failed: {e}"))?,
+    )
+    .map_err(|e| t!("写文件失败: {e}", "Failed to write file: {e}"))?;
+    if let Some(bytes) = png {
+        let _ = std::fs::write(dir.join(format!("{name}.png")), bytes);
+    }
+    Ok(())
+}
+
 /// 读取一条视口状态的本体 JSON。
 pub fn load_vpstate(doc_key: &str, name: &str) -> Option<String> {
     let data = std::fs::read_to_string(vpstate_dir(doc_key).join(format!("{name}.json"))).ok()?;
@@ -192,6 +222,21 @@ pub fn open_dir(doc_key: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn update_overwrites_state_and_keeps_name_and_fav() {
+        let doc = format!("__test_vpupd_{}", std::process::id());
+        let stem = save_vpstate(&doc, r#"{"v":1}"#, None).unwrap();
+        set_fav(&doc, &stem, true).unwrap();
+        update_vpstate(&doc, &stem, r#"{"v":2}"#, Some(b"png")).unwrap();
+        assert_eq!(load_vpstate(&doc, &stem).as_deref(), Some(r#"{"v":2}"#), "内容被覆盖");
+        let list = list_vpstates(&doc);
+        assert_eq!(list.len(), 1, "不新建条目");
+        assert!(list[0].fav, "收藏保留");
+        assert_eq!(std::fs::read(vpstate_dir(&doc).join(format!("{stem}.png"))).unwrap(), b"png");
+        let _ = delete_vpstates(&doc, &[stem]);
+        let _ = std::fs::remove_dir_all(vpstate_dir(&doc));
+    }
 
     #[test]
     fn save_list_fav_delete_flow() {

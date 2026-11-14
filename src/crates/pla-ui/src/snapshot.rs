@@ -117,6 +117,35 @@ pub fn take_manual_snapshot(doc_key: &str, plasticity_hwnd: Option<isize>) -> Re
     // R7-10: 简短序号名 SS001/SS002…; 富信息(源文档/拍摄时间)写 meta.json,
     // 不再拼进文件名。
     let stem = next_snapshot_stem(&dir);
+    write_snapshot(doc_key, &src, &dir, &stem, plasticity_hwnd)?;
+    Ok(stem)
+}
+
+/// R35: 用当前文档覆盖已有快照(名字、收藏保留; 截图与拍摄时间更新)。`name` 可带 `.plasticity` 后缀。
+pub fn update_snapshot(doc_key: &str, name: &str, plasticity_hwnd: Option<isize>) -> Result<String, String> {
+    let src = find_latest_doc(doc_key).ok_or_else(|| {
+        t!(
+            "未找到当前文档(关键字 '{doc_key}') — 请先在 Plasticity 中 Ctrl+S 保存一次",
+            "Current document not found (key '{doc_key}') — press Ctrl+S in Plasticity once first"
+        )
+    })?;
+    let dir = snapshot_dir_for(Some(&src));
+    let stem = name.trim_end_matches(".plasticity").to_string();
+    if !dir.join(format!("{stem}.plasticity")).exists() {
+        return Err(t!("快照 {stem} 不存在", "Snapshot {stem} does not exist"));
+    }
+    write_snapshot(doc_key, &src, &dir, &stem, plasticity_hwnd)?;
+    Ok(stem)
+}
+
+/// 复制当前文档到 `<dir>/<stem>.plasticity` + 窗口截图 + 写元数据(新建与更新共用)。
+fn write_snapshot(
+    doc_key: &str,
+    src: &std::path::Path,
+    dir: &std::path::Path,
+    stem: &str,
+    plasticity_hwnd: Option<isize>,
+) -> Result<(), String> {
     let dst = dir.join(format!("{stem}.plasticity"));
     std::fs::copy(&src, &dst).map_err(|e| t!("复制失败: {e}", "Copy failed: {e}"))?;
     // 缩略图: PrintWindow 抓 Plasticity 主窗口 → 同名 .png
@@ -138,7 +167,7 @@ pub fn take_manual_snapshot(doc_key: &str, plasticity_hwnd: Option<isize>) -> Re
         );
         let _ = save_meta2(doc_key, &favs, &info); // 尽力而为, 失败不阻断
     }
-    Ok(stem)
+    Ok(())
 }
 
 /// 当前文档对应的快照目录(不创建)。
