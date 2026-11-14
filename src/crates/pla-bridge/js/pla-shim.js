@@ -773,7 +773,9 @@
     var byName = page.delegated.get(reg);
     if (!byName) { byName = {}; page.delegated.set(reg, byName); }
     var set = byName[cmdName] || (byName[cmdName] = new WeakSet());
-    if (set.has(el)) return false;
+    // 页面级记录说挂过, 还要注册表里确实还在: 热替换时旧实例 dispose 会注销它挂的监听, 记录却跨实例保留
+    // → 以前就此认定"已挂"再不补挂, ping / 滚转命令失灵到页面重载(2026-11-15 自检实测)。
+    if (set.has(el) && hasListener(cmdName, el)) return false;
     // 已有别处注册的同名回调(旧版助手留下的)且不强制: 不再叠加, 避免一次按键执行两次。
     if (!force && hasListener(cmdName, el)) return false;
     var map = {};
@@ -1764,6 +1766,17 @@
   function plain(o) {
     return JSON.parse(JSON.stringify(o, function (k, v) { return (v && typeof v === 'object' && ArrayBuffer.isView(v)) ? Array.prototype.slice.call(v) : v; }));
   }
+  // 与键序无关的 JSON 比较: 存档经 Rust(serde_json 无 preserve_order)转一圈后对象键按字母排序,
+  // 直接比 JSON.stringify 会把"原样"判成"改了"(→ 材质走 memento、文档设置被写成"未保存")。
+  function canonJson(o) {
+    return JSON.stringify(plain(o), function (k, v) {
+      if (!v || typeof v !== 'object' || Array.isArray(v)) return v;
+      var s = {};
+      Object.keys(v).sort().forEach(function (q) { s[q] = v[q]; });
+      return s;
+    });
+  }
+  function sameJson(a, b) { return canonJson(a) === canonJson(b); }
   function texFile(t) { return t && t.userData ? (t.userData[NAMES.matcapFileKey] || null) : null; }
   function baseName(path) { var s = String(path || '').split('/').pop(); return s.replace(/\.[^.]+$/, ''); }
 
@@ -2104,7 +2117,7 @@
       seg('doc', !!S.doc, function () {
         var ds = need('ed.docSettings');
         // 文档设置一写就会让文件变"未保存" → 没变化就不写
-        if (JSON.stringify(plain(invokeOn('ds.snapshot', [], ds))) === JSON.stringify(S.doc)) { applied.push('doc(same)'); return; }
+        if (sameJson(invokeOn('ds.snapshot', [], ds), S.doc)) { applied.push('doc(same)'); return; }
         invokeOn('ds.init', [S.doc], ds);
         var sig = get('ed.sig.docSettings');
         if (sig && typeof sig.dispatch === 'function') sig.dispatch();
@@ -2280,7 +2293,7 @@
   def('mat.restore', 'mat.state', function (S) {
     if (!S || !Array.isArray(S.materials) || !Array.isArray(S.assign)) throw new Error('mat.restore needs {materials, assign}');
     var cur = materialsNow();
-    if (JSON.stringify(cur.materials) === JSON.stringify(S.materials) && JSON.stringify(cur.assign) === JSON.stringify(S.assign)) {
+    if (sameJson(cur.materials, S.materials) && sameJson(cur.assign, S.assign)) {
       return { applied: ['materials(same)'], missing: [], failed: [] };
     }
     mementoGuard();

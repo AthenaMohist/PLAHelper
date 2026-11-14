@@ -939,7 +939,7 @@ fn paint_row_label(ui: &egui::Ui, rect: egui::Rect, text: &str, hovered: bool, h
     if has_info {
         let c = egui::pos2(r.right() + 9.0, rect.center().y);
         let col = if hovered { egui::Color32::WHITE } else { COL_MUTED };
-        ui.painter().circle_stroke(c, 5.5, egui::Stroke::new(1.0, col));
+        ui.painter().circle_stroke(c, 5.5, egui::Stroke::new(1.0_f32, col));
         ui.painter().text(c, egui::Align2::CENTER_CENTER, "?", egui::FontId::proportional(8.5), col);
     }
 }
@@ -972,7 +972,7 @@ fn settings_card<R>(
             if let Some((t, lines)) = info {
                 let c = egui::pos2(r.right() + 9.0, rect.center().y);
                 let col = if hovered { egui::Color32::WHITE } else { COL_MUTED };
-                ui.painter().circle_stroke(c, 5.5, egui::Stroke::new(1.0, col));
+                ui.painter().circle_stroke(c, 5.5, egui::Stroke::new(1.0_f32, col));
                 ui.painter().text(c, egui::Align2::CENTER_CENTER, "?", egui::FontId::proportional(8.5), col);
                 hover_info(ui, rect, resp.hovered(), t, lines);
             }
@@ -1119,7 +1119,7 @@ fn drag_row<T: egui::emath::Numeric>(
                 w.bg_fill = fill;
                 w.bg_stroke = egui::Stroke::NONE;
                 w.rounding = egui::Rounding::same(6.0);
-                w.fg_stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
+                w.fg_stroke = egui::Stroke::new(1.0_f32, egui::Color32::WHITE);
                 w.expansion = 0.0;
             }
             ui.style_mut().override_font_id = Some(egui::FontId::proportional(13.0));
@@ -1724,7 +1724,7 @@ fn draw_item_buttons(ui: &mut egui::Ui, is_fav: bool, a: &mut SnapItemActions) {
     let dcol = if dresp.hovered() { COL_RED } else { COL_MUTED };
     let k = 11.0 / 14.0;
     let p = |x: f32, y: f32| egui::pos2(drect.left() + x * k, drect.top() + y * k);
-    let st = egui::Stroke::new(1.1, dcol);
+    let st = egui::Stroke::new(1.1_f32, dcol);
     ui.painter().line_segment([p(3.0, 4.0), p(11.0, 4.0)], st);
     ui.painter().line_segment([p(5.5, 4.0), p(5.5, 2.5)], st);
     ui.painter().line_segment([p(8.5, 4.0), p(8.5, 2.5)], st);
@@ -1757,7 +1757,7 @@ fn vector_icon_button(
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(16.0, 14.0), egui::Sense::click());
     let col = if resp.hovered() { COL_TEXT } else { COL_MUTED };
     let p = |x: f32, y: f32| egui::pos2(rect.left() + x, rect.top() + y);
-    let st = egui::Stroke::new(1.3, col);
+    let st = egui::Stroke::new(1.3_f32, col);
     match kind {
         IconKind::Trash => {
             // 桶身+盖+提手
@@ -1769,7 +1769,7 @@ fn vector_icon_button(
             ui.painter().line_segment([p(9.8, 4.0), p(8.8, 12.0)], st);
             ui.painter().line_segment([p(5.2, 12.0), p(8.8, 12.0)], st);
             // 桶内竖线
-            ui.painter().line_segment([p(7.0, 6.0), p(7.0, 10.0)], egui::Stroke::new(1.0, col));
+            ui.painter().line_segment([p(7.0, 6.0), p(7.0, 10.0)], egui::Stroke::new(1.0_f32, col));
         }
         IconKind::Folder => {
             // 文件夹: 顶舌 + 盒体
@@ -1841,7 +1841,7 @@ fn confirm_popup_with(
             egui::Frame::none()
                 .fill(egui::Color32::from_rgb(0x24, 0x24, 0x24))
                 .rounding(egui::Rounding::same(8.0))
-                .stroke(egui::Stroke::new(1.0, accent))
+                .stroke(egui::Stroke::new(1.0_f32, accent))
                 .inner_margin(egui::Margin::same(10.0))
                 .show(ui, |ui| {
                     ui.set_min_width(200.0);
@@ -2320,7 +2320,7 @@ impl PlaApp {
     }
 
     /// 尝试一次自动快照: 文档 mtime 未变(无新保存)则跳过; 成功后跑清理策略。
-    fn try_auto_snapshot(&mut self, reason: &str) {
+    fn try_auto_snapshot(&mut self, _reason: &str) {
         self.last_auto_time = Instant::now();
         if self.cdp_undo >= 0 {
             self.last_auto_step = self.cdp_undo;
@@ -2336,7 +2336,7 @@ impl PlaApp {
         }
         let hwnd = self.snap_target.as_ref().map(|t| t.hwnd);
         match pla_ui::snapshot::take_manual_snapshot(&self.doc_key, hwnd) {
-            Ok(name) => {
+            Ok(_) => {
                 self.last_auto_mtime = mtime;
                 self.snapshots = pla_ui::snapshot::list_snapshots(&self.doc_key);
                 self.snap_pngs.clear();
@@ -2600,7 +2600,7 @@ impl PlaApp {
                         let o = k as f32 * 3.5;
                         p.line_segment(
                             [egui::pos2(sr.right() - 3.0 - o, sr.bottom() - 3.0), egui::pos2(sr.right() - 3.0, sr.bottom() - 3.0 - o)],
-                            egui::Stroke::new(1.0, COL_MUTED),
+                            egui::Stroke::new(1.0_f32, COL_MUTED),
                         );
                     }
                 });
@@ -3696,7 +3696,7 @@ impl eframe::App for PlaApp {
                         Health::Partial => Some(COL_YELLOW),
                     };
                     if let Some(c) = ring {
-                        ui.painter().circle_stroke(dot_rect.center(), 5.4, egui::Stroke::new(1.2, c));
+                        ui.painter().circle_stroke(dot_rect.center(), 5.4, egui::Stroke::new(1.2_f32, c));
                     }
                     // F2: 单击 = 开关 CDP 能力面板; 双击 = 归位(见上)。
                     if dot_resp.clicked() {
@@ -4393,7 +4393,7 @@ impl eframe::App for PlaApp {
                     &mut flag,
                     true,
                     |ui| {
-                        let mut open_err: Option<String> = None;
+                        let open_err: Option<String> = None;
                         let inner_tip = std::cell::RefCell::new(None::<(String, String)>);
 
                         // ============ ENTITIES: 右侧单独一列(R23 用户要求, 不再挤占选择集墙) ============
@@ -4628,13 +4628,13 @@ impl eframe::App for PlaApp {
                                                 let (drect, dresp) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::click());
                                                 let dcol = if dresp.hovered() { COL_RED } else { COL_MUTED };
                                                 let p = |x: f32, y: f32| egui::pos2(drect.left() + x, drect.top() + y);
-                                                ui.painter().line_segment([p(3.0,4.0), p(11.0,4.0)], egui::Stroke::new(1.2, dcol));
-                                                ui.painter().line_segment([p(5.5,4.0), p(5.5,2.5)], egui::Stroke::new(1.2, dcol));
-                                                ui.painter().line_segment([p(8.5,4.0), p(8.5,2.5)], egui::Stroke::new(1.2, dcol));
-                                                ui.painter().line_segment([p(6.2,2.5), p(7.8,2.5)], egui::Stroke::new(1.2, dcol));
-                                                ui.painter().line_segment([p(4.0,4.0), p(5.0,12.0)], egui::Stroke::new(1.2, dcol));
-                                                ui.painter().line_segment([p(10.0,4.0), p(9.0,12.0)], egui::Stroke::new(1.2, dcol));
-                                                ui.painter().line_segment([p(5.0,12.0), p(9.0,12.0)], egui::Stroke::new(1.2, dcol));
+                                                ui.painter().line_segment([p(3.0,4.0), p(11.0,4.0)], egui::Stroke::new(1.2_f32, dcol));
+                                                ui.painter().line_segment([p(5.5,4.0), p(5.5,2.5)], egui::Stroke::new(1.2_f32, dcol));
+                                                ui.painter().line_segment([p(8.5,4.0), p(8.5,2.5)], egui::Stroke::new(1.2_f32, dcol));
+                                                ui.painter().line_segment([p(6.2,2.5), p(7.8,2.5)], egui::Stroke::new(1.2_f32, dcol));
+                                                ui.painter().line_segment([p(4.0,4.0), p(5.0,12.0)], egui::Stroke::new(1.2_f32, dcol));
+                                                ui.painter().line_segment([p(10.0,4.0), p(9.0,12.0)], egui::Stroke::new(1.2_f32, dcol));
+                                                ui.painter().line_segment([p(5.0,12.0), p(9.0,12.0)], egui::Stroke::new(1.2_f32, dcol));
                                                 if dresp.on_hover_text(tr("删除(需确认)", "Delete (confirm)")).clicked() { del = true; }
                                             });
                                         },

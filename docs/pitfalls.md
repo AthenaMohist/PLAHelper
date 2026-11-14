@@ -59,6 +59,8 @@
 | 56 | 第一次执行脚本命令要等 78 s | 代理按名复活工厂类时每个都调一次 `HeapProfiler.getObjectByHeapObjectId`, 它每次都扫整个堆(~0.3 s × 229 个) | 只按 id 复活一个类 → 沿原型链到类层次的根 → `Runtime.queryObjects(根)` 一次扫堆拿到全部子类; 没覆盖到的名字再重复(实测 10 次扫堆, 8 s, 其中快照 2.7 s)(N2) |
 | 57 | 工厂/命令报 PK_ERROR_field_of_wrong_type, 或按 `edgeIds` 查边抛 "object null is not iterable" | 26.x 几何内核是 Parasolid: 枚举值是 PK 常量(合并 = 15903, 不是 0/1/2); 拓扑 id 是字符串 `<物体版本id>e<边id>` / `f`(面), 组里的 `edgeIds`/`faceIds` 是裸数字, 不能直接查 | 枚举只写在垫片 NAMES 表; 边/面 id 取组上的 `versionIds`(与 `bboxes` 同序)(N2) |
 | 58 | 视口状态恢复: 存的是正交, 恢复后仍是透视(恢复结果里却有 projection) | 视口的 `fov` 不是视场角, 是投影开关(透视 1 / 正交 0), 写它(任何值, 包括 0)都会切成透视; 标量段排在视角段之后又写了一次 fov | fov 移出 `NAMES.vpScalars`, 投影只由 view 段 `togglePerspective` 负责; 老存档的 scalars.fov 忽略。附带: `vp.init` 收到 mode=perspective 时会自己切成透视, 反方向不会(R33, 2026-11-15) |
+| 59 | 原样恢复的材质状态被当成"改动"(走 memento, 窗口隐藏时报 window hidden); 视口状态恢复可能把文档写成"未保存" | 存档经 Rust 转一圈: serde_json 没开 preserve_order, 对象键按字母重排; 垫片拿 `JSON.stringify` 直接比字符串 | 比较一律用键序无关的 `sameJson`(垫片); 以后凡"没变化就不写"的判断都不要直接比 JSON 字符串 |
+| 60 | 升级 pla-ui(垫片热替换)后 Alt+←/→ 滚转、自检 cmd.ping 失灵, 重载页面才好 | 旧实例 `dispose` 注销了自己挂的命令监听, 但页面级"已挂委托"记录(`__PLA_PAGE__`)跨实例保留, 新实例以为挂过不再补挂 | `ensureDelegate`: 记录在**且**注册表里确实还在才跳过 |
 | 14 | 切换面板时旧面板滞留、新面板不出现、点击丢失 | R12 加深的文档定位(`find_latest_doc`)每次未命中都全盘深扫(热缓存 ~2s, 冷缓存 ~19s), 面板每帧取文档目录, 2s TTL 一过就在 UI 线程重扫 | 分阶段: leveldb + Recent 命中即返回; 深扫未命中负缓存 60s(R13) |
 
 ## 假按钮教训

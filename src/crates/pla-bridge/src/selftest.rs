@@ -145,6 +145,9 @@ fn selection_items(snapshot: &Value) -> Vec<Value> {
 }
 
 /// 去掉与状态无关、每次都可能变的字段(视口屏幕矩形、DPR、失败段说明)。
+/// 视口状态回环的相对容差(见 vp.restore 回环处的说明)。
+const VP_EPS: f64 = 1e-4;
+
 fn strip_volatile(v: &Value) -> Value {
     let mut v = v.clone();
     if let Some(o) = v.as_object_mut() {
@@ -167,6 +170,34 @@ fn json_close(a: &Value, b: &Value, eps: f64) -> bool {
             x.len() == y.len() && x.iter().all(|(k, p)| y.get(k).is_some_and(|q| json_close(p, q, eps)))
         }
         _ => a == b,
+    }
+}
+
+/// 列出前 `max` 处差异路径(同 [`json_close`] 的容差), 供"不一致"时直接说明差在哪。
+fn json_diff_paths(a: &Value, b: &Value, eps: f64, path: &str, out: &mut Vec<String>, max: usize) {
+    if out.len() >= max {
+        return;
+    }
+    match (a, b) {
+        (Value::Object(x), Value::Object(y)) => {
+            let mut keys: Vec<&String> = x.keys().chain(y.keys()).collect();
+            keys.sort();
+            keys.dedup();
+            for k in keys {
+                json_diff_paths(x.get(k).unwrap_or(&Value::Null), y.get(k).unwrap_or(&Value::Null), eps, &format!("{path}.{k}"), out, max);
+            }
+        }
+        (Value::Array(x), Value::Array(y)) if x.len() == y.len() => {
+            for (i, (p, q)) in x.iter().zip(y).enumerate() {
+                json_diff_paths(p, q, eps, &format!("{path}[{i}]"), out, max);
+            }
+        }
+        _ => {
+            if !json_close(a, b, eps) {
+                let s = |v: &Value| { let t = v.to_string(); if t.len() > 40 { format!("{}…", &t[..40]) } else { t } };
+                out.push(format!("{path}: {} → {}", s(a), s(b)));
+            }
+        }
     }
 }
 
@@ -238,6 +269,14 @@ pub async fn run(cdp_port: u16, inspector_port: u16, hwnd: Option<isize>) -> Rep
     let ws = &mut ws;
     let mut mid: u64 = 100;
     let mid = &mut mid;
+
+    // 窗口可见性: 不可见时(被遮挡/最小化/显示器关)帧率被节流, 相机阻尼收敛不完 → 相机类回环只作参考(WARN)。
+    let hidden = eval_roundtrip(ws, mid, "document.visibilityState").await.map(|s| s.trim() == "hidden").unwrap_or(false);
+    if hidden {
+        r.add(S_TRANSPORT, "窗口可见性", Level::Warn, "hidden — 相机 / 视口回环的偏差只作参考(阻尼在后台收敛很慢)");
+    }
+    // 不可见时相机类回环的 FAIL 降为 WARN
+    let cam_fail = if hidden { Level::Warn } else { Level::Fail };
 
     // ================= 垫片 =================
     match eval_roundtrip(ws, mid, &shim::install_expr()).await {
@@ -354,7 +393,7 @@ pub async fn run(cdp_port: u16, inspector_port: u16, hwnd: Option<isize>) -> Rep
                 Ok(_) => match call(ws, mid, api::CAM_GET, &Value::Null).await {
                     Ok(now) => match view_delta(cam, &now.to_string()) {
                         Ok(d) if d < CAM_EPS => r.add(S_ROUNDTRIP, "cam.set ← cam.get", Level::Pass, format!("回读偏差 {d:.1e}")),
-                        Ok(d) => r.add(S_ROUNDTRIP, "cam.set ← cam.get", Level::Fail, format!("回读偏差 {d:.3e} — 写入未生效或被拉回")),
+                        Ok(d) => r.add(S_ROUNDTRIP, "cam.set ← cam.get", cam_fail, format!("回读偏差 {d:.3e} — 写入未生效或被拉回")),
                         Err(e) => r.add(S_ROUNDTRIP, "cam.set ← cam.get", Level::Fail, e.to_string()),
                     },
                     Err(e) => r.add(S_ROUNDTRIP, "cam.set ← cam.get", Level::Fail, e),
@@ -379,12 +418,17 @@ pub async fn run(cdp_port: u16, inspector_port: u16, hwnd: Option<isize>) -> Rep
                 tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
                 match call(ws, mid, api::VP_SAVE, &Value::Null).await {
                     Ok(s1) => {
-                        let same = json_close(&strip_volatile(&s0), &strip_volatile(&s1), 1e-6);
-                        let level = if !same || failed > 0 { Level::Fail } else { Level::Pass };
+                        let (a, b) = (strip_volatile(&s0), strip_volatile(&s1));
+                        // 容差 1e-4: 缩放 / 轨道半径是阻尼量, 窗口在后台帧率被节流时 1.5 s 内收敛不完(实测漂移 ~2e-5);
+                        // 真正的恢复失败(视角被重置等)差距是数量级的, 照样抓得到。
+                        let same = json_close(&a, &b, VP_EPS);
+                        let level = if failed > 0 { Level::Fail } else if !same { cam_fail } else { Level::Pass };
                         r.add(S_ROUNDTRIP, "vp.restore ← vp.save", level, if same && failed == 0 {
                             format!("前后一致; 已应用 {}", applied.join(","))
                         } else {
-                            format!("前后{}; 失败段 {}", if same { "一致" } else { "不一致" }, res["failed"])
+                            let mut d = Vec::new();
+                            json_diff_paths(&a, &b, VP_EPS, "", &mut d, 4);
+                            format!("前后{}; 失败段 {}; 差异 {}", if same { "一致" } else { "不一致" }, res["failed"], d.join(" | "))
                         });
                     }
                     Err(e) => r.add(S_ROUNDTRIP, "vp.restore ← vp.save", Level::Fail, e),
@@ -441,12 +485,13 @@ pub async fn run(cdp_port: u16, inspector_port: u16, hwnd: Option<isize>) -> Rep
     match (before, after) {
         (Some((u0, g0, s0)), Some((u1, g1, s1))) => {
             // 几何版本必须不变; 撤销栈只允许多出本次执行的选择命令(选择进撤销历史, 不改几何)。
-            let doc_same = g0 == g1 && u1 == u0 + selection_commands;
+            // 选择原样恢复时 Plasticity 可能不记撤销步(实测 2026-11-15: 21→21) → 允许 +0..+N。
+            let doc_same = g0 == g1 && u1 >= u0 && u1 <= u0 + selection_commands;
             r.add(S_GUARD, "撤销栈 / 几何版本", if doc_same { Level::Pass } else { Level::Fail },
                 if doc_same {
                     format!("几何未变(版本 {g0}); 撤销栈 {u0}→{u1}(含 {selection_commands} 个选择命令)")
                 } else {
-                    format!("变了: {u0}→{u1} 步(预期 +{selection_commands}), 版本 {g0}→{g1} — 自检改动了文档!")
+                    format!("变了: {u0}→{u1} 步(预期 +0..+{selection_commands}), 版本 {g0}→{g1} — 自检改动了文档!")
                 });
             r.add(S_GUARD, "选择", if s0 == s1 { Level::Pass } else { Level::Fail },
                 if s0 == s1 { "未变".to_string() } else { "选择被改变".to_string() });

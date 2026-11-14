@@ -39,8 +39,8 @@
       - 代理托管：9334 在听且 9333 无人监听 → 自动 `node tools/pla-cdp/pla-cdp-v8.js proxy`
         （无窗口，日志 `%TEMP%\pla-cdp-proxy.log`），代理独立于 pla-ui 存活。
       - 后续：代理用 Rust 重写进 pla-bridge（去掉 node 依赖）；Plasticity 升级后提示重新打 fuse。
-- [ ] **Q2 视口立方体右键旋转按钮跟随步进角**（可选）：按钮命令是 `viewport:rotate:*`/`viewport:roll:*`，
-      固定 90°，不读 rotateDiscreteIncrement。要改只能在 CDP 连接时替换这组命令的监听器，待用户决定。
+- [x] **Q2 视口立方体右键旋转按钮跟随步进角**（用户 2026-11-15 确认已完成；仓库里没有对应提交记录，此前漏记）：按钮命令是
+      `viewport:rotate:*`/`viewport:roll:*`。
 
 ## U — UI 硬伤
 
@@ -305,6 +305,9 @@
       面积 / 体积 / 质心（显示网格，曲面近似 −0.3%，5 位有效数字）；`geo.query` 顶点改用真实体 id；CLI `pla-app cdp-call`。
       契约测试 2 项；真机 L 形支架：51 个吸附点、壁厚 5/5、90°、体积 6540.2（理论 6538.6）、质心与手算吻合。
       - [ ] 两实体干涉（N7 用）：还没做 —— 候选：布尔相交工厂试算后撤回（A3 事务），或网格相交近似。
+      - 用户提示（2026-11-15）：Plasticity 自带测量已够日常用 —— Measurement 工具量两点距离；选中元素后右侧 SELECTION 卡片
+        显示参数（两面夹角、实体体积 / 面积；材料面板 ADVANCED 设密度后显示质量）。→ **不做**单独的测量 / 质量面板（优先级低，以后再说）；
+        A2 改为复用 SELECTION 卡片背后的实现取精确体积 / 面积 / 质量（网格法作退路）。
 - [x] **A3 事务回滚**（2026-11-15，know-how/command-dispatch.md「A3」）：`hist.begin / rollback / commit`（能力 `hist.write`），
       撤销 = body 上派发 `edit:undo`（同 Ctrl+Z，异步，轮询确认）；begin 以下撤销栈被动过则拒绝；窗口不可见拒绝；
       `cmd.exec {atomic}` 失败整串撤回（CLI `--atomic`）。契约测试 2 项；真机：失败脚本撤回 2 步 270 ms、事务撤回 2 步 102 ms，前后一致。
@@ -333,9 +336,23 @@
 
 ## 工程债
 
-- [ ] 远端推送纳入每轮收尾（origin 已改 HTTPS，见 R12 后的推送记录）。
+- [x] 远端推送纳入每轮收尾（每项完成即 push，已成惯例）。
 - [ ] `pla-dim` 旧实现与 mock 测试随 N3 重做时清理。
-- [ ] 编译警告清理。
+- [x] 编译警告清理（2026-11-15）：pla-ui 16 处 `Stroke::new(1.0, …)` 浮点字面量 f32 回退（将来会变硬错误）加 `_f32`，
+      未用变量 / 多余 mut 各修；pla-ui / pla-bridge / pla-app release 构建 0 警告（测试目标里的旧 dead code 未动）。
+- [x] **还债（2026-11-15）**：
+      - 契约测试 `js/test/shim-contract.test.js` 入库：`.gitignore` 的 `test/` 原意只是根目录考古目录，误伤所有子目录 → 改 `/test/`。
+      - 自检 `vp.restore ← vp.save` 长期 FAIL：页面内同流程无差异；自检现在列出差异路径 —— 只有缩放 / 轨道半径 / far 的阻尼漂移
+        （~1e-5，窗口在后台收敛慢）→ 容差 1e-6 → 1e-4；窗口不可见时相机类回环 FAIL 降为 WARN 并注明。
+      - 自检守护误报"自检改动了文档"：选择原样恢复时 Plasticity 不记撤销步 → 允许 +0..+N。
+      - **真 bug** 存档经 Rust 转一圈键序被 serde_json 重排 → `mat.restore` 原样恢复被判成改动（走 memento，窗口隐藏时报错）、
+        `vp.restore` 的 `doc(same)` 同样会误判（会把文档设置写成"未保存"）→ 垫片 `sameJson`（键序无关）；契约测试补键序反转用例。
+      - **真 bug** shim 热替换后 `cmd.ping` / Alt 滚转命令失灵到页面重载：旧实例 dispose 注销了监听，页面级"已挂委托"记录却保留 →
+        只有记录在且注册表里确实还在才跳过；契约测试假注册表补 Disposable。
+      - 结果（MT_screws 副本，窗口隐藏）：37 PASS · 5 WARN · 0 FAIL。
+      - [ ] 待窗口可见时复跑：`cam.set ← cam.get` 稳定有 1.157e-5 偏差，确认可见时是否消失（不消失则查 cam.set）。
+      - [ ] 环境问题：pla-ui 的 bin 单测（`--bin pla-ui`，4 项）exe 被 Windows 拒绝执行（os error 5），换目录 / 重编都一样；
+            Defender / CodeIntegrity / AppLocker 无记录，exe 无提权清单，同源的 pla-ui.exe 正常运行。lib 单测 96 项正常。
 
 ---
 
