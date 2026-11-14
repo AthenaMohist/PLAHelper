@@ -13,7 +13,7 @@ use pla_ui::state_store::{StateMeta, StateStore};
 
 use super::{
     big_img_h_for, confirm_popup, confirm_popup_with, fav_img_h_for, manage_bar, pencil_button, png_dims, png_uri,
-    refresh_button, COL_ACCENT, COL_MUTED, COL_RED, COL_TEXT,
+    refresh_button, right_click_confirm, COL_ACCENT, COL_MUTED, COL_RED, COL_TEXT,
 };
 
 /// 一面墙的界面状态。
@@ -187,7 +187,7 @@ pub fn show(
                             ui.add_sized(egui::vec2((w - 60.0).max(30.0), 16.0), egui::TextEdit::singleline(&mut wall.rename_buf))
                                 .request_focus();
                             let (enter, esc) = ui.input(|i| (i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Escape)));
-                            if enter {
+                            if enter || right_click_confirm(ui) {
                                 rename_commit = true;
                             }
                             if esc {

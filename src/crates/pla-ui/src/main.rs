@@ -118,7 +118,8 @@ const PANEL_SNAPSHOTS: [f32; 2] = [280.0, 480.0];
 const PANEL_ENTITIES: [f32; 2] = [520.0, 560.0];
 /// R23: 选择集面板右侧 ENTITIES 列宽。
 const SEL_ENTITIES_COL_W: f32 = 220.0;
-const PANEL_DIM: [f32; 2] = [280.0, 170.0];
+/// N3 尺寸浮窗的默认外框(之后用户拖 / 拉的大小会记住)。
+const PANEL_DIM: [f32; 2] = [300.0, 200.0];
 const PANEL_SETTINGS: [f32; 2] = [300.0, 560.0];
 /// F2: CDP 能力面板(点工具栏状态点打开)。
 const PANEL_CAPS: [f32; 2] = [320.0, 600.0];
@@ -177,12 +178,10 @@ struct PlaApp {
     /// R30: 笔记面板(独立浮窗: 不互斥、不自动关、位置/大小记忆、可调大小)。
     show_notes: bool,
     notes: pla_ui::notes_ui::NotesPanel,
-    /// 本次打开时交给 ViewportBuilder 的外框(打开期间不变 → egui 不会每帧重发定位, 不和 OS 拖动打架)。
-    notes_open_rect: Option<[f32; 4]>,
-    /// 上次写进偏好文件的外框(变化且松手后再写)。
-    notes_saved_rect: Option<[f32; 4]>,
-    /// R30b: 笔记窗口自管拖动/调大小会话(SetCapture + 屏幕坐标 delta; 不用 OS StartDrag/BeginResize)。
-    notes_drag: Option<NotesDrag>,
+    /// 笔记浮窗的位置记忆与拖动/调大小状态(见 `floating_window`)。
+    notes_win: FloatWin,
+    /// N3: 尺寸窗口同样是独立浮窗(用户 2026-11-15: 与笔记一样, 不受其他二级面板影响)。
+    dim_win: FloatWin,
     /// R32: 笔记面板 panic 被拦下后的错误信息(面板改显示错误 + 重新载入按钮)。
     notes_crash: Option<String>,
     notes_crashed_saved: bool,
@@ -1367,7 +1366,6 @@ enum PanelId {
     Entities,
     VpState,
     MatState,
-    Dim,
     Settings,
     Caps,
 }
@@ -1611,7 +1609,7 @@ fn snap_item(
                     let (enter, esc) = ui.input(|i| {
                         (i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Escape))
                     });
-                    if enter {
+                    if enter || right_click_confirm(ui) {
                         a.rename_commit = true;
                     }
                     if esc {
@@ -1812,6 +1810,13 @@ fn vector_icon_button(
     resp
 }
 
+/// 右键 = 确认(与 Plasticity 本体一致: 命令里右键 = 确定)。所有面板的"确认类"动作都接它:
+/// 确认弹层(删除 / 更新)、改名输入、尺寸面板的应用。面板是各自的视口, 只看本视口内的右键。
+/// 有自己右键菜单的地方(笔记、工具栏按钮)不接。
+fn right_click_confirm(ui: &egui::Ui) -> bool {
+    ui.input(|i| i.pointer.secondary_clicked())
+}
+
 /// R8b: 通用删除确认弹层 — 覆盖在面板视口顶部居中(egui::Area + 新 layer)。
 /// 不占内容流空间(行内确认条会被 auto_shrink 滚动区推出可视区, 实测不可见)。
 /// 返回 Some(true)=确认, Some(false)=取消, None=仍在展示。
@@ -1855,6 +1860,14 @@ fn confirm_popup_with(
                             result = Some(false);
                         }
                     });
+                    // 右键(面板内任意处)= 确认; Esc = 取消
+                    if result.is_none() && right_click_confirm(ui) {
+                        result = Some(true);
+                    }
+                    if result.is_none() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        result = Some(false);
+                    }
+                    ui.label(egui::RichText::new(tr("右键 = 确认 · Esc = 取消", "Right-click = confirm · Esc = cancel")).small().color(COL_MUTED));
                 });
         });
     result
@@ -1956,9 +1969,8 @@ impl PlaApp {
             show_caps: false,
             show_notes: false,
             notes: pla_ui::notes_ui::NotesPanel::new(),
-            notes_open_rect: None,
-            notes_saved_rect: pla_ui::prefs::load_notes_rect(),
-            notes_drag: None,
+            notes_win: FloatWin::load(NOTES_RECT_KEY),
+            dim_win: FloatWin::load(DIM_RECT_KEY),
             notes_crash: None,
             notes_crashed_saved: false,
             step_loaded: false,
@@ -2449,9 +2461,10 @@ impl PlaApp {
                 }
             }
             Action::ToggleDim => {
+                // N3: 与笔记一样是独立浮窗 —— 不关别的面板, 也不被别的面板关掉(用户 2026-11-15)。
                 self.show_dim = !self.show_dim;
-                if self.show_dim {
-                    self.close_secondary_panels_except(PanelId::Dim);
+                if !self.show_dim {
+                    self.dim_win.closed();
                 }
             }
             Action::ToggleNotes => {
@@ -2461,7 +2474,7 @@ impl PlaApp {
                     self.notes.set_doc(&self.doc_key);
                 } else {
                     self.notes.flush();
-                    self.notes_open_rect = None;
+                    self.notes_win.closed();
                 }
             }
             Action::ToggleSettings => {
@@ -2475,33 +2488,18 @@ impl PlaApp {
         }
     }
 
-    /// R30: 笔记浮窗。与二级面板不同: 不跟随工具栏、不互斥; 首次在默认位置(工具栏下方、二级面板右侧),
-    /// 之后用户拖到哪/拉多大就记住(ui-prefs.json `notes_rect`), 关掉重开仍在原处。
-    /// 拖动 = 标题行 OS StartDrag; 调大小 = 四边/四角 BeginResize(无边框窗口自己画热区)。
+    /// 独立浮窗的默认外框: 工具栏下方、二级面板右侧。
+    fn default_float_rect(ctx: &egui::Context, w: f32, h: f32) -> [f32; 4] {
+        let root = ctx.input(|i| i.viewport().outer_rect).unwrap_or(egui::Rect::from_min_size(
+            egui::pos2(200.0, 120.0),
+            egui::vec2(TOOLBAR_SIZE[0], TOOLBAR_SIZE[1]),
+        ));
+        [root.left() + PANEL_SNAPSHOTS[0] + 12.0, root.bottom() + 8.0, w, h]
+    }
+
+    /// R30: 笔记浮窗(独立浮窗的外壳见 `floating_window`)。
     fn show_notes_window(&mut self, ctx: &egui::Context) {
-        const ID: &str = "panel-notes";
-        let open_rect = *self.notes_open_rect.get_or_insert_with(|| {
-            self.notes_saved_rect.unwrap_or_else(|| {
-                let root = ctx.input(|i| i.viewport().outer_rect).unwrap_or(egui::Rect::from_min_size(
-                    egui::pos2(200.0, 120.0),
-                    egui::vec2(TOOLBAR_SIZE[0], TOOLBAR_SIZE[1]),
-                ));
-                [root.left() + PANEL_SNAPSHOTS[0] + 12.0, root.bottom() + 8.0, 320.0, 440.0]
-            })
-        });
-        let (hide, reveal) = viewport_reveal(ctx, ID);
-        let mut builder = egui::ViewportBuilder::default()
-            .with_title(ID)
-            .with_decorations(false)
-            .with_resizable(true)
-            .with_transparent(true)
-            .with_window_level(egui::WindowLevel::AlwaysOnTop)
-            .with_position(egui::pos2(open_rect[0], open_rect[1]))
-            .with_inner_size(egui::vec2(open_rect[2], open_rect[3]))
-            .with_min_inner_size(egui::vec2(220.0, 160.0));
-        if hide {
-            builder = builder.with_visible(false);
-        }
+        let default = Self::default_float_rect(ctx, 320.0, 440.0);
         let theme = pla_ui::notes_ui::Theme {
             text: COL_TEXT,
             muted: COL_MUTED,
@@ -2512,47 +2510,23 @@ impl PlaApp {
             card: COL_CARD,
         };
         let doc = self.doc_key.clone();
-        let mut open = true;
-        let mut live_rect: Option<[f32; 4]> = None;
-        let mut pointer_down = false;
-        let mut start: Option<NotesDragMode> = None;
         let mut reload_notes = false;
         let notes = &mut self.notes;
-        let notes_drag = &mut self.notes_drag;
         let notes_crash = &mut self.notes_crash;
-        ctx.show_viewport_immediate(egui::ViewportId::from_hash_of(ID), builder, |ctx, _class| {
-            if reveal {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-            }
-            if ctx.input(|i| i.viewport().close_requested()) {
-                open = false;
-            }
-            egui::CentralPanel::default().frame(panel_frame()).show(ctx, |ui| {
-                // ---- 标题行: 拖动柄 + 标题 + 文档名 + × ----
-                let (row, drag) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 22.0), egui::Sense::click_and_drag());
-                if drag.drag_started() {
-                    start = Some(NotesDragMode::Move);
-                }
-                let p = ui.painter();
-                for dy in [-4.0f32, 0.0, 4.0] {
-                    for dx in [-2.5f32, 2.5] {
-                        p.circle_filled(egui::pos2(row.left() + 7.0 + dx, row.center().y + dy), 1.2, COL_MUTED);
-                    }
-                }
-                let tr_ = paint_text(p, egui::pos2(row.left() + 18.0, row.center().y), egui::Align2::LEFT_CENTER, tr("笔记", "Notes"), 13.0, egui::Color32::WHITE, true);
-                p.text(
-                    egui::pos2(tr_.right() + 8.0, row.center().y),
-                    egui::Align2::LEFT_CENTER,
-                    truncate_chars(&doc, 24),
-                    egui::FontId::proportional(11.0),
-                    COL_MUTED,
-                );
-                let xr = egui::Rect::from_center_size(egui::pos2(row.right() - 9.0, row.center().y), egui::vec2(18.0, 18.0));
-                let xresp = ui.interact(xr, egui::Id::new("notes-close"), egui::Sense::click());
-                ui.painter().text(xr.center(), egui::Align2::CENTER_CENTER, "×", egui::FontId::proportional(15.0), if xresp.hovered() { egui::Color32::WHITE } else { COL_MUTED });
-                if xresp.on_hover_text(tr("关闭(内容已自动保存)", "Close (content is saved automatically)")).clicked() {
-                    open = false;
-                }
+        let open = floating_window(
+            ctx,
+            FloatSpec {
+                id: "panel-notes",
+                prefs_key: NOTES_RECT_KEY,
+                title: tr("笔记", "Notes"),
+                subtitle: truncate_chars(&doc, 24),
+                close_tip: tr("关闭(内容已自动保存)", "Close (content is saved automatically)"),
+                default_rect: default,
+                min_size: egui::vec2(NotesDrag::MIN_W, NotesDrag::MIN_H),
+                resizable: true,
+            },
+            &mut self.notes_win,
+            |ui| {
                 // R32: 崩溃隔离 —— 笔记面板里的 bug 只让面板显示错误, 不再带走整个助手
                 // (panic 冒到 winit 的窗口过程 = FFI 边界, 那里无法展开 → 进程直接终止, 见 pitfalls #50)。
                 match notes_crash.as_ref() {
@@ -2577,92 +2551,8 @@ impl PlaApp {
                         }
                     }
                 }
-            });
-            paint_panel_border(ctx);
-            // ---- 调大小热区(四边 + 四角) ----
-            use egui::viewport::ResizeDirection as D;
-            let sr = ctx.screen_rect();
-            let e = 5.0;
-            let c = 12.0;
-            let zones = [
-                (egui::Rect::from_min_max(egui::pos2(sr.right() - c, sr.bottom() - c), sr.max), D::SouthEast, egui::CursorIcon::ResizeSouthEast),
-                (egui::Rect::from_min_max(egui::pos2(sr.left(), sr.bottom() - c), egui::pos2(sr.left() + c, sr.bottom())), D::SouthWest, egui::CursorIcon::ResizeSouthWest),
-                (egui::Rect::from_min_max(egui::pos2(sr.right() - c, sr.top()), egui::pos2(sr.right(), sr.top() + c)), D::NorthEast, egui::CursorIcon::ResizeNorthEast),
-                (egui::Rect::from_min_max(sr.min, egui::pos2(sr.left() + c, sr.top() + c)), D::NorthWest, egui::CursorIcon::ResizeNorthWest),
-                (egui::Rect::from_min_max(egui::pos2(sr.right() - e, sr.top() + c), egui::pos2(sr.right(), sr.bottom() - c)), D::East, egui::CursorIcon::ResizeEast),
-                (egui::Rect::from_min_max(egui::pos2(sr.left(), sr.top() + c), egui::pos2(sr.left() + e, sr.bottom() - c)), D::West, egui::CursorIcon::ResizeWest),
-                (egui::Rect::from_min_max(egui::pos2(sr.left() + c, sr.bottom() - e), egui::pos2(sr.right() - c, sr.bottom())), D::South, egui::CursorIcon::ResizeSouth),
-                (egui::Rect::from_min_max(egui::pos2(sr.left() + c, sr.top()), egui::pos2(sr.right() - c, sr.top() + e)), D::North, egui::CursorIcon::ResizeNorth),
-            ];
-            egui::Area::new(egui::Id::new("notes-resize"))
-                .order(egui::Order::Foreground)
-                .fixed_pos(sr.min)
-                .show(ctx, |ui| {
-                    for (i, (r, dir, icon)) in zones.into_iter().enumerate() {
-                        let resp = ui.interact(r, egui::Id::new(("notes-rz", i)), egui::Sense::drag());
-                        if resp.hovered() || resp.dragged() {
-                            ctx.set_cursor_icon(icon);
-                        }
-                        if resp.drag_started() {
-                            start = Some(NotesDragMode::Resize(dir));
-                        }
-                    }
-                    // 右下角斜纹提示
-                    let p = ui.painter();
-                    for k in 1..=3 {
-                        let o = k as f32 * 3.5;
-                        p.line_segment(
-                            [egui::pos2(sr.right() - 3.0 - o, sr.bottom() - 3.0), egui::pos2(sr.right() - 3.0, sr.bottom() - 3.0 - o)],
-                            egui::Stroke::new(1.0_f32, COL_MUTED),
-                        );
-                    }
-                });
-            let vp = ctx.input(|i| (i.viewport().outer_rect, i.viewport().inner_rect));
-            if let (Some(o), Some(inner)) = vp {
-                live_rect = Some([o.left(), o.top(), inner.width(), inner.height()]);
-            }
-            // ---- R30b: 自管拖动/调大小 —— 开始与结束都以鼠标左键**物理**状态为准 ----
-            // (旧版用 OS StartDrag/BeginResize: 模态循环吞掉松手事件 → egui 以为一直按着,
-            //  鼠标移到别的窗口再回来就自己又开始拖/调大小, 窗口越拉越大。pitfalls #49)
-            let phys_down = pla_ui::window_drag::primary_button_down();
-            let ppp = ctx.pixels_per_point().max(0.01);
-            if let (Some(mode), None, true, Some(r)) = (start, notes_drag.as_ref(), phys_down, live_rect) {
-                if let (Some(c), Some(h)) = (
-                    pla_ui::window_drag::cursor_pos_phys(),
-                    pla_ui::window_drag::find_own_window(ID, r[2], ppp),
-                ) {
-                    pla_ui::window_drag::set_capture(h);
-                    *notes_drag = Some(NotesDrag { mode, cursor: c, rect: r, last: r });
-                }
-            }
-            if let Some(d) = notes_drag.as_mut() {
-                if !phys_down {
-                    pla_ui::window_drag::release_capture();
-                    *notes_drag = None;
-                } else if let Some(c) = pla_ui::window_drag::cursor_pos_phys() {
-                    let next = d.apply((c.0 - d.cursor.0) / ppp, (c.1 - d.cursor.1) / ppp);
-                    if (next[0] - d.last[0]).abs() > 0.4 || (next[1] - d.last[1]).abs() > 0.4 {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(next[0], next[1])));
-                    }
-                    if (next[2] - d.last[2]).abs() > 0.4 || (next[3] - d.last[3]).abs() > 0.4 {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(next[2], next[3])));
-                    }
-                    d.last = next;
-                    ctx.request_repaint();
-                }
-            }
-            pointer_down = phys_down || notes_drag.is_some();
-        });
-        // 位置/大小变了且已松手 → 写偏好(拖动/调整中不写, 免得每帧写盘)
-        if let Some(r) = live_rect {
-            let moved = self.notes_saved_rect.map_or(true, |s| s.iter().zip(r.iter()).any(|(a, b)| (a - b).abs() > 1.0));
-            if moved && !pointer_down {
-                if let Err(e) = pla_ui::prefs::save_notes_rect(r) {
-                    pla_ui::diag::log(&format!("save notes rect failed: {e}"));
-                }
-                self.notes_saved_rect = Some(r);
-            }
-        }
+            },
+        );
         if self.notes_crash.is_some() && !self.notes_crashed_saved {
             // 出错前已输入的内容先落盘(数据结构本身是完整的, 只是某个操作逻辑出错)
             self.notes.flush();
@@ -2678,7 +2568,114 @@ impl PlaApp {
         if !open {
             self.show_notes = false;
             self.notes.flush();
-            self.notes_open_rect = None;
+            self.notes_win.closed();
+        }
+    }
+
+    /// N3: 尺寸浮窗(独立浮窗, 同笔记: 不跟随工具栏、不互斥、位置记忆)。
+    fn show_dim_window(&mut self, ctx: &egui::Context) {
+        let default = Self::default_float_rect(ctx, PANEL_DIM[0], PANEL_DIM[1]);
+        let mut win = std::mem::take(&mut self.dim_win);
+        let open = floating_window(
+            ctx,
+            FloatSpec {
+                id: "panel-dim",
+                prefs_key: DIM_RECT_KEY,
+                title: tr("改尺寸", "Resize"),
+                subtitle: String::new(),
+                close_tip: tr("关闭", "Close"),
+                default_rect: default,
+                min_size: egui::vec2(NotesDrag::MIN_W, NotesDrag::MIN_H),
+                resizable: true,
+            },
+            &mut win,
+            |ui| {
+                        section_header(ui, "DIMENSION");
+                        // N3 改尺寸: Plasticity 里只选中一个面 → dim.face 读出可改尺寸(厚度 / 半径 / 圆角半径)
+                        // → 改目标值 → cmd.exec {atomic, op(offsetFace | refillet), distance = (新 − 旧) × 系数}, 一个撤销步。
+                        if let Some(why) = self.feature_block(Feature::DimFace) {
+                            ui.label(egui::RichText::new(why).small().color(COL_RED));
+                        }
+                        let faces: Vec<String> =
+                            self.live_sel.iter().filter(|it| it.kind == "face").map(|it| it.id.clone()).collect();
+                        let cur = (faces.len() == 1 && self.live_sel.len() == 1).then(|| faces[0].clone());
+                        if cur != self.dim_face && !self.dim_busy {
+                            self.dim_face = cur.clone();
+                            self.dim_info = None;
+                            if let Some(f) = &cur {
+                                self.cdp.send(pla_bridge::cdp::CdpCmd::Call {
+                                    name: pla_bridge::shim::api::DIM_FACE,
+                                    args: serde_json::json!({ "face": f }),
+                                });
+                            }
+                        }
+                        let hint = |ui: &mut egui::Ui, s: &str| {
+                            ui.label(egui::RichText::new(s).small().color(COL_MUTED));
+                        };
+                        match (self.dim_face.clone(), self.dim_info.clone()) {
+                            (None, _) => hint(ui, tr(
+                                "在 Plasticity 里只选中一个面: 平面 = 厚度(到背对的平行面), 圆柱面 = 半径, 倒圆面 = 圆角半径。",
+                                "Select exactly one face in Plasticity: plane = thickness (to the opposite parallel face), cylinder = radius, fillet = fillet radius.",
+                            )),
+                            (Some(_), None) => hint(ui, tr("读取中…", "Reading…")),
+                            (Some(_), Some(Err(e))) => {
+                                ui.label(egui::RichText::new(t!("读不到这个面的尺寸: {e}", "Cannot read this face: {e}")).small().color(COL_RED));
+                            }
+                            (Some(face), Some(Ok(v))) => {
+                                let kind = v["kind"].as_str().unwrap_or("none");
+                                let units = match v["units"].as_str().unwrap_or("") {
+                                    "millimeter" => "mm", "centimeter" => "cm", "meter" => "m", "inch" => "in", "foot" => "ft", u => u,
+                                };
+                                let label = match kind {
+                                    "thickness" => tr("厚度(到背对的平行面)", "Thickness (to the opposite parallel face)"),
+                                    "radius" if v["convex"] == true => tr("半径(凸台, 轴线不动)", "Radius (boss, axis fixed)"),
+                                    "radius" => tr("半径(孔, 轴线不动)", "Radius (hole, axis fixed)"),
+                                    "filletRadius" => tr("圆角半径(保持与两侧相切)", "Fillet radius (stays tangent)"),
+                                    _ => "",
+                                };
+                                match (kind, v["value"].as_f64(), v["op"].as_str(), v["offsetSign"].as_f64()) {
+                                    ("none", ..) | (_, None, ..) | (_, _, None, _) | (.., None) => {
+                                        let surf = v["surface"].as_str().unwrap_or("?").to_string();
+                                        hint(ui, &t!(
+                                            "这个面没有可改的尺寸(曲面 {surf}; 平面需要同一实体里有背对的平行面)",
+                                            "No editable dimension on this face (surface {surf}; a plane needs an opposite parallel face in the same solid)"
+                                        ));
+                                    }
+                                    (_, Some(value), Some(op), Some(sign)) => {
+                                        ui.label(egui::RichText::new(label).color(COL_MUTED));
+                                        ui.horizontal(|ui| {
+                                            ui.label(t!("当前 {value} {units}  →", "Now {value} {units}  →"));
+                                            ui.add(egui::DragValue::new(&mut self.dim_target).speed(0.1).suffix(format!(" {units}")));
+                                        });
+                                        let changed = (self.dim_target - value).abs() > 1e-9;
+                                        let valid = self.dim_target > 0.0;
+                                        let can = changed && valid && !self.dim_busy;
+                                        let btn = ui.add_enabled(
+                                            can,
+                                            egui::Button::new(if self.dim_busy { tr("修改中…", "Applying…") } else { tr("应用", "Apply") }),
+                                        );
+                                        // 右键(窗口内任意处)= 应用, 同 Plasticity 本体的右键确定
+                                        let go = btn.clicked() || (can && right_click_confirm(ui));
+                                        if go && self.require_feature(Feature::DimFace) {
+                                            let script = serde_json::json!({
+                                                "atomic": true,
+                                                "ops": [{ "op": op, "faces": [face], "distance": (self.dim_target - value) * sign }],
+                                            });
+                                            self.cdp.send(pla_bridge::cdp::CdpCmd::Exec(script));
+                                            self.dim_busy = true;
+                                            self.set_notice((false, t!("正在修改: {value} → {} {units}…", "Changing: {value} → {} {units}…", self.dim_target)));
+                                        }
+                                        hint(ui, tr("右键 = 应用 · 一步可撤销(Ctrl+Z) · 失败自动撤回", "Right-click = apply · one undo step (Ctrl+Z) · rolled back on failure"));
+                                    }
+                                }
+                            }
+                        }
+            },
+        );
+        self.dim_win = win;
+        if !open {
+            self.show_dim = false;
+            self.dim_win.closed();
         }
     }
 
@@ -2857,9 +2854,6 @@ impl PlaApp {
         }
         if keep != PanelId::MatState {
             self.show_matstate = false;
-        }
-        if keep != PanelId::Dim {
-            self.show_dim = false;
         }
         if keep != PanelId::Settings {
             self.show_settings = false;
@@ -3176,7 +3170,6 @@ impl PlaApp {
             (self.show_entities, PANEL_ENTITIES),
             (self.show_vpstate, PANEL_VPSTATE),
             (self.show_matstate, PANEL_MATSTATE),
-            (self.show_dim, PANEL_DIM),
             (self.show_settings, PANEL_SETTINGS),
             (self.show_caps, PANEL_CAPS),
         ] {
@@ -3503,6 +3496,197 @@ fn header_extra_and_show(
         },
     );
     *open = flag;
+}
+
+/// 独立浮窗外框在 ui-prefs.json 里的键。
+const NOTES_RECT_KEY: &str = "notes_rect";
+const DIM_RECT_KEY: &str = "dim_rect";
+
+/// 独立浮窗(笔记 / 尺寸)的状态: 位置记忆 + 自管拖动/调大小会话。
+#[derive(Default)]
+struct FloatWin {
+    /// 本次打开时交给 ViewportBuilder 的外框(打开期间不变 → egui 不会每帧重发定位, 不和拖动打架)。
+    open_rect: Option<[f32; 4]>,
+    /// 上次写进偏好文件的外框(变化且松手后再写)。
+    saved_rect: Option<[f32; 4]>,
+    /// R30b: 自管拖动/调大小会话(SetCapture + 屏幕坐标 delta; 不用 OS StartDrag/BeginResize, pitfalls #49)。
+    drag: Option<NotesDrag>,
+}
+
+impl FloatWin {
+    fn load(key: &str) -> Self {
+        FloatWin { saved_rect: pla_ui::prefs::load_rect(key), ..Default::default() }
+    }
+    /// 关掉了: 下次打开重新按记住的外框定位。
+    fn closed(&mut self) {
+        self.open_rect = None;
+        self.drag = None;
+    }
+}
+
+/// 独立浮窗的外观与行为参数。
+struct FloatSpec<'a> {
+    id: &'static str,
+    prefs_key: &'static str,
+    title: &'a str,
+    subtitle: String,
+    close_tip: &'a str,
+    default_rect: [f32; 4],
+    min_size: egui::Vec2,
+    resizable: bool,
+}
+
+/// R30 / N3: 独立浮窗(笔记、尺寸)。与二级面板不同: 不跟随工具栏、不互斥、不被其他面板关掉;
+/// 首次在默认位置, 之后用户拖到哪(/拉多大)就记住(ui-prefs.json `<prefs_key>`), 关掉重开仍在原处。
+/// 标题行 = 拖动柄 + 标题 + 副标题 + ×; resizable 时四边四角可调大小。返回是否仍打开。
+fn floating_window(ctx: &egui::Context, spec: FloatSpec, st: &mut FloatWin, body: impl FnOnce(&mut egui::Ui)) -> bool {
+    let id = spec.id;
+    let saved = st.saved_rect;
+    let open_rect = *st.open_rect.get_or_insert_with(|| saved.unwrap_or(spec.default_rect));
+    let (hide, reveal) = viewport_reveal(ctx, id);
+    let mut builder = egui::ViewportBuilder::default()
+        .with_title(id)
+        .with_decorations(false)
+        .with_resizable(spec.resizable)
+        .with_transparent(true)
+        .with_window_level(egui::WindowLevel::AlwaysOnTop)
+        .with_position(egui::pos2(open_rect[0], open_rect[1]))
+        .with_inner_size(egui::vec2(open_rect[2], open_rect[3]))
+        .with_min_inner_size(spec.min_size);
+    if hide {
+        builder = builder.with_visible(false);
+    }
+    let mut open = true;
+    let mut live_rect: Option<[f32; 4]> = None;
+    let mut pointer_down = false;
+    let mut start: Option<NotesDragMode> = None;
+    let drag_state = &mut st.drag;
+    let mut body = Some(body);
+    ctx.show_viewport_immediate(egui::ViewportId::from_hash_of(id), builder, |ctx, _class| {
+        if reveal {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        }
+        if ctx.input(|i| i.viewport().close_requested()) {
+            open = false;
+        }
+        egui::CentralPanel::default().frame(panel_frame()).show(ctx, |ui| {
+            // ---- 标题行: 拖动柄 + 标题 + 副标题 + × ----
+            let (row, drag) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 22.0), egui::Sense::click_and_drag());
+            if drag.drag_started() {
+                start = Some(NotesDragMode::Move);
+            }
+            let p = ui.painter();
+            for dy in [-4.0f32, 0.0, 4.0] {
+                for dx in [-2.5f32, 2.5] {
+                    p.circle_filled(egui::pos2(row.left() + 7.0 + dx, row.center().y + dy), 1.2, COL_MUTED);
+                }
+            }
+            let tr_ = paint_text(p, egui::pos2(row.left() + 18.0, row.center().y), egui::Align2::LEFT_CENTER, spec.title, 13.0, egui::Color32::WHITE, true);
+            p.text(
+                egui::pos2(tr_.right() + 8.0, row.center().y),
+                egui::Align2::LEFT_CENTER,
+                &spec.subtitle,
+                egui::FontId::proportional(11.0),
+                COL_MUTED,
+            );
+            let xr = egui::Rect::from_center_size(egui::pos2(row.right() - 9.0, row.center().y), egui::vec2(18.0, 18.0));
+            let xresp = ui.interact(xr, egui::Id::new((id, "close")), egui::Sense::click());
+            ui.painter().text(xr.center(), egui::Align2::CENTER_CENTER, "×", egui::FontId::proportional(15.0), if xresp.hovered() { egui::Color32::WHITE } else { COL_MUTED });
+            if xresp.on_hover_text(spec.close_tip).clicked() {
+                open = false;
+            }
+            if let Some(b) = body.take() {
+                b(ui);
+            }
+        });
+        paint_panel_border(ctx);
+        let sr = ctx.screen_rect();
+        if spec.resizable {
+            // ---- 调大小热区(四边 + 四角) ----
+            use egui::viewport::ResizeDirection as D;
+            let e = 5.0;
+            let c = 12.0;
+            let zones = [
+                (egui::Rect::from_min_max(egui::pos2(sr.right() - c, sr.bottom() - c), sr.max), D::SouthEast, egui::CursorIcon::ResizeSouthEast),
+                (egui::Rect::from_min_max(egui::pos2(sr.left(), sr.bottom() - c), egui::pos2(sr.left() + c, sr.bottom())), D::SouthWest, egui::CursorIcon::ResizeSouthWest),
+                (egui::Rect::from_min_max(egui::pos2(sr.right() - c, sr.top()), egui::pos2(sr.right(), sr.top() + c)), D::NorthEast, egui::CursorIcon::ResizeNorthEast),
+                (egui::Rect::from_min_max(sr.min, egui::pos2(sr.left() + c, sr.top() + c)), D::NorthWest, egui::CursorIcon::ResizeNorthWest),
+                (egui::Rect::from_min_max(egui::pos2(sr.right() - e, sr.top() + c), egui::pos2(sr.right(), sr.bottom() - c)), D::East, egui::CursorIcon::ResizeEast),
+                (egui::Rect::from_min_max(egui::pos2(sr.left(), sr.top() + c), egui::pos2(sr.left() + e, sr.bottom() - c)), D::West, egui::CursorIcon::ResizeWest),
+                (egui::Rect::from_min_max(egui::pos2(sr.left() + c, sr.bottom() - e), egui::pos2(sr.right() - c, sr.bottom())), D::South, egui::CursorIcon::ResizeSouth),
+                (egui::Rect::from_min_max(egui::pos2(sr.left() + c, sr.top()), egui::pos2(sr.right() - c, sr.top() + e)), D::North, egui::CursorIcon::ResizeNorth),
+            ];
+            egui::Area::new(egui::Id::new((id, "resize")))
+                .order(egui::Order::Foreground)
+                .fixed_pos(sr.min)
+                .show(ctx, |ui| {
+                    for (i, (r, dir, icon)) in zones.into_iter().enumerate() {
+                        let resp = ui.interact(r, egui::Id::new((id, "rz", i)), egui::Sense::drag());
+                        if resp.hovered() || resp.dragged() {
+                            ctx.set_cursor_icon(icon);
+                        }
+                        if resp.drag_started() {
+                            start = Some(NotesDragMode::Resize(dir));
+                        }
+                    }
+                    // 右下角斜纹提示
+                    let p = ui.painter();
+                    for k in 1..=3 {
+                        let o = k as f32 * 3.5;
+                        p.line_segment(
+                            [egui::pos2(sr.right() - 3.0 - o, sr.bottom() - 3.0), egui::pos2(sr.right() - 3.0, sr.bottom() - 3.0 - o)],
+                            egui::Stroke::new(1.0_f32, COL_MUTED),
+                        );
+                    }
+                });
+        }
+        let vp = ctx.input(|i| (i.viewport().outer_rect, i.viewport().inner_rect));
+        if let (Some(o), Some(inner)) = vp {
+            live_rect = Some([o.left(), o.top(), inner.width(), inner.height()]);
+        }
+        // ---- R30b: 自管拖动/调大小 —— 开始与结束都以鼠标左键**物理**状态为准 ----
+        // (旧版用 OS StartDrag/BeginResize: 模态循环吞掉松手事件 → egui 以为一直按着,
+        //  鼠标移到别的窗口再回来就自己又开始拖/调大小, 窗口越拉越大。pitfalls #49)
+        let phys_down = pla_ui::window_drag::primary_button_down();
+        let ppp = ctx.pixels_per_point().max(0.01);
+        if let (Some(mode), None, true, Some(r)) = (start, drag_state.as_ref(), phys_down, live_rect) {
+            if let (Some(c), Some(h)) = (
+                pla_ui::window_drag::cursor_pos_phys(),
+                pla_ui::window_drag::find_own_window(id, r[2], ppp),
+            ) {
+                pla_ui::window_drag::set_capture(h);
+                *drag_state = Some(NotesDrag { mode, cursor: c, rect: r, last: r });
+            }
+        }
+        if let Some(d) = drag_state.as_mut() {
+            if !phys_down {
+                pla_ui::window_drag::release_capture();
+                *drag_state = None;
+            } else if let Some(c) = pla_ui::window_drag::cursor_pos_phys() {
+                let next = d.apply((c.0 - d.cursor.0) / ppp, (c.1 - d.cursor.1) / ppp);
+                if (next[0] - d.last[0]).abs() > 0.4 || (next[1] - d.last[1]).abs() > 0.4 {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(next[0], next[1])));
+                }
+                if (next[2] - d.last[2]).abs() > 0.4 || (next[3] - d.last[3]).abs() > 0.4 {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(next[2], next[3])));
+                }
+                d.last = next;
+                ctx.request_repaint();
+            }
+        }
+        pointer_down = phys_down || drag_state.is_some();
+    });
+    // 位置/大小变了且已松手 → 写偏好(拖动/调整中不写, 免得每帧写盘)
+    if let Some(r) = live_rect {
+        let moved = st.saved_rect.map_or(true, |s| s.iter().zip(r.iter()).any(|(a, b)| (a - b).abs() > 1.0));
+        if moved && !pointer_down {
+            if let Err(e) = pla_ui::prefs::save_rect(spec.prefs_key, r) {
+                pla_ui::diag::log(&format!("save {} rect failed: {e}", spec.prefs_key));
+            }
+            st.saved_rect = Some(r);
+        }
+    }
+    open
 }
 
 /// R30b: 笔记窗口拖动/调大小会话。
@@ -3889,9 +4073,6 @@ impl eframe::App for PlaApp {
             }
             if self.show_matstate {
                 open.insert("panel-matstate");
-            }
-            if self.show_dim {
-                open.insert("panel-dim");
             }
             if self.show_settings {
                 open.insert("panel-settings");
@@ -4617,7 +4798,7 @@ impl eframe::App for PlaApp {
                                                 if self.sel_rename.as_deref() == Some(meta.name.as_str()) {
                                                     ui.add_sized(egui::vec2((w - 60.0).max(30.0), 16.0), egui::TextEdit::singleline(&mut self.sel_rename_buf)).request_focus();
                                                     let (enter, esc) = ui.input(|i| (i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Escape)));
-                                                    if enter { rename_commit = true; }
+                                                    if enter || right_click_confirm(ui) { rename_commit = true; }
                                                     if esc { rename_cancel = true; }
                                                 } else {
                                                     // R8d: 名称独占一行
@@ -4851,101 +5032,6 @@ impl eframe::App for PlaApp {
             }
         }
 
-        if self.show_dim {
-            let desired = next_pos(&mut stack_y, PANEL_DIM[1]);
-            if let Some(desired) = desired {
-                let mut flag = self.show_dim;
-                show_child_window(
-                    ctx,
-                    "panel-dim",
-                    tr("尺寸驱动", "Dimension drive"),
-                    desired,
-                    egui::vec2(PANEL_DIM[0], PANEL_DIM[1]),
-                    &mut flag,
-                    true,
-                    |ui| {
-                        section_header(ui, "DIMENSION");
-                        // N3 改尺寸: Plasticity 里只选中一个面 → dim.face 读出可改尺寸(厚度 / 半径 / 圆角半径)
-                        // → 改目标值 → cmd.exec {atomic, op(offsetFace | refillet), distance = (新 − 旧) × 系数}, 一个撤销步。
-                        if let Some(why) = self.feature_block(Feature::DimFace) {
-                            ui.label(egui::RichText::new(why).small().color(COL_RED));
-                        }
-                        let faces: Vec<String> =
-                            self.live_sel.iter().filter(|it| it.kind == "face").map(|it| it.id.clone()).collect();
-                        let cur = (faces.len() == 1 && self.live_sel.len() == 1).then(|| faces[0].clone());
-                        if cur != self.dim_face && !self.dim_busy {
-                            self.dim_face = cur.clone();
-                            self.dim_info = None;
-                            if let Some(f) = &cur {
-                                self.cdp.send(pla_bridge::cdp::CdpCmd::Call {
-                                    name: pla_bridge::shim::api::DIM_FACE,
-                                    args: serde_json::json!({ "face": f }),
-                                });
-                            }
-                        }
-                        let hint = |ui: &mut egui::Ui, s: &str| {
-                            ui.label(egui::RichText::new(s).small().color(COL_MUTED));
-                        };
-                        match (self.dim_face.clone(), self.dim_info.clone()) {
-                            (None, _) => hint(ui, tr(
-                                "在 Plasticity 里只选中一个面: 平面 = 厚度(到背对的平行面), 圆柱面 = 半径, 倒圆面 = 圆角半径。",
-                                "Select exactly one face in Plasticity: plane = thickness (to the opposite parallel face), cylinder = radius, fillet = fillet radius.",
-                            )),
-                            (Some(_), None) => hint(ui, tr("读取中…", "Reading…")),
-                            (Some(_), Some(Err(e))) => {
-                                ui.label(egui::RichText::new(t!("读不到这个面的尺寸: {e}", "Cannot read this face: {e}")).small().color(COL_RED));
-                            }
-                            (Some(face), Some(Ok(v))) => {
-                                let kind = v["kind"].as_str().unwrap_or("none");
-                                let units = match v["units"].as_str().unwrap_or("") {
-                                    "millimeter" => "mm", "centimeter" => "cm", "meter" => "m", "inch" => "in", "foot" => "ft", u => u,
-                                };
-                                let label = match kind {
-                                    "thickness" => tr("厚度(到背对的平行面)", "Thickness (to the opposite parallel face)"),
-                                    "radius" if v["convex"] == true => tr("半径(凸台, 轴线不动)", "Radius (boss, axis fixed)"),
-                                    "radius" => tr("半径(孔, 轴线不动)", "Radius (hole, axis fixed)"),
-                                    "filletRadius" => tr("圆角半径(保持与两侧相切)", "Fillet radius (stays tangent)"),
-                                    _ => "",
-                                };
-                                match (kind, v["value"].as_f64(), v["op"].as_str(), v["offsetSign"].as_f64()) {
-                                    ("none", ..) | (_, None, ..) | (_, _, None, _) | (.., None) => {
-                                        let surf = v["surface"].as_str().unwrap_or("?").to_string();
-                                        hint(ui, &t!(
-                                            "这个面没有可改的尺寸(曲面 {surf}; 平面需要同一实体里有背对的平行面)",
-                                            "No editable dimension on this face (surface {surf}; a plane needs an opposite parallel face in the same solid)"
-                                        ));
-                                    }
-                                    (_, Some(value), Some(op), Some(sign)) => {
-                                        ui.label(egui::RichText::new(label).color(COL_MUTED));
-                                        ui.horizontal(|ui| {
-                                            ui.label(t!("当前 {value} {units}  →", "Now {value} {units}  →"));
-                                            ui.add(egui::DragValue::new(&mut self.dim_target).speed(0.1).suffix(format!(" {units}")));
-                                        });
-                                        let changed = (self.dim_target - value).abs() > 1e-9;
-                                        let valid = self.dim_target > 0.0;
-                                        let btn = ui.add_enabled(
-                                            changed && valid && !self.dim_busy,
-                                            egui::Button::new(if self.dim_busy { tr("修改中…", "Applying…") } else { tr("应用", "Apply") }),
-                                        );
-                                        if btn.clicked() && self.require_feature(Feature::DimFace) {
-                                            let script = serde_json::json!({
-                                                "atomic": true,
-                                                "ops": [{ "op": op, "faces": [face], "distance": (self.dim_target - value) * sign }],
-                                            });
-                                            self.cdp.send(pla_bridge::cdp::CdpCmd::Exec(script));
-                                            self.dim_busy = true;
-                                            self.set_notice((false, t!("正在修改: {value} → {} {units}…", "Changing: {value} → {} {units}…", self.dim_target)));
-                                        }
-                                        hint(ui, tr("一步可撤销(Ctrl+Z); 失败自动撤回。", "One undo step (Ctrl+Z); rolled back on failure."));
-                                    }
-                                }
-                            }
-                        }
-                    },
-                );
-                self.show_dim = flag;
-            }
-        }
 
         if self.show_settings {
             let desired = next_pos(&mut stack_y, PANEL_SETTINGS[1]);
@@ -5304,6 +5390,9 @@ impl eframe::App for PlaApp {
         if self.show_notes {
             self.notes.set_doc(&self.doc_key);
             self.show_notes_window(ctx);
+        }
+        if self.show_dim {
+            self.show_dim_window(ctx);
         }
 
         // ---- R15: 设置项悬停三级面板(面板本帧登记, 本帧渲染; 不悬停即关闭) ----

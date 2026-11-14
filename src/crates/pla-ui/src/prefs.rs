@@ -48,7 +48,16 @@ pub fn save_lang(lang: Lang) -> Result<(), String> {
 
 /// R30: 笔记窗口外框(逻辑 pt: x, y, 宽, 高); 从未打开过 → None(用默认位置)。
 pub fn load_notes_rect() -> Option<[f32; 4]> {
-    let a = load_value("notes_rect")?;
+    load_rect("notes_rect")
+}
+
+pub fn save_notes_rect(r: [f32; 4]) -> Result<(), String> {
+    save_rect("notes_rect", r)
+}
+
+/// 独立浮窗(笔记 / 尺寸…)的外框, 键名各窗口自定。
+pub fn load_rect(key: &str) -> Option<[f32; 4]> {
+    let a = load_value(key)?;
     let a = a.as_array()?;
     if a.len() != 4 {
         return None;
@@ -63,6 +72,6 @@ pub fn load_notes_rect() -> Option<[f32; 4]> {
     (r[2] >= 120.0 && r[3] >= 120.0).then_some(r)
 }
 
-pub fn save_notes_rect(r: [f32; 4]) -> Result<(), String> {
-    save_value("notes_rect", serde_json::json!(r.iter().map(|x| x.round()).collect::<Vec<_>>()))
+pub fn save_rect(key: &str, r: [f32; 4]) -> Result<(), String> {
+    save_value(key, serde_json::json!(r.iter().map(|x| x.round()).collect::<Vec<_>>()))
 }
