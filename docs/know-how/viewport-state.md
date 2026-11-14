@@ -60,6 +60,14 @@ shader mode、render mode、x-ray、摄像机参数、网格线、各类显示�
   窗口可见时不抛错。往返实测: 存(1 材质/12 指派)→ 改色为红 + 去掉一个物体的指派 → 恢复 → 数据逐字节一致, 截图与改动前像素一致(MAD 0)。
 * **恢复后视口不自己重画**: 数据已变但画面停在旧颜色, 要等下一次交互; 垫片在 restore 后主动 `vp.render`(R34c)。
 * 找不到的物体(`node:<稳定id>`)/材质(`material:<uuid>`)如实列在 missing, 其余照常应用。
+* **带贴图的材质**(Gold foil: `normalMap` / `roughnessMap` = `{repeat, texture: THREE.Texture}`, 文件名在 `texture.userData.filename`,
+  如 `.././img/gold-foil_normal.png`): 存档里 JSON 化后是 `Texture.toJSON` 的纯数据(image 只剩 uuid), 原样交回会在
+  `deserializeTexture` 抛 "undefined is not a function"(堆栈: BasicMaterialDatabase.restore → UndoSnapshotStore.restore → thaw →
+  deserializeMaterial → deserializeTexture)。做法: 同 uuid 同文件沿用当前 Texture; 否则 `materials.textures.get(filename)`
+  (TextureLoader, Promise<Texture>, 按文件名缓存)→ clone → 套回 repeat/offset/wrap/flipY/colorSpace。没文件名的(导入图片)恢复不了, 如实报 failed。
+  `texture3DMatrix` 以纯 `{elements}` 交回时 thaw 不报错(未在可见窗口验证渲染)。
+* **originator.restore 中途抛错会留下半套状态**: 节点指派先写入、材质段才失败 → 物体指向不存在的材质 id(用户文件实测出现过一次)。
+  垫片现在先存一份恢复前快照, 失败就整体退回再报错。
 * 自检(`pla-app cdp-selftest`)含 `mat.restore ← mat.save`: 原样恢复应识别为 `materials(same)`, 不碰 memento。
 
 ## 坑

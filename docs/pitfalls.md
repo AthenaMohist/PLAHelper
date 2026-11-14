@@ -55,6 +55,7 @@
 | 52 | 视口状态实验把着色弄坏: 视口冻结、右侧面板不再刷新 | shader 模式下调 `shading.setMatcap(file)` → matcap 变 undefined → `TextureLoader.lookup` 每帧抛 → 渲染循环停; 面板 React 树随之失效(点击仍生效但界面不刷新) | 着色一律点面板按钮恢复; 垫片在 shader 模式下禁用 setMatcap 兜底; 面板失效需重开该文件(R33, know-how/viewport-state.md) |
 | 53 | 每次保存视口状态/选择集, 整个屏幕闪一下黑 | 缩略图用 CDP `Page.captureScreenshot` 从合成器表面截取, 某些 GPU 上会让窗口闪黑 | 垫片 `cam.thumbnail`: 同一 JS 任务里 `vp.handleRender()` → 读 WebGL canvas(没开 preserveDrawingBuffer, 跨任务就读到旧缓冲) → 铺页面背景色(canvas 透明)→ 缩到 960 宽; CDP 截图只作兜底(R33d) |
 | 54 | 材质状态恢复"成功"、数据也对, 但视口还是旧颜色 | memento `originator.restore` 改了材质/指派, 但不会请求重画; 下一次交互才刷新(像是恢复没生效) | 恢复后主动 `vp.render`(LOC 表已有); 验收截图前不要手动强制渲染, 否则会掩盖这个问题(R34c) |
+| 55 | 材质状态恢复, 某几个存档(含 Gold foil)报 "垫片异常: undefined is not a function", 之后物体指向不存在的材质 | ① `mat.save` 把材质里的 THREE.Texture JSON 化了, Plasticity 的 deserializeTexture 要真 Texture; ② memento 恢复中途抛错不回滚, 指派已写、材质没写 | 恢复前按文件名经 `materials.textures.get` 重建 Texture(同文件沿用当前对象); restore 失败用恢复前快照整体退回(R34d)。复现要点: 只调 `ed.materials.restore(...)` 就能拿到堆栈, 窗口隐藏时也能做 |
 | 14 | 切换面板时旧面板滞留、新面板不出现、点击丢失 | R12 加深的文档定位(`find_latest_doc`)每次未命中都全盘深扫(热缓存 ~2s, 冷缓存 ~19s), 面板每帧取文档目录, 2s TTL 一过就在 UI 线程重扫 | 分阶段: leveldb + Recent 命中即返回; 深扫未命中负缓存 60s(R13) |
 
 ## 假按钮教训

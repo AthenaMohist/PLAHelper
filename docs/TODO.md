@@ -133,9 +133,16 @@
           功能表 `MatSave` / `MatApply` 挂能力 `mat.state`, 不可用时面板顶部写明原因、点击被拦截并提示。
         - [x] R34c 实机往返(MT_screws 副本, 用户文件未动): 存 → 改色 + 去掉一个指派 → 恢复, 数据一致、截图像素一致(MAD 0);
           发现恢复后视口不重画 → 垫片补 `vp.render`(pitfalls #54); missing 实测如实报出; 自检加 `mat.restore ← mat.save`。
+        - [x] R34d 用户实测: 含 Gold foil(带贴图)的 MS003 恢复报 "undefined is not a function", 且留下指向不存在材质的指派。
+          修: 贴图按文件名重建真 Texture + restore 失败整体回滚(pitfalls #55)。副本上 `materials.restore` 用重建的贴图成功;
+          完整 memento 恢复因测试窗口被遮挡(hidden)未在副本上跑, 待用户在面板里再点 MS003 验证(同时会修复那条悬空指派)。
+        - [x] 用户已在面板里点过保存/缩略图/恢复(MS001–MS003), 基本可用。
         - [ ] 待验证: 在 pla-ui 面板里实际点一遍(保存/缩略图/点击恢复/更新/改名/管理条) —— 本轮只验证了垫片与存储层, 没有模拟点击界面。
         - [ ] N1(可选, 待用户决定): 把方案应用到其它文件时, 稳定 id 找不到的物体按物体名匹配。
         - [ ] 逐面(face)颜色未覆盖。
+      - [x] **R36 快照目录移进 `.pla`**: `<文档目录>/.pla/snapshots/`(同文件夹文档共用一面墙, 不变)。旧 `snapshot/` 里本工具的文件
+        (SS###.plasticity/.png、meta.json)首次访问时移动过去; 其它东西(Plasticity 打开快照时建的 `plasticity/` 自动保存目录)不动, 旧目录空了才删。
+        实机: screws 文件夹 SS001–SS008 + meta.json 已迁移, 旧目录只剩 `plasticity/`。
         - 附带发现: 自检 `vp.restore ← vp.save` 在 MT_screws 上报"前后不一致"(视口状态垫片, 本轮未改), 待查。
         - [x] N31-1 粗体/斜体快捷键：编辑中 Ctrl+B / Ctrl+I 给选中文字包 `**…**` / `*…*`（无选区 = 插入成对标记、光标放中间；
           已包裹再按 = 去掉）。做法：TextEdit 前 `consume_key(COMMAND, B/I)`，读 `cursor.char_range()` 改文本后回写光标。
