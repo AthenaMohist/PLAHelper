@@ -103,7 +103,13 @@
     'ds.init':                 ['ds', 'init'],
     'sh.snapshot':             ['sh', 'snapshot'],
     'sh.init':                 ['sh', 'init'],
-    'sh.setMatcap':            ['sh', 'setMatcap']
+    'sh.setMatcap':            ['sh', 'setMatcap'],
+    // 视口截面(shading.section = Section; isSectioned 的 setter 同时切换截面模式)
+    'sh.isSectioned':          ['sh', 'isSectioned'],
+    'sh.section':              ['sh', 'section'],
+    // 渲染环境的旋转 / 强度(setter); 环境本身只能点渲染面板的缩略图按钮切换
+    'sh.envRotation':          ['sh', 'environmentRotation'],
+    'sh.envIntensity':         ['sh', 'environmentIntensity']
   };
 
   // 选择集里的各类 id 集合：[对外的 kind, Selection 上的集合名]。sel.ids.<kind> 表键由此生成。
@@ -195,6 +201,13 @@
     // 这几个按钮共用 basic_side matcap, 内部状态分不开 → 存档时以面板激活态为准。
     sharedMatcapButtons: ['color_matcap', 'black_silhouette', 'color_silhouette'],
     sharedMatcapFile: 'basic_side',
+    // 渲染环境按钮图片名 = 环境文件名去扩展名再去分辨率后缀(outdoor_cloudy_01.png ↔ outdoor_cloudy_01_1k.exr)。
+    envResSuffix: /_\d+k$/,
+    // Section 对象的参数: 基准平面 / 基准位置 + transform(distance, angle1, angle2, flip)。
+    sectionBasePlane: 'originalPlane',
+    sectionBasePos: 'originalPosition',
+    sectionTransform: 'transform',
+    sectionParams: ['distance', 'angle1', 'angle2', 'flip'],
     // ---- R34: 材质状态(memento 字段) ----
     mementoMaterials: 'materials',      // memento.materials = { version, counter, materials: [...] }
     materialsList: 'materials',
@@ -227,7 +240,7 @@
     'vp.state':  { needs: ['vp.camera', 'vp.orbit', 'ed.shading.mode', 'ed.shading.changed', 'ed.sections'],
                    optional: ['ed.shading.section', 'vp.cplane', 'vp.settings.renderer', 'vp.settings.ao', 'vp.settings.grid', 'vp.container',
                               'vp.snapshot', 'vp.init', 'vp.isRenderMode', 'vp.toggleRenderMode', 'vp.togglePerspective', 'ed.layers', 'ed.docSettings',
-                              'ed.originator', 'ed.shadingDb', 'nodes.state'] },
+                              'ed.originator', 'ed.shadingDb', 'nodes.state', 'sh.section', 'sh.isSectioned'] },
     'keymap':    { needs: ['km.add', 'km.bindings'], optional: ['kb.update'] },
     'cmd.dispatch': { needs: ['reg.add', 'reg.listeners'] },
     'err.hook':  { needs: ['ed.errorSignal'] },
@@ -999,6 +1012,78 @@
   function texFile(t) { return t && t.userData ? (t.userData[NAMES.matcapFileKey] || null) : null; }
   function baseName(path) { var s = String(path || '').split('/').pop(); return s.replace(/\.[^.]+$/, ''); }
 
+  // 页面上所有带图片的按钮(渲染面板的环境缩略图等): [{el, name}]。
+  function imageButtons() {
+    var doc = W.document;
+    if (!doc || !doc.querySelectorAll) return [];
+    var out = [], imgs = doc.querySelectorAll('button img');
+    for (var i = 0; i < imgs.length; i++) {
+      var b = imgs[i].closest ? imgs[i].closest('button') : null;
+      if (b) out.push({ el: b, name: baseName(imgs[i].getAttribute('src')) });
+    }
+    return out;
+  }
+
+  // 当前截面(存档用)。
+  function sectionNow() {
+    var sh = get('ed.shadingDb');
+    var s = get('sh.section', sh);
+    var out = { on: !!get('sh.isSectioned', sh) };
+    if (s) {
+      var bp = s[NAMES.sectionBasePlane];
+      out.basePlane = bp ? { n: xyz(bp.normal), c: bp.constant } : null;
+      out.basePos = xyz(s[NAMES.sectionBasePos]);
+      NAMES.sectionParams.forEach(function (k) { out[k] = s[k]; });
+    }
+    return out;
+  }
+
+  // 恢复截面: 基准平面/位置 → transform(参数) → isSectioned 开关(setter 会同时切换截面模式)。
+  function applySection(S) {
+    var sh = get('ed.shadingDb');
+    if (!S.on) { put('sh.isSectioned', false, sh); return 'section:off'; }
+    var s = need('sh.section', sh);
+    var bp = s[NAMES.sectionBasePlane];
+    if (S.basePlane && bp) {
+      if (S.basePlane.n && bp.normal && typeof bp.normal.set === 'function') bp.normal.set(S.basePlane.n.x, S.basePlane.n.y, S.basePlane.n.z);
+      if (typeof S.basePlane.c === 'number') bp.constant = S.basePlane.c;
+    }
+    var pos = s[NAMES.sectionBasePos];
+    if (S.basePos && pos && typeof pos.set === 'function') pos.set(S.basePos.x, S.basePos.y, S.basePos.z);
+    var args = NAMES.sectionParams.map(function (k) { return S[k]; });
+    if (typeof s[NAMES.sectionTransform] === 'function') s[NAMES.sectionTransform].apply(s, args);
+    put('sh.isSectioned', true, sh);
+    return 'section:on';
+  }
+
+  // 当前渲染环境: 文件 + 旋转 + 强度。
+  function envNow() {
+    var s = invokeOn('sh.snapshot', [], get('ed.shadingDb'));
+    return { file: texFile(s.environment), rotation: s.rotation, intensity: s.intensity };
+  }
+
+  // 恢复渲染环境: 点同名缩略图(setEnvironment(文件名) 实测会把环境清空, 不用), 再写旋转/强度。
+  function applyEnv(S) {
+    var sh = get('ed.shadingDb');
+    var cur = envNow();
+    var parts = [];
+    if (S.file && cur.file !== S.file) {
+      var want = baseName(S.file), alt = want.replace(NAMES.envResSuffix, '');
+      var btn = imageButtons().filter(function (b) { return b.name === want || b.name === alt; })[0];
+      if (!btn) throw new Error('no env button ' + alt);
+      btn.el.click();
+      parts.push('env:' + alt);
+    }
+    var writeRI = function () {
+      if (typeof S.rotation === 'number') put('sh.envRotation', S.rotation, sh);
+      if (typeof S.intensity === 'number') put('sh.envIntensity', S.intensity, sh);
+    };
+    writeRI();
+    // 换环境是异步加载, 加载完可能重置旋转/强度 → 稍后再写一次
+    if (parts.length && typeof W.setTimeout === 'function') W.setTimeout(writeRI, 800);
+    return parts.length ? parts.join(',') : 'env(same)';
+  }
+
   // Shader Mode 面板里带图片的按钮(DOM 由 Plasticity 自己渲染; 找不到 → 空数组, 调用方如实报告)。
   function shaderButtons() {
     var doc = W.document;
@@ -1183,12 +1268,13 @@
       });
     });
     seg('cplane', function () { var cp = get('vp.cplane'); if (cp) out.cplane = vecFields(cp); });
-    seg('renderer', function () { out.renderer = primFields(need('vp.settings.renderer'), NAMES.rendererKeys); });
-    seg('ao', function () {
+    // 旧版(26.2.3 之前)的视口设置路径; 26.2.3 上不存在 → 不记失败(网格/色调/AO 改由文档设置 doc 段保存)
+    if (get('vp.settings.renderer')) seg('renderer', function () { out.renderer = primFields(need('vp.settings.renderer'), NAMES.rendererKeys); });
+    if (get('vp.settings.ao')) seg('ao', function () {
       var ao = need('vp.settings.ao');
       out.ao = primFields(ao, Object.keys(ao).filter(function (k) { return typeof ao[k] !== 'string'; }));
     });
-    seg('grid', function () { out.grid = primFields(need('vp.settings.grid'), NAMES.gridKeys); });
+    if (get('vp.settings.grid')) seg('grid', function () { out.grid = primFields(need('vp.settings.grid'), NAMES.gridKeys); });
     // ---- R33 v2: 显示相关全部状态(旧字段保留, 老存档照常恢复) ----
     out.v = NAMES.vpStateVersion;
     seg('view', function () {
@@ -1206,6 +1292,8 @@
     seg('scalars', function () { var V = viewport(); out.scalars = primFields(V, NAMES.vpScalars); });
     seg('layers', function () { out.layers = primFields(need('ed.layers'), NAMES.layerFlags); });
     seg('shading2', function () { out.shading2 = shadingNow(); });
+    seg('section2', function () { out.section2 = sectionNow(); });
+    seg('env', function () { out.env = envNow(); });
     seg('doc', function () { out.doc = plain(invokeOn('ds.snapshot', [], need('ed.docSettings'))); });
     seg('vis', function () { out.vis = visibilityNow(); });
     try {
@@ -1275,7 +1363,8 @@
       if (S.shading.section) { var sm = get('ed.shading.section'); if (sm) sm[tag] = S.shading.section; }
       applied.push('shading');
     });
-    seg('sections', Array.isArray(S.sections), function () {
+    // v2 存档的视口截面在 section2(shading.section); 旧的 sections 段(SectionDatabase)只给老存档用
+    seg('sections', Array.isArray(S.sections) && !(v2 && S.section2), function () {
       var cur = listOf(need('ed.sections'));
       var n = Math.min(cur.length, S.sections.length);
       for (var i = 0; i < n; i++) {
@@ -1299,6 +1388,9 @@
     // ---- R33 v2 后段: 着色(render mode 下由它接管, 不动) → 视角(vp.init) → 缩放 → 标量 → 显示开关 ----
     if (v2) {
       seg('shading2', !!S.shading2 && !S.renderMode, function () { applied.push(applyShading(S.shading2)); });
+      // render mode 下的环境(文件/旋转/强度); render mode 关时不动
+      seg('env', !!S.env && S.renderMode === true, function () { applied.push(applyEnv(S.env)); });
+      seg('section2', !!S.section2, function () { applied.push(applySection(S.section2)); });
       seg('view', !!S.view, function () {
         var V = viewport();
         var cur = invokeOn('vp.snapshot', [], V);
