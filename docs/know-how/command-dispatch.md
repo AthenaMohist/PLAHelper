@@ -72,7 +72,12 @@
 - **Rust**: `exec::run`(need-factories 自动挂载重试)、`exec::summary`(双语状态栏文字)、`CdpCmd::Exec` → `ExecResult` + `Report`;
   CLI `pla-app cdp-exec [--hwnd N] 脚本.json`(退出码 0 = 全部完成)。
 
-### 例: L 形支架(M-A)
+### 例: L 形支架(M-A, 2026-11-15 副本实测通过)
+
+3 步 0.3 s(工厂已挂上), 撤销栈 +3。倒圆用 `MultiFilletShellFactory`(`edges = [边视图]`, `distance` 米), commit 返回
+`[新 Solid]`(替换原实体, 版本 id +1)。结果 8 个平面 + 1 个圆柱面, 圆柱面包围盒 205–208 × 0–20 × 5–8 mm(R3), 内角原边消失。
+核对方法: 读实体 `faces.versionIds` → `lookupTopologyItemById(id).model.GetSurface().surface` 的类型 + 逐面 bbox;
+截图用垫片 `cam.thumbnail`(先 `cam.set` 正视, 截完还原)。
 
 ```json
 { "ops": [

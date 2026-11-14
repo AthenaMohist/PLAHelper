@@ -268,7 +268,8 @@
       `PLA.exposeClosures`（首次使用时堆快照取工厂类，8 s，之后零等待）；Rust `exec::run`（need-factories 自动挂载重试）、
       `CdpCmd::Exec`；CLI `pla-app cdp-exec [--hwnd N] 脚本.json`；契约测试 4 项（含 M-A 假机）。
       配方表现有：box(+union/subtract/intersect)、fillet。
-      - [ ] M-A 真机验收：脚本画 L 形支架（2 box 合并 + 1 fillet）——底板+合并已在副本实测通过，fillet 待副本窗口可见后跑。
+      - [x] M-A 真机验收（2026-11-15, MT_screws 副本）：`pla-app cdp-exec` 一次跑完 3 步 0.3 s，撤销栈 +3；
+            结果 8 平面 + 1 圆柱面，圆角面包围盒 205–208 × 0–20 × 5–8 mm（R3），内角原边消失；正视截图内角为圆角。
       - [ ] 扩配方：cylinder、extrude、offsetFace(N3 用)、chamfer —— 每加一项先在副本上实测 setter 名与取值。
       - [ ] 界面入口(N3/N4 再做)；selftest 加 `cmd.factories` 只读检查。
 - [~] **N3 参数化修改（尺寸驱动 P1-1）**：现有 `pla-dim` 的设计是「网格顶点平移 + bridge PUT_SOME 写回」——
