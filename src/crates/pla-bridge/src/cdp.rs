@@ -432,6 +432,18 @@ async fn session_loop(
                 let _ = ev_tx.send(CdpEvent::Report { ok, msg });
             }
             Ok(CdpCmd::CaptureViewport(out_path)) => {
+                // R33d: 优先用垫片在页面里渲染并读 canvas(Page.captureScreenshot 会让整个窗口闪一下黑, 用户实测);
+                // 拿不到再退回下面的 CDP 截图。
+                if let Ok(v) = shim_call(ws, &mut mid, shim::api::CAM_THUMBNAIL, serde_json::json!({ "maxWidth": 960 })).await {
+                    if let Some(b64) = v["data"].as_str() {
+                        if let Ok(bytes) = base64_decode(b64) {
+                            if !bytes.is_empty() && std::fs::write(&out_path, &bytes).is_ok() {
+                                let _ = ev_tx.send(CdpEvent::ViewportPng(bytes.len()));
+                                continue;
+                            }
+                        }
+                    }
+                }
                 // 视口 DOM rect(CSS px) → clip(逻辑 px); captureScreenshot
                 // 的 clip 以 CSS 像素为单位(与 viewport 缩放无关, 按 dpr 放大输出)。
                 let clip: Value = match shim_call(ws, &mut mid, shim::api::CAM_VP_RECT, Value::Null).await {

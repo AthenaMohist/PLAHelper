@@ -50,6 +50,8 @@ pub mod api {
     pub const SEL_APPLY: &str = "sel.apply";
     pub const CAM_NAVIGATE: &str = "cam.navigateToSelection";
     pub const CAM_RENDER: &str = "cam.render";
+    /// R33d: 视口缩略图(页面内渲染后直接读 canvas; 取代会闪黑的 Page.captureScreenshot)。
+    pub const CAM_THUMBNAIL: &str = "cam.thumbnail";
     pub const CAM_VP_RECT: &str = "cam.vpRect";
     pub const CAM_SET_ORBIT_STEP: &str = "cam.setOrbitStep";
     pub const CAM_ROLL: &str = "cam.roll";
@@ -63,7 +65,7 @@ pub mod api {
     /// 全部接口名（契约测试用）。
     pub const ALL: &[&str] = &[
         CORE_PROBE, CORE_HEALTH, CORE_APIS, SEL_SNAPSHOT, HIST_STATE, CAM_GET, CAM_SET, CMD_DISPATCH,
-        CMD_PING, ERR_LAST, TREE_LIST, SEL_CANCEL_COMMAND, SEL_CLEAR, SEL_APPLY, CAM_NAVIGATE, CAM_RENDER, CAM_VP_RECT,
+        CMD_PING, ERR_LAST, TREE_LIST, SEL_CANCEL_COMMAND, SEL_CLEAR, SEL_APPLY, CAM_NAVIGATE, CAM_RENDER, CAM_THUMBNAIL, CAM_VP_RECT,
         CAM_SET_ORBIT_STEP, CAM_ROLL, KEYMAP_SET_BINDINGS, VP_SAVE, VP_RESTORE, MAT_SAVE, MAT_RESTORE,
     ];
 }

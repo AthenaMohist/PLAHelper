@@ -89,6 +89,10 @@
     'vp.isRenderMode':         ['vp', 'isRenderMode'],
     'vp.toggleRenderMode':     ['vp', 'toggleRenderMode'],
     'vp.togglePerspective':    ['vp', 'togglePerspective'],
+    // 缩略图: 同一任务里"渲一帧 → 读 WebGL canvas"(不走 CDP Page.captureScreenshot —— 它会让整个窗口闪黑)
+    'vp.handleRender':         ['vp', 'handleRender'],
+    'vp.needsRender':          ['vp', 'needsRender'],
+    'vp.canvas':               ['vp', 'renderer.domElement'],
     'ed.layers':               ['ed', 'layers'],
     'ed.docSettings':          ['ed', 'document.settings'],
     'ed.originator':           ['ed', 'originator'],
@@ -885,6 +889,31 @@
   // ---- 视角 / 视口杂项 ----
   def('cam.navigateToSelection', 'cam.nav', function () { invokeOn('vp.navigate', [], viewport()); return true; });
   def('cam.render', 'cam.read', function () { invokeOn('vp.render', [], viewport()); return true; });
+
+  // R33d: 视口缩略图(PNG base64)。canvas 没开 preserveDrawingBuffer, 必须在渲染的同一个 JS 任务里读;
+  // canvas 是透明的, 背景色来自页面 → 先铺最近的不透明祖先背景色。只含 3D 视口, 不含 Plasticity 的面板。
+  def('cam.thumbnail', 'cam.read', function (a) {
+    var V = viewport();
+    var maxW = (a && a.maxWidth) || 960;
+    put('vp.needsRender', true, V);
+    invokeOn('vp.handleRender', [W.performance ? W.performance.now() : Date.now()], V);
+    var src = need('vp.canvas', V);
+    var scale = Math.min(1, maxW / src.width);
+    var c = W.document.createElement('canvas');
+    c.width = Math.max(1, Math.round(src.width * scale));
+    c.height = Math.max(1, Math.round(src.height * scale));
+    var g = c.getContext('2d');
+    var bg = null;
+    for (var el = src; el && !bg; el = el.parentElement) {
+      var col = W.getComputedStyle ? W.getComputedStyle(el).backgroundColor : '';
+      if (col && col !== 'transparent' && !/rgba\([^)]*,\s*0\)$/.test(col)) bg = col;
+    }
+    g.fillStyle = bg || '#c9c9c4';
+    g.fillRect(0, 0, c.width, c.height);
+    g.drawImage(src, 0, 0, c.width, c.height);
+    var url = c.toDataURL('image/png');
+    return { data: url.slice(url.indexOf(',') + 1), width: c.width, height: c.height, bg: bg };
+  });
   def('cam.vpRect', 'cam.read', function () {
     var r = need('vp.container').getBoundingClientRect();
     return { x: r.x, y: r.y, width: r.width, height: r.height, scale: 1 };
@@ -1067,17 +1096,33 @@
     var sh = get('ed.shadingDb');
     var cur = envNow();
     var parts = [];
-    if (S.file && cur.file !== S.file) {
-      var want = baseName(S.file), alt = want.replace(NAMES.envResSuffix, '');
-      var btn = imageButtons().filter(function (b) { return b.name === want || b.name === alt; })[0];
-      if (!btn) throw new Error('no env button ' + alt);
-      btn.el.click();
-      parts.push('env:' + alt);
-    }
     var writeRI = function () {
       if (typeof S.rotation === 'number') put('sh.envRotation', S.rotation, sh);
       if (typeof S.intensity === 'number') put('sh.envIntensity', S.intensity, sh);
     };
+    if (S.file && cur.file !== S.file) {
+      var want = baseName(S.file), alt = want.replace(NAMES.envResSuffix, '');
+      var tryClick = function () {
+        var btn = imageButtons().filter(function (b) { return b.name === want || b.name === alt; })[0];
+        if (!btn) return false;
+        btn.el.click();
+        return true;
+      };
+      if (tryClick()) {
+        parts.push('env:' + alt);
+      } else if (typeof W.setTimeout === 'function' && W.document && W.document.querySelectorAll) {
+        // 刚打开 render mode 时渲染面板(环境缩略图)下一帧才出来 → 每 200ms 再找, 最多 3s
+        var tries = 0;
+        var again = function () {
+          if (tryClick()) { W.setTimeout(writeRI, 800); return; }
+          if (++tries < 15) W.setTimeout(again, 200);
+        };
+        W.setTimeout(again, 200);
+        parts.push('env:pending ' + alt);
+      } else {
+        throw new Error('no env button ' + alt);
+      }
+    }
     writeRI();
     // 换环境是异步加载, 加载完可能重置旋转/强度 → 稍后再写一次
     if (parts.length && typeof W.setTimeout === 'function') W.setTimeout(writeRI, 800);
@@ -1420,6 +1465,11 @@
       seg('layers', !!S.layers, function () { assignPrims(need('ed.layers'), S.layers, NAMES.layerFlags); applied.push('layers'); });
     }
     call0(viewport(), 'vp.render');
+    if (v2) {
+      // v2 存档里旧格式段落本来就没有(或已由新段落取代), 不算"缺失"; render mode 下跳过着色也是预期
+      var legacy = ['cam', 'orbit', 'shading', 'sections', 'cplane', 'renderer', 'ao', 'grid', 'shading2'];
+      missing = missing.filter(function (m) { return legacy.indexOf(m) < 0; });
+    }
     return { applied: applied, missing: missing, failed: failed };
   });
 

@@ -53,6 +53,7 @@
 | 50 | 笔记表格选 3 行右键删除 → 助手闪退 | 选区只在帧首夹回表内; 右键菜单在帧中途删了行, 同一帧后面的状态栏还按旧选区下标 `t.cells[r][c]` 读 → 越界 panic(整个进程崩) | `TableState::clamp_to()` 在每次结构变化后立即调用 + 帧内二次夹回; 读格子改 `.get()`。panic 日志在 `%TEMP%\pla-ui.log`(R31c) |
 | 51 | 夜间无人时 CDP 截图"冻结"、memento 恢复抛 "reading 'Viewport'" | 显示器关闭/窗口被遮挡 → 页面 visibilityState=hidden, rAF 停(0 帧), 截图一直是最后一帧; 此时 `originator.restore` 连原样恢复当前快照都在 Plasticity 内部抛错 | 验收前先查 `document.visibilityState`/rAF; 垫片 `mementoGuard()` 在 hidden 时拒绝 memento 恢复并如实报告(R33) |
 | 52 | 视口状态实验把着色弄坏: 视口冻结、右侧面板不再刷新 | shader 模式下调 `shading.setMatcap(file)` → matcap 变 undefined → `TextureLoader.lookup` 每帧抛 → 渲染循环停; 面板 React 树随之失效(点击仍生效但界面不刷新) | 着色一律点面板按钮恢复; 垫片在 shader 模式下禁用 setMatcap 兜底; 面板失效需重开该文件(R33, know-how/viewport-state.md) |
+| 53 | 每次保存视口状态/选择集, 整个屏幕闪一下黑 | 缩略图用 CDP `Page.captureScreenshot` 从合成器表面截取, 某些 GPU 上会让窗口闪黑 | 垫片 `cam.thumbnail`: 同一 JS 任务里 `vp.handleRender()` → 读 WebGL canvas(没开 preserveDrawingBuffer, 跨任务就读到旧缓冲) → 铺页面背景色(canvas 透明)→ 缩到 960 宽; CDP 截图只作兜底(R33d) |
 | 14 | 切换面板时旧面板滞留、新面板不出现、点击丢失 | R12 加深的文档定位(`find_latest_doc`)每次未命中都全盘深扫(热缓存 ~2s, 冷缓存 ~19s), 面板每帧取文档目录, 2s TTL 一过就在 UI 线程重扫 | 分阶段: leveldb + Recent 命中即返回; 深扫未命中负缓存 60s(R13) |
 
 ## 假按钮教训
