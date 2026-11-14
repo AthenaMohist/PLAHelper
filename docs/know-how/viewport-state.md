@@ -29,6 +29,28 @@ shader mode、render mode、x-ray、摄像机参数、网格线、各类显示�
 | 网格/色调/AO(文档级) | `ed.document.settings.snapshot()`: Grid{factor,every,size}, Display{ao{…}, toneMapping{type,exposure}}, Unit | | `init(s)` / `update(partial)` 写值有效; **会让文档变"未保存"** |
 | 隐藏 / 眼睛关闭 / 隔离 | `ed.nodes.read.hidden`(Set<nodeKey>)、`invisible`、`isolations`; `read.node2id`: nodeKey → **稳定 id**(字符串, 跨会话不变) | | **只能**走 memento: `m = ed.originator.snapshot(); m.nodes = {...m.nodes, hidden: Float64Array.from(keys), invisible: …}; ed.originator.restore(m)` |
 
+## 隔离(isolate, 2026-11-14 白天实测)
+
+* `nodes.read.isolations` = 层栈(外 → 内), 每层是 nodeKey 的 `Set`; `nodes.isolationLevel` = 层数。memento 里是 `Float64Array[]`。
+* **memento 里的 isolations 恢复时被忽略**(改了 restore 也不变)。
+* 正确做法: `nodes.unisolate()`(一次清空**全部**层) → 每层 `nodes.isolate(new Set(keys))` 压栈 →
+  `originator.restore(originator.snapshot())` 原样恢复一次让场景重算(不做这步显示不变)。实测两层往返: 0 层 22 个可见 ↔ 2 层 1 个可见。
+* 存档按稳定 id: `vis.isolations = [[id…], [id…]]`。
+* 26.2.3 上 `executor.hasActiveCommand` 是**常为 true 的属性**(默认选择命令常驻), 不能拿来"拒绝恢复";
+  改为恢复前 `cancelActiveCommand()`(同 sel.apply)。
+
+## 渲染环境(render mode 下)
+
+* `shading.snapshot().environment` 是纹理, `userData.filename` 如 `.././img/outdoor_cloudy_01_1k.exr`; rotation / intensity 有 setter。
+* **`shading.setEnvironment(filename)` 不能用**: 会把环境清空(实测事故, 点 outdoor_cloudy_01 按钮恢复)。
+* 渲染面板有 8 个环境缩略图按钮, 图片名 = 环境文件名去扩展名再去 `_1k` 后缀(`outdoor_cloudy_01.png` ↔ `outdoor_cloudy_01_1k.exr`)。
+  恢复 = 点对应按钮 + 写 rotation / intensity。
+
+## 截面(section, 待实测)
+
+* 视口截面在 `shading.section`(Section, Object3D: position / quaternion 即截面平面位姿)、`shading.isSectioned`、
+  `shading._sectionMode.tag`(none / …)。旧实现存的 `ed.sections.sections`(SectionDatabase)是另一回事(截面分析), 不是视口截面。
+
 ## 坑
 
 1. **`nodes.setHidden(item, true)` 只改集合, 场景不刷新**(scene.update / renderList.fullRecompute /

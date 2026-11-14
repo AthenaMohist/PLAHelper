@@ -95,14 +95,15 @@
     'ed.shadingDb':            ['ed', 'shading'],
     'ed.sig.docSettings':      ['ed', 'signals.documentSettingsChanged'],
     'nodes.state':             ['nodes', 'read'],
+    'nodes.isolate':           ['nodes', 'isolate'],
+    'nodes.unisolate':         ['nodes', 'unisolate'],
     'orig.snapshot':           ['orig', 'snapshot'],
     'orig.restore':            ['orig', 'restore'],
     'ds.snapshot':             ['ds', 'snapshot'],
     'ds.init':                 ['ds', 'init'],
     'sh.snapshot':             ['sh', 'snapshot'],
     'sh.init':                 ['sh', 'init'],
-    'sh.setMatcap':            ['sh', 'setMatcap'],
-    'exec.hasActive':          ['exec', 'hasActiveCommand']
+    'sh.setMatcap':            ['sh', 'setMatcap']
   };
 
   // 选择集里的各类 id 集合：[对外的 kind, Selection 上的集合名]。sel.ids.<kind> 表键由此生成。
@@ -1067,10 +1068,12 @@
 
   // memento 恢复(originator.restore)前的前置条件。实测(2026-11-14 夜): 窗口不可见(visibilityState=hidden,
   // 显示器关闭/被遮挡)时连"原样恢复当前快照"都在 Plasticity 内部抛 "reading 'Viewport'" —— 不冒这个险。
+  // 进行中的命令先取消(同 sel.apply; 26.2.3 上 hasActiveCommand 是常为 true 的属性 —— 默认选择命令一直在,
+  // 不能拿它当"拒绝"条件)。
   function mementoGuard() {
-    var exec = get('ed.executor');
-    if (exec && get('exec.hasActive') && invokeOn('exec.hasActive', [], exec)) throw new Error('command active');
     if (W.document && W.document.visibilityState === 'hidden') throw new Error('window hidden');
+    var exec = get('ed.executor');
+    if (exec && get('exec.cancel')) { try { invokeOn('exec.cancel', [], exec); } catch (e) {} }
   }
 
   // 隐藏 / 眼睛关闭 → 稳定 id 列表。
@@ -1080,8 +1083,18 @@
     var ids = function (set) { var a = []; set.forEach(function (k) { var id = map.get(k); if (id) a.push(id); }); return a; };
     var out = {};
     NAMES.nodeVisSets.forEach(function (n) { out[n] = ids(st[n]); });
-    out[NAMES.nodeIsolations] = plain(st[NAMES.nodeIsolations] || []);
+    // 隔离 = 层栈(外 → 内), 每层是 nodeKey 的 Set(实测 26.2.3); 存成每层一个稳定 id 列表
+    out[NAMES.nodeIsolations] = (st[NAMES.nodeIsolations] || []).map(function (layer) { return ids(toSet(layer)); });
     return out;
+  }
+
+  // Set / 数组 / 类型化数组 → Set(隔离层的几种可能形态)。
+  function toSet(x) {
+    if (x instanceof Set) return x;
+    var s = new Set();
+    if (x && typeof x.forEach === 'function') x.forEach(function (k) { s.add(k); });
+    else if (x && typeof x.length === 'number') for (var i = 0; i < x.length; i++) s.add(x[i]);
+    return s;
   }
 
   // 恢复可见性: 只改 memento 的 nodes 可见性字段, 走编辑器自己的 restore(与撤销同一条路, 场景才会刷新;
@@ -1095,22 +1108,44 @@
       (list || []).forEach(function (id) { var k = inv.get(id); if (k === undefined) missing.push('node:' + id); else ks.push(k); });
       return ks;
     };
-    var want = {}, same = true;
+    var want = {}, visSame = true;
+    var sameSet = function (cur, keys) { return cur.size === keys.length && keys.every(function (k) { return cur.has(k); }); };
     NAMES.nodeVisSets.forEach(function (n) {
       want[n] = keysOf(V[n]);
-      var cur = st[n];
-      if (cur.size !== want[n].length || !want[n].every(function (k) { return cur.has(k); })) same = false;
+      if (!sameSet(st[n], want[n])) visSame = false;
     });
-    if (same) return 'vis(same)';
+    // 隔离层栈: 老存档(没有/格式不对)不动隔离
+    var isoSaved = Array.isArray(V[NAMES.nodeIsolations]) && V[NAMES.nodeIsolations].every(Array.isArray) ? V[NAMES.nodeIsolations] : null;
+    var isoWant = isoSaved ? isoSaved.map(keysOf).filter(function (l) { return l.length > 0; }) : null;
+    var isoSame = true;
+    if (isoWant) {
+      var curIso = st[NAMES.nodeIsolations] || [];
+      if (curIso.length !== isoWant.length || !isoWant.every(function (l, i) { return sameSet(toSet(curIso[i]), l); })) isoSame = false;
+    }
+    if (visSame && isoSame) return 'vis(same)';
     mementoGuard();
     var orig = need('ed.originator');
-    var m = invokeOn('orig.snapshot', [], orig);
-    var nodes = {};
-    Object.keys(m[NAMES.mementoNodes]).forEach(function (k) { nodes[k] = m[NAMES.mementoNodes][k]; });
-    NAMES.nodeVisSets.forEach(function (n) { nodes[n] = Float64Array.from(want[n]); });
-    m[NAMES.mementoNodes] = nodes;
-    invokeOn('orig.restore', [m], orig);
-    return 'vis:' + want[NAMES.nodeVisSets[0]].length + '/' + want[NAMES.nodeVisSets[1]].length;
+    var parts = [];
+    if (!visSame) {
+      // 隐藏 / 眼睛: 改 memento 的两项再 restore(场景随之重算)
+      var m = invokeOn('orig.snapshot', [], orig);
+      var nodes = {};
+      Object.keys(m[NAMES.mementoNodes]).forEach(function (k) { nodes[k] = m[NAMES.mementoNodes][k]; });
+      NAMES.nodeVisSets.forEach(function (n) { nodes[n] = Float64Array.from(want[n]); });
+      m[NAMES.mementoNodes] = nodes;
+      invokeOn('orig.restore', [m], orig);
+      parts.push(want[NAMES.nodeVisSets[0]].length + '/' + want[NAMES.nodeVisSets[1]].length);
+    }
+    if (!isoSame) {
+      // 隔离: memento 里的 isolations 恢复时被忽略(实测) → 用 NodeState 自己的方法: unisolate 清空全部层,
+      // isolate(Set<nodeKey>) 压一层; 之后原样 restore 一次当前快照让场景重算(不重算则显示不变)。
+      var nst = need('ed.nodes');
+      invokeOn('nodes.unisolate', [], nst);
+      isoWant.forEach(function (l) { invokeOn('nodes.isolate', [new Set(l)], nst); });
+      invokeOn('orig.restore', [invokeOn('orig.snapshot', [], orig)], orig);
+      parts.push('iso' + isoWant.length);
+    }
+    return 'vis:' + parts.join('/');
   }
 
   def('vp.save', 'vp.state', function () {
