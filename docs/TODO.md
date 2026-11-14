@@ -11,6 +11,8 @@
 3. **B** 现有功能 bug：选择集、视口状态、快照墙（真机复现后逐条修）
 4. **F** CDP 地基：垫片层、能力探测、契约测试、自动重定位
 5. **N** 新功能：材质方案 → 命令派发层 → 参数化修改 → 打孔工具 → 常用件库 → AI 建模 → 轻量装配
+6. **A** 自动建模 pipeline（`docs/PRD/PRD-ai-modeling-v2.md`）：P1 基础设施 → P2 规格层 → P3 经验层 → P4 设计师 agent。
+   P1 与 N3/N4 共用底座（查询、事务、配方），优先做。
 
 ---
 
@@ -270,7 +272,7 @@
       配方表现有：box(+union/subtract/intersect)、fillet。
       - [x] M-A 真机验收（2026-11-15, MT_screws 副本）：`pla-app cdp-exec` 一次跑完 3 步 0.3 s，撤销栈 +3；
             结果 8 平面 + 1 圆柱面，圆角面包围盒 205–208 × 0–20 × 5–8 mm（R3），内角原边消失；正视截图内角为圆角。
-      - [ ] 扩配方：cylinder、extrude、offsetFace(N3 用)、chamfer —— 每加一项先在副本上实测 setter 名与取值。
+      - [ ] 扩配方 → 并入 **A4**（cylinder、extrude、offsetFace(N3 用)、chamfer…，每加一项先在副本上实测 setter 名与取值）。
       - [ ] 界面入口(N3/N4 再做)；selftest 加 `cmd.factories` 只读检查。
 - [~] **N3 参数化修改（尺寸驱动 P1-1）**：现有 `pla-dim` 的设计是「网格顶点平移 + bridge PUT_SOME 写回」——
       **此路不通**，只存在于纸面：bridge 唯一的写入通道 PUT_SOME 是 Blender「Outbox → PolySplines」用的，
@@ -281,9 +283,42 @@
       选面/点 → 自动放负体、定长度、布尔、放螺丝实例。一期可先自动化现有 asset 负体流程。
 - [ ] **N5 常用件库**：常用件白名单入库（STEP + 缩略图 + 规格字段，SQLite 索引），PLAhelper 搜索面板一键放入当前文档；
       常用度按本人插入次数统计；商家具体型号用到时下载归档。
-- [ ] **N6 AI 建模**：LLM 生成 build123d → STEP → 导入 Plasticity；N2 成熟后再试直接驱动 Plasticity 命令。
+- [ ] **N6 AI 建模**：已细化为 **A 自动建模 pipeline**（见下节）。build123d → STEP → 导入 作为退路保留。
 - [ ] **N7 轻量装配**：实例 + PLAhelper 记录装配关系 + 干涉检查 + 隐藏线/SVG 导出。完整配合约束和工程图不在范围内。
 - [ ] **N8 交付出口**：STEP 导出 → SolidWorks / COMSOL；网页 3D（glTF + three.js 单文件）。
+
+## A — 自动建模 pipeline（设计: `docs/PRD/PRD-ai-modeling-v2.md`）
+
+> 分层: L0 通道(N2 已有) → L1 工具层(MCP + skill) → L2 规格层(规格 JSON + 编译器 + 映射表) → L3 经验层 → L4 设计师 agent。
+> 大模型只产规格, 几何正确性交给编译器与校验; 编号不可靠, 一律语义引用 + 几何签名。
+
+**P1 基础设施**（验收: MCP 客户端里一句话建 L 形支架 → 查面 → 量孔距 → 截图; 失败步自动回滚）
+- [ ] **A1 几何查询** `geo.query`：实体 / 面 / 边 / 顶点 + 几何签名（曲面类型、法向/轴线、质心、面积/长度、包围盒），
+      可按物体、类型、法向、位置过滤；`pla-app cdp-state` 一条命令输出 LLM 可读的完整状态（= v1 M-B）。
+- [ ] **A2 测量** `geo.measure`：距离、角度、体积、面积、包围盒、两实体干涉。
+- [ ] **A3 事务回滚**：`begin` 记撤销栈深度、失败 `rollback` 撤到起点、`commit`；`cmd.exec` 可选整串原子执行。
+- [ ] **A4 配方补齐**（即 N2 扩配方）：cylinder、sketch+extrude、hole、chamfer、shell、offsetFace、pattern —— 每项先在副本实测。
+- [ ] **A5 视图工具**：指定视角截图（正/俯/等轴/对准某实体），截完还原视角。
+- [ ] **A6 MCP 服务**（`pla-app mcp` 子命令或 `pla-mcp` crate，待定）：exec / query / measure / view / undo / model 六个工具，
+      包 pla-bridge 现有代码；附 skill 文档（配方、示例、常见坑）。
+
+**P2 规格层**（验收: 同一份规格改一个参数后重放, 几何与 checks 全部吻合）
+- [ ] **A7 规格 JSON schema**：参数表、基准、特征序列（语义 id）、checks、intent；从图纸开始先出"参数表 + 疑点"。
+- [ ] **A8 编译器**：规格 → 步骤，逐步执行、解析语义引用（`face(base.top)`、`edge(a.top, b.inner)`）、失败回滚并报特征。
+- [ ] **A9 映射表**：`.pla/models/<doc_key>/{spec.json, map.json, log.jsonl}`；语义名 → 解析规则 + 几何签名 + 最近编号缓存；
+      重放。调研 `store.version2stable` 能否给稳定 id。N3 尺寸驱动是它的第一个用户。
+- [ ] **A10 特征宏** 5–10 个：带孔安装板、L 形支架、凸台加筋、沉头孔、抽壳外壳、螺丝柱（选题待用户定零件类别）。
+
+**P3 经验层**（验收: 评测集通过率可量化并随迭代上升; "20×10×5 带圆角底座"全自动完成 = v1 M-C）
+- [ ] **A11 评测集** ≥20 题，几何断言自动判分，副本上跑完撤销到起点；每次改宏 / skill / 模型跑回归。
+- [ ] **A12 案例库 + 教训库**：成功案例（需求 → 规格 → 步骤 → 结果 + 截图）按相似度检索进上下文；失败原因结构化反馈进 skill。
+- [ ] **A13 闭环自检**：建完 query / measure / view 对照 checks，不符自动修（限轮数），仍失败回滚交人。
+
+**P4 设计师 agent**（验收: 一个真实小项目从场景描述走到可用模型）
+- [ ] **A14 窄领域试点**：场景 → 多方案 → 规则 / 指标评分 → 人工选 → 规格 → 建模；依赖 N4 打孔库、N5 常用件库、N7 干涉、N8 COMSOL 出口。
+- [ ] **A15 训练**（数据量到几千条之后）：成功 / 失败轨迹作训练数据，几何断言作奖励。
+
+待用户定：零件类别（A10/A11 选题）；MCP 放 `pla-app mcp` 还是独立 crate。
 
 ## 工程债
 
