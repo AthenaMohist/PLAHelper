@@ -87,6 +87,21 @@
 ] }
 ```
 
+## A3 事务回滚(2026-11-15)
+
+- **撤销路径**: 在 `document.body` 上派发 `CustomEvent('edit:undo', {bubbles: true})` —— 与 Ctrl+Z 同一条路径
+  (命令注册在 inline 监听里, WeakMap 键是某个祖先元素, 冒泡即可命中)。**异步**: 实测 300 ms 内撤销栈 −1、重做栈 +1、物体恢复;
+  垫片按撤销栈长度轮询确认(50 ms / 步超时 5 s)。也有 `editor.history.undo()`, 但没走命令系统, 不用。
+- 撤销栈项 = `{name, snapshot}`(memento); 自建工厂命令的项名是 `PlaFactory`。撤销走 memento 恢复 → **窗口不可见时拒绝**(`mementoGuard`)。
+- 垫片(能力 `hist.write`):
+  - `hist.begin` → `{depth}`: 记下撤销栈深度 + 每一项的对象引用; `hist.commit` → `{committed, steps}` 结束事务;
+  - `hist.rollback`(异步) → `{undone, depth}`: 撤到 begin 时的深度。**安全检查**: begin 以下的撤销栈必须原样
+    (用户撤到 begin 之前、或撤了又做了别的 → 拒绝, 一步都不撤)。会撤掉 begin 之后的全部步骤, 包括期间用户自己的操作。
+  - `cmd.exec {atomic: true}`: 某步失败 → 撤回本次全部已完成步骤, 回包 `results: []` + `rolledBack: n`(撤回失败则 `rollbackErr`);
+    窗口不可见时一开始就拒绝。CLI: `pla-app cdp-exec --atomic`。
+- 真机(MT_screws 副本): 3 步脚本第 3 步倒圆被内核拒绝(`PK_BODY_fix_blends` 16067) → 前 2 步撤回, 前后撤销栈 12 / 实体 31, 共 270 ms;
+  `hist.begin` → 2 次 `cmd.exec` → `hist.rollback` 撤 2 步 102 ms, 回到原样。
+
 ## 加一个新操作
 
 1. 副本上读工厂原型链的 setter 名(本文 4.), 用 lab 脚本试出参数取值与 commit 返回值;

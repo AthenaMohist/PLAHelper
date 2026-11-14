@@ -246,7 +246,8 @@ fn main() {
         println!("  cdp-eval <js>                                 经 CDP(9333) 在 Plasticity renderer 执行 JS");
         println!("  cdp-probe                                     注入垫片 __PLA__ 并打印能力探测 + 只读接口回读");
         println!("  cdp-selftest [--hwnd N] [--json 文件]          CDP 契约自检(不改动文档); 退出码 0 通过/1 有失败/2 连不上");
-        println!("  cdp-exec [--hwnd N] <脚本.json>                 N2 命令派发: 按配方表执行几何步骤(改动文档, 每步一个撤销步)");
+        println!("  cdp-exec [--hwnd N] [--atomic] <脚本.json>      N2 命令派发: 按配方表执行几何步骤(改动文档, 每步一个撤销步;");
+        println!("                                                --atomic = 某步失败时撤回本次全部步骤)");
         println!("  cdp-state [--hwnd N] [--detail solids|faces|edges|all] [--of id,id|名字] [--units U] [--out 文件]");
         println!("                                                A1 只读: 撤销深度 + 选择 + 几何签名(给大模型读的 JSON)");
         println!("  doc-list / ping");
@@ -352,19 +353,25 @@ fn main() {
             // N2: 脚本 = 垫片 cmd.exec 的参数 {ops, units?}(docs/know-how/command-dispatch.md)。
             let mut hwnd: isize = 0;
             let mut file: Option<String> = None;
+            let mut atomic = false;
             let mut it = a.iter();
             while let Some(x) = it.next() {
                 match x.as_str() {
                     "--hwnd" => hwnd = it.next().and_then(|v| v.parse().ok()).unwrap_or(0),
+                    "--atomic" => atomic = true,
                     other => file = Some(other.to_string()),
                 }
             }
-            let Some(file) = file else { eprintln!("用法: cdp-exec [--hwnd N] <脚本.json>"); std::process::exit(2); };
-            let script: serde_json::Value = match std::fs::read_to_string(&file).map_err(|e| e.to_string())
+            let Some(file) = file else { eprintln!("用法: cdp-exec [--hwnd N] [--atomic] <脚本.json>"); std::process::exit(2); };
+            let mut script: serde_json::Value = match std::fs::read_to_string(&file).map_err(|e| e.to_string())
                 .and_then(|s| serde_json::from_str(s.trim_start_matches('\u{feff}')).map_err(|e| e.to_string())) {
                 Ok(v) => v,
                 Err(e) => { eprintln!("脚本读不了: {e}"); std::process::exit(2); }
             };
+            // A3: 失败时撤回本次全部步骤
+            if atomic {
+                script["atomic"] = serde_json::Value::Bool(true);
+            }
             match rt.block_on(pla_bridge::exec::run_once(9333, hwnd, &script)) {
                 Ok(v) => {
                     println!("{}", serde_json::to_string_pretty(&v).unwrap());

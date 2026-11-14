@@ -84,13 +84,17 @@ pub mod api {
     pub const CMD_FACTORIES: &str = "cmd.factories";
     /// A1: 几何查询(实体 / 面 / 边 / 顶点 + 几何签名, 只读)。
     pub const GEO_QUERY: &str = "geo.query";
+    /// A3: 事务(begin 记撤销栈 / rollback 撤到 begin / commit 结束)。
+    pub const HIST_BEGIN: &str = "hist.begin";
+    pub const HIST_ROLLBACK: &str = "hist.rollback";
+    pub const HIST_COMMIT: &str = "hist.commit";
 
     /// 全部接口名（契约测试用）。
     pub const ALL: &[&str] = &[
         CORE_PROBE, CORE_HEALTH, CORE_APIS, SEL_SNAPSHOT, HIST_STATE, CAM_GET, CAM_SET, CMD_DISPATCH,
         CMD_PING, ERR_LAST, TREE_LIST, SEL_CANCEL_COMMAND, SEL_CLEAR, SEL_APPLY, CAM_NAVIGATE, CAM_RENDER, CAM_THUMBNAIL, CAM_VP_RECT,
         CAM_SET_ORBIT_STEP, CAM_ROLL, KEYMAP_SET_BINDINGS, VP_SAVE, VP_RESTORE, MAT_SAVE, MAT_RESTORE, CMD_EXEC, CMD_FACTORIES,
-        GEO_QUERY,
+        GEO_QUERY, HIST_BEGIN, HIST_ROLLBACK, HIST_COMMIT,
     ];
 }
 
@@ -117,13 +121,15 @@ pub mod cap {
     pub const CMD_EXEC: &str = "cmd.exec";
     /// A1: 几何查询(只读)。
     pub const GEO_READ: &str = "geo.read";
+    /// A3: 事务回滚(撤销栈 + edit:undo)。
+    pub const HIST_WRITE: &str = "hist.write";
     pub const BOOL_RUN: &str = "bool.run";
     pub const ASSET_PLACE: &str = "asset.place";
 
     /// 全部能力名（契约测试用）。
     pub const ALL: &[&str] = &[
         EDITOR, SEL_READ, SEL_WRITE, HIST_READ, CAM_READ, CAM_WRITE, CAM_NAV, CAM_STEP, CAM_ROLL, SEL_APPLY,
-        VP_STATE, KEYMAP, CMD_DISPATCH, ERR_HOOK, TREE, MAT_STATE, MAT_SET, CMD_EXEC, GEO_READ, BOOL_RUN, ASSET_PLACE,
+        VP_STATE, KEYMAP, CMD_DISPATCH, ERR_HOOK, TREE, MAT_STATE, MAT_SET, CMD_EXEC, GEO_READ, HIST_WRITE, BOOL_RUN, ASSET_PLACE,
     ];
 }
 

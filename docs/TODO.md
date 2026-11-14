@@ -300,7 +300,12 @@
       契约测试 1 项。真机：L 形支架 9 面 / 21 边 / 14 顶点全部正确（278 ms）；整文档 481 面 203 ms。
       未覆盖：面积 / 体积 / 质心（并入 A2）。
 - [ ] **A2 测量** `geo.measure`：距离、角度、体积、面积、包围盒、两实体干涉。
-- [ ] **A3 事务回滚**：`begin` 记撤销栈深度、失败 `rollback` 撤到起点、`commit`；`cmd.exec` 可选整串原子执行。
+      用户提示（2026-11-15）：试**吸附点**（snap points）——测量命令和自由移动（freestyle move）命令里会显示；
+      开 **X-ray** 模式后能选到实体内部的点（普通模式选不到）。先找这两个命令用的吸附点来源（对象 / 方法），
+      看能否直接读出关键点（端点、中点、圆心、面心…）作为测量与映射表的锚点。面积 / 体积 / 质心接口也一并找（A1 未覆盖）。
+- [x] **A3 事务回滚**（2026-11-15，know-how/command-dispatch.md「A3」）：`hist.begin / rollback / commit`（能力 `hist.write`），
+      撤销 = body 上派发 `edit:undo`（同 Ctrl+Z，异步，轮询确认）；begin 以下撤销栈被动过则拒绝；窗口不可见拒绝；
+      `cmd.exec {atomic}` 失败整串撤回（CLI `--atomic`）。契约测试 2 项；真机：失败脚本撤回 2 步 270 ms、事务撤回 2 步 102 ms，前后一致。
 - [ ] **A4 配方补齐**（即 N2 扩配方）：cylinder、sketch+extrude、hole、chamfer、shell、offsetFace、pattern —— 每项先在副本实测。
 - [ ] **A5 视图工具**：指定视角截图（正/俯/等轴/对准某实体），截完还原视角。
 - [ ] **A6 MCP 服务**（`pla-app mcp` 子命令或 `pla-mcp` crate，待定）：exec / query / measure / view / undo / model 六个工具，

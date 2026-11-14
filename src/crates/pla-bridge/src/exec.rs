@@ -116,6 +116,19 @@ pub fn summary(v: &Value) -> (bool, String) {
             let i = f["index"].as_u64().unwrap_or(0) + 1;
             let op = f["op"].as_str().unwrap_or("?");
             let err = f["err"].as_str().unwrap_or("");
+            // atomic: 已完成的步骤被撤回(或撤回失败)
+            if let Some(n) = v["rolledBack"].as_u64() {
+                return (false, crate::t!(
+                    "命令派发: 第 {i} 步({op})失败: {err}; 已撤回本次全部 {n} 步, 文档回到执行前",
+                    "Command dispatch: step {i} ({op}) failed: {err}; rolled back all {n} steps, document as before"
+                ));
+            }
+            if let Some(re) = v["rollbackErr"].as_str() {
+                return (false, crate::t!(
+                    "命令派发: 第 {i} 步({op})失败: {err}; 撤回也失败({re}), 已完成的 {done} 步还在文档里",
+                    "Command dispatch: step {i} ({op}) failed: {err}; rollback failed too ({re}), {done} completed steps remain"
+                ));
+            }
             (false, crate::t!(
                 "命令派发: 完成 {done} 步, 第 {i} 步({op})失败: {err}",
                 "Command dispatch: {done} steps done, step {i} ({op}) failed: {err}"
@@ -140,6 +153,11 @@ mod tests {
         assert!(!ok);
         assert!(msg.contains("fillet") && msg.contains("none within"), "{msg}");
         assert!(msg.contains('2'), "第 2 步(从 1 数): {msg}");
+        let rb = json!({"results":[],"failed":{"index":2,"op":"fillet","err":"PK"},"rolledBack":2});
+        let (ok, msg) = summary(&rb);
+        assert!(!ok && msg.contains("撤回") && msg.contains('2'), "{msg}");
+        let rbe = json!({"results":[{},{}],"failed":{"index":2,"op":"fillet","err":"PK"},"rollbackErr":"window hidden"});
+        assert!(summary(&rbe).1.contains("window hidden"));
     }
 
     #[test]

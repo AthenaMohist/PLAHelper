@@ -267,6 +267,11 @@
     vertexIdTag: 'v',
     // geo.query 每类最多返回的项数(超出如实报 truncated)
     queryLimit: 2000,
+    // ---- A3: 事务回滚 ----
+    // 撤销 = 在 document.body 上派发 edit:undo(与 Ctrl+Z 同一条路径; 异步, 实测 300 ms 内完成; 内部走 memento 恢复)
+    undoCommand: 'edit:undo',
+    undoPollMs: 50,
+    undoStepTimeoutMs: 5000,
     // 每步命令的超时(ms); 按位置挑边/面的默认容差(文档单位)
     cmdTimeoutMs: 15000,
     pickTolerance: 0.5,
@@ -312,6 +317,7 @@
     'mat.state': { needs: ['ed.originator', 'nodes.state'], optional: ['mat.textures', 'tex.get'] },
     'mat.set':     { todo: 'N1' },
     'geo.read':  { needs: ['geo.items', 'geo.lookupTopo', 'geo.lookupItem', 'ed.docUnit'] },
+    'hist.write': { needs: ['ed.undoStack', 'exec.cancel'] },
     // 工厂类不列入: 首次使用前本来就没有(由代理按需挂上), 缺哪个在执行时按表键报
     'cmd.exec':    { needs: ['ed.enqueue', 'sig.commandEnded', 'exec.cancel', 'cmd.factoryBaseHolder', 'geo.items',
                              'geo.lookupTopo', 'geo.lookupItem', 'ed.docUnit', 'vp.camera'] },
@@ -1112,7 +1118,7 @@
     var rc = o && NAMES.recipes[o.op];
     if (!rc) throw new Error(at + 'unknown op (known: ' + Object.keys(NAMES.recipes).join(', ') + ')');
     rc.required.forEach(function (p) { if (o[p] === undefined) throw new Error(at + 'missing ' + p); });
-    Object.keys(o).forEach(function (p) {
+    Object.keys(o || {}).forEach(function (p) {
       if (p !== 'op' && p !== 'id' && p !== 'bool' && p !== 'targets' && !rc.params[p]) throw new Error(at + 'unknown param ' + p);
     });
     if (o.bool !== undefined) {
@@ -1121,6 +1127,65 @@
     }
     need(rc.fac);
   }
+
+  // =====================================================================
+  // A3: 事务回滚。begin 记下撤销栈(深度 + 每一项的对象引用); rollback 逐步派发 edit:undo 撤到 begin 时的深度。
+  // 安全: begin 位置以下的撤销栈必须原样(用户撤到 begin 之前 / 栈被换掉 → 拒绝, 不乱撤)。
+  // 撤销走 memento 恢复 → 窗口不可见时拒绝(mementoGuard)。
+  // =====================================================================
+  function undoStack() { var s = need('ed.undoStack'); return s; }
+
+  function markNow() { var s = undoStack(); return { depth: s.length, base: Array.from(s) }; }
+
+  function checkMark(mark) {
+    var s = undoStack();
+    if (s.length < mark.depth) throw new Error('undo stack is below the transaction start (' + s.length + ' < ' + mark.depth + ')');
+    for (var i = 0; i < mark.depth; i++) if (s[i] !== mark.base[i]) throw new Error('undo history changed below the transaction start (entry ' + i + ')');
+  }
+
+  function undoOnce() {
+    var before = undoStack().length;
+    W.document.body.dispatchEvent(new CustomEvent(NAMES.undoCommand, { bubbles: true }));
+    return new Promise(function (resolve, reject) {
+      var t0 = Date.now();
+      (function poll() {
+        if (undoStack().length < before) return resolve();
+        if (Date.now() - t0 > NAMES.undoStepTimeoutMs) return reject(new Error('undo did not complete within ' + NAMES.undoStepTimeoutMs + ' ms'));
+        setTimeout(poll, NAMES.undoPollMs);
+      })();
+    });
+  }
+
+  // 撤到 mark.depth; 返回撤销的步数。
+  function rollbackTo(mark) {
+    checkMark(mark);
+    mementoGuard();
+    var n = 0;
+    var loop = function () {
+      if (undoStack().length <= mark.depth) return Promise.resolve(n);
+      return undoOnce().then(function () { n++; return loop(); });
+    };
+    return loop();
+  }
+
+  def('hist.begin', 'hist.write', function () {
+    state.tx = markNow();
+    return { depth: state.tx.depth };
+  });
+
+  def('hist.commit', 'hist.write', function () {
+    var had = !!state.tx;
+    var d = had ? undoStack().length - state.tx.depth : 0;
+    state.tx = null;
+    return { committed: had, steps: d };
+  });
+
+  // 回滚当前事务(hist.begin 之后的全部步骤, 含期间用户自己的操作); 结束事务。
+  def('hist.rollback', 'hist.write', function () {
+    if (!state.tx) throw new Error('no transaction (call hist.begin first)');
+    var mark = state.tx;
+    return rollbackTo(mark).then(function (n) { state.tx = null; return { undone: n, depth: undoStack().length }; });
+  }, { async: true });
 
   // 工厂挂载状态(只读): 供 Rust 判断要不要让代理拍快照、自检显示。
   def('cmd.factories', 'cmd.exec', function () {
@@ -1131,9 +1196,10 @@
     return { loaded: !!F, count: F ? Object.keys(F).length : 0, missing: missing, ops: Object.keys(NAMES.recipes) };
   });
 
-  // 执行一串步骤。args = { ops: [{op, id?, <参数>..., bool?, targets?}], units?: 文档单位名(默认取文档设置) }。
+  // 执行一串步骤。args = { ops: [{op, id?, <参数>..., bool?, targets?}], units?: 文档单位名(默认取文档设置), atomic? }。
   // 每步一个命令(一个撤销步); 某步失败即停, 已完成的保留并如实返回:
   // { units, results: [{index, op, id, items:[{kind, id, name, bbox}]}], failed: null | {index, op, err} }。
+  // atomic: 失败时撤回本次全部已完成步骤 → results 清空, 带 rolledBack(撤销步数); 撤回失败带 rollbackErr。
   def('cmd.exec', 'cmd.exec', function (a) {
     if (!a || !Array.isArray(a.ops) || !a.ops.length) throw new Error('cmd.exec needs {ops: [...]}');
     if (!W[CFG.factoriesGlobal]) throw new Error(CFG.needFactoriesErr);
@@ -1141,13 +1207,28 @@
     a.ops.forEach(checkStep);
     var ctx = { k: U.k, V3: need('vp.camera').position.constructor, refs: {} };
     var Cls = factoryCommandClass();
+    // A3 atomic: 某步失败 → 撤回本次已完成的全部步骤(窗口不可见时撤不了 → 一开始就拒绝)
+    var mark = null;
+    if (a.atomic) {
+      if (!resolve('ed.undoStack').ok) throw new CapError('ed.undoStack', ['ed.undoStack']);
+      if (W.document && W.document.visibilityState === 'hidden') throw new Error('atomic needs a visible window (undo uses memento restore)');
+      mark = markNow();
+    }
     var results = [];
-    var done = function (failed) { return { units: U.unit, results: results, failed: failed }; };
+    var finish = function (failed) { return { units: U.unit, results: results, failed: failed }; };
+    var done = function (failed) {
+      if (!failed || !mark) return Promise.resolve(finish(failed));
+      return rollbackTo(mark).then(function (n) {
+        var r = finish(failed); r.rolledBack = n; r.results = []; return r;
+      }, function (e) {
+        var r = finish(failed); r.rollbackErr = errMsg(e); return r;
+      });
+    };
     var step = function (i) {
-      if (i >= a.ops.length) return Promise.resolve(done(null));
+      if (i >= a.ops.length) return done(null);
       var o = a.ops[i];
       var build;
-      try { build = buildStep(o, ctx); } catch (e) { return Promise.resolve(done({ index: i, op: o.op, err: errMsg(e) })); }
+      try { build = buildStep(o, ctx); } catch (e) { return done({ index: i, op: o.op, err: errMsg(e) }); }
       var cmd = new Cls(editor(), build);
       return runCommand(cmd, NAMES.cmdTimeoutMs).then(function (how) {
         if (cmd.plaErr || how !== 'ended') return done({ index: i, op: o.op, err: cmd.plaErr || how });
