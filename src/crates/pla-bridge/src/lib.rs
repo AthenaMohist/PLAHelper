@@ -3,6 +3,7 @@
 pub mod cdp;
 pub mod connection;
 pub mod error;
+pub mod exec;
 pub mod i18n;
 pub mod protocol;
 pub mod reconnect;

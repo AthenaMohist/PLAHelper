@@ -56,6 +56,8 @@
 | 53 | 每次保存视口状态/选择集, 整个屏幕闪一下黑 | 缩略图用 CDP `Page.captureScreenshot` 从合成器表面截取, 某些 GPU 上会让窗口闪黑 | 垫片 `cam.thumbnail`: 同一 JS 任务里 `vp.handleRender()` → 读 WebGL canvas(没开 preserveDrawingBuffer, 跨任务就读到旧缓冲) → 铺页面背景色(canvas 透明)→ 缩到 960 宽; CDP 截图只作兜底(R33d) |
 | 54 | 材质状态恢复"成功"、数据也对, 但视口还是旧颜色 | memento `originator.restore` 改了材质/指派, 但不会请求重画; 下一次交互才刷新(像是恢复没生效) | 恢复后主动 `vp.render`(LOC 表已有); 验收截图前不要手动强制渲染, 否则会掩盖这个问题(R34c) |
 | 55 | 材质状态恢复, 某几个存档(含 Gold foil)报 "垫片异常: undefined is not a function", 之后物体指向不存在的材质 | ① `mat.save` 把材质里的 THREE.Texture JSON 化了, Plasticity 的 deserializeTexture 要真 Texture; ② memento 恢复中途抛错不回滚, 指派已写、材质没写 | 恢复前按文件名经 `materials.textures.get` 重建 Texture(同文件沿用当前对象); restore 失败用恢复前快照整体退回(R34d)。复现要点: 只调 `ed.materials.restore(...)` 就能拿到堆栈, 窗口隐藏时也能做 |
+| 56 | 第一次执行脚本命令要等 78 s | 代理按名复活工厂类时每个都调一次 `HeapProfiler.getObjectByHeapObjectId`, 它每次都扫整个堆(~0.3 s × 229 个) | 只按 id 复活一个类 → 沿原型链到类层次的根 → `Runtime.queryObjects(根)` 一次扫堆拿到全部子类; 没覆盖到的名字再重复(实测 10 次扫堆, 8 s, 其中快照 2.7 s)(N2) |
+| 57 | 工厂/命令报 PK_ERROR_field_of_wrong_type, 或按 `edgeIds` 查边抛 "object null is not iterable" | 26.x 几何内核是 Parasolid: 枚举值是 PK 常量(合并 = 15903, 不是 0/1/2); 拓扑 id 是字符串 `<物体版本id>e<边id>` / `f`(面), 组里的 `edgeIds`/`faceIds` 是裸数字, 不能直接查 | 枚举只写在垫片 NAMES 表; 边/面 id 取组上的 `versionIds`(与 `bboxes` 同序)(N2) |
 | 14 | 切换面板时旧面板滞留、新面板不出现、点击丢失 | R12 加深的文档定位(`find_latest_doc`)每次未命中都全盘深扫(热缓存 ~2s, 冷缓存 ~19s), 面板每帧取文档目录, 2s TTL 一过就在 UI 线程重扫 | 分阶段: leveldb + Recent 命中即返回; 深扫未命中负缓存 60s(R13) |
 
 ## 假按钮教训

@@ -32,6 +32,8 @@ pub enum CdpCmd {
     MatStateSave,
     /// R34: 恢复材质状态(state = MatStateSave 采集的 JSON; memento, 不进撤销栈) → Report。
     MatStateApply(String),
+    /// N2: 执行一串几何步骤(`cmd.exec` 的参数 `{ops, units?}`) → ExecResult + Report。
+    Exec(Value),
     /// R8-1: 视口裁剪截图(Page.captureScreenshot clip=视口 rect)。
     /// 参数 = 输出 PNG 路径; 结果经 Status 上报。
     CaptureViewport(String),
@@ -92,6 +94,8 @@ pub enum CdpEvent {
     VpStateResult(String),
     /// R34: 材质状态采集回包(JSON 字符串; err 字段非空表示失败)。
     MatStateResult(String),
+    /// N2: `CdpCmd::Exec` 的回包(`cmd.exec` 的 v; 部分完成时 failed 非空, 仍是 Ok)。
+    ExecResult(Result<Value, String>),
     /// R8-1: 视口截图回包(PNG 字节数)。
     ViewportPng(usize),
     /// R7-28: 请 UI 把前台焦点交还 Plasticity(武装按键丢失时重试前置)。
@@ -453,6 +457,16 @@ async fn session_loop(
                         Err(e) => (false, crate::t!("材质状态恢复失败: {e}", "Restore material state failed: {e}")),
                     },
                 };
+                let _ = ev_tx.send(CdpEvent::Report { ok, msg });
+            }
+            // ---- N2: 命令派发 ----
+            Ok(CdpCmd::Exec(script)) => {
+                let result = crate::exec::run(ws, &mut mid, &script).await;
+                let (ok, msg) = match &result {
+                    Ok(v) => crate::exec::summary(v),
+                    Err(e) => (false, crate::t!("命令派发失败: {e}", "Command dispatch failed: {e}")),
+                };
+                let _ = ev_tx.send(CdpEvent::ExecResult(result));
                 let _ = ev_tx.send(CdpEvent::Report { ok, msg });
             }
             Ok(CdpCmd::CaptureViewport(out_path)) => {
@@ -913,7 +927,7 @@ pub(crate) fn view_delta(target_json: &str, actual_json: &str) -> anyhow::Result
     Ok(dist / scale + 2.0 * dot.acos())
 }
 
-async fn ws_send(ws: &mut WsStream, v: Value) -> anyhow::Result<()> {
+pub(crate) async fn ws_send(ws: &mut WsStream, v: Value) -> anyhow::Result<()> {
     use futures_util::SinkExt;
     ws.send(tokio_tungstenite::tungstenite::Message::Text(v.to_string()))
         .await
@@ -1017,11 +1031,21 @@ pub(crate) async fn eval_roundtrip(
     mid: &mut u64,
     expr: &str,
 ) -> anyhow::Result<String> {
+    eval_roundtrip_timeout(ws, mid, expr, Duration::from_secs(15)).await
+}
+
+/// 同 [`eval_roundtrip`], 自定超时(N2 命令派发一串步骤可能超过 15 s)。
+pub(crate) async fn eval_roundtrip_timeout(
+    ws: &mut WsStream,
+    mid: &mut u64,
+    expr: &str,
+    timeout: Duration,
+) -> anyhow::Result<String> {
     use futures_util::StreamExt;
     *mid += 1;
     let want = *mid;
     ws_send(ws, json_eval(want, expr)).await?;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let deadline = tokio::time::Instant::now() + timeout;
     loop {
         let msg = tokio::time::timeout_at(deadline, ws.next())
             .await

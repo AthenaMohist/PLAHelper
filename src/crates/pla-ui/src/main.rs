@@ -2153,6 +2153,12 @@ impl PlaApp {
                             .send(pla_bridge::cdp::CdpCmd::CaptureViewport(path));
                     }
                 }
+                // N2: 命令派发回包(界面尚无发起入口; 结果文字随后的 Report 显示, 这里只记日志)。
+                pla_bridge::cdp::CdpEvent::ExecResult(r) => {
+                    if let Err(e) = r {
+                        eprintln!("[pla-ui] 命令派发失败: {e}");
+                    }
+                }
                 // R34: 材质状态采集回包 → 失败如实提示; 成功则暂存并补发缩略图(同视口状态的串行流程)。
                 pla_bridge::cdp::CdpEvent::MatStateResult(state) => {
                     let err = serde_json::from_str::<serde_json::Value>(&state)

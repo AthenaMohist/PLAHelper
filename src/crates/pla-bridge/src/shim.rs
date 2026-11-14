@@ -22,6 +22,24 @@ pub const EDITOR_GLOBAL: &str = "__PLA_EDITOR__";
 /// Editor 特征：同时拥有这些属性的对象即 Editor。垫片校验与堆快照搜索共用这一份。
 pub const EDITOR_SIGNATURE: &[&str] = &["selection", "shading", "viewports"];
 
+/// N2: 代理按需拍堆快照、把几何工厂类挂到页面上的全局名(代理与垫片的交接点)。
+pub const FACTORIES_GLOBAL: &str = "__PLA_FACTORIES__";
+
+/// N2: 堆快照里按闭包名匹配工厂类的正则(JS 语法)。
+pub const FACTORY_CLASS_PATTERN: &str = r"^[A-Z]\w*Factory$";
+
+/// N2: 代理(tools/pla-cdp/pla-cdp-v8.js)的自定义 CDP 方法: 拍堆快照 → 按名匹配闭包 → 同会话复活挂到全局。
+/// 代理是另一个进程(JS), 那边有同名常量; 改名两边一起改。
+pub const PROXY_EXPOSE_CLOSURES: &str = "PLA.exposeClosures";
+
+/// N2: 工厂还没挂上时 `cmd.exec` 抛的错误文字(Rust 据此让代理挂一次再重试)。
+pub const NEED_FACTORIES_ERR: &str = "need-factories";
+
+/// `PLA.exposeClosures` 的参数。`force` = 页面上已有也重拍(默认有就直接用)。
+pub fn expose_closures_params(force: bool) -> Value {
+    json!({ "pattern": FACTORY_CLASS_PATTERN, "global": FACTORIES_GLOBAL, "force": force })
+}
+
 /// 视口自定义元素（`orbit:rotate:*` / `viewport:*` 命令的监听器挂在它上面；keymap 也用它做选择器）。
 pub const VIEWPORT_SELECTOR: &str = "plasticity-viewport";
 
@@ -61,12 +79,15 @@ pub mod api {
     /// R34: 材质与颜色状态(材质定义 + 物体指派)。
     pub const MAT_SAVE: &str = "mat.save";
     pub const MAT_RESTORE: &str = "mat.restore";
+    /// N2: 命令派发(配方表驱动的几何工厂, 一步一个撤销步)与工厂挂载状态。
+    pub const CMD_EXEC: &str = "cmd.exec";
+    pub const CMD_FACTORIES: &str = "cmd.factories";
 
     /// 全部接口名（契约测试用）。
     pub const ALL: &[&str] = &[
         CORE_PROBE, CORE_HEALTH, CORE_APIS, SEL_SNAPSHOT, HIST_STATE, CAM_GET, CAM_SET, CMD_DISPATCH,
         CMD_PING, ERR_LAST, TREE_LIST, SEL_CANCEL_COMMAND, SEL_CLEAR, SEL_APPLY, CAM_NAVIGATE, CAM_RENDER, CAM_THUMBNAIL, CAM_VP_RECT,
-        CAM_SET_ORBIT_STEP, CAM_ROLL, KEYMAP_SET_BINDINGS, VP_SAVE, VP_RESTORE, MAT_SAVE, MAT_RESTORE,
+        CAM_SET_ORBIT_STEP, CAM_ROLL, KEYMAP_SET_BINDINGS, VP_SAVE, VP_RESTORE, MAT_SAVE, MAT_RESTORE, CMD_EXEC, CMD_FACTORIES,
     ];
 }
 
@@ -235,6 +256,8 @@ pub fn config_json() -> Value {
         "viewportSelector": VIEWPORT_SELECTOR,
         "pingCommand": PING_COMMAND,
         "rollCommands": { "left": ROLL_LEFT_COMMAND, "right": ROLL_RIGHT_COMMAND },
+        "factoriesGlobal": FACTORIES_GLOBAL,
+        "needFactoriesErr": NEED_FACTORIES_ERR,
     })
 }
 

@@ -36,9 +36,54 @@
 8. **验收截图**: 测试窗口被用户窗口遮住时, CDP `Page.captureScreenshot` 返回冻结的旧帧(两次字节完全相同);
    用垫片 `cam.thumbnail`(页面内渲染一帧读 canvas)才是当前画面。
 
-## 待做(设计见 TODO N2)
+9. **几何内核是 Parasolid**(报错前缀 `PK_`): 枚举取 PK 常量。布尔 `operationType`: 合并 = `PK_boolean_unite_c` 15903
+   (实测; 给 2 报 `PK_ERROR_field_of_wrong_type`), 相减 15902、相交 15901(同一枚举, 未单独实测)。
+   `CornerBoxFactory` 设 `targets = [实体视图]` + `operationType = 15903` → 新盒子与目标合并成一个实体, 目标被吃掉。
+10. **拓扑 id**: 字符串 `<物体版本id>e<边id>` / `<物体版本id>f<面id>`(如 `31e9439`), 取自实体视图
+   `view.edges.versionIds` / `view.faces.versionIds`, 与同组 `bboxes`(每项 6 个数: min xyz + max xyz, Float32)同序。
+   组里的 `edgeIds`/`faceIds` 是裸数字, 直接给 `lookupTopologyItemById` 会抛 "object null is not iterable"。
+   物体版本 id = `view.userData.versionId`(`lookupItemById` 用)。
+11. **工厂源码看不到**: 打包成字节码(.jsc), `Function.prototype.toString` 只回空白 → setter 名从原型链读, 取值靠实验。
+12. **页面里没有 webpack 模块表**(无 `webpackChunk*` 全局、无 `require`), 堆快照是拿到工厂类的唯一途径。
 
-- 类发现: 运行时一次性堆快照(Rust inspector 通道)还是别的途径; 结果缓存到 renderer 重载为止。
-- 配方表(单一来源): 对外操作名 → 工厂类名 + 参数类型(point / length / angle / count / edges / faces / bool), 由类型决定单位换算与对象构造。
-- 拓扑选择: fillet / extrude / offset 需要边/面对象 —— 按 id(同 sel.apply 的 lookupTopologyItemById)或按几何条件(边中点、面法向)查找。
-- M-A 验收: 脚本画 L 形支架(2 box 合并 + 1 fillet)。
+## 实现(2026-11-14)
+
+链路: 脚本 → Rust `exec::run` → 垫片 `cmd.exec` → (首次) `need-factories` → 代理 `PLA.exposeClosures` → 重试。
+
+- **垫片 `cmd.exec`**(`pla-shim.js` N2 段): 参数 `{ops: [...], units?}`; 每步 = 配方表里的工厂, 在自建
+  `PlaFactoryCommand`(基类 = `CornerBoxCommand` 的父类)里 `new F(editor)` → `resource(cmd)` → setter → `commit()`,
+  经 `runCommand`(取消活动命令 → enqueue → 等 `commandEnded`)执行。某步失败即停, 已完成的保留, 如实返回:
+  `{units, results: [{index, op, id, items: [{kind, id, name, bbox}]}], failed: null | {index, op, err}}`。
+  参数错(未知 op/参数、缺必填、bool 值不对、单位不认识)在执行任何一步之前就报, 不产生命令。
+- **配方表** `NAMES.recipes`(唯一来源): 操作名 → 工厂表键(`LOC fac.*`) + 参数 `对外名: [setter, 类型]` + 必填 + 是否支持布尔。
+  类型: point(文档单位 → 米, Vector3) / length / angle(度 → 弧度) / number / bool / edges / faces / solids。
+  现有: `box {p1, p2, height}`(+ `bool: union|subtract|intersect`, `targets`)、`fillet {edges, distance}`。
+- **引用**: 一步写 `id: "base"`, 后面用 `"$base"` 引用它的产物; 被后续步骤吃掉(如合并)再引用会报 `no longer exists`。
+  也可给物体版本 id 或 `{name: 大纲名}`。
+- **挑边/面**: 拓扑 id 字符串, 或 `{near: [x,y,z], of?: 物体引用, tol?: 容差(默认 0.5 文档单位)}` —— 取包围盒中心最近的一项;
+  超出容差或两项一样近都报错, 不猜。
+- **单位**: 默认读 `document.settings._Unit.length`(millimeter/centimeter/meter/inch/foot), `units` 可覆盖。
+  回读 bbox 换回文档单位, 保留 7 位有效数字(bboxes 是 Float32)。
+- **工厂类挂载**: 代理(`pla-cdp-v8.js`)自定义 CDP 方法 `PLA.exposeClosures {pattern, global, force}`, 与编辑器定位共用
+  单飞队列(堆快照绝不并行)。拍快照(主进程收块) → 按闭包名匹配 → 复活: 只按 id 复活一个类, 沿原型链到类层次的根,
+  `Runtime.queryObjects(根)` 一次拿到全部子类(`getObjectByHeapObjectId` 每次扫整个堆, 逐个复活 229 个要 73 s)。
+  实测 64 MB 快照: 快照 2.7 s + 解析 0.2 s + 复活 5 s(10 次扫堆) = 8 s; 之后同一页面零等待(已有就直接返回 cached)。
+  页面重载后全局没了, 下次使用时自动重做。常量(全局名、正则、方法名、错误文字)在 Rust `shim.rs`, 经配置注入垫片。
+- **Rust**: `exec::run`(need-factories 自动挂载重试)、`exec::summary`(双语状态栏文字)、`CdpCmd::Exec` → `ExecResult` + `Report`;
+  CLI `pla-app cdp-exec [--hwnd N] 脚本.json`(退出码 0 = 全部完成)。
+
+### 例: L 形支架(M-A)
+
+```json
+{ "ops": [
+  { "op": "box", "id": "base", "p1": [100, 0, 0], "p2": [140, 20, 0], "height": 5 },
+  { "op": "box", "id": "L", "p1": [100, 0, 0], "p2": [105, 20, 0], "height": 30, "bool": "union", "targets": ["$base"] },
+  { "op": "fillet", "edges": [{ "near": [105, 10, 5], "of": "$L" }], "distance": 3 }
+] }
+```
+
+## 加一个新操作
+
+1. 副本上读工厂原型链的 setter 名(本文 4.), 用 lab 脚本试出参数取值与 commit 返回值;
+2. LOC 加 `fac.<名>`, NAMES.recipes 加一行; 契约测试的假工厂补上;
+3. 副本上用 `pla-app cdp-exec` 跑一遍, 量包围盒/截图核对。

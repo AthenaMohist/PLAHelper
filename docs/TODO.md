@@ -262,7 +262,15 @@
 
 - [ ] **N1 材质 / 配色方案**：方案存 `<doc>/.pla/materials/<doc_key>`；CDP 调 `SetMaterialCommand` 族应用；
       PoC 先做单实体改材质，再做方案保存/切换。降级：改文档 JSON 头写副本后重开。
-- [ ] **N2 命令派发层**（PRD-ai-modeling M-A）：带参数可靠执行 Plasticity 命令，产出命令/参数格式 know-how。N3/N4/N6 共用。
+- [~] **N2 命令派发层**（PRD-ai-modeling M-A）：带参数可靠执行 Plasticity 命令，产出命令/参数格式 know-how。N3/N4/N6 共用。
+      已实现(know-how/command-dispatch.md)：垫片 `cmd.exec`（配方表驱动几何工厂，一步一个撤销步；mm→米；
+      边/面按 id 或按位置 `{near, of, tol}` 挑；布尔用 Parasolid 枚举）+ `cmd.factories`；代理自定义方法
+      `PLA.exposeClosures`（首次使用时堆快照取工厂类，8 s，之后零等待）；Rust `exec::run`（need-factories 自动挂载重试）、
+      `CdpCmd::Exec`；CLI `pla-app cdp-exec [--hwnd N] 脚本.json`；契约测试 4 项（含 M-A 假机）。
+      配方表现有：box(+union/subtract/intersect)、fillet。
+      - [ ] M-A 真机验收：脚本画 L 形支架（2 box 合并 + 1 fillet）——底板+合并已在副本实测通过，fillet 待副本窗口可见后跑。
+      - [ ] 扩配方：cylinder、extrude、offsetFace(N3 用)、chamfer —— 每加一项先在副本上实测 setter 名与取值。
+      - [ ] 界面入口(N3/N4 再做)；selftest 加 `cmd.factories` 只读检查。
 - [~] **N3 参数化修改（尺寸驱动 P1-1）**：现有 `pla-dim` 的设计是「网格顶点平移 + bridge PUT_SOME 写回」——
       **此路不通**，只存在于纸面：bridge 唯一的写入通道 PUT_SOME 是 Blender「Outbox → PolySplines」用的，
       把多边形网格转成光滑 NURBS 曲面（Studio 功能），不能改已有实体的尺寸，也会丢掉倒角等特征。

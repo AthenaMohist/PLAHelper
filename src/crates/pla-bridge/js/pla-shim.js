@@ -22,7 +22,7 @@
   //    键 -> [根, 备选路径...]
   //    根：ed = Editor；sel = 当前 Selection；vp = 视口（见 viewport()）；oc = 视口的轨道控制器；
   //        reg = 命令注册表(CommandRegistry)；click = 选择点击器；cs = changeSelection；
-  //        exec = 命令执行器；km = KeymapManager；kb = 键盘。
+  //        exec = 命令执行器；km = KeymapManager；kb = 键盘；fac = 代理挂上的几何工厂类表(N2)。
   //    方法类表键一律挂在其所属对象的根下, 调用时 this = 该对象(见 invokeOn)。
   // =====================================================================
   var LOC = {
@@ -116,7 +116,15 @@
     'sh.section':              ['sh', 'section'],
     // 渲染环境的旋转 / 强度(setter); 环境本身只能点渲染面板的缩略图按钮切换
     'sh.envRotation':          ['sh', 'environmentRotation'],
-    'sh.envIntensity':         ['sh', 'environmentIntensity']
+    'sh.envIntensity':         ['sh', 'environmentIntensity'],
+    // ---- N2: 命令派发(know-how/command-dispatch.md) ----
+    'geo.items':               ['geo', 'items'],
+    'ed.docUnit':              ['ed', 'document.settings._Unit.length'],
+    // 自建工厂命令的基类 Command: 取任一几何命令类的父类
+    'cmd.factoryBaseHolder':   ['ed', 'commands.CornerBoxCommand'],
+    // 几何工厂类(只在闭包里; 代理按需拍堆快照挂到 CFG.factoriesGlobal, 根 fac)
+    'fac.cornerBox':           ['fac', 'CornerBoxFactory'],
+    'fac.multiFillet':         ['fac', 'MultiFilletShellFactory']
   };
 
   // 选择集里的各类 id 集合：[对外的 kind, Selection 上的集合名]。sel.ids.<kind> 表键由此生成。
@@ -224,7 +232,36 @@
     mementoNodeMaterials: 'materials',  // memento.nodes.materials = [nodeKeys(类型化数组), materialIds]
     node2material: 'node2material',     // nodes.read.node2material: nodeKey → materialId
     // 材质的贴图槽: { repeat, texture: THREE.Texture }(normalMap / roughnessMap …); 文件名在 texture.userData(同 matcapFileKey)
-    materialTexSlot: 'texture'
+    materialTexSlot: 'texture',
+    // ---- N2: 命令派发 ----
+    // 工厂实例方法: resource(命令) 随命令释放; commit() 生成几何(返回新物体视图数组)
+    facResource: 'resource',
+    facCommit: 'commit',
+    solidCtor: 'Solid',
+    // 实体视图上的面组/边组; 组里 versionIds(拓扑 id '<物体>f<n>' / '<物体>e<n>')与逐项 bboxes(6 个数一项)同序
+    shellGroups: { face: 'faces', edge: 'edges' },
+    groupVersionIds: 'versionIds',
+    groupBboxes: 'bboxes',
+    // 物体视图的版本 id(= lookupItemById 的 id): view.userData.versionId
+    itemUserData: 'userData',
+    // 文档长度单位 → 内部单位(米)的倍数
+    unitScale: { millimeter: 0.001, centimeter: 0.01, meter: 1, inch: 0.0254, foot: 0.3048 },
+    // 布尔运算(Parasolid PK_boolean_*_c; union 实测, 另两个按同一枚举)
+    boolOps: { union: 15903, subtract: 15902, intersect: 15901 },
+    boolSetters: { op: 'operationType', targets: 'targets' },
+    // 每步命令的超时(ms); 按位置挑边/面的默认容差(文档单位)
+    cmdTimeoutMs: 15000,
+    pickTolerance: 0.5,
+    // 配方表(唯一来源): 对外操作名 → 工厂表键 + 参数(对外名 → [工厂 setter, 类型]) + 必填 + 是否支持布尔。
+    // 类型决定换算: point(文档单位 → 米, 构造 Vector3) / length / angle(度 → 弧度) / number / bool /
+    //               edges / faces(拓扑 id 或 {near, of?, tol?}) / solids(物体 id / '$引用' / {name})。
+    // 参数按这里的顺序设置。
+    recipes: {
+      box: { fac: 'fac.cornerBox', bool: true, required: ['p1', 'p2', 'height'],
+             params: { p1: ['p1', 'point'], p2: ['p2', 'point'], height: ['height', 'length'] } },
+      fillet: { fac: 'fac.multiFillet', required: ['edges', 'distance'],
+                params: { edges: ['edges', 'edges'], distance: ['distance', 'length'] } }
+    }
   };
 
   // =====================================================================
@@ -256,7 +293,9 @@
     'tree':      { needs: [], dom: true },
     'mat.state': { needs: ['ed.originator', 'nodes.state'], optional: ['mat.textures', 'tex.get'] },
     'mat.set':     { todo: 'N1' },
-    'cmd.exec':    { todo: 'N2' },
+    // 工厂类不列入: 首次使用前本来就没有(由代理按需挂上), 缺哪个在执行时按表键报
+    'cmd.exec':    { needs: ['ed.enqueue', 'sig.commandEnded', 'exec.cancel', 'cmd.factoryBaseHolder', 'geo.items',
+                             'geo.lookupTopo', 'geo.lookupItem', 'ed.docUnit', 'vp.camera'] },
     'bool.run':    { todo: 'N4' },
     'asset.place': { todo: 'N5' }
   };
@@ -305,6 +344,7 @@
       case 'sh': return get('ed.shadingDb');
       case 'ds': return get('ed.docSettings');
       case 'tex': return get('mat.textures');
+      case 'fac': return W[CFG.factoriesGlobal];
     }
     return undefined;
   }
@@ -890,6 +930,215 @@
   def('sel.clear', 'sel.apply', function () {
     var Ctor = need('cmd.selectionBaseHolder');
     return runCommand(new Ctor(editor()), 5000).then(function (how) { return { how: how, size: get('sel.size') }; });
+  }, { async: true });
+
+  // =====================================================================
+  // N2: 命令派发(know-how/command-dispatch.md)
+  // 不模拟点选: 每步 = 配方表里的几何工厂(new F(editor) → setter 设参 → commit), 包在自建 Command 里入队,
+  // 与手工操作同路径(进撤销栈, 一步一个撤销步)。工厂类只在闭包里, 由代理堆快照挂到 CFG.factoriesGlobal;
+  // 还没挂上时抛 CFG.needFactoriesErr, Rust 侧据此让代理挂一次再重试。
+  // =====================================================================
+  function factoryCommandClass() {
+    var Base = Object.getPrototypeOf(need('cmd.factoryBaseHolder'));
+    if (typeof Base !== 'function') throw new CapError('cmd.factoryBaseHolder', ['cmd.factoryBaseHolder']);
+    if (state.facCmd && state.facCmd.base === Base) return state.facCmd.cls;
+    class PlaFactoryCommand extends Base {
+      constructor(editor, build) { super(editor); this.plaBuild = build; this.plaResult = null; this.plaErr = null; }
+      async execute() {
+        // 失败要再抛出去: 让 Plasticity 按命令失败收尾(工厂随 resource 释放、不进撤销栈)
+        try { this.plaResult = await this.plaBuild(this); } catch (e) { this.plaErr = errMsg(e); throw e; }
+      }
+    }
+    state.facCmd = { base: Base, cls: PlaFactoryCommand };
+    return PlaFactoryCommand;
+  }
+
+  function unitOf(a) {
+    var u = a && a.units ? String(a.units) : get('ed.docUnit');
+    var k = NAMES.unitScale[u];
+    if (typeof k !== 'number') throw new Error('unknown unit: ' + u + ' (known: ' + Object.keys(NAMES.unitScale).join(', ') + ')');
+    return { unit: u, k: k };
+  }
+
+  function solidViews() {
+    var out = [];
+    Array.from(need('geo.items') || []).forEach(function (it) {
+      var v = it && it[NAMES.lookupViewKey];
+      if (v && v.constructor && v.constructor.name === NAMES.solidCtor) out.push(v);
+    });
+    return out;
+  }
+
+  function itemIdOf(view) {
+    var ud = view && view[NAMES.itemUserData];
+    return ud && ud[NAMES.versionIdKey] !== undefined ? ud[NAMES.versionIdKey] : null;
+  }
+
+  // 物体包围盒(文档单位, 由逐面 bboxes 合成); 读不到 → null
+  function bboxOf(view, k) {
+    var g = view && view[NAMES.shellGroups.face];
+    var b = g && g[NAMES.groupBboxes];
+    if (!b || !b.length) return null;
+    var mn = [Infinity, Infinity, Infinity], mx = [-Infinity, -Infinity, -Infinity];
+    for (var i = 0; i + 5 < b.length; i += 6) {
+      for (var j = 0; j < 3; j++) { mn[j] = Math.min(mn[j], b[i + j]); mx[j] = Math.max(mx[j], b[i + 3 + j]); }
+    }
+    // bboxes 是 Float32: 只保留 7 位有效数字(再多就是单精度噪声, 如 100.000002)
+    var r = function (x) { return Number((x / k).toPrecision(7)); };
+    return [mn.map(r), mx.map(r)];
+  }
+
+  function describeMade(view, k) {
+    var id = itemIdOf(view);
+    if (id === null) return { kind: (view && view.constructor && view.constructor.name) || typeof view };
+    return { kind: 'solid', id: id, name: nameOf(view), bbox: bboxOf(view, k) };
+  }
+
+  // 物体引用: '$名' = 前面某步 id 的产物(必须还活着) / {name} = 大纲名 / 其余 = 物体 id
+  function resolveSolids(ref, refs) {
+    if (typeof ref === 'string' && ref.charAt(0) === '$') {
+      var made = refs[ref.slice(1)];
+      if (!made) throw new Error('unknown ref ' + ref);
+      var alive = solidViews();
+      var v = made.filter(function (x) { return alive.indexOf(x) >= 0; });
+      if (!v.length) throw new Error('ref ' + ref + ' no longer exists (consumed by a later step)');
+      return v;
+    }
+    if (ref && typeof ref === 'object' && typeof ref.name === 'string') {
+      var m = solidViews().filter(function (x) { return nameOf(x) === ref.name; });
+      if (!m.length) throw new Error('no solid named ' + JSON.stringify(ref.name));
+      return m;
+    }
+    var view = viewOf('solid', ref);
+    if (!view) throw new Error('solid not found: ' + JSON.stringify(ref));
+    return [view];
+  }
+
+  // 边/面选择: 拓扑 id 字符串, 或 {near:[x,y,z](文档单位), of?: 物体引用, tol?: 容差}。
+  // 按逐项包围盒中心取最近的一项; 超出容差、或有两项一样近(分不清)都报错, 不猜。
+  function pickTopo(kind, sel, ctx) {
+    if (typeof sel === 'string' && sel.charAt(0) !== '$') {
+      var byId = viewOf(kind, sel);
+      if (!byId) throw new Error(kind + ' not found: ' + sel);
+      return byId;
+    }
+    if (!sel || !Array.isArray(sel.near) || sel.near.length !== 3) throw new Error(kind + ' selector needs an id or {near:[x,y,z], of?, tol?}');
+    var k = ctx.k;
+    var pool = sel.of !== undefined ? resolveSolids(sel.of, ctx.refs) : solidViews();
+    var p = sel.near.map(function (x) { return Number(x) * k; });
+    var tol = (sel.tol !== undefined ? Number(sel.tol) : NAMES.pickTolerance) * k;
+    var best = null, bd = Infinity, second = Infinity;
+    pool.forEach(function (sv) {
+      var g = sv[NAMES.shellGroups[kind]];
+      var ids = g && g[NAMES.groupVersionIds], bx = g && g[NAMES.groupBboxes];
+      if (!ids || !bx) return;
+      ids = Array.from(ids);
+      for (var i = 0; i < ids.length; i++) {
+        var o = i * 6;
+        var d = Math.hypot((bx[o] + bx[o + 3]) / 2 - p[0], (bx[o + 1] + bx[o + 4]) / 2 - p[1], (bx[o + 2] + bx[o + 5]) / 2 - p[2]);
+        if (d < bd) { second = bd; bd = d; best = ids[i]; } else if (d < second) second = d;
+      }
+    });
+    var show = function (x) { return Math.round(x / k * 1000) / 1000; };
+    if (best === null || bd > tol) throw new Error(kind + ' near [' + sel.near.join(',') + ']: none within ' + show(tol) + (best === null ? '' : ' (nearest ' + show(bd) + ')'));
+    if (second - bd < 1e-9 * Math.max(1, k)) throw new Error(kind + ' near [' + sel.near.join(',') + ']: ambiguous (two equally near)');
+    var view = viewOf(kind, best);
+    if (!view) throw new Error(kind + ' ' + best + ' could not be looked up');
+    return view;
+  }
+
+  function convertParam(type, val, ctx) {
+    var num = function (x) { var n = Number(x); if (!isFinite(n)) throw new Error('not a number: ' + JSON.stringify(x)); return n; };
+    var list = function (x) { return Array.isArray(x) ? x : [x]; };
+    switch (type) {
+      case 'point':
+        if (!Array.isArray(val) || val.length !== 3) throw new Error('point must be [x,y,z]');
+        return new ctx.V3(num(val[0]) * ctx.k, num(val[1]) * ctx.k, num(val[2]) * ctx.k);
+      case 'length': return num(val) * ctx.k;
+      case 'angle': return num(val) * Math.PI / 180;
+      case 'number': return num(val);
+      case 'bool': return !!val;
+      case 'edges': return list(val).map(function (s) { return pickTopo('edge', s, ctx); });
+      case 'faces': return list(val).map(function (s) { return pickTopo('face', s, ctx); });
+      case 'solids': return list(val).reduce(function (acc, r) { return acc.concat(resolveSolids(r, ctx.refs)); }, []);
+    }
+    throw new Error('recipe: unknown param type ' + type);
+  }
+
+  // 一步 → build(cmd) 函数。参数在入队前全部换算好(选择器出错就不产生命令)。
+  function buildStep(o, ctx) {
+    var rc = NAMES.recipes[o.op];
+    var Fac = need(rc.fac);
+    var sets = [];
+    Object.keys(rc.params).forEach(function (p) {
+      if (o[p] === undefined) return;
+      sets.push([rc.params[p][0], convertParam(rc.params[p][1], o[p], ctx)]);
+    });
+    if (o.bool !== undefined) {
+      var targets = o.targets !== undefined ? convertParam('solids', o.targets, ctx) : [];
+      if (!targets.length) throw new Error('bool needs targets');
+      sets.push([NAMES.boolSetters.targets, targets]);
+      sets.push([NAMES.boolSetters.op, NAMES.boolOps[o.bool]]);
+    }
+    return function (cmd) {
+      var f = new Fac(cmd.editor);
+      f[NAMES.facResource](cmd);
+      sets.forEach(function (s) { f[s[0]] = s[1]; });
+      return f[NAMES.facCommit]();
+    };
+  }
+
+  function checkStep(o, i) {
+    var at = 'step #' + i + ' (' + (o && o.op) + '): ';
+    var rc = o && NAMES.recipes[o.op];
+    if (!rc) throw new Error(at + 'unknown op (known: ' + Object.keys(NAMES.recipes).join(', ') + ')');
+    rc.required.forEach(function (p) { if (o[p] === undefined) throw new Error(at + 'missing ' + p); });
+    Object.keys(o).forEach(function (p) {
+      if (p !== 'op' && p !== 'id' && p !== 'bool' && p !== 'targets' && !rc.params[p]) throw new Error(at + 'unknown param ' + p);
+    });
+    if (o.bool !== undefined) {
+      if (!rc.bool) throw new Error(at + 'bool not supported');
+      if (!(o.bool in NAMES.boolOps)) throw new Error(at + 'bool must be one of ' + Object.keys(NAMES.boolOps).join(', '));
+    }
+    need(rc.fac);
+  }
+
+  // 工厂挂载状态(只读): 供 Rust 判断要不要让代理拍快照、自检显示。
+  def('cmd.factories', 'cmd.exec', function () {
+    var F = W[CFG.factoriesGlobal];
+    var keys = {};
+    Object.keys(NAMES.recipes).forEach(function (op) { keys[NAMES.recipes[op].fac] = true; });
+    var missing = Object.keys(keys).filter(function (k) { return !resolve(k).ok; });
+    return { loaded: !!F, count: F ? Object.keys(F).length : 0, missing: missing, ops: Object.keys(NAMES.recipes) };
+  });
+
+  // 执行一串步骤。args = { ops: [{op, id?, <参数>..., bool?, targets?}], units?: 文档单位名(默认取文档设置) }。
+  // 每步一个命令(一个撤销步); 某步失败即停, 已完成的保留并如实返回:
+  // { units, results: [{index, op, id, items:[{kind, id, name, bbox}]}], failed: null | {index, op, err} }。
+  def('cmd.exec', 'cmd.exec', function (a) {
+    if (!a || !Array.isArray(a.ops) || !a.ops.length) throw new Error('cmd.exec needs {ops: [...]}');
+    if (!W[CFG.factoriesGlobal]) throw new Error(CFG.needFactoriesErr);
+    var U = unitOf(a);
+    a.ops.forEach(checkStep);
+    var ctx = { k: U.k, V3: need('vp.camera').position.constructor, refs: {} };
+    var Cls = factoryCommandClass();
+    var results = [];
+    var done = function (failed) { return { units: U.unit, results: results, failed: failed }; };
+    var step = function (i) {
+      if (i >= a.ops.length) return Promise.resolve(done(null));
+      var o = a.ops[i];
+      var build;
+      try { build = buildStep(o, ctx); } catch (e) { return Promise.resolve(done({ index: i, op: o.op, err: errMsg(e) })); }
+      var cmd = new Cls(editor(), build);
+      return runCommand(cmd, NAMES.cmdTimeoutMs).then(function (how) {
+        if (cmd.plaErr || how !== 'ended') return done({ index: i, op: o.op, err: cmd.plaErr || how });
+        var made = cmd.plaResult === null || cmd.plaResult === undefined ? [] : (Array.isArray(cmd.plaResult) ? cmd.plaResult : [cmd.plaResult]);
+        if (o.id) ctx.refs[o.id] = made.filter(function (v) { return itemIdOf(v) !== null; });
+        results.push({ index: i, op: o.op, id: o.id || null, items: made.map(function (v) { return describeMade(v, U.k); }) });
+        return step(i + 1);
+      });
+    };
+    return step(0);
   }, { async: true });
 
   // ---- 视角 / 视口杂项 ----

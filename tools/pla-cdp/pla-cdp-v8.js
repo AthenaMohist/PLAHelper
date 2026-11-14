@@ -34,8 +34,29 @@ const path = require('path');
 const http = require('http');
 const { spawn } = require('child_process');
 
-/** R14: the one editor-locate (heap snapshot) chain shared by all sessions. */
+/**
+ * R14: the one heap-snapshot chain shared by all sessions (editor locate, N2 closure
+ * expose). Parallel snapshots corrupted files and crashed Plasticity -> strictly serial.
+ */
 let locateInFlight = null;
+
+/**
+ * N2: custom CDP method handled by the proxy itself (not forwarded): heap snapshot ->
+ * closures whose name matches params.pattern -> revived on the same debugger session
+ * and stored on window[params.global]. Same name as Rust shim::PROXY_EXPOSE_CLOSURES.
+ */
+const PLA_EXPOSE_CLOSURES = 'PLA.exposeClosures';
+
+/**
+ * Runs fn after every earlier heap-snapshot job (and before later ones).
+ * @param {function(): Promise<*>} fn
+ * @return {Promise<*>}
+ */
+function runExclusive(fn) {
+  const p = (locateInFlight || Promise.resolve()).catch(() => {}).then(fn);
+  locateInFlight = p.catch(() => {});
+  return p;
+}
 
 /**
  * R19: main-process JS helper — the decimal HWND of a BrowserWindow. Plasticity can
@@ -227,6 +248,32 @@ function findEditorInHeapFile(heapPath) {
   return null;
 }
 
+/**
+ * N2: closures (functions/classes) whose name matches `re` -> heap object id
+ * (first hit per name).
+ * @param {string} heapPath
+ * @param {RegExp} re
+ * @return {Object<string, number>}
+ */
+function findClosuresInHeapFile(heapPath, re) {
+  const d = JSON.parse(fs.readFileSync(heapPath, 'utf8'));
+  const meta = d.snapshot.meta;
+  const nf = meta.node_fields.length;
+  const iType = meta.node_fields.indexOf('type');
+  const iName = meta.node_fields.indexOf('name');
+  const iId = meta.node_fields.indexOf('id');
+  const closureT = meta.node_types[0].indexOf('closure');
+  const nodes = d.nodes;
+  const strings = d.strings;
+  const found = {};
+  for (let o = 0; o < nodes.length; o += nf) {
+    if (nodes[o + iType] !== closureT) continue;
+    const name = strings[nodes[o + iName]];
+    if (!(name in found) && re.test(name)) found[name] = nodes[o + iId];
+  }
+  return found;
+}
+
 /* ------------------------------------------------------------------ */
 /* CDP proxy                                                            */
 /* ------------------------------------------------------------------ */
@@ -399,13 +446,9 @@ class RendererBridge {
     // parallel (each is ~160 MB; parallel ones corrupted pla-heap.json and a burst of
     // them crashed Plasticity). Later sessions wait for the running locate, then hit
     // the fast path.
-    const run = () => br.locateAndExposeEditor();
-    locateInFlight = (locateInFlight || Promise.resolve())
-      .catch(() => {})
-      .then(run)
-      .catch((e) => {
-        process.stderr.write('editor locate failed: ' + e.message + '\n');
-      });
+    runExclusive(() => br.locateAndExposeEditor()).catch((e) => {
+      process.stderr.write('editor locate failed: ' + e.message + '\n');
+    });
     return br;
   }
   constructor(io, key) {
@@ -456,30 +499,8 @@ class RendererBridge {
     if (await exposedNow()) return 'OK: already';
     await new Promise((r) => setTimeout(r, 6000));
     if (await exposedNow()) return 'OK: shim';
-    // 1) take heap snapshot, collect chunks in the renderer-side main world
-    const SNAP_JS = '(async () => {'
-      + ' const electron = process.mainModule.require("electron");'
-      + ' const hwndOf = ' + HWND_OF_JS + ';'
-      + ' const w = electron.BrowserWindow.getAllWindows().find((x) => hwndOf(x) === ' + JSON.stringify(this.key) + ');'
-      + ' if (!w) return "NO_SUCH_WINDOW";'
-      + ' const dbg = w.webContents.debugger;'
-      + ' const chunks = [];'
-      + ' const onMsg = (ev, method, params) => { if (method === "HeapProfiler.addHeapSnapshotChunk") chunks.push(params.chunk); };'
-      + ' dbg.on("message", onMsg);'
-      + ' await ' + this.sendRef + '("HeapProfiler.enable", {});'
-      + ' await ' + this.sendRef + '("HeapProfiler.takeHeapSnapshot", { reportProgress: false });'
-      + ' await new Promise(r => setTimeout(r, 8000));'
-      + ' dbg.removeListener("message", onMsg);'
-      + ' const fs = process.mainModule.require("fs");'
-      + ' try { fs.writeFileSync(' + JSON.stringify(heapPath) + ', chunks.join("")); }'
-      + ' catch (e) { return "WRITE_ERR: " + e.message; }'
-      + ' return "len=" + chunks.join("").length;'
-      + '})()';
-    const snap = await this.io.call('Runtime.evaluate', { expression: SNAP_JS, returnByValue: true, awaitPromise: true });
-    const snapLen = snap.result && snap.result.result && snap.result.result.value;
-    if (!snapLen || !String(snapLen).startsWith('len=')) {
-      throw new Error('snapshot failed: ' + JSON.stringify(snap).slice(0, 200));
-    }
+    // 1) take heap snapshot into a file
+    const snapLen = await this.snapshotToFile(heapPath);
     // 2) parse in-process (pure JS, no external Python dependency), get editor heap object id
     const foundId = findEditorInHeapFile(heapPath);
     if (foundId === null || foundId === undefined) {
@@ -501,6 +522,119 @@ class RendererBridge {
     if (revVal !== 'OK') throw new Error('expose failed: ' + JSON.stringify(rev).slice(0, 300));
     return 'OK';
   }
+
+  /**
+   * Takes a heap snapshot of this window's renderer and writes it to heapPath
+   * (chunks are collected in the main process; they never reach proxy clients).
+   * Waits until the chunk stream has been idle for 400 ms after the command
+   * returned (max 15 s) instead of a fixed sleep.
+   * @param {string} heapPath
+   * @return {Promise<string>} 'len=<n>'
+   */
+  async snapshotToFile(heapPath) {
+    const SNAP_JS = '(async () => {'
+      + ' const electron = process.mainModule.require("electron");'
+      + ' const hwndOf = ' + HWND_OF_JS + ';'
+      + ' const w = electron.BrowserWindow.getAllWindows().find((x) => hwndOf(x) === ' + JSON.stringify(this.key) + ');'
+      + ' if (!w) return "NO_SUCH_WINDOW";'
+      + ' const dbg = w.webContents.debugger;'
+      + ' const chunks = []; let last = Date.now();'
+      + ' const onMsg = (ev, method, params) => { if (method === "HeapProfiler.addHeapSnapshotChunk") { chunks.push(params.chunk); last = Date.now(); } };'
+      + ' dbg.on("message", onMsg);'
+      + ' try {'
+      + '   await ' + this.sendRef + '("HeapProfiler.enable", {});'
+      + '   await ' + this.sendRef + '("HeapProfiler.takeHeapSnapshot", { reportProgress: false });'
+      + '   const t0 = Date.now();'
+      + '   while (Date.now() - last < 400 && Date.now() - t0 < 15000) await new Promise(r => setTimeout(r, 100));'
+      + ' } finally { dbg.removeListener("message", onMsg); }'
+      + ' const fs = process.mainModule.require("fs");'
+      + ' const all = chunks.join("");'
+      + ' try { fs.writeFileSync(' + JSON.stringify(heapPath) + ', all); }'
+      + ' catch (e) { return "WRITE_ERR: " + e.message; }'
+      + ' return "len=" + all.length;'
+      + '})()';
+    const snap = await this.io.call('Runtime.evaluate', { expression: SNAP_JS, returnByValue: true, awaitPromise: true });
+    const snapLen = snap.result && snap.result.result && snap.result.result.value;
+    if (!snapLen || !String(snapLen).startsWith('len=')) {
+      throw new Error('snapshot failed: ' + JSON.stringify(snap).slice(0, 200));
+    }
+    return snapLen;
+  }
+
+  /**
+   * N2: heap snapshot -> closures matching params.pattern -> revived on this
+   * window's debugger session -> window[params.global][name]. Skips the snapshot
+   * when the global is already populated (unless params.force).
+   * @param {{pattern:string, global:string, force?:boolean}} params
+   * @return {Promise<object>} {cached, count, found, bad, ms, bytes}
+   */
+  async exposeClosures(params) {
+    const p = params || {};
+    if (!p.pattern || !p.global) throw new Error('exposeClosures needs {pattern, global}');
+    const re = new RegExp(p.pattern);
+    const G = JSON.stringify(p.global);
+    const evalPage = (expression) => this.io.call('Runtime.evaluate', {
+      expression: `${this.sendRef}("Runtime.evaluate", ${JSON.stringify({ expression, returnByValue: true })})`,
+      returnByValue: true, awaitPromise: true,
+    }).then((r) => {
+      const v = r.result && r.result.result && r.result.result.value;
+      return v && v.result ? v.result.value : undefined;
+    });
+    const t0 = Date.now();
+    if (!p.force) {
+      const n = await evalPage(`(() => { const g = window[${G}]; return g ? Object.keys(g).length : 0; })()`);
+      if (n > 0) return { cached: true, count: n, ms: Date.now() - t0 };
+    }
+    const os = require('os');
+    const heapPath = path.join(os.tmpdir(), `pla-heap-closures-${this.key}.json`);
+    const bytes = await this.snapshotToFile(heapPath);
+    const tSnap = Date.now();
+    let found;
+    try { found = findClosuresInHeapFile(heapPath, re); } finally { try { fs.unlinkSync(heapPath); } catch (e) {} }
+    const tParse = Date.now();
+    // Revive in one main-process evaluate (heap object ids are only valid on this debugger session).
+    // getObjectByHeapObjectId walks the whole heap per call (~0.3 s each on a 60 MB heap: 229
+    // classes took 73 s). So: revive ONE class by id, climb to the root of its class hierarchy,
+    // and Runtime.queryObjects(root) returns every subclass constructor in a single heap walk.
+    // Repeat for names still missing (other hierarchies).
+    const REVIVE_JS = '(async () => {'
+      + ' const S = ' + this.sendRef + ';'
+      + ' const ids = ' + JSON.stringify(found) + ';'
+      + ' const names = Object.keys(ids);'
+      + ' const done = new Set(); const bad = []; let walks = 0;'
+      + ' const STORE = "function (g, wanted, a, b) { const w = new Set(wanted); const G = (window[g] = window[g] || {}); const out = [];'
+      + '   const add = (f) => { if (typeof f === \\"function\\" && w.has(f.name) && !(f.name in G)) { G[f.name] = f; out.push(f.name); } };'
+      + '   this.forEach(add); add(a); add(b); return out; }";'
+      + ' const ROOT = "function () { let c = this; for (;;) { const p = Object.getPrototypeOf(c); if (!p || p === Function.prototype) return c; c = p; } }";'
+      + ' const rel = async (id) => { try { if (id) await S("Runtime.releaseObject", { objectId: id }); } catch (e) {} };'
+      + ' for (const name of names) {'
+      + '   if (done.has(name)) continue;'
+      + '   let anchor = null, root = null, list = null;'
+      + '   try {'
+      + '     const r = await S("HeapProfiler.getObjectByHeapObjectId", { objectId: String(ids[name]) }); walks++;'
+      + '     anchor = r && r.result && r.result.objectId;'
+      + '     if (!anchor) { bad.push(name); done.add(name); continue; }'
+      + '     const rr = await S("Runtime.callFunctionOn", { objectId: anchor, functionDeclaration: ROOT });'
+      + '     root = rr && rr.result && rr.result.objectId;'
+      + '     const q = await S("Runtime.queryObjects", { prototypeObjectId: root }); walks++;'
+      + '     list = q && q.objects && q.objects.objectId;'
+      + '     const st = await S("Runtime.callFunctionOn", { objectId: list, functionDeclaration: STORE, returnByValue: true,'
+      + '       arguments: [{ value: ' + G + ' }, { value: names }, { objectId: anchor }, { objectId: root }] });'
+      + '     ((st && st.result && st.result.value) || []).forEach((n) => done.add(n));'
+      + '     if (!done.has(name)) { bad.push(name); done.add(name); }'
+      + '   } catch (e) { bad.push(name + ": " + (e && e.message)); done.add(name); }'
+      + '   await rel(list); await rel(root); await rel(anchor);'
+      + ' }'
+      + ' try { await S("HeapProfiler.disable", {}); } catch (e) {}'
+      + ' return { ok: names.length - bad.length, bad, walks };'
+      + '})()';
+    const rev = await this.io.call('Runtime.evaluate', { expression: REVIVE_JS, returnByValue: true, awaitPromise: true });
+    const v = rev.result && rev.result.result && rev.result.result.value;
+    if (!v || typeof v.ok !== 'number') throw new Error('revive failed: ' + JSON.stringify(rev).slice(0, 300));
+    const tEnd = Date.now();
+    return { cached: false, count: v.ok, found: Object.keys(found).length, bad: v.bad.slice(0, 10), walks: v.walks, ms: tEnd - t0, bytes,
+             snapMs: tSnap - t0, parseMs: tParse - tSnap, reviveMs: tEnd - tParse };
+  }
   /** @param {Buffer} buf raw client bytes. */
   feedClient(buf) {
     this.buffer = Buffer.concat([this.buffer, buf]);
@@ -509,6 +643,14 @@ class RendererBridge {
       consumed = frameEnd;
       let msg;
       try { msg = JSON.parse(text); } catch (e) { return; }
+      // N2: handled here (needs main-process access), serialized with all heap snapshots.
+      if (msg.method === PLA_EXPOSE_CLOSURES) {
+        runExclusive(() => this.exposeClosures(msg.params)).then(
+          (v) => this.serverMsgCb && this.serverMsgCb({ id: msg.id, result: v }),
+          (e) => this.serverMsgCb && this.serverMsgCb({ id: msg.id, error: { code: -32000, message: String(e && e.message) } }),
+        );
+        return;
+      }
       const forward = `${this.sendRef}(${JSON.stringify(msg.method)}, ${JSON.stringify(msg.params || {})})`;
       this.io.call('Runtime.evaluate', {
         expression: forward,
