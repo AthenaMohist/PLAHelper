@@ -192,8 +192,9 @@
     cameraExtraKeys: ['fov', 'zoom', 'near', 'far'],
     // ---- R33: 视口状态 v2 ----
     vpStateVersion: 2,
-    // 视口上可读写的显示标量(getter/setter)。
-    vpScalars: ['fov', 'squish', 'curvatureScale', 'g0Scale', 'g1Scale', 'g2Scale'],
+    // 视口上可读写的显示标量(getter/setter)。不含 fov: 视口 fov 不是视场角而是投影开关(透视 1 / 正交 0),
+    // 写它(任何值)都会切成透视 —— 投影只由 view 段(togglePerspective)负责(用户实测 2026-11-15, pitfalls #58)。
+    vpScalars: ['squish', 'curvatureScale', 'g0Scale', 'g1Scale', 'g2Scale'],
     // LayerManager 的显示开关(getter/setter)。
     layerFlags: ['isShowingEdges', 'isShowingFaces', 'isShowingCurves', 'isShowingMeshes', 'isShowingImages',
                  'isShowingConstraints', 'isShowingControlPoints', 'isShowingContinuityLabels'],

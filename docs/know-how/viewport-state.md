@@ -22,7 +22,8 @@ shader mode、render mode、x-ray、摄像机参数、网格线、各类显示�
 | 视角 + X-ray + overlays + 构造面 + 着色 | `vp.snapshot()` / `vp.init(s)` | snapshot 里 camera{mode,position,quaternion,zoom,fov}, target, focalOffset, isXRay, showOverlays, constructionPlane{n,o}, shading | `vp.init(改过的 snapshot)` 一次到位, 改回原 snapshot 像素一致 |
 | 缩放 | `vp.orbitControls.zoom / zoomEnd` | snapshot.camera.zoom = 轨道控制器 zoom; `camera.zoom` 是派生值(差 ~0.6%) | 写 `oc.zoom` + `oc.zoomEnd`(阻尼两份); `vp.init` **不**恢复缩放 |
 | render mode | `vp.isRenderMode` / `vp.toggleRenderMode()` | getter | toggle; 与右上角圆形图标等价(进入: per-object 材质 + studio 环境 + AO; 退出复原) |
-| 视口标量 | `vp.fov / squish / curvatureScale / g0Scale / g1Scale / g2Scale` | getter | setter(均为 gs) |
+| 视口标量 | `vp.squish / curvatureScale / g0Scale / g1Scale / g2Scale` | getter | setter(均为 gs) |
+| 投影(透视/正交) | `vp.togglePerspective()`(同步生效); `vp.fov` 是投影开关(透视 1 / 正交 0), **不是视场角** | `vp.snapshot().camera.mode` | 模式不同才 toggle; **不要写 `vp.fov`**(任何值都会切成透视, pitfalls #58)。`vp.init` 收到 mode=perspective 会自己切透视, 反方向不会 |
 | 显示开关 | `ed.layers.isShowingEdges / Faces / Curves / Meshes / Images / Constraints / ControlPoints / ContinuityLabels`, `isXray` | getter | setter |
 | 着色 | `ed.shading.snapshot()`: mode, matcap(Texture, `userData.filename`), shader(材质实例, `.name`), isTinted, isSectioned, environment, rotation, intensity, shaderProperties | | 见下 |
 | 截面模式 | `ed.shading._sectionMode.tag`、`ed.sections.sections` | | 旧实现 |
