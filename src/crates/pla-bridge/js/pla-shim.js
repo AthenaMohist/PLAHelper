@@ -1163,14 +1163,27 @@
   }
 
   // 恢复着色: 点对应按钮(同面板操作一样完整切换模式), 再把 shader 参数写回。返回结果文字。
-  function applyShading(S) {
+  // panelPending = 本次恢复刚关掉 render mode, Shader Mode 面板下一帧才出现 → 找不到按钮时排队重试。
+  function applyShading(S, panelPending) {
     var sh = get('ed.shadingDb');
     var cur = shadingNow();
     var sameLook = cur.shader === S.shader && cur.matcap === S.matcap && cur.tint === S.tint;
+    var pending = false;
     if (!sameLook) {
       var btn = shaderButtons().filter(function (b) { return b.name === S.button; })[0];
+      var docOk = W.document && W.document.querySelectorAll && typeof W.setTimeout === 'function';
       if (btn) {
         btn.el.click();
+      } else if (docOk && panelPending) {
+        // 刚关掉 render mode 时 Shader Mode 面板下一帧才出来 → 每 200ms 再找, 最多 3s(找到后再写 shader 参数)
+        var tries = 0;
+        var again = function () {
+          var b = shaderButtons().filter(function (x) { return x.name === S.button; })[0];
+          if (b) { b.el.click(); W.setTimeout(function () { writeProps(); }, 300); return; }
+          if (++tries < 15) W.setTimeout(again, 200);
+        };
+        W.setTimeout(again, 200);
+        pending = true;
       } else if (!S.shader && S.matcap && !cur.shader && LOC['sh.setMatcap'] && get('sh.setMatcap')) {
         // 兜底(自定义 matcap 等面板上没有的): 只在当前不是 shader 模式时直接 setMatcap
         invokeOn('sh.setMatcap', [S.matcap, S.tint], sh);
@@ -1193,7 +1206,7 @@
       // 按钮切换若是异步的, 稍后再写一次参数
       if (!writeProps() && typeof W.setTimeout === 'function') W.setTimeout(writeProps, 400);
     }
-    return sameLook ? 'shading(same)' : 'shading:' + S.button;
+    return sameLook ? 'shading(same)' : (pending ? 'shading:pending ' : 'shading:') + S.button;
   }
 
   // memento 恢复(originator.restore)前的前置条件。实测(2026-11-14 夜): 窗口不可见(visibilityState=hidden,
@@ -1358,6 +1371,7 @@
       try { fn(); } catch (e) { failed.push(name + ':' + errMsg(e)); }
     }
     var v2 = S.v === NAMES.vpStateVersion;
+    var renderToggled = false;
     // ---- R33 v2 前段: 可见性 → 文档设置(网格/色调/AO) → render mode(它会改着色, 必须在着色之前) ----
     if (v2) {
       seg('vis', !!S.vis, function () { applied.push(applyVisibility(S.vis, missing)); });
@@ -1372,7 +1386,7 @@
       });
       seg('renderMode', typeof S.renderMode === 'boolean', function () {
         var V = viewport();
-        if (!!need('vp.isRenderMode') !== S.renderMode) invokeOn('vp.toggleRenderMode', [], V);
+        if (!!need('vp.isRenderMode') !== S.renderMode) { invokeOn('vp.toggleRenderMode', [], V); renderToggled = true; }
         applied.push('renderMode');
       });
     }
@@ -1432,9 +1446,9 @@
     seg('grid', !!S.grid, function () { assignPrims(need('vp.settings.grid'), S.grid, NAMES.gridKeys); applied.push('grid'); });
     // ---- R33 v2 后段: 着色(render mode 下由它接管, 不动) → 视角(vp.init) → 缩放 → 标量 → 显示开关 ----
     if (v2) {
-      seg('shading2', !!S.shading2 && !S.renderMode, function () { applied.push(applyShading(S.shading2)); });
+      seg('shading2', !!S.shading2 && !S.renderMode, function () { applied.push(applyShading(S.shading2, renderToggled)); });
       // render mode 下的环境(文件/旋转/强度); render mode 关时不动
-      seg('env', !!S.env && S.renderMode === true, function () { applied.push(applyEnv(S.env)); });
+      if (S.renderMode === true) seg('env', !!S.env, function () { applied.push(applyEnv(S.env)); });
       seg('section2', !!S.section2, function () { applied.push(applySection(S.section2)); });
       seg('view', !!S.view, function () {
         var V = viewport();
