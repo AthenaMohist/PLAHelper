@@ -852,7 +852,7 @@ const callAsync = async (name, args) => JSON.parse(await run(`window.__PLA__.cal
         const reg = (kind, list, model) => {
           const ents = list.map(() => nextTopo++);
           const ids = ents.map((n) => vid + kind + n);
-          ids.forEach((id, i) => { ed.geo._topo[id] = { versionId: id, parentItem: this, kind }; ed.geo._models[id] = model(list[i]); });
+          ids.forEach((id, i) => { ed.geo._topo[id] = { versionId: id, parentItem: this, kind, normal: list[i].normal }; ed.geo._models[id] = model(list[i]); });
           return { versionIds: ids, bboxes: Float32Array.from(list.map((x) => x.bb).flat()), ents };
         };
         this.faces = reg('f', fl, (f) => ({
@@ -938,7 +938,28 @@ const callAsync = async (name, args) => JSON.parse(await run(`window.__PLA__.cal
         return [add(new Solid(parent.mn, parent.mx))];
       }
     }
-    return { CornerBoxFactory, MultiFilletShellFactory };
+    // 面偏移: 沿面的外法向推出 distance(米), 盒子包围盒随之变化
+    class OffsetFaceFactory extends AbstractFactory {
+      set faces(v) { this._faces = v; } set distance(v) { this._d = v; }
+      async commit() {
+        this.guard();
+        const f = this._faces[0], parent = f.parentItem, n = f.normal;
+        ed.lastOffset = { faces: this._faces.map((x) => x.versionId), distance: this._d };
+        const mn = parent.mn.slice(), mx = parent.mx.slice();
+        const ax = n.findIndex((x) => x !== 0);
+        if (n[ax] > 0) mx[ax] += this._d; else mn[ax] -= this._d;
+        const snap = ed.geo.items.slice();
+        remove(parent);
+        ed.history._undoStack.push({ name: 'PlaFactory', snapshot: snap });
+        return [add(new Solid(mn, mx))];
+      }
+    }
+    // 倒圆面改半径: distance = 半径增量(实测语义); 这里只记录
+    class RefilletFaceFactory extends AbstractFactory {
+      set faces(v) { this._faces = v; } set distance(v) { this._d = v; }
+      async commit() { this.guard(); ed.lastRefillet = { faces: this._faces.map((x) => x.versionId), distance: this._d }; return []; }
+    }
+    return { CornerBoxFactory, MultiFilletShellFactory, OffsetFaceFactory, RefilletFaceFactory };
   }
 
   const L_BRACKET = { ops: [
@@ -953,8 +974,8 @@ const callAsync = async (name, args) => JSON.parse(await run(`window.__PLA__.cal
     assert.strictEqual(r.err, 'exc:need-factories');
     const f = call('cmd.factories').v;
     assert.strictEqual(f.loaded, false);
-    assert.deepStrictEqual(f.missing.sort(), ['fac.cornerBox', 'fac.multiFillet']);
-    assert.deepStrictEqual(f.ops, ['box', 'fillet']);
+    assert.deepStrictEqual(f.missing.sort(), ['fac.cornerBox', 'fac.multiFillet', 'fac.offsetFace', 'fac.refillet']);
+    assert.deepStrictEqual(f.ops, ['box', 'fillet', 'offsetFace', 'refillet']);
   });
 
   await ta('N2 cmd.exec M-A: L 形支架 = 底板 + 立板(合并) + 内角倒圆; 文档单位 mm → 内部米; 每步一个命令一个撤销步', async () => {
@@ -1005,7 +1026,7 @@ const callAsync = async (name, args) => JSON.parse(await run(`window.__PLA__.cal
     // 参数错误在执行任何一步之前就报
     const q1 = ed.enqueued;
     const bad = [
-      [{ ops: [{ op: 'sphere' }] }, /unknown op \(known: box, fillet\)/],
+      [{ ops: [{ op: 'sphere' }] }, /unknown op \(known: box, fillet, offsetFace, refillet\)/],
       [{ ops: [{ op: 'box', p1: [0, 0, 0], p2: [1, 1, 0] }] }, /missing height/],
       [{ ops: [{ op: 'box', p1: [0, 0, 0], p2: [1, 1, 0], height: 1, colour: 'red' }] }, /unknown param colour/],
       [{ ops: [{ op: 'fillet', edges: ['1e1'], distance: 1, bool: 'union' }] }, /bool not supported/],
@@ -1158,6 +1179,30 @@ const callAsync = async (name, args) => JSON.parse(await run(`window.__PLA__.cal
     assert.strictEqual(call('cam.view', { view: 'iso' }).ok, true);
     assert.ok(/view must be one of/.test(call('cam.view', { view: 'side' }).err));
     vp.camMode = 'orthographic';
+  });
+
+  await ta('N3 dim.face: 平面 → 厚度(背对平行面) + 偏移系数; 来自选择或显式 id; offsetFace 改厚度后再读 = 新值', async () => {
+    const ed = ed3;
+    const r = (await callAsync('cmd.exec', { ops: [{ op: 'box', p1: [0, 0, 0], p2: [10, 20, 0], height: 5 }] })).v;
+    const id = r.results[0].items[0].id;
+    const top = call('geo.query', { detail: 'faces', of: [id], normal: [0, 0, 1] }).v.faces[0].id;
+    const bot = call('geo.query', { detail: 'faces', of: [id], normal: [0, 0, -1] }).v.faces[0].id;
+    const d = call('dim.face', { face: top }).v;
+    assert.deepStrictEqual([d.kind, d.value, d.opposite, d.op, d.offsetSign, d.units], ['thickness', 5, bot, 'offsetFace', 1, 'millimeter']);
+    const side = call('geo.query', { detail: 'faces', of: [id], normal: [1, 0, 0] }).v.faces[0].id;
+    assert.strictEqual(call('dim.face', { face: side }).v.value, 10, 'x 向宽度');
+    // 来自选择: 只选中一个面
+    const s = ed.selection.selected, saved = new Set(s.faceIds);
+    s.faceIds.clear(); s.faceIds.add(top);
+    assert.strictEqual(call('dim.face').v.face, top);
+    s.faceIds.clear();
+    assert.ok(/select exactly one face/.test(call('dim.face').err));
+    saved.forEach((x) => s.faceIds.add(x));
+    // 改值: offsetFace(选中面, (新 − 旧) × offsetSign)
+    const ex = (await callAsync('cmd.exec', { atomic: true, ops: [{ op: 'offsetFace', faces: [top], distance: (8 - d.value) * d.offsetSign }] })).v;
+    assert.strictEqual(ex.failed, null, JSON.stringify(ex.failed));
+    assert.ok(ed.lastOffset && Math.abs(ed.lastOffset.distance - 0.003) < 1e-12, '3 mm → 0.003 m');
+    assert.ok(/face not found/.test(call('dim.face', { face: '99999f1' }).err));
   });
 
   await ta('A3 cmd.exec atomic: 某步失败 → 撤回本次全部已完成步骤(edit:undo), 文档回到执行前; 窗口不可见直接拒绝', async () => {

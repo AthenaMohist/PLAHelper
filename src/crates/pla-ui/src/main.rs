@@ -244,12 +244,11 @@ struct PlaApp {
     /// R7-27: Plasticity 侧最近一次命令报错(原文 + 堆栈)。
     cdp_err_msg: Option<String>,
     cdp_err_stack: String,
-    dim_value: f64,
-    /// 尺寸驱动(R7-16): 关联选择集 + 方向 + 数值(PRD P1-1 定义)。
-    dim_sets: Vec<String>,
-    dim_set_sel: usize,
-    dim_axis: usize,
-    dim_loaded: bool,
+    /// N3 改尺寸: 上次查询的面(拓扑 id); 查询结果(`dim.face` 的 v 或错误); 输入的目标值; 应用中。
+    dim_face: Option<String>,
+    dim_info: Option<Result<serde_json::Value, String>>,
+    dim_target: f64,
+    dim_busy: bool,
     hotkeys: HotkeyMap,
     /// 正在录制快捷键的动作名 (None = 未在录制)。
     recording: Option<String>,
@@ -2004,11 +2003,10 @@ impl PlaApp {
             cdp_undo: -1,
             cdp_err_msg: None,
             cdp_err_stack: String::new(),
-            dim_value: 0.0,
-            dim_sets: Vec::new(),
-            dim_set_sel: 0,
-            dim_axis: 0,
-            dim_loaded: false,
+            dim_face: None,
+            dim_info: None,
+            dim_target: 0.0,
+            dim_busy: false,
             hotkeys: pla_ui::hotkey::load_binds().unwrap_or_default(),
             recording: None,
             notice: None,
@@ -2139,6 +2137,15 @@ impl PlaApp {
                         self.live_sel.clear();
                     }
                 }
+                // N3: 面的可改尺寸 → 面板显示, 目标值初始化为当前值
+                pla_bridge::cdp::CdpEvent::CallResult { name, result } if name == pla_bridge::shim::api::DIM_FACE => {
+                    if let Ok(v) = &result {
+                        if let Some(x) = v["value"].as_f64() {
+                            self.dim_target = x;
+                        }
+                    }
+                    self.dim_info = Some(result);
+                }
                 pla_bridge::cdp::CdpEvent::CallResult { name, result } => match result {
                     // 即时生效类调用成功时不打扰(面板上已显示"立即生效"); 失败如实提示。
                     Ok(v) => pla_ui::diag::log(&format!("CDP {name} ok: {v}")),
@@ -2155,8 +2162,14 @@ impl PlaApp {
                 }
                 // N2: 命令派发回包(界面尚无发起入口; 结果文字随后的 Report 显示, 这里只记日志)。
                 pla_bridge::cdp::CdpEvent::ExecResult(r) => {
-                    if let Err(e) = r {
+                    if let Err(e) = &r {
                         eprintln!("[pla-ui] 命令派发失败: {e}");
+                    }
+                    // N3: 应用完成 → 面 id 已变(几何改了), 下一帧按当前选择重新查询
+                    if self.dim_busy {
+                        self.dim_busy = false;
+                        self.dim_face = None;
+                        self.dim_info = None;
                     }
                 }
                 // R34: 材质状态采集回包 → 失败如实提示; 成功则暂存并补发缩略图(同视口状态的串行流程)。
@@ -2969,10 +2982,10 @@ impl PlaApp {
         self.ms_wall.reset();
         self.ms_pending_state = None;
         self.ms_update_target = None;
-        // 尺寸驱动(关联选择集)
-        self.dim_sets.clear();
-        self.dim_set_sel = 0;
-        self.dim_loaded = false;
+        // N3 改尺寸
+        self.dim_face = None;
+        self.dim_info = None;
+        self.dim_busy = false;
     }
 
     fn update_snap(&mut self, ctx: &egui::Context) {
@@ -4852,112 +4865,82 @@ impl eframe::App for PlaApp {
                     true,
                     |ui| {
                         section_header(ui, "DIMENSION");
-                        // R7-16: 尺寸关联 = 选择集 + 方向 + 数值(PRD P1-1)。
-                        if !self.dim_loaded {
-                            self.dim_sets =
-                                pla_ui::selection::list_cdp_selections(&self.doc_key);
-                            self.dim_loaded = true;
+                        // N3 改尺寸: Plasticity 里只选中一个面 → dim.face 读出可改尺寸(厚度 / 半径 / 圆角半径)
+                        // → 改目标值 → cmd.exec {atomic, op(offsetFace | refillet), distance = (新 − 旧) × 系数}, 一个撤销步。
+                        if let Some(why) = self.feature_block(Feature::DimFace) {
+                            ui.label(egui::RichText::new(why).small().color(COL_RED));
                         }
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(tr("关联选择集:", "Linked set:"));
-                            let cur = self
-                                .dim_sets
-                                .get(self.dim_set_sel)
-                                .map(|s| s.as_str())
-                                .unwrap_or(tr("(无)", "(none)"));
-                            egui::ComboBox::from_id_salt("dim-set")
-                                .selected_text(cur)
-                                .show_ui(ui, |ui| {
-                                    for (i, s) in self.dim_sets.iter().enumerate() {
-                                        ui.selectable_value(&mut self.dim_set_sel, i, s);
-                                    }
+                        let faces: Vec<String> =
+                            self.live_sel.iter().filter(|it| it.kind == "face").map(|it| it.id.clone()).collect();
+                        let cur = (faces.len() == 1 && self.live_sel.len() == 1).then(|| faces[0].clone());
+                        if cur != self.dim_face && !self.dim_busy {
+                            self.dim_face = cur.clone();
+                            self.dim_info = None;
+                            if let Some(f) = &cur {
+                                self.cdp.send(pla_bridge::cdp::CdpCmd::Call {
+                                    name: pla_bridge::shim::api::DIM_FACE,
+                                    args: serde_json::json!({ "face": f }),
                                 });
-                            if ui.small_button(tr("刷新", "Refresh")).clicked() {
-                                self.dim_sets =
-                                    pla_ui::selection::list_cdp_selections(&self.doc_key);
                             }
-                        });
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(tr("方向:", "Axis:"));
-                            for (i, ax) in ["X", "Y", "Z"].iter().enumerate() {
-                                ui.selectable_value(&mut self.dim_axis, i, *ax);
+                        }
+                        let hint = |ui: &mut egui::Ui, s: &str| {
+                            ui.label(egui::RichText::new(s).small().color(COL_MUTED));
+                        };
+                        match (self.dim_face.clone(), self.dim_info.clone()) {
+                            (None, _) => hint(ui, tr(
+                                "在 Plasticity 里只选中一个面: 平面 = 厚度(到背对的平行面), 圆柱面 = 半径, 倒圆面 = 圆角半径。",
+                                "Select exactly one face in Plasticity: plane = thickness (to the opposite parallel face), cylinder = radius, fillet = fillet radius.",
+                            )),
+                            (Some(_), None) => hint(ui, tr("读取中…", "Reading…")),
+                            (Some(_), Some(Err(e))) => {
+                                ui.label(egui::RichText::new(t!("读不到这个面的尺寸: {e}", "Cannot read this face: {e}")).small().color(COL_RED));
                             }
-                            ui.label(tr("数值(毫米):", "Value (mm):"));
-                            ui.add(egui::DragValue::new(&mut self.dim_value).speed(0.1));
-                        });
-                        ui.horizontal_wrapped(|ui| {
-                            if ui.button(tr("① 选中关联实体", "① Select linked")).clicked() {
-                                let Some(name) = self.dim_sets.get(self.dim_set_sel).cloned() else {
-                                    self.set_notice((
-                                        true,
-                                        tr(
-                                            "没有已保存的选择集 — 先在选择集窗口保存",
-                                            "No saved selection sets — save one in the Selection sets panel first",
-                                        )
-                                        .into(),
-                                    ));
-                                    return;
+                            (Some(face), Some(Ok(v))) => {
+                                let kind = v["kind"].as_str().unwrap_or("none");
+                                let units = match v["units"].as_str().unwrap_or("") {
+                                    "millimeter" => "mm", "centimeter" => "cm", "meter" => "m", "inch" => "in", "foot" => "ft", u => u,
                                 };
-                                match pla_ui::selection::load_cdp_selection(&self.doc_key, &name) {
-                                    Some(members) => {
-                                        let entries: Vec<pla_bridge::cdp::ApplyEntry> = members
-                                            .iter()
-                                            .map(|m| pla_bridge::cdp::ApplyEntry {
-                                                kind: m.kind.clone(),
-                                                id: m.id.clone(),
-                                                key: m.key.clone(),
-                                                camera: m.camera.clone(),
-                                            })
-                                            .collect();
-                                        if entries.is_empty() {
-                                            self.set_notice((true, tr("选择集没有成员", "Selection set has no members").into()));
-                                        } else {
-                                            let n = entries.len();
-                                            self.send_apply(entries);
-                                            // R7-26: 应用完成后把焦点还给 Plasticity。
-                                            self.pending_focus = true;
-                                            self.set_notice((
-                                                false,
-                                                t!("正在选中 {n} 项 ({name})…", "Selecting {n} items ({name})…"),
-                                            ));
+                                let label = match kind {
+                                    "thickness" => tr("厚度(到背对的平行面)", "Thickness (to the opposite parallel face)"),
+                                    "radius" if v["convex"] == true => tr("半径(凸台, 轴线不动)", "Radius (boss, axis fixed)"),
+                                    "radius" => tr("半径(孔, 轴线不动)", "Radius (hole, axis fixed)"),
+                                    "filletRadius" => tr("圆角半径(保持与两侧相切)", "Fillet radius (stays tangent)"),
+                                    _ => "",
+                                };
+                                match (kind, v["value"].as_f64(), v["op"].as_str(), v["offsetSign"].as_f64()) {
+                                    ("none", ..) | (_, None, ..) | (_, _, None, _) | (.., None) => {
+                                        let surf = v["surface"].as_str().unwrap_or("?").to_string();
+                                        hint(ui, &t!(
+                                            "这个面没有可改的尺寸(曲面 {surf}; 平面需要同一实体里有背对的平行面)",
+                                            "No editable dimension on this face (surface {surf}; a plane needs an opposite parallel face in the same solid)"
+                                        ));
+                                    }
+                                    (_, Some(value), Some(op), Some(sign)) => {
+                                        ui.label(egui::RichText::new(label).color(COL_MUTED));
+                                        ui.horizontal(|ui| {
+                                            ui.label(t!("当前 {value} {units}  →", "Now {value} {units}  →"));
+                                            ui.add(egui::DragValue::new(&mut self.dim_target).speed(0.1).suffix(format!(" {units}")));
+                                        });
+                                        let changed = (self.dim_target - value).abs() > 1e-9;
+                                        let valid = self.dim_target > 0.0;
+                                        let btn = ui.add_enabled(
+                                            changed && valid && !self.dim_busy,
+                                            egui::Button::new(if self.dim_busy { tr("修改中…", "Applying…") } else { tr("应用", "Apply") }),
+                                        );
+                                        if btn.clicked() && self.require_feature(Feature::DimFace) {
+                                            let script = serde_json::json!({
+                                                "atomic": true,
+                                                "ops": [{ "op": op, "faces": [face], "distance": (self.dim_target - value) * sign }],
+                                            });
+                                            self.cdp.send(pla_bridge::cdp::CdpCmd::Exec(script));
+                                            self.dim_busy = true;
+                                            self.set_notice((false, t!("正在修改: {value} → {} {units}…", "Changing: {value} → {} {units}…", self.dim_target)));
                                         }
-                                    }
-                                    None => {
-                                        self.set_notice((true, t!("选择集 {name} 读取失败", "Failed to read selection set {name}")))
+                                        hint(ui, tr("一步可撤销(Ctrl+Z); 失败自动撤回。", "One undo step (Ctrl+Z); rolled back on failure."));
                                     }
                                 }
                             }
-                            if ui.button(tr("保存关联", "Save link")).clicked() {
-                                let Some(name) = self.dim_sets.get(self.dim_set_sel).cloned() else {
-                                    self.set_notice((true, tr("没有关联的选择集", "No linked selection set").into()));
-                                    return;
-                                };
-                                let axis = ["X", "Y", "Z"][self.dim_axis.min(2)];
-                                // 与选择集同目录(唯一入口 cdp_selections_dir)。
-                                let dir = pla_ui::selection::cdp_selections_dir(&self.doc_key);
-                                let json = serde_json::json!({
-                                    "set": name, "axis": axis, "value": self.dim_value,
-                                });
-                                match std::fs::write(
-                                    dir.join(format!("dim-{}.json", name)),
-                                    serde_json::to_vec_pretty(&json).unwrap_or_default(),
-                                ) {
-                                    Ok(_) => self.set_notice((
-                                        false,
-                                        t!("尺寸关联已保存: {name} {axis}={}", "Dimension link saved: {name} {axis}={}", self.dim_value),
-                                    )),
-                                    Err(e) => self.set_notice((true, t!("保存失败: {e}", "Save failed: {e}"))),
-                                }
-                            }
-                        });
-                        ui.label(
-                            egui::RichText::new(tr(
-                                "② 应用平移: 命令参数化(move-item 交互状态机)待活体逆向 — ① 已可用",
-                                "② Apply move: command parameterization (move-item state machine) pending live RE — ① works",
-                            ))
-                            .small()
-                            .color(COL_MUTED),
-                        );
+                        }
                     },
                 );
                 self.show_dim = flag;

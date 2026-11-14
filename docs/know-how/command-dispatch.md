@@ -102,6 +102,16 @@
 - 真机(MT_screws 副本): 3 步脚本第 3 步倒圆被内核拒绝(`PK_BODY_fix_blends` 16067) → 前 2 步撤回, 前后撤销栈 12 / 实体 31, 共 270 ms;
   `hist.begin` → 2 次 `cmd.exec` → `hist.rollback` 撤 2 步 102 ms, 回到原样。
 
+## N3 改尺寸用到的工厂(2026-11-15 副本实测)
+
+- `OffsetFaceFactory`(→ MultiModifyFaceFactory → MultiModifyShellFactory): `faces = [面视图]`, `distance`(米)。
+  **正 = 沿外法向长出去**(10 mm 高盒子顶面 +2 → 12)。圆柱面: 轴线不动、半径变(孔 = 凹, 外法向指向轴线 → 正值让孔变小)。
+  对**倒圆面**用它: 半径变了但圆角鼓出两侧平面(包围盒变大)—— 不是 CAD 意义的改圆角。
+- `RefilletFaceFactory`: `faces`, `distance` = **半径增量**(R2 + 0.003 → R5), 保持与两侧面相切(包围盒不变)。
+- 区分倒圆面: 面模型 `GetBlendRadius()` → 倒圆面返回半径(米), 普通圆柱返回 −1。
+- 垫片 `dim.face` 据此返回 `{kind: thickness|radius|filletRadius, value, op: offsetFace|refillet, offsetSign}`,
+  改值 = `cmd.exec {atomic: true, ops: [{op, faces: [面], distance: (新 − 旧) × offsetSign}]}`。
+
 ## 加一个新操作
 
 1. 副本上读工厂原型链的 setter 名(本文 4.), 用 lab 脚本试出参数取值与 commit 返回值;

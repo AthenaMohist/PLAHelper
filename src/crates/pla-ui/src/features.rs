@@ -83,6 +83,7 @@ pub enum Feature {
     AutoSnapSteps,
     ErrorDisplay,
     EntityTree,
+    DimFace,
 }
 
 impl Feature {
@@ -100,6 +101,7 @@ impl Feature {
         Feature::AutoSnapSteps,
         Feature::ErrorDisplay,
         Feature::EntityTree,
+        Feature::DimFace,
     ];
 
     pub fn label(self) -> &'static str {
@@ -117,6 +119,7 @@ impl Feature {
             Feature::AutoSnapSteps => tr("自动快照(定步数)", "Auto snapshot (every N steps)"),
             Feature::ErrorDisplay => tr("Plasticity 报错显示", "Plasticity error display"),
             Feature::EntityTree => tr("实体树", "Entity tree"),
+            Feature::DimFace => tr("改尺寸(厚度 / 半径)", "Resize (thickness / radius)"),
         }
     }
 
@@ -125,7 +128,7 @@ impl Feature {
             Feature::SelMirror | Feature::SelSave | Feature::SelApply => Group::Selection,
             Feature::VpSave | Feature::VpApply | Feature::MatSave | Feature::MatApply | Feature::OrbitStepLive | Feature::Roll => Group::View,
             Feature::ArrowKeysLive => Group::Input,
-            Feature::AutoSnapSteps | Feature::ErrorDisplay | Feature::EntityTree => Group::Document,
+            Feature::AutoSnapSteps | Feature::ErrorDisplay | Feature::EntityTree | Feature::DimFace => Group::Document,
         }
     }
 
@@ -145,6 +148,8 @@ impl Feature {
             Feature::AutoSnapSteps => &[cap::HIST_READ],
             Feature::ErrorDisplay => &[cap::ERR_HOOK],
             Feature::EntityTree => &[cap::TREE],
+            // N3: 读面尺寸(geo.read) + 面偏移 / 重新倒圆(cmd.exec, atomic 回滚要 hist.write)
+            Feature::DimFace => &[cap::GEO_READ, cap::CMD_EXEC, cap::HIST_WRITE],
         }
     }
 }

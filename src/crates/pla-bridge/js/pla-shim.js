@@ -128,7 +128,9 @@
     'snap.canonicals':         ['ss', 'canonicals'],
     'snap.occurrences':        ['ss', 'occurrences'],
     'fac.cornerBox':           ['fac', 'CornerBoxFactory'],
-    'fac.multiFillet':         ['fac', 'MultiFilletShellFactory']
+    'fac.multiFillet':         ['fac', 'MultiFilletShellFactory'],
+    'fac.offsetFace':          ['fac', 'OffsetFaceFactory'],
+    'fac.refillet':            ['fac', 'RefilletFaceFactory']
   };
 
   // 选择集里的各类 id 集合：[对外的 kind, Selection 上的集合名]。sel.ids.<kind> 表键由此生成。
@@ -265,7 +267,8 @@
       curve: 'GetCurve', curveKey: 'curve',   // edge.GetCurve() → { curve: Line|Circle|…, sense, uMin, uMax }
       length: 'FindLength', lengthKey: 'length', // edge.FindLength() → { length, min, max }
       vertices: 'GetVertices', vLeft: 'left', vRight: 'right', // edge.GetVertices() → { left, right }
-      point: 'GetPoint', ident: 'GetIdentifier'
+      point: 'GetPoint', ident: 'GetIdentifier',
+      blendRadius: 'GetBlendRadius'     // 倒圆面 → 半径(米); 普通圆柱 → −1(实测)
     },
     // 顶点没有 Plasticity 拓扑 id(lookupTopologyItemById 不认) → 自拟 '<物体版本id>v<顶点实体id>'(实体 id 取自吸附数据,
     // 与面/边拓扑 id 里的数字同一套; 没有吸附数据时退回 Parasolid 标识)
@@ -321,7 +324,13 @@
       box: { fac: 'fac.cornerBox', bool: true, required: ['p1', 'p2', 'height'],
              params: { p1: ['p1', 'point'], p2: ['p2', 'point'], height: ['height', 'length'] } },
       fillet: { fac: 'fac.multiFillet', required: ['edges', 'distance'],
-                params: { edges: ['edges', 'edges'], distance: ['distance', 'length'] } }
+                params: { edges: ['edges', 'edges'], distance: ['distance', 'length'] } },
+      // N3: 面沿法向偏移(正 = 沿外法向长出去, 实测见 know-how/command-dispatch.md)
+      offsetFace: { fac: 'fac.offsetFace', required: ['faces', 'distance'],
+                    params: { faces: ['faces', 'faces'], distance: ['distance', 'length'] } },
+      // N3: 倒圆面改半径(保持与两侧相切; distance = 半径增量, 实测 R2 + 3 → R5)
+      refillet: { fac: 'fac.refillet', required: ['faces', 'distance'],
+                  params: { faces: ['faces', 'faces'], distance: ['distance', 'length'] } }
     }
   };
 
@@ -1728,6 +1737,71 @@
     }
     return { view: name, data: shot.data, width: shot.width, height: shot.height,
              target: center.map(function (x) { return sig7(x / k); }), zoom: sig7(zoom), restored: !a.keep };
+  });
+
+  // =====================================================================
+  // N3: 面的可改尺寸。平面 → 厚度(同一实体里最近的背对平行平面, 投影有重叠的优先);
+  // 倒圆面 → 圆角半径(op = refillet, 保持相切); 普通圆柱等带半径的面 → 半径(op = offsetFace, 轴线不动;
+  // 凸 = 法向背离轴线: 外偏变大; 凹(孔) = 法向指向轴线: 外偏变小)。
+  // 改值 = cmd.exec { op, faces: [选中面], distance: (新 − 旧) × offsetSign }。
+  // (倒圆面若用 offsetFace, 半径变了但圆角鼓出两侧平面 —— 实测, 所以要分开。)
+  // =====================================================================
+  // args = { face?: 拓扑 id(默认 = 当前选择里唯一的面), units?, angleTol?: 度(默认 0.1) }
+  // → { face, solid, surface, kind: 'thickness'|'radius'|'filletRadius'|'none', value?, op?, offsetSign?, opposite?, normal?, axis?, units }
+  def('dim.face', 'geo.read', function (a) {
+    a = a || {};
+    var id = a.face;
+    if (!id) {
+      var ids = idList(need('sel.selected'), 'face');
+      if (ids.length !== 1) throw new Error('select exactly one face (selected faces: ' + ids.length + ')');
+      id = ids[0];
+    }
+    id = String(id);
+    var m = /^(\d+)[a-z]/.exec(id);
+    var sv = m && viewOf('solid', m[1]);
+    if (!sv) throw new Error('face not found: ' + id);
+    var U = unitOf(a), k = U.k, sid = itemIdOf(sv);
+    var entries = groupEntries(sv, 'face', k);
+    var me = entries.filter(function (e) { return e.id === id; })[0];
+    if (!me) throw new Error('face not found in its solid: ' + id);
+    var f = faceSig(me, sid, k);
+    var out = { face: id, solid: sid, surface: f.surface || null, units: U.unit, kind: 'none' };
+    var blend = -1;
+    try { var fm = modelOf('face', id); if (fm && typeof fm[NAMES.geoApi.blendRadius] === 'function') blend = fm[NAMES.geoApi.blendRadius](); } catch (e) {}
+    if (typeof blend === 'number' && blend > 0) {
+      out.kind = 'filletRadius'; out.value = sig7(blend / k); out.op = 'refillet'; out.offsetSign = 1;
+      return out;
+    }
+    if (typeof f.radius === 'number' && f.axisOrigin && f.axis && f.center && f.normal) {
+      var w = [f.center[0] - f.axisOrigin[0], f.center[1] - f.axisOrigin[1], f.center[2] - f.axisOrigin[2]];
+      var along = vdot(w, f.axis);
+      w = [w[0] - along * f.axis[0], w[1] - along * f.axis[1], w[2] - along * f.axis[2]];
+      var convex = vdot(w, f.normal) > 0;
+      out.kind = 'radius'; out.value = f.radius; out.axis = f.axis; out.convex = convex; out.op = 'offsetFace'; out.offsetSign = convex ? 1 : -1;
+      return out;
+    }
+    if (f.surface !== NAMES.planeSurface || !f.normal || !f.center) return out;
+    var n = f.normal, cosTol = Math.cos(((a.angleTol !== undefined ? Number(a.angleTol) : NAMES.parallelTolDeg) * Math.PI) / 180);
+    // 屏幕外两条世界轴上的投影重叠(法向的主轴之外)
+    var ax = [0, 1, 2].sort(function (p, q) { return Math.abs(n[q]) - Math.abs(n[p]); });
+    var overlap = function (b1, b2) {
+      return [ax[1], ax[2]].every(function (j) { return Math.min(b1[1][j], b2[1][j]) - Math.max(b1[0][j], b2[0][j]) > -1e-9; });
+    };
+    var best = null;
+    entries.forEach(function (e) {
+      if (e.id === id) return;
+      var o = faceSig(e, sid, k);
+      if (o.surface !== NAMES.planeSurface || !o.normal || !o.center) return;
+      if (vdot(o.normal, n) > -cosTol) return;
+      var d = vdot([f.center[0] - o.center[0], f.center[1] - o.center[1], f.center[2] - o.center[2]], n);
+      if (!(d > 1e-9)) return;
+      var ov = overlap(me.bbox, e.bbox);
+      if (!best || (ov && !best.ov) || (ov === best.ov && d < best.d)) best = { id: e.id, d: d, ov: ov };
+    });
+    out.normal = n;
+    if (!best) return out;
+    out.kind = 'thickness'; out.value = sig7(best.d); out.opposite = best.id; out.overlap = best.ov; out.op = 'offsetFace'; out.offsetSign = 1;
+    return out;
   });
 
   def('cam.vpRect', 'cam.read', function () {
