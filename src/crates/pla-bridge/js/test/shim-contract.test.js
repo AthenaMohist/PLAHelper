@@ -967,7 +967,24 @@ const callAsync = async (name, args) => JSON.parse(await run(`window.__PLA__.cal
       set faces(v) { this._faces = v; } set distance(v) { this._d = v; }
       async commit() { this.guard(); ed.lastRefillet = { faces: this._faces.map((x) => x.versionId), distance: this._d }; return []; }
     }
-    return { CornerBoxFactory, MultiFilletShellFactory, OffsetFaceFactory, RefilletFaceFactory };
+    // 整组面平移(仿实测): move(Vector3)与 matrix(平移矩阵)都设了才生效, 否则 commit 什么也不做(返回 null, 不进撤销栈)
+    class MultiMoveFaceFactory extends AbstractFactory {
+      constructor(editor) {
+        super(editor);
+        this.move = { x: 0, y: 0, z: 0, set(x, y, z) { this.x = x; this.y = y; this.z = z; } };
+        this.matrix = { t: null, makeTranslation(x, y, z) { this.t = [x, y, z]; return this; } };
+      }
+      set faces(v) { this._faces = v; }
+      async commit() {
+        this.guard();
+        const m = this.move;
+        if (!(m.x || m.y || m.z) || !this.matrix.t) return null;
+        ed.lastMove = { faces: this._faces.map((x) => x.versionId), move: [m.x, m.y, m.z], matrix: this.matrix.t };
+        ed.history._undoStack.push({ name: 'PlaFactory', snapshot: ed.geo.items.slice() });
+        return [];
+      }
+    }
+    return { CornerBoxFactory, MultiFilletShellFactory, OffsetFaceFactory, RefilletFaceFactory, MultiMoveFaceFactory };
   }
 
   const L_BRACKET = { ops: [
@@ -982,8 +999,8 @@ const callAsync = async (name, args) => JSON.parse(await run(`window.__PLA__.cal
     assert.strictEqual(r.err, 'exc:need-factories');
     const f = call('cmd.factories').v;
     assert.strictEqual(f.loaded, false);
-    assert.deepStrictEqual(f.missing.sort(), ['fac.cornerBox', 'fac.multiFillet', 'fac.offsetFace', 'fac.refillet']);
-    assert.deepStrictEqual(f.ops, ['box', 'fillet', 'offsetFace', 'refillet']);
+    assert.deepStrictEqual(f.missing.sort(), ['fac.cornerBox', 'fac.moveFaces', 'fac.multiFillet', 'fac.offsetFace', 'fac.refillet']);
+    assert.deepStrictEqual(f.ops, ['box', 'fillet', 'offsetFace', 'refillet', 'moveFaces']);
   });
 
   await ta('N2 cmd.exec M-A: L 形支架 = 底板 + 立板(合并) + 内角倒圆; 文档单位 mm → 内部米; 每步一个命令一个撤销步', async () => {
@@ -1034,7 +1051,7 @@ const callAsync = async (name, args) => JSON.parse(await run(`window.__PLA__.cal
     // 参数错误在执行任何一步之前就报
     const q1 = ed.enqueued;
     const bad = [
-      [{ ops: [{ op: 'sphere' }] }, /unknown op \(known: box, fillet, offsetFace, refillet\)/],
+      [{ ops: [{ op: 'sphere' }] }, /unknown op \(known: box, fillet, offsetFace, refillet, moveFaces\)/],
       [{ ops: [{ op: 'box', p1: [0, 0, 0], p2: [1, 1, 0] }] }, /missing height/],
       [{ ops: [{ op: 'box', p1: [0, 0, 0], p2: [1, 1, 0], height: 1, colour: 'red' }] }, /unknown param colour/],
       [{ ops: [{ op: 'fillet', edges: ['1e1'], distance: 1, bool: 'union' }] }, /bool not supported/],
@@ -1217,6 +1234,30 @@ const callAsync = async (name, args) => JSON.parse(await run(`window.__PLA__.cal
     assert.deepStrictEqual(d.candidates.map((c) => [c.id, c.value, c.overlap]), [[bot, 5, true]]);
     assert.strictEqual(call('dim.face', { face: top, opposite: bot }).v.value, 5);
     assert.ok(/not an opposite parallel face/.test(call('dim.face', { face: top, opposite: top }).err));
+  });
+
+  await ta('N3c dim.distance: 参考面(第一个) → 动的面组; 平面锚 → 法向距离 + 方向; moveFaces 同时设 move 与 matrix; 参数错如实报', async () => {
+    const ed = ed3;
+    const r = (await callAsync('cmd.exec', { ops: [{ op: 'box', p1: [0, 0, 0], p2: [10, 20, 0], height: 5 }] })).v;
+    const id = r.results[0].items[0].id;
+    const f = (n) => call('geo.query', { detail: 'faces', of: [id], normal: n }).v.faces[0].id;
+    const top = f([0, 0, 1]), bot = f([0, 0, -1]), side = f([1, 0, 0]);
+    const d = call('dim.distance', { reference: bot, moving: [top] }).v;
+    assert.deepStrictEqual([d.kind, d.value, d.anchor, d.anchorFace, d.op], ['distance', 5, 'plane', top, 'moveFaces']);
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(d.direction)), [0, 0, 1], '从参考面指向动的面');
+    // 不平行的面 → 用面中点(近似, 如实标出)
+    const c = call('dim.distance', { reference: bot, moving: [side] }).v;
+    assert.deepStrictEqual([c.anchor, c.value], ['center', 2.5]);
+    // 改值: 整组沿 direction 平移 (新 − 旧)
+    const ex = (await callAsync('cmd.exec', { atomic: true, ops: [{ op: 'moveFaces', faces: [top], move: d.direction.map((x) => x * (8 - d.value)) }] })).v;
+    assert.strictEqual(ex.failed, null, JSON.stringify(ex.failed));
+    assert.deepStrictEqual(ed.lastMove.move.map((x) => Math.round(x * 1e9) / 1e9), [0, 0, 0.003], '3 mm → 0.003 m');
+    assert.deepStrictEqual(ed.lastMove.matrix.map((x) => Math.round(x * 1e9) / 1e9), [0, 0, 0.003], '平移矩阵同时设');
+    // 参数错
+    assert.ok(/needs \{reference, moving/.test(call('dim.distance', { reference: bot }).err));
+    assert.ok(/also in moving/.test(call('dim.distance', { reference: bot, moving: [bot] }).err));
+    assert.ok(/face not found/.test(call('dim.distance', { reference: bot, moving: ['99999f1'] }).err));
+    assert.ok(/move must be \[dx,dy,dz\]/.test((await callAsync('cmd.exec', { ops: [{ op: 'moveFaces', faces: [top], move: [1, 2] }] })).v.failed.err));
   });
 
   await ta('N3 dim.face: 平面 → 厚度(背对平行面) + 偏移系数; 来自选择或显式 id; offsetFace 改厚度后再读 = 新值', async () => {

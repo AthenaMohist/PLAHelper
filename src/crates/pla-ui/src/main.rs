@@ -2162,7 +2162,9 @@ impl PlaApp {
                     }
                 }
                 // N3: 面的可改尺寸 → 面板显示, 目标值初始化为当前值
-                pla_bridge::cdp::CdpEvent::CallResult { name, result } if name == pla_bridge::shim::api::DIM_FACE => {
+                pla_bridge::cdp::CdpEvent::CallResult { name, result }
+                    if name == pla_bridge::shim::api::DIM_FACE || name == pla_bridge::shim::api::DIM_DISTANCE =>
+                {
                     if let Ok(v) = &result {
                         if let Some(x) = v["value"].as_f64() {
                             self.dim_target = x;
@@ -2619,23 +2621,30 @@ impl PlaApp {
                 let faces: Vec<String> =
                     self.live_sel.iter().filter(|it| it.kind == "face").map(|it| it.id.clone()).collect();
                 let only_faces = faces.len() == self.live_sel.len();
-                // 查询键: "面" 或 "面|指定对面"
+                // 查询键: 单选 = "面"(dim.face: 厚度 / 半径 / 圆角半径);
+                // 多选 = "D:参考|动的…"(dim.distance; 约定: **第一个选的面 = 参考面**, 其余 = 要动的面 —— 用户 2026-11-15 确认)
                 let cur = match faces.len() {
                     1 if only_faces => Some(faces[0].clone()),
-                    2 if only_faces => Some(format!("{}|{}", faces[0], faces[1])),
+                    n if n >= 2 && only_faces => Some(format!("D:{}", faces.join("|"))),
                     _ => None,
                 };
                 if cur != self.dim_face && !self.dim_busy {
                     self.dim_face = cur.clone();
                     self.dim_info = None;
                     if let Some(k) = &cur {
-                        let mut parts = k.split('|');
-                        let face = parts.next().unwrap_or("");
-                        let args = match parts.next() {
-                            Some(opp) => serde_json::json!({ "face": face, "opposite": opp }),
-                            None => serde_json::json!({ "face": face }),
-                        };
-                        self.cdp.send(pla_bridge::cdp::CdpCmd::Call { name: pla_bridge::shim::api::DIM_FACE, args });
+                        match k.strip_prefix("D:") {
+                            Some(list) => {
+                                let ids: Vec<&str> = list.split('|').collect();
+                                self.cdp.send(pla_bridge::cdp::CdpCmd::Call {
+                                    name: pla_bridge::shim::api::DIM_DISTANCE,
+                                    args: serde_json::json!({ "reference": ids[0], "moving": &ids[1..] }),
+                                });
+                            }
+                            None => self.cdp.send(pla_bridge::cdp::CdpCmd::Call {
+                                name: pla_bridge::shim::api::DIM_FACE,
+                                args: serde_json::json!({ "face": k }),
+                            }),
+                        }
                     }
                 }
                 let hint = |ui: &mut egui::Ui, s: &str| {
@@ -2657,14 +2666,25 @@ impl PlaApp {
                             .collect();
                         (format!("{}#{idx}#{}", v["face"], cands.len()), list)
                     }
+                    // 距离: 参考面绿色, 锚(孔 / 平行面)橙色; 动的面本身已是 Plasticity 的选中色
+                    Some(v) if v["kind"] == "distance" => (
+                        format!("D{}#{}", v["reference"], v["anchorFace"]),
+                        vec![
+                            serde_json::json!({ "id": v["reference"], "role": "source" }),
+                            serde_json::json!({ "id": v["anchorFace"], "role": "primary" }),
+                        ],
+                    ),
                     _ => (String::new(), Vec::new()),
                 };
                 self.dim_set_highlight(hl_key, hl_faces);
                 match (self.dim_face.clone(), self.dim_info.clone()) {
                     (None, _) => hint(ui, tr(
-                        "在 Plasticity 里选中一个面: 平面 = 厚度(到背对的平行面), 圆柱面 = 半径, 倒圆面 = 圆角半径。\n再按住 Shift 选第二个面 = 指定对面。",
-                        "Select one face in Plasticity: plane = thickness (to the opposite parallel face), cylinder = radius, fillet = fillet radius.\nShift-select a second face to pick the opposite face.",
+                        "选一个面: 平面 = 厚度(到背对的平行面), 圆柱面 = 半径, 倒圆面 = 圆角半径。\n先选参考平面, 再 Shift 加选要动的面(可多个: 孔的圆柱 + 倒角 / 凸台侧面…) = 距离 / 孔位。",
+                        "Select one face: plane = thickness (to the opposite parallel face), cylinder = radius, fillet = fillet radius.\nSelect a reference plane first, then Shift-add the faces to move (several: hole + chamfer / boss sides…) = distance / hole position.",
                     )),
+                    (Some(_), Some(Ok(v))) if v["kind"] == "distance" => {
+                        self.dim_distance_ui(ui, &v);
+                    }
                     (Some(_), None) => hint(ui, tr("读取中…", "Reading…")),
                     (Some(_), Some(Err(e))) => {
                         ui.label(egui::RichText::new(t!("读不到这个面的尺寸: {e}", "Cannot read this face: {e}")).small().color(COL_RED));
@@ -2784,6 +2804,50 @@ impl PlaApp {
             self.dim_win.closed();
             self.dim_set_highlight(String::new(), Vec::new());
         }
+    }
+
+    /// N3c: 多选 = 参考面(第一个, 绿) → 动的面组(锚 = 孔轴线 / 最近的平行面 / 面中点, 橙); 改值 = 整组沿方向平移。
+    fn dim_distance_ui(&mut self, ui: &mut egui::Ui, v: &serde_json::Value) {
+        let units = match v["units"].as_str().unwrap_or("") {
+            "millimeter" => "mm", "centimeter" => "cm", "meter" => "m", "inch" => "in", "foot" => "ft", u => u,
+        }
+        .to_string();
+        let Some(value) = v["value"].as_f64() else { return };
+        let moving: Vec<serde_json::Value> = v["moving"].as_array().cloned().unwrap_or_default();
+        let dir: Vec<f64> = v["direction"].as_array().map(|a| a.iter().filter_map(|x| x.as_f64()).collect()).unwrap_or_default();
+        let anchor = match v["anchor"].as_str().unwrap_or("") {
+            "axis" => tr("孔 / 凸台轴线", "hole / boss axis"),
+            "plane" => tr("最近的平行面", "nearest parallel face"),
+            _ => tr("面中点(近似: 没有平行面或垂直的轴线)", "face midpoint (approx.: no parallel face or perpendicular axis)"),
+        };
+        let n = moving.len();
+        ui.label(egui::RichText::new(tr("距离: 参考面(第一个选的, 绿) → 要动的面", "Distance: reference (first selected, green) → faces to move")).color(COL_MUTED));
+        ui.label(egui::RichText::new(t!("动 {n} 个面 · 量到: {anchor}(橙)", "Moving {n} faces · measured to: {anchor} (orange)")).small().color(COL_MUTED));
+        let mut enter = false;
+        ui.horizontal(|ui| {
+            ui.label(t!("当前 {value} {units}  →", "Now {value} {units}  →"));
+            let r = ui.add(egui::TextEdit::singleline(&mut self.dim_text).desired_width(70.0));
+            ui.label(&units);
+            enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        });
+        let target = self.dim_text.trim().parse::<f64>().ok();
+        let changed = target.is_some_and(|t| (t - value).abs() > 1e-9);
+        let valid = target.is_some_and(|t| t >= 0.0) && dir.len() == 3;
+        let can = changed && valid && !self.dim_busy;
+        let btn = ui.add_enabled(can, egui::Button::new(if self.dim_busy { tr("修改中…", "Applying…") } else { tr("应用", "Apply") }));
+        let go = btn.clicked() || (can && (right_click_confirm(ui) || enter));
+        if go && self.require_feature(Feature::DimFace) {
+            let t = target.unwrap_or(value);
+            let delta = t - value;
+            let script = serde_json::json!({
+                "atomic": true,
+                "ops": [{ "op": "moveFaces", "faces": moving, "move": [dir[0] * delta, dir[1] * delta, dir[2] * delta] }],
+            });
+            self.cdp.send(pla_bridge::cdp::CdpCmd::Exec(script));
+            self.dim_busy = true;
+            self.set_notice((false, t!("正在移动 {n} 个面: {value} → {t} {units}…", "Moving {n} faces: {value} → {t} {units}…")));
+        }
+        ui.label(egui::RichText::new(tr("右键 / 回车 = 应用 · 一步可撤销(Ctrl+Z) · 失败自动撤回", "Right-click / Enter = apply · one undo step (Ctrl+Z) · rolled back on failure")).small().color(COL_MUTED));
     }
 
     /// N3: 在 Plasticity 里高亮面(对面 = primary, 其余候选 = candidate); key 没变不重发; 空 = 清除。

@@ -112,6 +112,12 @@
 - 垫片 `dim.face` 据此返回 `{kind: thickness|radius|filletRadius, value, op: offsetFace|refillet, offsetSign}`,
   改值 = `cmd.exec {atomic: true, ops: [{op, faces: [面], distance: (新 − 旧) × offsetSign}]}`。
 
+- `MultiMoveFaceFactory`(→ MoveRotateScaleFactory2 → MultiTransformFaceFactory): `faces`, 平移要**同时**设
+  `move`(实例上的 Vector3, 用 `.set`)和 `matrix`(Matrix4, `.makeTranslation`)。只设 move: commit 返回 null、无效果;
+  只设 matrix: 同样无效果; `push()` 报 "Operation has no effect"; `prepare()` 抛 "reading 'elements'"。
+  配方 `moveFaces {faces, move: [dx,dy,dz]}`(参数类型 translation)。方槽 5 个面一次平移, 孔形不变。
+- 布尔相减 `operationType = 15902`(subtract)实测可用(盒子挖方槽)。
+
 ## 加一个新操作
 
 1. 副本上读工厂原型链的 setter 名(本文 4.), 用 lab 脚本试出参数取值与 commit 返回值;

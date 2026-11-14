@@ -135,7 +135,8 @@
     'fac.cornerBox':           ['fac', 'CornerBoxFactory'],
     'fac.multiFillet':         ['fac', 'MultiFilletShellFactory'],
     'fac.offsetFace':          ['fac', 'OffsetFaceFactory'],
-    'fac.refillet':            ['fac', 'RefilletFaceFactory']
+    'fac.refillet':            ['fac', 'RefilletFaceFactory'],
+    'fac.moveFaces':           ['fac', 'MultiMoveFaceFactory']
   };
 
   // 选择集里的各类 id 集合：[对外的 kind, Selection 上的集合名]。sel.ids.<kind> 表键由此生成。
@@ -342,8 +343,14 @@
                     params: { faces: ['faces', 'faces'], distance: ['distance', 'length'] } },
       // N3: 倒圆面改半径(保持与两侧相切; distance = 半径增量, 实测 R2 + 3 → R5)
       refillet: { fac: 'fac.refillet', required: ['faces', 'distance'],
-                  params: { faces: ['faces', 'faces'], distance: ['distance', 'length'] } }
-    }
+                  params: { faces: ['faces', 'faces'], distance: ['distance', 'length'] } },
+      // N3c: 一组面整体平移(孔位 / 凸台位置 / 两面间距); move = [dx, dy, dz](文档单位)。
+      // 实测要同时设 move(Vector3)与 matrix(平移矩阵): 只设 move 无效果, 只设 matrix 也无效果。
+      moveFaces: { fac: 'fac.moveFaces', required: ['faces', 'move'],
+                   params: { faces: ['faces', 'faces'], move: [null, 'translation'] } }
+    },
+    // translation 类型参数写到工厂的哪两个字段(Vector3.set + Matrix4.makeTranslation)
+    translationFields: { vector: 'move', matrix: 'matrix' }
   };
 
   // =====================================================================
@@ -1151,6 +1158,9 @@
       case 'edges': return list(val).map(function (s) { return pickTopo('edge', s, ctx); });
       case 'faces': return list(val).map(function (s) { return pickTopo('face', s, ctx); });
       case 'solids': return list(val).reduce(function (acc, r) { return acc.concat(resolveSolids(r, ctx.refs)); }, []);
+      case 'translation':
+        if (!Array.isArray(val) || val.length !== 3) throw new Error('move must be [dx,dy,dz]');
+        return [num(val[0]) * ctx.k, num(val[1]) * ctx.k, num(val[2]) * ctx.k];
     }
     throw new Error('recipe: unknown param type ' + type);
   }
@@ -1162,7 +1172,14 @@
     var sets = [];
     Object.keys(rc.params).forEach(function (p) {
       if (o[p] === undefined) return;
-      sets.push([rc.params[p][0], convertParam(rc.params[p][1], o[p], ctx)]);
+      var type = rc.params[p][1], val = convertParam(type, o[p], ctx);
+      if (type === 'translation') {
+        // 平移: 向量与平移矩阵都要设(见 recipes.moveFaces)
+        var TF = NAMES.translationFields;
+        sets.push(function (f) { f[TF.vector].set(val[0], val[1], val[2]); f[TF.matrix].makeTranslation(val[0], val[1], val[2]); });
+      } else {
+        sets.push([rc.params[p][0], val]);
+      }
     });
     if (o.bool !== undefined) {
       var targets = o.targets !== undefined ? convertParam('solids', o.targets, ctx) : [];
@@ -1173,7 +1190,7 @@
     return function (cmd) {
       var f = new Fac(cmd.editor);
       f[NAMES.facResource](cmd);
-      sets.forEach(function (s) { f[s[0]] = s[1]; });
+      sets.forEach(function (s) { if (typeof s === 'function') s(f); else f[s[0]] = s[1]; });
       return f[NAMES.facCommit]();
     };
   }
@@ -1824,6 +1841,60 @@
     }
     out.kind = 'thickness'; out.value = pick.value; out.opposite = pick.id; out.overlap = pick.overlap; out.op = 'offsetFace'; out.offsetSign = 1;
     return out;
+  });
+
+  // N3c: 参考面 → 一组动的面的距离(约定: 第一个选的面 = 参考面, 其余 = 动的面; 用户 2026-11-15 确认)。
+  // 参考面必须是平面(法向 n)。动的面的"锚": 有圆柱等带轴线的面 → 轴线(要求与参考面平行, 即轴 ⟂ n; 孔位 / 凸台位置);
+  // 否则有与参考面平行的平面 → 其中离参考面最近的那个(两面间距 / 到近壁); 都没有 → 第一个面的中点(近似, 如实标出)。
+  // 距离 = 锚到参考平面的法向距离; direction = 参考面指向锚的单位向量。改值 = cmd.exec moveFaces(动的面, direction × (新 − 旧))。
+  // args = { reference: 拓扑 id, moving: [拓扑 id…], units?, angleTol? }
+  // → { kind: 'distance', value, anchor: 'axis'|'plane'|'center', anchorFace, direction, reference, moving, op: 'moveFaces', units }
+  def('dim.distance', 'geo.read', function (a) {
+    a = a || {};
+    var ref = a.reference !== undefined ? String(a.reference) : null;
+    var moving = (Array.isArray(a.moving) ? a.moving : (a.moving !== undefined ? [a.moving] : [])).map(String);
+    if (!ref || !moving.length) throw new Error('dim.distance needs {reference, moving: [...]}');
+    if (moving.indexOf(ref) >= 0) throw new Error('reference face is also in moving faces');
+    var U = unitOf(a), k = U.k;
+    var tolRad = ((a.angleTol !== undefined ? Number(a.angleTol) : NAMES.parallelTolDeg) * Math.PI) / 180;
+    var cosTol = Math.cos(tolRad), sinTol = Math.sin(tolRad);
+    var sigOf = function (id) {
+      var m = /^(\d+)[a-z]/.exec(id);
+      var sv = m && viewOf('solid', m[1]);
+      if (!sv) throw new Error('face not found: ' + id);
+      var e = groupEntries(sv, 'face', k).filter(function (x) { return x.id === id; })[0];
+      if (!e) throw new Error('face not found in its solid: ' + id);
+      return faceSig(e, itemIdOf(sv), k);
+    };
+    var r = sigOf(ref);
+    if (r.surface !== NAMES.planeSurface || !r.normal || !r.center) throw new Error('reference must be a plane (got ' + (r.surface || '?') + ')');
+    var ms = moving.map(sigOf);
+    var solids = {};
+    ms.forEach(function (m) { solids[m.solid] = true; });
+    if (Object.keys(solids).length > 1) throw new Error('moving faces must belong to one solid');
+    var n = r.normal, anchor = null, kind = null, anchorFace = null;
+    ms.some(function (m) {
+      // 轴线与参考面平行 = 轴 ⟂ 法向(夹角容差内)
+      if (typeof m.radius === 'number' && m.axis && m.axisOrigin && Math.abs(vdot(m.axis, n)) <= sinTol) {
+        anchor = m.axisOrigin; kind = 'axis'; anchorFace = m.id; return true;
+      }
+      return false;
+    });
+    if (!anchor) {
+      // 多个平行平面(如方槽两侧壁): 取离参考面最近的那个(确定、可预期: "到近壁")
+      var bestD = Infinity;
+      ms.forEach(function (m) {
+        if (m.surface !== NAMES.planeSurface || !m.normal || !m.center || Math.abs(vdot(m.normal, n)) < cosTol) return;
+        var dd = Math.abs(vdot([m.center[0] - r.center[0], m.center[1] - r.center[1], m.center[2] - r.center[2]], n));
+        if (dd < bestD) { bestD = dd; anchor = m.center; kind = 'plane'; anchorFace = m.id; }
+      });
+    }
+    if (!anchor) { anchor = ms[0].center; kind = 'center'; anchorFace = ms[0].id; }
+    if (!anchor) throw new Error('cannot locate moving faces');
+    var s = vdot([anchor[0] - r.center[0], anchor[1] - r.center[1], anchor[2] - r.center[2]], n);
+    var dir = s >= 0 ? n : [-n[0], -n[1], -n[2]];
+    return { kind: 'distance', value: sig7(Math.abs(s)), anchor: kind, anchorFace: anchorFace, direction: dir.map(sig7),
+             reference: ref, moving: moving, op: 'moveFaces', units: U.unit };
   });
 
   // N3: 面高亮。args = { faces: [{id, role?: primary|candidate|source}] } —— 每次调用替换上一次; faces 为空 = 清除。
