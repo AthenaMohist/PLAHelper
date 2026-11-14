@@ -41,6 +41,24 @@ pub fn open_dir(doc_key: &str) -> Result<(), String> {
     STORE.open_dir(doc_key)
 }
 
+/// 悬浮摘要: 显示模式 / 剖面 / 透视正交 / 缩放。
+pub fn brief(state: &str) -> String {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(state) else {
+        return pla_bridge::i18n::tr("状态数据无法解析", "State data unparsable").into();
+    };
+    let mode = v["shading"]["mode"].as_str().unwrap_or("-");
+    let sec = v["shading"]["section"].as_str().unwrap_or("none");
+    let nsec = v["sections"].as_array().map(|a| a.len()).unwrap_or(0);
+    let zoom = v["orbit"]["zoom"].as_f64();
+    let fov = v["cam"]["fov"].as_f64();
+    pla_bridge::t!(
+        "显示: {mode} / 剖面模式: {sec}({nsec}) / {} / zoom {}",
+        "Shading: {mode} / Section: {sec} ({nsec}) / {} / zoom {}",
+        if fov == Some(0.0) { pla_bridge::i18n::tr("正交", "Ortho") } else { pla_bridge::i18n::tr("透视", "Persp") },
+        zoom.map(|z| format!("{z:.1}")).unwrap_or("-".into()),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

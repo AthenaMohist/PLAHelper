@@ -28,6 +28,10 @@ pub enum CdpCmd {
     VpStateSave,
     /// R8-1: 恢复视口状态(state = VpStateSave 采集的 JSON)。
     VpStateApply(String),
+    /// R34: 采集材质状态(定义 + 指派) → MatStateResult。
+    MatStateSave,
+    /// R34: 恢复材质状态(state = MatStateSave 采集的 JSON; memento, 不进撤销栈) → Report。
+    MatStateApply(String),
     /// R8-1: 视口裁剪截图(Page.captureScreenshot clip=视口 rect)。
     /// 参数 = 输出 PNG 路径; 结果经 Status 上报。
     CaptureViewport(String),
@@ -86,6 +90,8 @@ pub enum CdpEvent {
     CallResult { name: &'static str, result: Result<Value, String> },
     /// R8-1: 视口状态采集回包(JSON 字符串; err 字段非空表示失败)。
     VpStateResult(String),
+    /// R34: 材质状态采集回包(JSON 字符串; err 字段非空表示失败)。
+    MatStateResult(String),
     /// R8-1: 视口截图回包(PNG 字节数)。
     ViewportPng(usize),
     /// R7-28: 请 UI 把前台焦点交还 Plasticity(武装按键丢失时重试前置)。
@@ -427,6 +433,24 @@ async fn session_loop(
                     Ok(s) => match shim_call(ws, &mut mid, shim::api::VP_RESTORE, s).await {
                         Ok(r) => fmt_vpstate_apply_result(&r.to_string()),
                         Err(e) => (false, crate::t!("视口状态恢复失败: {e}", "Restore viewport state failed: {e}")),
+                    },
+                };
+                let _ = ev_tx.send(CdpEvent::Report { ok, msg });
+            }
+            // ---- R34: 材质状态采集/恢复 ----
+            Ok(CdpCmd::MatStateSave) => {
+                let s = match shim_call(ws, &mut mid, shim::api::MAT_SAVE, Value::Null).await {
+                    Ok(v) => v.to_string(),
+                    Err(e) => serde_json::json!({ "err": e.to_string() }).to_string(),
+                };
+                let _ = ev_tx.send(CdpEvent::MatStateResult(s));
+            }
+            Ok(CdpCmd::MatStateApply(state)) => {
+                let (ok, msg) = match serde_json::from_str::<Value>(&state) {
+                    Err(e) => (false, crate::t!("材质状态恢复失败: 存档无法解析({e})", "Restore material state failed: unreadable save ({e})")),
+                    Ok(s) => match shim_call(ws, &mut mid, shim::api::MAT_RESTORE, s).await {
+                        Ok(r) => fmt_matstate_apply_result(&r),
+                        Err(e) => (false, crate::t!("材质状态恢复失败: {e}", "Restore material state failed: {e}")),
                     },
                 };
                 let _ = ev_tx.send(CdpEvent::Report { ok, msg });
@@ -817,6 +841,42 @@ fn fmt_vpstate_apply_result(raw: &str) -> (bool, String) {
     (!nothing && failed.is_empty(), msg)
 }
 
+/// R34: `mat.restore` 回包 → (ok, 提示)。
+/// applied = ["materials(same)"] 表示内容本来就一样(没碰 memento);
+/// missing = 当前文件里找不到的物体(node:id) / 材质(material:uuid) —— 如实列出, 有缺失不算全成功。
+fn fmt_matstate_apply_result(v: &Value) -> (bool, String) {
+    let list = |key: &str| -> Vec<String> {
+        v[key]
+            .as_array()
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .unwrap_or_default()
+    };
+    let (applied, missing, failed) = (list("applied"), list("missing"), list("failed"));
+    let mut msg = if applied.iter().any(|a| a == "materials(same)") {
+        crate::i18n::tr("材质状态与当前一致, 未改动", "Material state already matches; nothing changed").to_string()
+    } else if applied.is_empty() {
+        crate::i18n::tr("材质状态恢复: 没有任何项被应用", "Restore material state: nothing was applied").to_string()
+    } else {
+        let a = applied.join(" / ");
+        crate::t!("材质状态已恢复: {a}", "Material state restored: {a}")
+    };
+    if !failed.is_empty() {
+        let f = failed.join(", ");
+        msg.push_str(&crate::t!(" | 失败: {f}", " | failed: {f}"));
+    }
+    if !missing.is_empty() {
+        let n = missing.len();
+        let shown: Vec<&str> = missing.iter().take(6).map(|s| s.as_str()).collect();
+        let more = if n > 6 { " …" } else { "" };
+        let m = shown.join(", ");
+        msg.push_str(&crate::t!(
+            " | 当前文件找不到 {n} 项: {m}{more}",
+            " | {n} not found in this file: {m}{more}"
+        ));
+    }
+    (!applied.is_empty() && failed.is_empty() && missing.is_empty(), msg)
+}
+
 /// R10: 比较两个 CAM_SNAPSHOT_JS 回包的差异(相对位移 + 四元数夹角, 无量纲)。
 ///
 /// 用途: 「切到保存视角」之后回读一次相机, 确认真的切过去了。相机在 Plasticity
@@ -1164,6 +1224,20 @@ mod tests {
         assert!(!fmt_vpstate_apply_result(none).0);
         // 老格式 / 坏数据原样透出, 不丢信息
         assert_eq!(fmt_vpstate_apply_result("ok:cam,orbit").1, "视口状态已恢复: ok:cam,orbit");
+    }
+
+    #[test]
+    fn fmt_matstate_apply_result_reports_same_and_missing() {
+        let j = |s: &str| serde_json::from_str::<Value>(s).unwrap();
+        let (ok, s) = fmt_matstate_apply_result(&j(r#"{"applied":["materials(same)"],"missing":[],"failed":[]}"#));
+        assert!(ok, "{s}");
+        assert!(s.contains("一致") || s.contains("matches"), "{s}");
+        let (ok, s) = fmt_matstate_apply_result(&j(r#"{"applied":["materials:2","assign:11"],"missing":[],"failed":[]}"#));
+        assert!(ok && s.contains("assign:11"), "{s}");
+        // 找不到的物体必须如实列出, 且不算全成功(界面红色)
+        let (ok, s) = fmt_matstate_apply_result(&j(r#"{"applied":["materials:2","assign:10"],"missing":["node:abc","material:u9"],"failed":[]}"#));
+        assert!(!ok, "{s}");
+        assert!(s.contains("node:abc") && s.contains("material:u9") && s.contains('2'), "{s}");
     }
 
 }

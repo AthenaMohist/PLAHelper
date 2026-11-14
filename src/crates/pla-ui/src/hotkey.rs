@@ -36,6 +36,7 @@ pub enum Action {
     ToggleDim,        // 工具栏: 开/关尺寸驱动面板
     ToggleSettings,   // 工具栏: 开/关设置面板
     ToggleVpState,    // R8-1: 开/关视口状态面板
+    ToggleMatState,   // R34: 开/关材质状态面板
     ToggleNotes,      // R30: 开/关笔记面板(记录 + 计算器, 不与其他面板互斥)
 }
 
@@ -53,6 +54,7 @@ impl Action {
             Action::ToggleDim => tr("尺寸驱动面板", "Dimension panel"),
             Action::ToggleSettings => tr("设置面板", "Settings panel"),
             Action::ToggleVpState => tr("视口状态面板", "Viewport state panel"),
+            Action::ToggleMatState => tr("材质状态面板", "Material state panel"),
             Action::ToggleNotes => tr("笔记(记录 + 计算)", "Notes (notes + calculator)"),
         }
     }
@@ -70,14 +72,15 @@ impl Action {
             Action::ToggleDim => "📐",
             Action::ToggleSettings => "⚙",
             Action::ToggleVpState => "🎥",
+            Action::ToggleMatState => "🎨",
             Action::ToggleNotes => "📝",
         }
     }
-    pub const ALL: [Action; 12] = [
+    pub const ALL: [Action; 13] = [
         Action::SnapshotManual, Action::SnapshotRestore, Action::SelSave,
         Action::SelApply, Action::DimApply, Action::EntitiesRefresh,
         Action::ToggleSnapshots, Action::ToggleEntities, Action::ToggleDim,
-        Action::ToggleSettings, Action::ToggleVpState, Action::ToggleNotes,
+        Action::ToggleSettings, Action::ToggleVpState, Action::ToggleMatState, Action::ToggleNotes,
     ];
 }
 

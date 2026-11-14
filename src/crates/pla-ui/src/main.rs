@@ -13,6 +13,8 @@
 
 use std::time::{Duration, Instant};
 
+mod state_wall;
+
 use pla_bridge::i18n::tr;
 use pla_bridge::t;
 
@@ -53,8 +55,8 @@ const COL_GRAY_DOT: egui::Color32 = egui::Color32::from_rgb(0x77, 0x77, 0x77);
 // ---------------- 工具栏形态/吸附参数(可调) ----------------
 /// 工具栏固定逻辑尺寸: 圆点+分隔线+6 按钮+分隔线+关闭键。
 /// 宽 246(R8-1: +30 视口状态按钮); 高 30。
-/// R30: +30 笔记按钮 → 276。
-const TOOLBAR_SIZE: [f32; 2] = [276.0, 30.0];
+/// R30: +30 笔记按钮 → 276。R34: +30 材质状态按钮 → 306。
+const TOOLBAR_SIZE: [f32; 2] = [306.0, 30.0];
 /// 面板整体右移微调(逻辑 px, 按 ppp 缩放; R6-2e 用户要求再偏右 10)。
 const SNAP_RIGHT_SHIFT: f32 = 10.0;
 /// 吸附垂直微调(逻辑 pt, 按 ppp 缩放; 仅作用于探测命中分支)。
@@ -92,10 +94,11 @@ const ROUNDING: f32 = 10.0;
 /// 工具栏按钮列(横向排列, 顺序即产品顺序)。
 /// R7-5: 手动快照移入快照墙头部(图标钮); R7-11: 刷新实体移入选择集窗口头部 —
 /// 一级工具栏只留面板开关类按钮。R8-1: 加视口状态。
-const TOOLBAR_ACTIONS: [Action; 6] = [
+const TOOLBAR_ACTIONS: [Action; 7] = [
     Action::ToggleSnapshots,
     Action::ToggleEntities,
     Action::ToggleVpState,
+    Action::ToggleMatState,
     Action::ToggleDim,
     Action::ToggleNotes,
     Action::ToggleSettings,
@@ -103,6 +106,8 @@ const TOOLBAR_ACTIONS: [Action; 6] = [
 
 /// R8-1: 视口状态面板尺寸(同快照墙)。
 const PANEL_VPSTATE: [f32; 2] = [PANEL_SNAPSHOTS[0], PANEL_SNAPSHOTS[1]];
+/// R34: 材质状态面板尺寸(同视口状态)。
+const PANEL_MATSTATE: [f32; 2] = PANEL_VPSTATE;
 
 /// 面板逻辑尺寸 (宽, 高) — 子视口 OS 窗口大小。
 /// R7-6: 快照墙改窄加高(232x480) — 一行一个快照, 缩略图撑满内容宽。
@@ -272,24 +277,21 @@ struct PlaApp {
     /// R35: 三个面板的"更新"确认中(项名) + 视口状态更新的目标(采集回包后覆盖它, 而不是新建)。
     snap_update_confirm: Option<String>,
     sel_update_confirm: Option<String>,
-    vp_update_confirm: Option<String>,
     vp_update_target: Option<String>,
-    /// R8-1: 视口状态面板数据。
-    vp_states: Vec<pla_ui::vpstate::VpStateMeta>,
-    vp_states_loaded: bool,
+    /// R8-1: 视口状态面板(R34: 墙的界面状态并入 state_wall, 与材质状态共用)。
+    vp_wall: state_wall::StateWall,
     vp_pending_state: Option<String>,
-    vp_rename: Option<String>,
-    vp_rename_buf: String,
-    vp_delete_confirm: Option<String>,
-    vp_pngs: std::collections::HashMap<String, std::sync::Arc<[u8]>>,
     vp_shot_path: Option<String>,
+    /// R34: 材质状态面板 + 采集/更新流程(采集回包 → 缩略图 → 落盘)。
+    show_matstate: bool,
+    ms_wall: state_wall::StateWall,
+    ms_pending_state: Option<String>,
+    ms_shot_path: Option<String>,
+    ms_update_target: Option<String>,
     /// R8-1: 选择集截图缓存 + 管理模式 + pending 保存流程。
     sel_pngs: std::collections::HashMap<String, std::sync::Arc<[u8]>>,
     sel_manage: bool,
     sel_selected: std::collections::HashSet<String>,
-    /// R28: 视口状态面板自己的管理模式/勾选集(以前借用 sel_manage, 两个面板会一起进管理模式)。
-    vp_manage: bool,
-    vp_selected: std::collections::HashSet<String>,
     sel_save_pending: Option<(String, Vec<(String, String, String, Option<String>, Option<String>)>, Option<String>)>,
     sel_shot_path: Option<String>,
     /// 正在改名的快照名 + 编辑缓冲。
@@ -1352,12 +1354,20 @@ impl Default for PanelDragState {
     }
 }
 
+/// R34: 用同一套存档墙的两个面板。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StatePanel {
+    Vp,
+    Mat,
+}
+
 /// R8b: 二级面板标识(互斥用)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PanelId {
     Snapshots,
     Entities,
     VpState,
+    MatState,
     Dim,
     Settings,
     Caps,
@@ -2014,21 +2024,18 @@ impl PlaApp {
             sel_delete_confirm: None,
             snap_update_confirm: None,
             sel_update_confirm: None,
-            vp_update_confirm: None,
             vp_update_target: None,
-            vp_states: Vec::new(),
-            vp_states_loaded: false,
+            vp_wall: state_wall::StateWall::default(),
             vp_pending_state: None,
-            vp_rename: None,
-            vp_rename_buf: String::new(),
-            vp_delete_confirm: None,
-            vp_pngs: std::collections::HashMap::new(),
             vp_shot_path: None,
+            show_matstate: false,
+            ms_wall: state_wall::StateWall::default(),
+            ms_pending_state: None,
+            ms_shot_path: None,
+            ms_update_target: None,
             sel_pngs: std::collections::HashMap::new(),
             sel_manage: false,
             sel_selected: std::collections::HashSet::new(),
-            vp_manage: false,
-            vp_selected: std::collections::HashSet::new(),
             sel_save_pending: None,
             sel_shot_path: None,
             rename_edit: None,
@@ -2146,6 +2153,23 @@ impl PlaApp {
                             .send(pla_bridge::cdp::CdpCmd::CaptureViewport(path));
                     }
                 }
+                // R34: 材质状态采集回包 → 失败如实提示; 成功则暂存并补发缩略图(同视口状态的串行流程)。
+                pla_bridge::cdp::CdpEvent::MatStateResult(state) => {
+                    let err = serde_json::from_str::<serde_json::Value>(&state)
+                        .ok()
+                        .and_then(|v| v["err"].as_str().map(String::from));
+                    if let Some(e) = err {
+                        self.ms_update_target = None;
+                        self.set_notice((true, t!("材质状态采集失败: {e}", "Capturing material state failed: {e}")));
+                    } else {
+                        // 发 MatStateSave 前总会先设好 ms_shot_path; 截图失败也会回 ViewportPng(0) → 无图落盘
+                        self.ms_pending_state = Some(state);
+                        let path = self.ms_shot_path.clone().unwrap_or_else(|| {
+                            pla_ui::matstate::STORE.dir(&self.doc_key).join("__shot_tmp.png").display().to_string()
+                        });
+                        self.cdp.send(pla_bridge::cdp::CdpCmd::CaptureViewport(path));
+                    }
+                }
                 // R8-1: 视口截图回包 → 读盘, 完成 pending 存档。
                 // (len=0 = 截图失败 — 跳过读盘, pending 照常落盘为无图版本)
                 pla_bridge::cdp::CdpEvent::ViewportPng(png_len) => {
@@ -2160,8 +2184,7 @@ impl PlaApp {
                         self.vp_pending_state = None;
                         match pla_ui::vpstate::update_vpstate(&self.doc_key, &target, &state, png_bytes.as_deref()) {
                             Ok(()) => {
-                                self.vp_states_loaded = false;
-                                self.vp_pngs.clear();
+                                self.vp_wall.invalidate();
                                 self.set_notice((false, t!("视口状态已更新: {target}", "View state updated: {target}")));
                             }
                             Err(e) => self.set_notice((true, e)),
@@ -2177,8 +2200,7 @@ impl PlaApp {
                             Some(png),
                         ) {
                             Ok(stem) => {
-                                self.vp_states_loaded = false;
-                                self.vp_pngs.clear();
+                                self.vp_wall.invalidate();
                                 self.set_notice((false, t!("视口状态已保存: {stem}", "View state saved: {stem}")));
                             }
                             Err(e) => self.set_notice((true, e)),
@@ -2187,7 +2209,7 @@ impl PlaApp {
                         // 截图失败: 仍然保存(无图)
                         match pla_ui::vpstate::save_vpstate(&self.doc_key, &state, None) {
                             Ok(stem) => {
-                                self.vp_states_loaded = false;
+                                self.vp_wall.invalidate();
                                 self.set_notice((
                                     false,
                                     t!(
@@ -2195,6 +2217,33 @@ impl PlaApp {
                                         "View state saved: {stem} (capture failed, no thumbnail)"
                                     ),
                                 ));
+                            }
+                            Err(e) => self.set_notice((true, e)),
+                        }
+                    }
+                    // R34: 材质状态存档 / 更新(截图失败照样落盘, 只是没有缩略图)
+                    if let Some(state) = self.ms_pending_state.take() {
+                        let png = if png_len > 0 {
+                            self.ms_shot_path.clone().and_then(|p| std::fs::read(p).ok())
+                        } else {
+                            None
+                        };
+                        let store = pla_ui::matstate::STORE;
+                        let res = match self.ms_update_target.take() {
+                            Some(target) => store
+                                .update(&self.doc_key, &target, &state, png.as_deref())
+                                .map(|_| t!("材质状态已更新: {target}", "Material state updated: {target}")),
+                            None => store
+                                .save(&self.doc_key, &state, png.as_deref())
+                                .map(|stem| t!("材质状态已保存: {stem}", "Material state saved: {stem}")),
+                        };
+                        match res {
+                            Ok(mut msg) => {
+                                self.ms_wall.invalidate();
+                                if png.is_none() {
+                                    msg.push_str(tr("(截图失败, 无缩略图)", " (capture failed, no thumbnail)"));
+                                }
+                                self.set_notice((false, msg));
                             }
                             Err(e) => self.set_notice((true, e)),
                         }
@@ -2370,7 +2419,14 @@ impl PlaApp {
                 self.show_vpstate = !self.show_vpstate;
                 if self.show_vpstate {
                     self.close_secondary_panels_except(PanelId::VpState);
-                    self.vp_states_loaded = false;
+                    self.vp_wall.loaded = false;
+                }
+            }
+            Action::ToggleMatState => {
+                self.show_matstate = !self.show_matstate;
+                if self.show_matstate {
+                    self.close_secondary_panels_except(PanelId::MatState);
+                    self.ms_wall.loaded = false;
                 }
             }
             Action::ToggleDim => {
@@ -2607,6 +2663,168 @@ impl PlaApp {
         }
     }
 
+    /// R34: 视口状态 / 材质状态面板(同一套墙, 按 kind 取存储/文字/功能/CDP 命令)。返回面板是否仍开着。
+    fn state_panel(&mut self, ctx: &egui::Context, desired: egui::Pos2, kind: StatePanel) -> bool {
+        let (store, text, size, id, title, f_save, f_apply) = match kind {
+            StatePanel::Vp => (
+                pla_ui::vpstate::STORE,
+                state_wall::WallText {
+                    id: "vp",
+                    kind: tr("视口状态", "view state"),
+                    empty: tr("(空 — 点右上软盘图标保存当前视口)", "(Empty — click the disk icon at top right to save the view)"),
+                    batch_delete_tip: tr("删除勾选的视口状态(含截图), 不可恢复", "Delete checked view states (with images), cannot be undone"),
+                    update_confirm: |n| t!("用当前视口状态覆盖「{n}」? 原内容不可恢复", "Overwrite \"{n}\" with the current view state? The old content cannot be recovered"),
+                },
+                PANEL_VPSTATE,
+                "panel-vpstate",
+                tr("视口状态", "View states"),
+                Feature::VpSave,
+                Feature::VpApply,
+            ),
+            StatePanel::Mat => (
+                pla_ui::matstate::STORE,
+                state_wall::WallText {
+                    id: "ms",
+                    kind: tr("材质状态", "material state"),
+                    empty: tr("(空 — 点右上软盘图标保存当前材质与指派)", "(Empty — click the disk icon at top right to save materials and assignments)"),
+                    batch_delete_tip: tr("删除勾选的材质状态(含截图), 不可恢复", "Delete checked material states (with images), cannot be undone"),
+                    update_confirm: |n| t!("用当前材质与指派覆盖「{n}」? 原内容不可恢复", "Overwrite \"{n}\" with the current materials and assignments? The old content cannot be recovered"),
+                },
+                PANEL_MATSTATE,
+                "panel-matstate",
+                tr("材质状态", "Material states"),
+                Feature::MatSave,
+                Feature::MatApply,
+            ),
+        };
+        let mut flag = true;
+        let do_save = std::rc::Rc::new(std::cell::Cell::new(false));
+        let do_open_dir = std::rc::Rc::new(std::cell::Cell::new(false));
+        let do_manage = std::rc::Rc::new(std::cell::Cell::new(false));
+        let tip_slot = std::rc::Rc::new(std::cell::RefCell::new(None::<(String, String)>));
+        let (dsv, dodv, dmv, tsv) = (do_save.clone(), do_open_dir.clone(), do_manage.clone(), tip_slot.clone());
+        let (folder_tip, save_tip) = match kind {
+            StatePanel::Vp => (
+                tr("打开视口状态文件夹", "Open view state folder"),
+                tr("保存当前视口状态(VS 自动命名 + 截图)", "Save current view state (auto VS name + image)"),
+            ),
+            StatePanel::Mat => (
+                tr("打开材质状态文件夹", "Open material state folder"),
+                tr("保存当前材质与指派(MS 自动命名 + 截图)", "Save current materials and assignments (auto MS name + image)"),
+            ),
+        };
+        let icons: Box<dyn FnOnce(&mut egui::Ui)> = Box::new(move |ui| {
+            let vbtn = |ui: &mut egui::Ui, kind: IconKind, tip: &str, hit: &std::cell::Cell<bool>| {
+                if vector_icon_button(ui, kind, tip, &tsv).clicked() {
+                    hit.set(true);
+                }
+            };
+            vbtn(ui, IconKind::Trash, tr("批量删除", "Batch delete"), &dmv);
+            vbtn(ui, IconKind::Folder, folder_tip, &dodv);
+            vbtn(ui, IconKind::Save, save_tip, &dsv);
+        });
+        // 能力不可用: 面板顶部如实说明原因(点保存/恢复时 require_feature 同样拦截并提示)
+        let blocked: Vec<String> = [f_save, f_apply]
+            .iter()
+            .filter_map(|f| self.feature_block(*f).map(|why| t!("「{}」不可用: {why}", "\"{}\" unavailable: {why}", f.label())))
+            .collect();
+        let doc_key = self.doc_key.clone();
+        let mut wall = std::mem::take(match kind {
+            StatePanel::Vp => &mut self.vp_wall,
+            StatePanel::Mat => &mut self.ms_wall,
+        });
+        let brief = |name: &str| -> String {
+            match store.load(&doc_key, name) {
+                Some(s) => match kind {
+                    StatePanel::Vp => pla_ui::vpstate::brief(&s),
+                    StatePanel::Mat => pla_ui::matstate::brief(&s),
+                },
+                None => tr("状态数据缺失", "State data missing").into(),
+            }
+        };
+        let mut outcome = state_wall::WallOutcome::default();
+        header_extra_and_show(ctx, id, title, desired, egui::vec2(size[0], size[1]), &mut flag, true, |ui| {
+            for b in &blocked {
+                ui.label(egui::RichText::new(b).small().color(COL_RED));
+            }
+            outcome = state_wall::show(ui, &mut wall, store, &doc_key, &text, &brief);
+        }, Some(icons));
+        match kind {
+            StatePanel::Vp => self.vp_wall = wall,
+            StatePanel::Mat => self.ms_wall = wall,
+        }
+        for n in outcome.notices {
+            self.set_notice(n);
+        }
+        if let Some(t) = tip_slot.borrow_mut().take().or(outcome.hint) {
+            self.hovered_hint = Some(t);
+        }
+        // 点击恢复
+        if let Some(name) = outcome.apply.filter(|_| self.require_feature(f_apply)) {
+            match store.load(&self.doc_key, &name) {
+                Some(state) => {
+                    let (cmd, msg) = match kind {
+                        StatePanel::Vp => (
+                            pla_bridge::cdp::CdpCmd::VpStateApply(state),
+                            t!("正在恢复视口状态「{name}」…", "Restoring view state \"{name}\"…"),
+                        ),
+                        StatePanel::Mat => (
+                            pla_bridge::cdp::CdpCmd::MatStateApply(state),
+                            t!("正在恢复材质状态「{name}」…", "Restoring material state \"{name}\"…"),
+                        ),
+                    };
+                    self.cdp.send(cmd);
+                    self.pending_focus = true;
+                    self.set_notice((false, msg));
+                }
+                None => self.set_notice((true, tr("状态数据缺失", "State data missing").into())),
+            }
+        }
+        // 保存 / 更新: 先采集状态 → 回包后再截图(VpStateResult / MatStateResult 处理器触发) → 落盘
+        let update = outcome.update;
+        let want_save = do_save.get();
+        if (update.is_some() || want_save) && self.require_feature(f_save) {
+            let tmp = store.dir(&self.doc_key).join("__shot_tmp.png");
+            let _ = std::fs::create_dir_all(tmp.parent().unwrap_or(std::path::Path::new(".")));
+            let tmp = tmp.display().to_string();
+            let target = if want_save { None } else { update };
+            let msg = match &target {
+                Some(n) => t!("正在更新 {n}…", "Updating {n}…"),
+                None => tr("正在采集当前状态…", "Capturing current state…").into(),
+            };
+            match kind {
+                StatePanel::Vp => {
+                    self.vp_shot_path = Some(tmp);
+                    self.vp_pending_state = None;
+                    self.vp_update_target = target;
+                    self.cdp.send(pla_bridge::cdp::CdpCmd::VpStateSave);
+                }
+                StatePanel::Mat => {
+                    self.ms_shot_path = Some(tmp);
+                    self.ms_pending_state = None;
+                    self.ms_update_target = target;
+                    self.cdp.send(pla_bridge::cdp::CdpCmd::MatStateSave);
+                }
+            }
+            self.set_notice((false, msg));
+        }
+        if do_open_dir.get() {
+            if let Err(e) = store.open_dir(&self.doc_key) {
+                self.set_notice((true, e));
+            }
+        }
+        if do_manage.get() {
+            let w = match kind {
+                StatePanel::Vp => &mut self.vp_wall,
+                StatePanel::Mat => &mut self.ms_wall,
+            };
+            w.manage = !w.manage;
+            w.selected.clear();
+            w.rename = None;
+        }
+        flag
+    }
+
     /// R8b: 二级面板统一互斥 — 打开一个, 关掉其余全部。
     fn close_secondary_panels_except(&mut self, keep: PanelId) {
         if keep != PanelId::Snapshots {
@@ -2617,6 +2835,9 @@ impl PlaApp {
         }
         if keep != PanelId::VpState {
             self.show_vpstate = false;
+        }
+        if keep != PanelId::MatState {
+            self.show_matstate = false;
         }
         if keep != PanelId::Dim {
             self.show_dim = false;
@@ -2733,17 +2954,15 @@ impl PlaApp {
         self.sel_delete_confirm = None;
         self.sel_rename = None;
         // 视口状态
-        self.vp_states.clear();
-        self.vp_states_loaded = false;
-        self.vp_pngs.clear();
-        self.vp_selected.clear();
+        self.vp_wall.reset();
         self.vp_pending_state = None;
-        self.vp_delete_confirm = None;
-        self.vp_rename = None;
         self.snap_update_confirm = None;
         self.sel_update_confirm = None;
-        self.vp_update_confirm = None;
         self.vp_update_target = None;
+        // 材质状态
+        self.ms_wall.reset();
+        self.ms_pending_state = None;
+        self.ms_update_target = None;
         // 尺寸驱动(关联选择集)
         self.dim_sets.clear();
         self.dim_set_sel = 0;
@@ -2937,6 +3156,7 @@ impl PlaApp {
             (self.show_snapshots, PANEL_SNAPSHOTS),
             (self.show_entities, PANEL_ENTITIES),
             (self.show_vpstate, PANEL_VPSTATE),
+            (self.show_matstate, PANEL_MATSTATE),
             (self.show_dim, PANEL_DIM),
             (self.show_settings, PANEL_SETTINGS),
             (self.show_caps, PANEL_CAPS),
@@ -3499,6 +3719,7 @@ impl eframe::App for PlaApp {
                             Action::ToggleSnapshots => self.show_snapshots,
                             Action::ToggleEntities => self.show_entities,
                             Action::ToggleVpState => self.show_vpstate,
+                            Action::ToggleMatState => self.show_matstate,
                             Action::ToggleDim => self.show_dim,
                             Action::ToggleSettings => self.show_settings,
                             Action::ToggleNotes => self.show_notes,
@@ -3646,6 +3867,9 @@ impl eframe::App for PlaApp {
             }
             if self.show_vpstate {
                 open.insert("panel-vpstate");
+            }
+            if self.show_matstate {
+                open.insert("panel-matstate");
             }
             if self.show_dim {
                 open.insert("panel-dim");
@@ -4596,366 +4820,15 @@ impl eframe::App for PlaApp {
             }
         }
 
-        // ============ R8-1: 视口状态面板(布局与快照墙一致) ============
+        // ============ R8-1 视口状态 / R34 材质状态面板(同一套墙: state_wall) ============
         if self.show_vpstate {
-            let desired = next_pos(&mut stack_y, PANEL_VPSTATE[1]);
-            if let Some(desired) = desired {
-                let mut flag = self.show_vpstate;
-                let do_save = std::rc::Rc::new(std::cell::Cell::new(false));
-                let do_open_dir = std::rc::Rc::new(std::cell::Cell::new(false));
-                let do_manage = std::rc::Rc::new(std::cell::Cell::new(false));
-                let tip_slot = std::rc::Rc::new(std::cell::RefCell::new(None::<(String, String)>));
-                let (dsv, dodv, dmv, tsv) = (do_save.clone(), do_open_dir.clone(), do_manage.clone(), tip_slot.clone());
-                let icons: Box<dyn FnOnce(&mut egui::Ui)> = Box::new(move |ui| {
-                    let vbtn = |ui: &mut egui::Ui, kind: IconKind, tip: &str, hit: &std::cell::Cell<bool>, ts: &std::cell::RefCell<Option<(String, String)>>| {
-                        let resp = vector_icon_button(ui, kind, tip, ts);
-                        if resp.clicked() {
-                            hit.set(true);
-                        }
-                    };
-                    vbtn(ui, IconKind::Trash, tr("批量删除", "Batch delete"), &dmv, &tsv);
-                    vbtn(ui, IconKind::Folder, tr("打开视口状态文件夹", "Open view state folder"), &dodv, &tsv);
-                    vbtn(
-                        ui,
-                        IconKind::Save,
-                        tr("保存当前视口状态(VS 自动命名 + 截图)", "Save current view state (auto VS name + image)"),
-                        &dsv,
-                        &tsv,
-                    );
-                });
-                header_extra_and_show(
-                    ctx,
-                    "panel-vpstate",
-                    tr("视口状态", "View states"),
-                    desired,
-                    egui::vec2(PANEL_VPSTATE[0], PANEL_VPSTATE[1]),
-                    &mut flag,
-                    true,
-                    |ui| {
-                        let inner_tip = std::cell::RefCell::new(None::<(String, String)>);
-                        if !self.vp_states_loaded {
-                            self.vp_states = pla_ui::vpstate::list_vpstates(&self.doc_key);
-                            self.vp_states_loaded = true;
-                        }
-                        // R28: 管理模式操作条放列表顶部(与快照墙一致; 独立的 vp_manage/vp_selected, 不再借用选择集的)
-                        if self.vp_manage {
-                            let all: Vec<String> = self.vp_states.iter().map(|m| m.name.clone()).collect();
-                            let (del, done) = manage_bar(
-                                ui,
-                                &all,
-                                &mut self.vp_selected,
-                                tr("删除勾选的视口状态(含截图), 不可恢复", "Delete checked view states (with images), cannot be undone"),
-                            );
-                            if del {
-                                let names: Vec<String> = self.vp_selected.iter().cloned().collect();
-                                match pla_ui::vpstate::delete_vpstates(&self.doc_key, &names) {
-                                    Ok(n) => {
-                                        self.vp_states_loaded = false;
-                                        self.vp_states.retain(|m| !names.contains(&m.name));
-                                        for nm in &names { self.vp_pngs.remove(nm); }
-                                        self.vp_selected.clear();
-                                        self.set_notice((false, t!("已删除 {n} 个视口状态", "Deleted {n} view states")));
-                                    }
-                                    Err(e) => self.set_notice((true, e)),
-                                }
-                            }
-                            if done {
-                                self.vp_manage = false;
-                                self.vp_selected.clear();
-                            }
-                        }
-                        // PNG 缓存
-                        let vdir = pla_ui::vpstate::vpstate_dir(&self.doc_key);
-                        for m in self.vp_states.clone() {
-                            if !self.vp_pngs.contains_key(&m.name) {
-                                if let Ok(b) = std::fs::read(vdir.join(format!("{}.png", m.name))) {
-                                    self.vp_pngs.insert(m.name.clone(), std::sync::Arc::from(b));
-                                }
-                            }
-                        }
-                        let (fav_list, other_list): (Vec<_>, Vec<_>) =
-                            self.vp_states.iter().cloned().partition(|m| m.fav);
-                        if self.vp_states.is_empty() {
-                            ui.label(
-                                egui::RichText::new(tr(
-                                    "(空 — 点右上软盘图标保存当前视口)",
-                                    "(Empty — click the disk icon at top right to save the view)",
-                                ))
-                                .small()
-                                .color(COL_MUTED),
-                            );
-                        }
-                        let mut delete_ask: Option<String> = None; let mut update_ask: Option<String> = None;
-                        let mut apply_now: Option<String> = None;
-                        let mut fav_toggle: Option<(String, bool)> = None;
-                        let mut rename_start: Option<String> = None;
-                        let mut rename_commit = false;
-                        let mut rename_cancel = false;
-                        // 悬浮信息: 从 JSON 里提取相机/显示模式摘要
-                        let state_brief = |name: &str| -> String {
-                            match pla_ui::vpstate::load_vpstate(&self.doc_key, name) {
-                                Some(s) => {
-                                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
-                                        let mode = v["shading"]["mode"].as_str().unwrap_or("-");
-                                        let sec = v["shading"]["section"].as_str().unwrap_or("none");
-                                        let nsec = v["sections"].as_array().map(|a| a.len()).unwrap_or(0);
-                                        let zoom = v["orbit"]["zoom"].as_f64();
-                                        let fov = v["cam"]["fov"].as_f64();
-                                        t!(
-                                            "显示: {mode} / 剖面模式: {sec}({nsec}) / {} / zoom {}",
-                                            "Shading: {mode} / Section: {sec} ({nsec}) / {} / zoom {}",
-                                            if fov == Some(0.0) { tr("正交", "Ortho") } else { tr("透视", "Persp") },
-                                            zoom.map(|z| format!("{z:.1}")).unwrap_or("-".into()),
-                                        )
-                                    } else {
-                                        tr("状态数据无法解析", "State data unparsable").into()
-                                    }
-                                }
-                                None => tr("状态数据缺失", "State data missing").into(),
-                            }
-                        };
-                        // R23: 存档墙占满剩余高度(以前封顶屏高 1/3 → 收藏区挤得放不下一个); 管理模式给下方操作条留高度。
-                        let content_h = ui.available_height().max(72.0);
-                        egui::ScrollArea::vertical()
-                            .id_salt("vp-wall")
-                            .max_height(content_h)
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                let avail_w = ui.available_width();
-                                let sp = ui.spacing().item_spacing.x;
-                                let cell_w = ((avail_w - sp * 2.0) / 3.0).max(40.0);
-                                let mut item = |ui: &mut egui::Ui, meta: &pla_ui::vpstate::VpStateMeta, w: f32, img_h: f32| {
-                                    let mut del = false; let mut fav = false; let mut rn = false; let mut upd = false;
-                                    ui.allocate_ui_with_layout(
-                                        egui::vec2(w, img_h + 38.0),
-                                        egui::Layout::top_down(egui::Align::LEFT),
-                                        |ui| {
-                                            let png = self.vp_pngs.get(&meta.name);
-                                            let brief = state_brief(&meta.name);
-                                            let dims = png.and_then(|b| png_dims(b));
-                                            let img_resp = match (png, dims) {
-                                                (Some(bytes), Some((pw, ph))) => {
-                                                    let iw = (img_h * pw / ph).min(w);
-                                                    ui.allocate_ui_with_layout(
-                                                        egui::vec2(w, img_h),
-                                                        egui::Layout::top_down(egui::Align::Center),
-                                                        |ui| ui.add(
-                                                            egui::Image::from_bytes(png_uri("vp", &meta.name, &bytes), bytes.clone())
-                                                                .fit_to_exact_size(egui::vec2(iw, img_h))
-                                                                .sense(egui::Sense::click()),
-                                                        ),
-                                                    ).inner
-                                                }
-                                                _ => ui.add_sized(
-                                                    egui::vec2(w, img_h),
-                                                    egui::Label::new(egui::RichText::new(tr("无截图", "No image")).small().color(COL_MUTED)).sense(egui::Sense::click()),
-                                                ),
-                                            };
-                                            if img_resp.hovered() {
-                                                *inner_tip.borrow_mut() = Some((
-                                                    t!("{} — 视口状态", "{} — view state", meta.name),
-                                                    t!(
-                                                        "{brief} · 保存于 {} · 点击恢复",
-                                                        "{brief} · saved {} · click to restore",
-                                                        if meta.created.is_empty() { "-" } else { &meta.created }
-                                                    ),
-                                                ));
-                                            }
-                                            if img_resp.clicked() {
-                                                apply_now = Some(meta.name.clone());
-                                            }
-                                            ui.horizontal(|ui| {
-                                                if self.vp_manage {
-                                                    let mut on = self.vp_selected.contains(&meta.name);
-                                                    if ui.checkbox(&mut on, "").changed() {
-                                                        if on { self.vp_selected.insert(meta.name.clone()); } else { self.vp_selected.remove(&meta.name); }
-                                                    }
-                                                }
-                                                if self.vp_rename.as_deref() == Some(meta.name.as_str()) {
-                                                    ui.add_sized(egui::vec2((w - 60.0).max(30.0), 16.0), egui::TextEdit::singleline(&mut self.vp_rename_buf)).request_focus();
-                                                    let (enter, esc) = ui.input(|i| (i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Escape)));
-                                                    if enter { rename_commit = true; }
-                                                    if esc { rename_cancel = true; }
-                                                } else {
-                                                    // R8d: 名称独占一行
-                                                    let name_w = (w - if self.vp_manage { 16.0 + sp } else { 0.0 }).max(30.0);
-                                                    let nr = ui.allocate_ui_with_layout(
-                                                        egui::vec2(name_w, 14.0),
-                                                        egui::Layout::left_to_right(egui::Align::Center),
-                                                        |ui| ui.add(egui::Label::new(egui::RichText::new(&meta.name).small().color(COL_TEXT)).sense(egui::Sense::click()).truncate()),
-                                                    ).inner;
-                                                    if nr.clicked() {
-                                                        apply_now = Some(meta.name.clone());
-                                                    }
-                                                }
-                                            });
-                                            // R8d: 第二行按钮组(★ ✎ 🗑)
-                                            ui.horizontal(|ui| {
-                                                let (srect, sresp) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::click());
-                                                ui.painter().text(srect.center(), egui::Align2::CENTER_CENTER, if meta.fav { "★" } else { "☆" }, egui::FontId::proportional(13.0), if meta.fav { egui::Color32::from_rgb(255,200,60) } else { COL_MUTED });
-                                                if sresp.on_hover_text(if meta.fav { tr("取消收藏", "Unfavorite") } else { tr("收藏(置顶)", "Favorite (pin to top)") }).clicked() { fav = true; }
-                                                if pencil_button(ui).on_hover_text(tr("改名", "Rename")).clicked() { rn = true; } if refresh_button(ui, 14.0).on_hover_text(tr("更新: 用当前状态覆盖这一项(需确认)", "Update: overwrite this item with the current state (confirm)")).clicked() { upd = true; }
-                                                let (drect, dresp) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::click());
-                                                let dcol = if dresp.hovered() { COL_RED } else { COL_MUTED };
-                                                let p = |x: f32, y: f32| egui::pos2(drect.left() + x, drect.top() + y);
-                                                ui.painter().line_segment([p(3.0,4.0), p(11.0,4.0)], egui::Stroke::new(1.2, dcol));
-                                                ui.painter().line_segment([p(5.5,4.0), p(5.5,2.5)], egui::Stroke::new(1.2, dcol));
-                                                ui.painter().line_segment([p(8.5,4.0), p(8.5,2.5)], egui::Stroke::new(1.2, dcol));
-                                                ui.painter().line_segment([p(6.2,2.5), p(7.8,2.5)], egui::Stroke::new(1.2, dcol));
-                                                ui.painter().line_segment([p(4.0,4.0), p(5.0,12.0)], egui::Stroke::new(1.2, dcol));
-                                                ui.painter().line_segment([p(10.0,4.0), p(9.0,12.0)], egui::Stroke::new(1.2, dcol));
-                                                ui.painter().line_segment([p(5.0,12.0), p(9.0,12.0)], egui::Stroke::new(1.2, dcol));
-                                                if dresp.on_hover_text(tr("删除(需确认)", "Delete (confirm)")).clicked() { del = true; }
-                                            });
-                                        },
-                                    );
-                                    (del, fav, rn, upd)
-                                };
-                                if !fav_list.is_empty() {
-                                    ui.label(egui::RichText::new(tr("★ 收藏", "★ Favorites")).small().strong().color(COL_MUTED));
-                                    let fav_img_h = fav_img_h_for(cell_w);
-                                    let fav_row_h = fav_img_h + 26.0; // R8e: 图+名称+紧凑按钮行
-                                    for trio in fav_list.chunks(3) {
-                                        let row_rect = ui.allocate_exact_size(egui::vec2(avail_w, fav_row_h), egui::Sense::hover()).0;
-                                        for (ci, meta) in trio.iter().enumerate() {
-                                            let cell = egui::Rect::from_min_size(
-                                                egui::pos2(row_rect.left() + ci as f32 * (cell_w + sp), row_rect.top()),
-                                                egui::vec2(cell_w, fav_row_h),
-                                            );
-                                            let (del, fav, rn, upd) = ui.allocate_new_ui(egui::UiBuilder::new().max_rect(cell), |ui| item(ui, meta, cell_w, fav_img_h)).inner;
-                                            if del { delete_ask = Some(meta.name.clone()); }
-                                            if fav { fav_toggle = Some((meta.name.clone(), !meta.fav)); }
-                                            if rn { rename_start = Some(meta.name.clone()); } if upd { update_ask = Some(meta.name.clone()); }
-                                        }
-                                    }
-                                    ui.separator();
-                                }
-                                if !other_list.is_empty() {
-                                    ui.label(egui::RichText::new(tr("全部", "All")).small().strong().color(COL_MUTED));
-                                    for meta in &other_list {
-                                        let (del, fav, rn, upd) = item(ui, meta, avail_w, big_img_h_for(avail_w));
-                                        ui.add_space(4.0);
-                                        if del { delete_ask = Some(meta.name.clone()); }
-                                        if fav { fav_toggle = Some((meta.name.clone(), !meta.fav)); }
-                                        if rn { rename_start = Some(meta.name.clone()); } if upd { update_ask = Some(meta.name.clone()); }
-                                    }
-                                }
-                            });
-                        // 删除确认(R8b: 弹层)
-                        if let Some(name) = self.vp_delete_confirm.clone() {
-                            let text = t!("删除「{name}」? 不可恢复", "Delete \"{name}\"? Cannot be undone");
-                            match confirm_popup(ui.ctx(), "vp-del", &text) {
-                                Some(true) => {
-                                    match pla_ui::vpstate::delete_vpstates(
-                                        &self.doc_key,
-                                        &[name.clone()],
-                                    ) {
-                                        Ok(_) => {
-                                            self.vp_states_loaded = false;
-                                            self.vp_pngs.remove(&name);
-                                            self.set_notice((false, t!("已删除「{name}」", "Deleted \"{name}\"")));
-                                        }
-                                        Err(e) => self.set_notice((true, e)),
-                                    }
-                                    self.vp_delete_confirm = None;
-                                }
-                                Some(false) => self.vp_delete_confirm = None,
-                                None => {}
-                            }
-                        }
-                        if let Some(n) = delete_ask {
-                            self.vp_delete_confirm = Some(n);
-                        }
-                        // R35: 更新确认 — 采集当前视口状态 + 缩略图, 覆盖这一项(名字与收藏保留)
-                        if let Some(name) = self.vp_update_confirm.clone() {
-                            let text = t!("用当前视口状态覆盖「{name}」? 原内容不可恢复", "Overwrite \"{name}\" with the current view state? The old content cannot be recovered");
-                            match confirm_popup_with(ui.ctx(), "vp-upd", &text, tr("确认更新", "Update"), COL_ACCENT) {
-                                Some(true) => {
-                                    let tmp = pla_ui::vpstate::vpstate_dir(&self.doc_key).join("__shot_tmp.png");
-                                    let _ = std::fs::create_dir_all(tmp.parent().unwrap_or(std::path::Path::new(".")));
-                                    self.vp_shot_path = Some(tmp.display().to_string());
-                                    self.vp_pending_state = None;
-                                    self.vp_update_target = Some(name.clone());
-                                    self.vp_pngs.remove(&name);
-                                    self.cdp.send(pla_bridge::cdp::CdpCmd::VpStateSave);
-                                    self.set_notice((false, t!("正在更新视口状态 {name}…", "Updating view state {name}…")));
-                                    self.vp_update_confirm = None;
-                                }
-                                Some(false) => self.vp_update_confirm = None,
-                                None => {}
-                            }
-                        }
-                        if let Some(n) = update_ask {
-                            self.vp_update_confirm = Some(n);
-                        }
-                        // 动作执行
-                        if let Some((name, fav)) = fav_toggle {
-                            let _ = pla_ui::vpstate::set_fav(&self.doc_key, &name, fav);
-                            self.vp_states_loaded = false;
-                        }
-                        if rename_cancel {
-                            self.vp_rename = None;
-                        }
-                        if let Some(old) = rename_start {
-                            self.vp_rename_buf = old.clone();
-                            self.vp_rename = Some(old);
-                        }
-                        if rename_commit {
-                            if let Some(old) = self.vp_rename.clone() {
-                                match pla_ui::vpstate::rename_vpstate(&self.doc_key, &old, &self.vp_rename_buf) {
-                                    Ok(_) => {
-                                        self.vp_states_loaded = false;
-                                        self.vp_pngs.remove(&old);
-                                        self.set_notice((false, t!("已改名: {old} → {}", "Renamed: {old} → {}", self.vp_rename_buf.trim())));
-                                    }
-                                    Err(e) => self.set_notice((true, e)),
-                                }
-                            }
-                            self.vp_rename = None;
-                        }
-                        if let Some(name) = apply_now.filter(|_| self.require_feature(Feature::VpApply)) {
-                            match pla_ui::vpstate::load_vpstate(&self.doc_key, &name) {
-                                Some(state) => {
-                                    self.cdp.send(pla_bridge::cdp::CdpCmd::VpStateApply(state));
-                                    self.pending_focus = true;
-                                    self.set_notice((false, t!("正在恢复视口状态「{name}」…", "Restoring view state \"{name}\"…")));
-                                }
-                                None => self.set_notice((true, tr("状态数据缺失", "State data missing").into())),
-                            }
-                        }
-                        if let Some(t) = inner_tip.into_inner() {
-                            self.hovered_hint = Some(t);
-                        }
-                    },
-                    Some(icons),
-                );
-                if let Some(t) = tip_slot.borrow_mut().take() {
-                    self.hovered_hint = Some(t);
-                }
-                // 💾: 采集 + 截图 → pending 落盘
-                if do_save.get() && self.require_feature(Feature::VpSave) {
-                    // 串行流程: 先采集状态 → 回包后再截图(VpStateResult 处理器触发)
-                    let tmp = pla_ui::vpstate::vpstate_dir(&self.doc_key)
-                        .join("__shot_tmp.png");
-                    let _ = std::fs::create_dir_all(
-                        &tmp.parent().unwrap_or(std::path::Path::new(".")),
-                    );
-                    self.vp_shot_path = Some(tmp.display().to_string());
-                    self.vp_pending_state = None;
-                    self.cdp.send(pla_bridge::cdp::CdpCmd::VpStateSave);
-                    self.set_notice((false, tr("正在采集视口状态…", "Capturing view state…").into()));
-                }
-                if do_open_dir.get() {
-                    if let Err(e) = pla_ui::vpstate::open_dir(&self.doc_key) {
-                        self.set_notice((true, e));
-                    }
-                }
-                if do_manage.get() {
-                    self.vp_manage = !self.vp_manage;
-                    self.vp_selected.clear();
-                    self.vp_rename = None;
-                }
-                self.show_vpstate = flag;
+            if let Some(desired) = next_pos(&mut stack_y, PANEL_VPSTATE[1]) {
+                self.show_vpstate = self.state_panel(ctx, desired, StatePanel::Vp);
+            }
+        }
+        if self.show_matstate {
+            if let Some(desired) = next_pos(&mut stack_y, PANEL_MATSTATE[1]) {
+                self.show_matstate = self.state_panel(ctx, desired, StatePanel::Mat);
             }
         }
 
