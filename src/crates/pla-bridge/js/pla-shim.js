@@ -250,6 +250,23 @@
     // 布尔运算(Parasolid PK_boolean_*_c; union 实测, 另两个按同一枚举)
     boolOps: { union: 15903, subtract: 15902, intersect: 15901 },
     boolSetters: { op: 'operationType', targets: 'targets' },
+    // ---- A1: 几何查询(Parasolid 封装对象上的只读方法与结果字段, 26.2.3 实测) ----
+    geoApi: {
+      surfaceKey: 'surface',            // face.GetSurface() → { surface, orientation, uMin… }
+      midpoint: 'FindMidpoint',         // face.FindMidpoint() → { position, normal }(法向朝外)
+      midPos: 'position', midNormal: 'normal',
+      info: 'GetInfo',                  // 曲面/曲线 GetInfo(): Cylinder/Circle → { radius, basis }; Line → { origin, direction }
+      infoRadius: 'radius', infoBasis: 'basis', lineOrigin: 'origin', lineDir: 'direction',
+      basisLoc: 'Location', basisAxis: 'Axis',
+      curve: 'GetCurve', curveKey: 'curve',   // edge.GetCurve() → { curve: Line|Circle|…, sense, uMin, uMax }
+      length: 'FindLength', lengthKey: 'length', // edge.FindLength() → { length, min, max }
+      vertices: 'GetVertices', vLeft: 'left', vRight: 'right', // edge.GetVertices() → { left, right }
+      point: 'GetPoint', ident: 'GetIdentifier'
+    },
+    // 顶点没有 Plasticity 拓扑 id(lookupTopologyItemById 不认) → 自拟 '<物体版本id>v<顶点标识>'
+    vertexIdTag: 'v',
+    // geo.query 每类最多返回的项数(超出如实报 truncated)
+    queryLimit: 2000,
     // 每步命令的超时(ms); 按位置挑边/面的默认容差(文档单位)
     cmdTimeoutMs: 15000,
     pickTolerance: 0.5,
@@ -294,6 +311,7 @@
     'tree':      { needs: [], dom: true },
     'mat.state': { needs: ['ed.originator', 'nodes.state'], optional: ['mat.textures', 'tex.get'] },
     'mat.set':     { todo: 'N1' },
+    'geo.read':  { needs: ['geo.items', 'geo.lookupTopo', 'geo.lookupItem', 'ed.docUnit'] },
     // 工厂类不列入: 首次使用前本来就没有(由代理按需挂上), 缺哪个在执行时按表键报
     'cmd.exec':    { needs: ['ed.enqueue', 'sig.commandEnded', 'exec.cancel', 'cmd.factoryBaseHolder', 'geo.items',
                              'geo.lookupTopo', 'geo.lookupItem', 'ed.docUnit', 'vp.camera'] },
@@ -1141,6 +1159,149 @@
     };
     return step(0);
   }, { async: true });
+
+  // =====================================================================
+  // A1: 几何查询(只读; PRD-ai-modeling-v2 §2/§4 的几何签名)
+  // 长度按文档单位(或 args.units)输出, 方向是单位向量; 数值保留 7 位有效数字(Float32 / 浮点噪声)。
+  // =====================================================================
+  function sig7(x) { var n = Number(Number(x).toPrecision(7)); return Math.abs(n) < 1e-12 ? 0 : n; }
+  function vecOut(v, k) { return v && typeof v.x === 'number' ? [sig7(v.x / k), sig7(v.y / k), sig7(v.z / k)] : null; }
+  function dirOut(v) { return vecOut(v, 1); }
+  function box6Out(b, o, k) { return [[sig7(b[o] / k), sig7(b[o + 1] / k), sig7(b[o + 2] / k)], [sig7(b[o + 3] / k), sig7(b[o + 4] / k), sig7(b[o + 5] / k)]]; }
+  function boxCenter(bb) { return [(bb[0][0] + bb[1][0]) / 2, (bb[0][1] + bb[1][1]) / 2, (bb[0][2] + bb[1][2]) / 2]; }
+
+  // 组(面组/边组)里的项: [{id, bbox(文档单位)}], 与 versionIds 同序
+  function groupEntries(view, kind, k) {
+    var g = view && view[NAMES.shellGroups[kind]];
+    var ids = g && g[NAMES.groupVersionIds], bx = g && g[NAMES.groupBboxes];
+    if (!ids || !bx) return [];
+    return Array.from(ids).map(function (id, i) { return { id: String(id), bbox: box6Out(bx, i * 6, k) }; });
+  }
+
+  function modelOf(kind, id) { var t = lookupOf(kind, id); return t ? t[NAMES.lookupModelKey] : null; }
+
+  // 曲面/曲线 GetInfo 里的半径 + 轴(圆柱/圆锥/圆/圆弧…); 平面/直线没有半径
+  function radialInfo(geom, o, k) {
+    var A = NAMES.geoApi;
+    var info = geom && typeof geom[A.info] === 'function' ? geom[A.info]() : null;
+    if (!info) return;
+    if (typeof info[A.infoRadius] === 'number') {
+      o.radius = sig7(info[A.infoRadius] / k);
+      var b = info[A.infoBasis];
+      if (b) { o.axisOrigin = vecOut(b[A.basisLoc], k); o.axis = dirOut(b[A.basisAxis]); }
+    } else if (info[A.lineDir]) {
+      o.direction = dirOut(info[A.lineDir]);
+    }
+  }
+
+  function faceSig(e, solidId, k) {
+    var A = NAMES.geoApi;
+    var o = { id: e.id, solid: solidId, bbox: e.bbox };
+    var m = modelOf('face', e.id);
+    if (!m) { o.err = 'lookup failed'; return o; }
+    try {
+      var surf = m[NAMES.surfaceGetter]()[A.surfaceKey];
+      o.surface = surf && surf.constructor ? surf.constructor.name : null;
+      radialInfo(surf, o, k);
+    } catch (x) { o.err = errMsg(x); }
+    try { var mp = m[A.midpoint](); o.center = vecOut(mp[A.midPos], k); o.normal = dirOut(mp[A.midNormal]); } catch (x2) {}
+    return o;
+  }
+
+  function edgeSig(e, solidId, k, verts) {
+    var A = NAMES.geoApi;
+    var o = { id: e.id, solid: solidId, bbox: e.bbox };
+    var m = modelOf('edge', e.id);
+    if (!m) { o.err = 'lookup failed'; return o; }
+    try {
+      var c = m[A.curve]()[A.curveKey];
+      o.curve = c && c.constructor ? c.constructor.name : null;
+      radialInfo(c, o, k);
+    } catch (x) { o.err = errMsg(x); }
+    try { o.length = sig7(m[A.length]()[A.lengthKey] / k); } catch (x2) {}
+    try {
+      var lr = m[A.vertices]();
+      [['start', A.vLeft], ['end', A.vRight]].forEach(function (p) {
+        var v = lr[p[1]];
+        if (!v) return;
+        o[p[0]] = vecOut(v[A.point](), k);
+        if (verts) {
+          var vid = solidId + NAMES.vertexIdTag + v[A.ident]();
+          if (!verts.has(vid)) verts.set(vid, { id: vid, solid: solidId, point: o[p[0]] });
+        }
+      });
+    } catch (x3) {}
+    return o;
+  }
+
+  // 过滤: surface / curve(类型名), normal + angleTol(度, 默认 1), near + tol(到包围盒中心, 文档单位, 默认 pickTolerance)
+  function topoFilter(a) {
+    var cosTol = Math.cos(((a.angleTol !== undefined ? Number(a.angleTol) : 1) * Math.PI) / 180);
+    var n = a.normal;
+    if (n !== undefined) {
+      if (!Array.isArray(n) || n.length !== 3) throw new Error('normal must be [x,y,z]');
+      var len = Math.hypot(n[0], n[1], n[2]);
+      if (!(len > 0)) throw new Error('normal must be non-zero');
+      n = n.map(function (x) { return x / len; });
+    }
+    if (a.near !== undefined && (!Array.isArray(a.near) || a.near.length !== 3)) throw new Error('near must be [x,y,z]');
+    var tol = a.tol !== undefined ? Number(a.tol) : NAMES.pickTolerance;
+    return {
+      cheap: function (e) { // 只用包围盒(不调内核)
+        if (!a.near) return true;
+        var c = boxCenter(e.bbox);
+        return Math.hypot(c[0] - a.near[0], c[1] - a.near[1], c[2] - a.near[2]) <= tol;
+      },
+      face: function (o) {
+        if (a.surface && o.surface !== a.surface) return false;
+        if (n && !(o.normal && o.normal[0] * n[0] + o.normal[1] * n[1] + o.normal[2] * n[2] >= cosTol)) return false;
+        return true;
+      },
+      edge: function (o) { return !a.curve || o.curve === a.curve; }
+    };
+  }
+
+  // args = { detail?: 'solids'(默认)|'faces'|'edges'|'all', of?: [物体 id | {name}], units?,
+  //          surface?, curve?, normal?, angleTol?, near?, tol?, limit? }
+  // 返回 { units, solids: [{id, name, bbox, faces, edges}], faces?: [...], edges?: [...], vertices?: [...], truncated? }
+  def('geo.query', 'geo.read', function (a) {
+    a = a || {};
+    var detail = a.detail || 'solids';
+    var want = { solids: ['solids'], faces: ['faces'], edges: ['edges'], all: ['faces', 'edges', 'vertices'] }[detail];
+    if (!want) throw new Error('detail must be solids | faces | edges | all');
+    var U = unitOf(a), k = U.k;
+    var pool = a.of !== undefined ? (Array.isArray(a.of) ? a.of : [a.of]).reduce(function (acc, r) { return acc.concat(resolveSolids(r, {})); }, []) : solidViews();
+    var flt = topoFilter(a);
+    var limit = a.limit !== undefined ? Math.max(0, Number(a.limit)) : NAMES.queryLimit;
+    var out = { units: U.unit, solids: [] };
+    var total = {};
+    var verts = want.indexOf('vertices') >= 0 ? new Map() : null;
+    want.forEach(function (w) { if (w !== 'solids') { out[w] = []; total[w] = 0; } });
+    pool.forEach(function (sv) {
+      var sid = itemIdOf(sv);
+      var fe = groupEntries(sv, 'face', k), ee = groupEntries(sv, 'edge', k);
+      out.solids.push({ id: sid, name: nameOf(sv), bbox: bboxOf(sv, k), faces: fe.length, edges: ee.length });
+      if (out.faces) fe.forEach(function (e) {
+        if (!flt.cheap(e)) return;
+        var o = faceSig(e, sid, k);
+        if (!flt.face(o)) return;
+        total.faces++;
+        if (out.faces.length < limit) out.faces.push(o);
+      });
+      if (out.edges) ee.forEach(function (e) {
+        if (!flt.cheap(e)) return;
+        var o = edgeSig(e, sid, k, verts);
+        if (!flt.edge(o)) return;
+        total.edges++;
+        if (out.edges.length < limit) out.edges.push(o);
+      });
+    });
+    if (verts) { var vs = Array.from(verts.values()); total.vertices = vs.length; out.vertices = vs.slice(0, limit); }
+    var tr = {};
+    Object.keys(total).forEach(function (w) { if (total[w] > out[w].length) tr[w] = total[w] - out[w].length; });
+    if (Object.keys(tr).length) out.truncated = tr;
+    return out;
+  });
 
   // ---- 视角 / 视口杂项 ----
   def('cam.navigateToSelection', 'cam.nav', function () { invokeOn('vp.navigate', [], viewport()); return true; });

@@ -6,6 +6,7 @@ pub mod error;
 pub mod exec;
 pub mod i18n;
 pub mod protocol;
+pub mod query;
 pub mod reconnect;
 pub mod request_id;
 pub mod selftest;

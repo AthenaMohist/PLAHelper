@@ -247,6 +247,8 @@ fn main() {
         println!("  cdp-probe                                     注入垫片 __PLA__ 并打印能力探测 + 只读接口回读");
         println!("  cdp-selftest [--hwnd N] [--json 文件]          CDP 契约自检(不改动文档); 退出码 0 通过/1 有失败/2 连不上");
         println!("  cdp-exec [--hwnd N] <脚本.json>                 N2 命令派发: 按配方表执行几何步骤(改动文档, 每步一个撤销步)");
+        println!("  cdp-state [--hwnd N] [--detail solids|faces|edges|all] [--of id,id|名字] [--units U] [--out 文件]");
+        println!("                                                A1 只读: 撤销深度 + 选择 + 几何签名(给大模型读的 JSON)");
         println!("  doc-list / ping");
         return;
     }
@@ -369,6 +371,38 @@ fn main() {
                     let (ok, msg) = pla_bridge::exec::summary(&v);
                     eprintln!("{msg}");
                     std::process::exit(if ok { 0 } else { 1 });
+                }
+                Err(e) => { eprintln!("CDP ERROR: {e:#}"); std::process::exit(1); }
+            }
+        },
+        "cdp-state" => {
+            // A1: 只读状态(docs/PRD/PRD-ai-modeling-v2.md §2)。
+            let (mut hwnd, mut detail, mut of, mut units, mut out): (isize, Option<String>, Option<String>, Option<String>, Option<String>) =
+                (0, None, None, None, None);
+            let mut it = a.iter();
+            while let Some(x) = it.next() {
+                match x.as_str() {
+                    "--hwnd" => hwnd = it.next().and_then(|v| v.parse().ok()).unwrap_or(0),
+                    "--detail" => detail = it.next().cloned(),
+                    "--of" => of = it.next().cloned(),
+                    "--units" => units = it.next().cloned(),
+                    "--out" => out = it.next().cloned(),
+                    other => { eprintln!("未知参数: {other}(见 --help)"); std::process::exit(2); }
+                }
+            }
+            let args = pla_bridge::query::geo_args(detail.as_deref(), of.as_deref(), units.as_deref());
+            match rt.block_on(pla_bridge::query::state_once(9333, hwnd, &args)) {
+                Ok(v) => {
+                    let s = serde_json::to_string_pretty(&v).unwrap();
+                    match out {
+                        Some(p) => match std::fs::write(&p, &s) {
+                            Ok(()) => eprintln!("已写入 {p}"),
+                            Err(e) => { eprintln!("写入失败: {e}"); std::process::exit(1); }
+                        },
+                        None => println!("{s}"),
+                    }
+                    let failed = ["history", "selection", "geometry"].iter().any(|k| v[*k].get("err").is_some());
+                    std::process::exit(if failed { 1 } else { 0 });
                 }
                 Err(e) => { eprintln!("CDP ERROR: {e:#}"); std::process::exit(1); }
             }

@@ -54,7 +54,8 @@ pub fn cap_label(c: &str) -> &'static str {
         cap::ERR_HOOK => tr("捕获命令报错", "Capture command errors"),
         cap::TREE => tr("读取实体树(Outliner)", "Read entity tree (Outliner)"),
         cap::MAT_SET => tr("材质方案", "Material schemes"),
-        cap::CMD_EXEC => tr("带参数执行命令", "Execute commands with parameters"),
+        cap::CMD_EXEC => tr("带参数执行几何命令(N2 配方表)", "Execute geometry commands with parameters (N2 recipes)"),
+        cap::GEO_READ => tr("几何查询(实体/面/边/顶点签名)", "Geometry query (solid/face/edge/vertex signatures)"),
         cap::BOOL_RUN => tr("布尔运算", "Boolean operations"),
         cap::ASSET_PLACE => tr("放置常用件", "Place common parts"),
         _ => "",
@@ -62,7 +63,8 @@ pub fn cap_label(c: &str) -> &'static str {
 }
 
 /// 路线图预留的能力（面板「ROADMAP」组显示其状态）。
-pub const ROADMAP_CAPS: &[&str] = &[cap::MAT_SET, cap::CMD_EXEC, cap::BOOL_RUN, cap::ASSET_PLACE];
+/// (cmd.exec 已在 N2 实现, 移出; 与 geo.read 一样未被界面功能引用, 自动列入 OTHER 组。)
+pub const ROADMAP_CAPS: &[&str] = &[cap::MAT_SET, cap::BOOL_RUN, cap::ASSET_PLACE];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Feature {
