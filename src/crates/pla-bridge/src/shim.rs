@@ -91,13 +91,15 @@ pub mod api {
     /// A2: 吸附点(测量 / 自由移动命令的那批点)与测量(距离 / 角度 / 面积体积质心)。
     pub const GEO_SNAPS: &str = "geo.snaps";
     pub const GEO_MEASURE: &str = "geo.measure";
+    /// A5: 指定视角截图(对准物体, 截完还原视角)。
+    pub const CAM_VIEW: &str = "cam.view";
 
     /// 全部接口名（契约测试用）。
     pub const ALL: &[&str] = &[
         CORE_PROBE, CORE_HEALTH, CORE_APIS, SEL_SNAPSHOT, HIST_STATE, CAM_GET, CAM_SET, CMD_DISPATCH,
         CMD_PING, ERR_LAST, TREE_LIST, SEL_CANCEL_COMMAND, SEL_CLEAR, SEL_APPLY, CAM_NAVIGATE, CAM_RENDER, CAM_THUMBNAIL, CAM_VP_RECT,
         CAM_SET_ORBIT_STEP, CAM_ROLL, KEYMAP_SET_BINDINGS, VP_SAVE, VP_RESTORE, MAT_SAVE, MAT_RESTORE, CMD_EXEC, CMD_FACTORIES,
-        GEO_QUERY, HIST_BEGIN, HIST_ROLLBACK, HIST_COMMIT, GEO_SNAPS, GEO_MEASURE,
+        GEO_QUERY, HIST_BEGIN, HIST_ROLLBACK, HIST_COMMIT, GEO_SNAPS, GEO_MEASURE, CAM_VIEW,
     ];
 }
 

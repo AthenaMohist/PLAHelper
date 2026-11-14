@@ -66,7 +66,7 @@ const faceKey = (f) => String(f && f.versionId !== undefined ? f.versionId : f);
 function mkEditor(opts = {}) {
   const errListeners = new Set();
   const vp = {
-    camera: { position: v3(1, 2, 3), quaternion: quat(0, 0, 0, 1), zoom: 1, fov: 50, near: 0.1, far: 1000 },
+    camera: { position: v3(1, 2, 3), quaternion: quat(0, 0, 0, 1), zoom: 1, fov: 50, near: 0.1, far: 1000, top: 3, aspect: 1.5 },
     orbitControls: {
       target: v3(0, 0, 0), targetEnd: v3(0, 0, 1), focalOffset: v3(0, 0, 0), focalOffsetEnd: v3(0, 0, 0),
       radius: 10, radiusEnd: 12, zoom: 1, zoomEnd: 1, quaternion: quat(0, 0, 0, 1), quaternionEnd: quat(0, 0, 0, 1),
@@ -89,6 +89,10 @@ function mkEditor(opts = {}) {
     squish: 1, curvatureScale: 0.1, g0Scale: 11, g1Scale: 10, g2Scale: 0.2,
     camMode: 'orthographic', perspToggles: 0,
     togglePerspective() { this.camMode = this.camMode === 'orthographic' ? 'perspective' : 'orthographic'; this.perspToggles++; },
+    // A5: 截图(cam.thumbnail: needsRender + handleRender + 读 canvas); 渲染时记下相机状态供断言
+    needsRender: false, renders2: [],
+    handleRender() { const c = this.camera, o = this.orbitControls; this.renders2.push({ q: [c.quaternion.x, c.quaternion.y, c.quaternion.z, c.quaternion.w], zoom: o.zoom, target: [o.target.x, o.target.y, o.target.z], mode: this.camMode }); },
+    renderer: { domElement: { width: 1200, height: 800, parentElement: null } },
     snapshot() {
       return { camera: { mode: this.camMode, position: v3(1, 2, 3), quaternion: { _x: 0, _y: 0, _z: 0, _w: 1 }, zoom: 64, fov: 35 },
                target: v3(0, 0, 0), focalOffset: v3(0, 0, 0), isXRay: this.isXRay, showOverlays: this.showOverlays,
@@ -281,6 +285,8 @@ const ctx = vm.createContext({
   document: {
     body,
     getElementById: () => null,
+    // A5: cam.thumbnail 用的离屏 canvas
+    createElement: () => ({ width: 0, height: 0, getContext: () => ({ fillRect() {}, drawImage() {} }), toDataURL: () => 'data:image/png;base64,UE5H' }),
     querySelectorAll: () => [vpEl],
     querySelector: (sel) => (sel === 'plasticity-viewport' ? vpEl : sel === 'plasticity-viewport canvas' ? canvasEl : null),
   },
@@ -1120,6 +1126,38 @@ const callAsync = async (name, args) => JSON.parse(await run(`window.__PLA__.cal
     assert.strictEqual(call('geo.measure', { op: 'mass', of: [id], units: 'meter' }).v.solids[0].volume, 1e-6);
     assert.ok(/op must be/.test(call('geo.measure', { op: 'x' }).err));
     assert.ok(/reference must be/.test(call('geo.measure', { op: 'distance', a: 'abc', b: [0, 0, 0] }).err));
+  });
+
+  await ta('A5 cam.view: 临时切正交 → 按视角朝向 + 包围盒投影算缩放对准物体 → 截图 → 还原相机与投影', async () => {
+    const ed = ed3, vp = [...ed.viewports][0];
+    const r = (await callAsync('cmd.exec', { ops: [{ op: 'box', p1: [0, 0, 0], p2: [10, 20, 0], height: 5 }] })).v;
+    const id = r.results[0].items[0].id;
+    vp.camMode = 'perspective';
+    const q0 = [vp.camera.quaternion.x, vp.camera.quaternion.y, vp.camera.quaternion.z, vp.camera.quaternion.w];
+    const z0 = vp.orbitControls.zoom, t0 = vp.renders2.length;
+    const v = call('cam.view', { view: 'front', of: [id] });
+    assert.strictEqual(v.ok, true, JSON.stringify(v));
+    assert.strictEqual(v.v.data, 'UE5H');
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(v.v.target)), [5, 10, 2.5], '对准包围盒中心(文档单位)');
+    const at = vp.renders2[vp.renders2.length - 1];
+    assert.ok(vp.renders2.length > t0);
+    assert.strictEqual(at.mode, 'orthographic', '截图时是正交');
+    const s = Math.SQRT1_2;
+    at.q.forEach((x, i) => assert.ok(Math.abs(x - [s, 0, 0, s][i]) < 1e-9, '前视: 绕 X 转 90° ' + JSON.stringify(at.q)));
+    // 半宽 5 mm / aspect 1.5 = 3.33 mm > 半高 2.5 mm → zoom = 3 / (0.00333 × 1.15)
+    assert.ok(Math.abs(at.zoom - 3 / ((0.005 / 1.5) * 1.15)) < 1e-6, String(at.zoom));
+    assert.deepStrictEqual(at.target.map((x) => Math.round(x * 1e6) / 1e6), [0.005, 0.01, 0.0025]);
+    // 还原
+    assert.strictEqual(vp.camMode, 'perspective', '投影切回去');
+    assert.deepStrictEqual([vp.camera.quaternion.x, vp.camera.quaternion.y, vp.camera.quaternion.z, vp.camera.quaternion.w], q0, '相机还原');
+    assert.strictEqual(vp.orbitControls.zoom, z0);
+    // 等轴 / 顶视: 朝向正确(相机 z 轴 = 视角方向)
+    call('cam.view', { view: 'top', of: [id] });
+    const tq = vp.renders2[vp.renders2.length - 1].q;
+    assert.ok(Math.abs(tq[3]) > 0.999 || Math.abs(tq[2]) > 0.999, '顶视: 相机朝 -Z 看, 无旋转或绕 Z 180° ' + JSON.stringify(tq));
+    assert.strictEqual(call('cam.view', { view: 'iso' }).ok, true);
+    assert.ok(/view must be one of/.test(call('cam.view', { view: 'side' }).err));
+    vp.camMode = 'orthographic';
   });
 
   await ta('A3 cmd.exec atomic: 某步失败 → 撤回本次全部已完成步骤(edit:undo), 文档回到执行前; 窗口不可见直接拒绝', async () => {

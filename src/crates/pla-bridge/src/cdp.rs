@@ -936,7 +936,7 @@ pub(crate) async fn ws_send(ws: &mut WsStream, v: Value) -> anyhow::Result<()> {
 
 /// R8-1: 标准 base64 解码(captureScreenshot 的 data 字段)。
 /// 非法字符跳过(容错), 输出字节流。
-fn base64_decode(s: &str) -> anyhow::Result<Vec<u8>> {
+pub(crate) fn base64_decode(s: &str) -> anyhow::Result<Vec<u8>> {
     let mut lookup = [255u8; 256];
     for (i, c) in b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
         .iter()

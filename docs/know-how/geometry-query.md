@@ -74,6 +74,10 @@ L 形支架: 8 面心 + 21 边中点 + 2 圆心 + 6 弧上点 + 14 顶点 = 51, 
 三角形面积求和 = 面积, 有向四面体求和 = 体积与质心。曲面是近似: R3 圆角面 93.979 vs 理论 94.248(−0.29%),
 L 形支架体积 6540.2 vs 6538.6(+0.025%); 平面精确。网格量保留 5 位有效数字(Float32 噪声在第 6 位)。
 
+Plasticity 自己的数值: 右侧 SELECTION 卡片(组件 `StatsPanelBody`)状态里有 `solidVolume / solidArea / solidMass / faceArea /
+edgeLength…`, 在 hook 里算(字节码), 显示时取整(L 形支架 6,500 mm³ / 3,450 mm²)。给模型原型方法挂记录器选中实体时没抓到
+质量属性接口(窗口隐藏, 卡片也没算) → 暂用网格法; 要对照可在窗口可见时选中实体后读该组件状态。
+
 **接口**(垫片; 能力 `snap.read` / `geo.read`):
 
 ```
@@ -90,6 +94,19 @@ CLI: `pla-app cdp-call [--hwnd N] geo.snaps|geo.measure|… '<JSON>'`(任一垫�
 
 真机(L 形支架 34): 底板 / 立板壁厚 `normalDistance` 均 5(面心直线距离 6.4); 顶面 ⟂ 立板内侧 90°;
 质心 (213.22, 10, 8.2533), 手算 ≈ (213.226, 10, 8.255); 整文档 31 实体质量 112 ms。
+
+## A5 指定视角截图(2026-11-15)
+
+垫片 `cam.view`(能力 `cam.write`): `{view?: front|back|left|right|top|bottom|iso(默认), of?, margin?: 1.15, maxWidth?: 960, keep?}`
+→ `{view, data(PNG base64), width, height, target, zoom, restored}`。CLI `pla-app cdp-view [--hwnd N] [--view iso] [--of 34] [--out x.png] [--width W]`。
+
+- 流程: 记下 `cam.get` → 透视则临时 `togglePerspective` 切正交 → 相机朝向由"视角方向 + 上方向"构造四元数(前视 = 绕 X +90°,
+  与早先实测可用的值一致; iso = 右前上 (1,−1,1)) → 对准物体包围盒中心 → 包围盒 8 角投影到屏幕轴取半宽 / 半高,
+  `zoom = top / (max(半高, 半宽 / aspect) × margin)`(正交 ProxyCamera: 可见半高 = `top / zoom`, top 固定 3)→ `cam.thumbnail`
+  → 还原相机与投影。只动视角, 不改文档; 窗口隐藏时照样能渲染(实测)。
+- 坑: 要把轨道控制器的 `focalOffset` 清零 —— 平移过视图会留下焦点偏移(实测 (0.016, 0.072, 0) m), 放大到 100 多倍后画面被推离物体,
+  截出来只剩方向立方体。
+- 真机(物体 34): 前 / 等轴 / 顶 三张, 物体居中占画面高 ~87%, 圆角清楚; 截完相机四元数 / 位置 / 缩放 / 半径与截前完全一致。
 
 ## 真机核对(L 形支架, 物体 34)
 

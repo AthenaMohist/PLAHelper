@@ -288,6 +288,18 @@
     // 面积 / 体积 / 质心: 内核没有对外方法(26.2.3 只有 GetCentroid = 包围盒中心) → 用显示网格算:
     // FaceGroup.mesh.geometry(position + index), groups = [起点, 数量] × 面(与 versionIds 同序)。曲面是近似(R3 圆角面 −0.3%)。
     faceMesh: 'mesh', meshGroups: 'groups',
+    // ---- A5: 视角截图 ----
+    // 视角 → 相机朝向(目标 → 相机)+ 上方向(世界 Z 朝上; 顶/底视图以 +Y 为上)。iso = 右前上(同 SW 等轴)
+    camViews: {
+      front:  { dir: [0, -1, 0], up: [0, 0, 1] }, back:   { dir: [0, 1, 0], up: [0, 0, 1] },
+      right:  { dir: [1, 0, 0], up: [0, 0, 1] },  left:   { dir: [-1, 0, 0], up: [0, 0, 1] },
+      top:    { dir: [0, 0, 1], up: [0, 1, 0] },  bottom: { dir: [0, 0, -1], up: [0, 1, 0] },
+      iso:    { dir: [1, -1, 1], up: [0, 0, 1] }
+    },
+    orthoMode: 'orthographic',
+    // 正交相机: 可见半高 = top / zoom(ProxyCamera 的 top 固定 3); aspect = 宽 / 高
+    camOrthoTop: 'top', camAspect: 'aspect',
+    viewMargin: 1.15,
     // 判定两平面"平行"的角度容差(度): 平行时 measure 额外给法向距离(壁厚); 平面的曲面类名
     parallelTolDeg: 0.1,
     planeSurface: 'Plane',
@@ -1642,6 +1654,82 @@
     var url = c.toDataURL('image/png');
     return { data: url.slice(url.indexOf(',') + 1), width: c.width, height: c.height, bg: bg };
   });
+  // =====================================================================
+  // A5: 指定视角截图。临时切正交 → 相机朝向按视角(朝向 + 上方向构造四元数) → 对准物体包围盒、按投影尺寸算缩放 →
+  // 截图(cam.thumbnail) → 还原相机与投影模式(keep=true 时不还原)。只动视角, 不改文档。
+  // =====================================================================
+  function vnorm(v) { var l = Math.hypot(v[0], v[1], v[2]) || 1; return [v[0] / l, v[1] / l, v[2] / l]; }
+  function vcross(a, b) { return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]; }
+  function vdot(a, b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
+  // 相机基: z = 朝向相机(目标 → 相机), x = 右, y = 上; 旋转矩阵 [x y z] → 四元数
+  function viewBasis(dir, up) {
+    var z = vnorm(dir), x = vnorm(vcross(up, z)), y = vcross(z, x);
+    var m00 = x[0], m01 = y[0], m02 = z[0], m10 = x[1], m11 = y[1], m12 = z[1], m20 = x[2], m21 = y[2], m22 = z[2];
+    var tr = m00 + m11 + m22, q;
+    if (tr > 0) { var s = 0.5 / Math.sqrt(tr + 1); q = [(m21 - m12) * s, (m02 - m20) * s, (m10 - m01) * s, 0.25 / s]; }
+    else if (m00 > m11 && m00 > m22) { var s1 = 2 * Math.sqrt(1 + m00 - m11 - m22); q = [0.25 * s1, (m01 + m10) / s1, (m02 + m20) / s1, (m21 - m12) / s1]; }
+    else if (m11 > m22) { var s2 = 2 * Math.sqrt(1 + m11 - m00 - m22); q = [(m01 + m10) / s2, 0.25 * s2, (m12 + m21) / s2, (m02 - m20) / s2]; }
+    else { var s3 = 2 * Math.sqrt(1 + m22 - m00 - m11); q = [(m02 + m20) / s3, (m12 + m21) / s3, 0.25 * s3, (m10 - m01) / s3]; }
+    return { x: x, y: y, z: z, q: q };
+  }
+
+  // args = { view?: front|back|left|right|top|bottom|iso(默认), of?: [物体], margin?: 1.15, maxWidth?: 960, keep?: false }
+  // → { view, data(PNG base64), width, height, target(文档单位), zoom, restored }
+  def('cam.view', 'cam.write', function (a) {
+    a = a || {};
+    var name = a.view || 'iso';
+    var spec = NAMES.camViews[name];
+    if (!spec) throw new Error('view must be one of ' + Object.keys(NAMES.camViews).join(', '));
+    var k = unitOf(a).k;
+    var pool = a.of !== undefined ? (Array.isArray(a.of) ? a.of : [a.of]).reduce(function (acc, r) { return acc.concat(resolveSolids(r, {})); }, []) : solidViews();
+    // 包围盒(米)
+    var mn = [Infinity, Infinity, Infinity], mx = [-Infinity, -Infinity, -Infinity];
+    pool.forEach(function (sv) {
+      var b = bboxOf(sv, 1);
+      if (!b) return;
+      for (var j = 0; j < 3; j++) { mn[j] = Math.min(mn[j], b[0][j]); mx[j] = Math.max(mx[j], b[1][j]); }
+    });
+    if (!(mn[0] <= mx[0])) throw new Error('nothing to frame (no solids / no bounding box)');
+    var V = viewport();
+    var cam = need('vp.camera', V);
+    var c0 = API['cam.get'].fn();
+    var mode0 = (invokeOn('vp.snapshot', [], V).camera || {}).mode;
+    var toggled = false;
+    if (mode0 !== NAMES.orthoMode) { invokeOn('vp.togglePerspective', [], V); toggled = true; }
+    var shot, zoom, center = [(mn[0] + mx[0]) / 2, (mn[1] + mx[1]) / 2, (mn[2] + mx[2]) / 2];
+    try {
+      var B = viewBasis(spec.dir, spec.up);
+      // 包围盒 8 个角投影到屏幕轴上的半宽 / 半高
+      var hw = 0, hh = 0, depth = 0;
+      for (var i = 0; i < 8; i++) {
+        var p = [(i & 1 ? mx : mn)[0] - center[0], (i & 2 ? mx : mn)[1] - center[1], (i & 4 ? mx : mn)[2] - center[2]];
+        hw = Math.max(hw, Math.abs(vdot(p, B.x))); hh = Math.max(hh, Math.abs(vdot(p, B.y))); depth = Math.max(depth, Math.abs(vdot(p, B.z)));
+      }
+      var margin = a.margin !== undefined ? Number(a.margin) : NAMES.viewMargin;
+      var top = cam[NAMES.camOrthoTop], aspect = cam[NAMES.camAspect] || 1;
+      zoom = top / (Math.max(hh, hw / aspect, 1e-9) * margin);
+      var R = Math.max((c0.orbit && c0.orbit.radius) || 1, depth * 4);
+      var c = JSON.parse(JSON.stringify(c0));
+      c.px = center[0] + B.z[0] * R; c.py = center[1] + B.z[1] * R; c.pz = center[2] + B.z[2] * R;
+      c.qx = B.q[0]; c.qy = B.q[1]; c.qz = B.q[2]; c.qw = B.q[3];
+      c.orbit = c.orbit || {};
+      c.orbit.target = center; c.orbit.targetEnd = center;
+      // 平移视图留下的焦点偏移要清零, 否则放大后画面被推离物体(实测: 只剩方向立方体)
+      c.orbit.focal = [0, 0, 0]; c.orbit.focalEnd = [0, 0, 0];
+      c.orbit.radius = R; c.orbit.radiusEnd = R;
+      c.orbit.zoom = zoom; c.orbit.zoomEnd = zoom;
+      API['cam.set'].fn(c);
+      shot = API['cam.thumbnail'].fn({ maxWidth: a.maxWidth || 960 });
+    } finally {
+      if (!a.keep) {
+        API['cam.set'].fn(c0);
+        if (toggled) invokeOn('vp.togglePerspective', [], V);
+      }
+    }
+    return { view: name, data: shot.data, width: shot.width, height: shot.height,
+             target: center.map(function (x) { return sig7(x / k); }), zoom: sig7(zoom), restored: !a.keep };
+  });
+
   def('cam.vpRect', 'cam.read', function () {
     var r = need('vp.container').getBoundingClientRect();
     return { x: r.x, y: r.y, width: r.width, height: r.height, scale: 1 };

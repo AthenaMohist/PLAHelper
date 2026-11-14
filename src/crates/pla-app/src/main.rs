@@ -251,6 +251,8 @@ fn main() {
         println!("  cdp-state [--hwnd N] [--detail solids|faces|edges|all] [--of id,id|名字] [--units U] [--out 文件]");
         println!("                                                A1 只读: 撤销深度 + 选择 + 几何签名(给大模型读的 JSON)");
         println!("  cdp-call [--hwnd N] <接口名> [JSON 参数]        调任一垫片接口(geo.snaps / geo.measure / hist.* …)");
+        println!("  cdp-view [--hwnd N] [--view front|back|left|right|top|bottom|iso] [--of id,id] [--out x.png] [--width W]");
+        println!("                                                A5 指定视角截图(对准物体, 截完还原视角)");
         println!("  doc-list / ping");
         return;
     }
@@ -412,6 +414,34 @@ fn main() {
                     let failed = ["history", "selection", "geometry"].iter().any(|k| v[*k].get("err").is_some());
                     std::process::exit(if failed { 1 } else { 0 });
                 }
+                Err(e) => { eprintln!("CDP ERROR: {e:#}"); std::process::exit(1); }
+            }
+        },
+        "cdp-view" => {
+            // A5: 指定视角截图(对准物体, 截完还原视角), 存 PNG。
+            let (mut hwnd, mut view, mut of, mut out, mut width): (isize, String, Option<String>, String, Option<u32>) =
+                (0, "iso".into(), None, "view.png".into(), None);
+            let mut it = a.iter();
+            while let Some(x) = it.next() {
+                match x.as_str() {
+                    "--hwnd" => hwnd = it.next().and_then(|v| v.parse().ok()).unwrap_or(0),
+                    "--view" => view = it.next().cloned().unwrap_or(view),
+                    "--of" => of = it.next().cloned(),
+                    "--out" => out = it.next().cloned().unwrap_or(out),
+                    "--width" => width = it.next().and_then(|v| v.parse().ok()),
+                    other => { eprintln!("未知参数: {other}(见 --help)"); std::process::exit(2); }
+                }
+            }
+            let mut args = pla_bridge::query::geo_args(None, of.as_deref(), None);
+            args["view"] = serde_json::json!(view);
+            if let Some(w) = width {
+                args["maxWidth"] = serde_json::json!(w);
+            }
+            match rt.block_on(pla_bridge::query::view_png_once(9333, hwnd, &args)) {
+                Ok((png, meta)) => match std::fs::write(&out, &png) {
+                    Ok(()) => println!("{} ({} 字节) {meta}", out, png.len()),
+                    Err(e) => { eprintln!("写入失败: {e}"); std::process::exit(1); }
+                },
                 Err(e) => { eprintln!("CDP ERROR: {e:#}"); std::process::exit(1); }
             }
         },

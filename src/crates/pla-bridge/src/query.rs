@@ -53,6 +53,16 @@ pub async fn call_once(cdp_port: u16, hwnd: isize, name: &str, args: &Value) -> 
     Ok(shim::parse_reply(&raw)?)
 }
 
+/// A5 CLI 用: 指定视角截图 → (PNG 字节, 回包去掉 data 后的其余字段)。
+pub async fn view_png_once(cdp_port: u16, hwnd: isize, args: &Value) -> anyhow::Result<(Vec<u8>, Value)> {
+    let mut v = call_once(cdp_port, hwnd, api::CAM_VIEW, args).await?;
+    let b64 = v["data"].as_str().ok_or_else(|| anyhow::anyhow!("cam.view: no image data"))?.to_string();
+    if let Some(o) = v.as_object_mut() {
+        o.remove("data");
+    }
+    Ok((crate::cdp::base64_decode(&b64)?, v))
+}
+
 /// 由 CLI 参数拼 `geo.query` 的参数: detail / of(逗号分隔的物体 id) / units。
 pub fn geo_args(detail: Option<&str>, of: Option<&str>, units: Option<&str>) -> Value {
     let mut a = serde_json::Map::new();

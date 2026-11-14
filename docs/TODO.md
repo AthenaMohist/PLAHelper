@@ -308,11 +308,17 @@
       - 用户提示（2026-11-15）：Plasticity 自带测量已够日常用 —— Measurement 工具量两点距离；选中元素后右侧 SELECTION 卡片
         显示参数（两面夹角、实体体积 / 面积；材料面板 ADVANCED 设密度后显示质量）。→ **不做**单独的测量 / 质量面板（优先级低，以后再说）；
         A2 改为复用 SELECTION 卡片背后的实现取精确体积 / 面积 / 质量（网格法作退路）。
+        → 已查（2026-11-15，限时）：卡片组件 `StatsPanelBody`，状态 `{faceArea, facePerimeter, edgeLength, curveLength, sheetArea,
+        sheetPerimeter, solidVolume, solidArea, solidMass}` 在 hook 里算（字节码看不到）；给模型原型方法挂记录器后选中实体，
+        窗口隐藏时卡片没算，记录到的只有 lookup 类调用，没抓到质量属性接口。卡片显示值本身取整（6,500 mm³ / 3,450 mm²），
+        精度不高于网格法（体积 +0.03%）→ **保留网格法**；窗口可见时可再试一次（选中后读 `StatsPanelBody` 状态即可拿到其数值）。
 - [x] **A3 事务回滚**（2026-11-15，know-how/command-dispatch.md「A3」）：`hist.begin / rollback / commit`（能力 `hist.write`），
       撤销 = body 上派发 `edit:undo`（同 Ctrl+Z，异步，轮询确认）；begin 以下撤销栈被动过则拒绝；窗口不可见拒绝；
       `cmd.exec {atomic}` 失败整串撤回（CLI `--atomic`）。契约测试 2 项；真机：失败脚本撤回 2 步 270 ms、事务撤回 2 步 102 ms，前后一致。
 - [ ] **A4 配方补齐**（即 N2 扩配方）：cylinder、sketch+extrude、hole、chamfer、shell、offsetFace、pattern —— 每项先在副本实测。
-- [ ] **A5 视图工具**：指定视角截图（正/俯/等轴/对准某实体），截完还原视角。
+- [x] **A5 视图工具**（2026-11-15，know-how/geometry-query.md「A5」）：垫片 `cam.view`（临时切正交 → 视角朝向 + 包围盒投影算缩放
+      对准物体 → 截图 → 还原相机与投影；七个视角）+ CLI `pla-app cdp-view`；契约测试 1 项；真机前 / 等轴 / 顶三张居中清晰、相机完全还原。
+      坑：轨道控制器 `focalOffset` 要清零，否则放大后画面被推离物体。
 - [ ] **A6 MCP 服务**（`pla-app mcp` 子命令或 `pla-mcp` crate，待定）：exec / query / measure / view / undo / model 六个工具，
       包 pla-bridge 现有代码；附 skill 文档（配方、示例、常见坑）。
 
