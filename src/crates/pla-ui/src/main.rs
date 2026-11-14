@@ -262,7 +262,7 @@ struct PlaApp {
     doc_key: String,
     /// 快照 PNG 字节缓存(name → bytes): 快照文件不可变, 读盘一次。
     snap_pngs: std::collections::HashMap<String, std::sync::Arc<[u8]>>,
-    /// 收藏的快照名(含 .plasticity), 与 snapshot/meta.json 同步。
+    /// 收藏的快照名(含 .plasticity), 与 .pla/snapshots/meta.json 同步。
     snap_favs: std::collections::HashSet<String>,
     /// 快照元数据(名 → (源文档, 拍摄时间)): 开墙/拍/删/改名后整表重读, 悬浮显示用。
     snap_infos: std::collections::HashMap<String, (String, String)>,
@@ -5186,8 +5186,8 @@ impl eframe::App for PlaApp {
                                             "Requires CDP. Triggered by \"Interval\" or \"Every N steps\" (undo stack growth).",
                                         )),
                                         info_text(tr(
-                                            "快照 = 文档同级 snapshot/ 下的副本; 文档未保存新内容时自动跳过。",
-                                            "A snapshot is a copy in snapshot/ next to the document; skipped when nothing new was saved.",
+                                            "快照 = 文档同级 .pla/snapshots/ 下的副本; 文档未保存新内容时自动跳过。",
+                                            "A snapshot is a copy in .pla/snapshots/ next to the document; skipped when nothing new was saved.",
                                         )),
                                         info_text(t!("当前步数: {steps_now}", "Current steps: {steps_now}")),
                                     ],

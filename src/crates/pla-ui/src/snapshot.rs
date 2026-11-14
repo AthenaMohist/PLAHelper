@@ -5,16 +5,67 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use pla_bridge::i18n::tr;
 use pla_bridge::t;
 
-/// 快照目录策略(R7-4): 跟随文档 — 文档同级的 snapshot/ 文件夹, 每个文档的快照各归其位。
+/// 快照目录策略(R7-4 跟随文档; R36 起与其它存档一起放进 `.pla`): `<文档目录>/.pla/snapshots/`
+/// (同一文件夹的文档共用一面快照墙, 源文档记在 meta.json)。旧位置 `<文档目录>/snapshot/` 首次访问时迁移。
 /// doc 为 None(尚未定位到文档)时退回 exe 同级 snapshots/(旧行为兜底)。
 pub fn snapshot_dir_for(doc: Option<&PathBuf>) -> PathBuf {
-    match doc {
-        Some(d) => d
-            .parent()
-            .map(|p| p.join("snapshot"))
-            .unwrap_or_else(fallback_dir),
+    match doc.and_then(|d| d.parent()) {
+        Some(p) => {
+            let dir = p.join(".pla").join("snapshots");
+            migrate_legacy_snapshots(&p.join("snapshot"), &dir);
+            dir
+        }
         None => fallback_dir(),
     }
+}
+
+/// 本进程已检查过迁移的旧目录(快照目录每帧都会取, 迁移检查只做一次)。
+static MIGRATED: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// R36: 旧快照目录 → `.pla/snapshots`。只**移动**本工具自己产生的文件(SS###.plasticity / SS###.png / meta.json),
+/// 其它东西(例如 Plasticity 打开快照时自己建的 `plasticity/` 自动保存目录)原地不动; 旧目录空了才删。
+/// 目标已有同名文件 / 文件被占用(快照正开着)→ 跳过, 下次启动再试。
+fn migrate_legacy_snapshots(legacy: &std::path::Path, new: &std::path::Path) {
+    if let Ok(mut done) = MIGRATED.lock() {
+        if done.iter().any(|p| p == legacy) {
+            return;
+        }
+        done.push(legacy.to_path_buf());
+    }
+    migrate_legacy_snapshots_now(legacy, new);
+}
+
+fn is_own_snapshot_file(name: &str) -> bool {
+    if name.eq_ignore_ascii_case("meta.json") {
+        return true;
+    }
+    let stem = name
+        .strip_suffix(".plasticity")
+        .or_else(|| name.strip_suffix(".png"))
+        .unwrap_or("");
+    stem.len() > 2 && stem[..2].eq_ignore_ascii_case("SS") && stem[2..].chars().all(|c| c.is_ascii_digit())
+}
+
+/// 迁移本体(测试直接调)。返回移动的文件数。
+fn migrate_legacy_snapshots_now(legacy: &std::path::Path, new: &std::path::Path) -> usize {
+    let Ok(rd) = std::fs::read_dir(legacy) else { return 0 };
+    let files: Vec<_> = rd
+        .flatten()
+        .filter(|e| e.path().is_file() && is_own_snapshot_file(&e.file_name().to_string_lossy()))
+        .collect();
+    if files.is_empty() || std::fs::create_dir_all(new).is_err() {
+        return 0;
+    }
+    let mut moved = 0;
+    for e in files {
+        let dst = new.join(e.file_name());
+        if !dst.exists() && std::fs::rename(e.path(), &dst).is_ok() {
+            moved += 1;
+        }
+    }
+    // 旧目录空了才删(remove_dir 只删空目录)
+    let _ = std::fs::remove_dir(legacy);
+    moved
 }
 
 fn fallback_dir() -> PathBuf {
@@ -201,8 +252,8 @@ pub fn latest_doc_cached(doc_key: &str) -> Option<PathBuf> {
 }
 
 /// R9: 文档同级存档目录 —— `<文档目录>/.pla/<sub>/<doc_key>`。
-/// 快照走 `<文档目录>/snapshot/`, 选择集/视口状态走 `.pla/selections`、
-/// `.pla/viewstates`(隐藏目录, 不污染文档文件夹)。定位不到文档 → None,
+/// 选择集/视口状态/材质状态走 `.pla/selections`、`.pla/viewstates`、`.pla/materials`;
+/// 快照走 `.pla/snapshots/`(按文件夹共用, 见 snapshot_dir_for)。定位不到文档 → None,
 /// 由调用方退回 exe 同级的旧位置。
 pub fn doc_side_dir(doc_key: &str, sub: &str) -> Option<PathBuf> {
     let doc = latest_doc_cached(doc_key)?;
@@ -488,7 +539,7 @@ impl DocCandidates {
         let in_snapshot_dir = p.components().any(|c| {
             c.as_os_str()
                 .to_str()
-                .map(|s| s.eq_ignore_ascii_case("snapshot") || s.eq_ignore_ascii_case("snapshots"))
+                .map(|s| s.eq_ignore_ascii_case("snapshot") || s.eq_ignore_ascii_case("snapshots") || s.eq_ignore_ascii_case(".pla"))
                 .unwrap_or(false)
         });
         if in_snapshot_dir {
@@ -965,6 +1016,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn legacy_snapshot_dir_migrates_own_files_only() {
+        let base = std::env::temp_dir().join(format!("__pla_snapmig_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let legacy = base.join("snapshot");
+        let new = base.join(".pla").join("snapshots");
+        std::fs::create_dir_all(legacy.join("plasticity")).unwrap();
+        for f in ["SS001.plasticity", "SS001.png", "SS012.plasticity", "meta.json", "notes.txt"] {
+            std::fs::write(legacy.join(f), f).unwrap();
+        }
+        assert_eq!(migrate_legacy_snapshots_now(&legacy, &new), 4);
+        for f in ["SS001.plasticity", "SS001.png", "SS012.plasticity", "meta.json"] {
+            assert_eq!(std::fs::read_to_string(new.join(f)).unwrap(), f, "{f} 移到 .pla/snapshots");
+            assert!(!legacy.join(f).exists(), "{f} 旧位置不再保留");
+        }
+        assert!(legacy.join("notes.txt").exists(), "不是本工具的文件原地不动");
+        assert!(legacy.join("plasticity").is_dir(), "Plasticity 自己的目录原地不动");
+        // 目标已有同名 → 不覆盖
+        std::fs::write(legacy.join("SS001.png"), "old").unwrap();
+        assert_eq!(migrate_legacy_snapshots_now(&legacy, &new), 0);
+        assert_eq!(std::fs::read_to_string(new.join("SS001.png")).unwrap(), "SS001.png");
+        // 只剩本工具文件且都已迁完 → 旧目录删掉
+        let base2 = base.join("b");
+        std::fs::create_dir_all(base2.join("snapshot")).unwrap();
+        std::fs::write(base2.join("snapshot").join("SS002.plasticity"), "x").unwrap();
+        assert_eq!(migrate_legacy_snapshots_now(&base2.join("snapshot"), &base2.join(".pla").join("snapshots")), 1);
+        assert!(!base2.join("snapshot").exists(), "空的旧目录删除");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// 冒烟(本机手动跑: cargo test -p pla-ui --release -- --ignored --nocapture):
     /// 验证 Recent .lnk 解析能定位到真实文档(用户实际文档在 D 盘项目目录,
     /// 旧版只扫 USERPROFILE 必然报"未找到" — R7-3 根因回归)。
@@ -983,7 +1064,7 @@ mod tests {
         let result = take_manual_snapshot("model1", None);
         println!("take_manual_snapshot(model1) = {result:?}");
         assert!(result.is_ok(), "手动快照失败: {result:?}");
-        // R7-4: 快照必须落在文档同级 snapshot/ 目录
+        // R7-4 / R36: 快照必须落在文档同级 .pla/snapshots/ 目录
         if let Some(doc) = find_latest_doc("model1") {
             let expect = snapshot_dir_for(Some(&doc));
             println!("期望快照目录: {expect:?} (exists={})", expect.is_dir());

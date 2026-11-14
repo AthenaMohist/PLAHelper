@@ -103,6 +103,9 @@
     'nodes.unisolate':         ['nodes', 'unisolate'],
     'orig.snapshot':           ['orig', 'snapshot'],
     'orig.restore':            ['orig', 'restore'],
+    // R34d: 材质库的纹理加载器(按文件名缓存 Promise<Texture>); 恢复带贴图的材质时用它重建真 Texture
+    'mat.textures':            ['ed', 'materials.textures'],
+    'tex.get':                 ['tex', 'get'],
     'ds.snapshot':             ['ds', 'snapshot'],
     'ds.init':                 ['ds', 'init'],
     'sh.snapshot':             ['sh', 'snapshot'],
@@ -219,7 +222,9 @@
     materialId: 'id',
     materialUuid: 'uuid',
     mementoNodeMaterials: 'materials',  // memento.nodes.materials = [nodeKeys(类型化数组), materialIds]
-    node2material: 'node2material'      // nodes.read.node2material: nodeKey → materialId
+    node2material: 'node2material',     // nodes.read.node2material: nodeKey → materialId
+    // 材质的贴图槽: { repeat, texture: THREE.Texture }(normalMap / roughnessMap …); 文件名在 texture.userData(同 matcapFileKey)
+    materialTexSlot: 'texture'
   };
 
   // =====================================================================
@@ -249,7 +254,7 @@
     'cmd.dispatch': { needs: ['reg.add', 'reg.listeners'] },
     'err.hook':  { needs: ['ed.errorSignal'] },
     'tree':      { needs: [], dom: true },
-    'mat.state': { needs: ['ed.originator', 'nodes.state'] },
+    'mat.state': { needs: ['ed.originator', 'nodes.state'], optional: ['mat.textures', 'tex.get'] },
     'mat.set':     { todo: 'N1' },
     'cmd.exec':    { todo: 'N2' },
     'bool.run':    { todo: 'N4' },
@@ -299,6 +304,7 @@
       case 'orig': return get('ed.originator');
       case 'sh': return get('ed.shadingDb');
       case 'ds': return get('ed.docSettings');
+      case 'tex': return get('mat.textures');
     }
     return undefined;
   }
@@ -1506,6 +1512,51 @@
 
   def('mat.save', 'mat.state', function () { return materialsNow(); });
 
+  // R34d: 存档里的贴图是 Texture.toJSON 的纯数据, Plasticity 恢复时(deserializeTexture)要真 Texture 对象,
+  // 否则抛 "undefined is not a function"(实测: 带贴图的 Gold foil)。同 uuid 同文件的贴图直接沿用当前对象;
+  // 否则按文件名经材质库的 TextureLoader 加载再套回存档里的参数; 没有文件名的(导入图片)如实列入 failed 并去掉该槽。
+  function isTexSlot(v) {
+    var t = v && typeof v === 'object' && !Array.isArray(v) ? v[NAMES.materialTexSlot] : null;
+    return !!(t && typeof t === 'object');
+  }
+  function reviveTextures(defs, failed) {
+    var live = {};
+    var m = invokeOn('orig.snapshot', [], need('ed.originator'));
+    (m[NAMES.mementoMaterials][NAMES.materialsList] || []).forEach(function (d) { live[d[NAMES.materialUuid]] = d; });
+    var jobs = [];
+    var out = defs.map(function (d0) {
+      var d = {};
+      Object.keys(d0).forEach(function (k) { d[k] = d0[k]; });
+      Object.keys(d).forEach(function (k) {
+        if (!isTexSlot(d[k])) return;
+        var j = d[k][NAMES.materialTexSlot];
+        if (typeof j.clone === 'function') return; // 已是真对象
+        var file = texFile(j);
+        var l = live[d[NAMES.materialUuid]];
+        var slot = {};
+        Object.keys(d[k]).forEach(function (s) { slot[s] = d[k][s]; });
+        d[k] = slot;
+        if (l && isTexSlot(l[k]) && file && texFile(l[k][NAMES.materialTexSlot]) === file) { slot[NAMES.materialTexSlot] = l[k][NAMES.materialTexSlot]; return; }
+        if (!file || !get('tex.get')) { failed.push('texture:' + d.name + '.' + k); delete d[k]; return; }
+        jobs.push(Promise.resolve(invokeOn('tex.get', [file], get('mat.textures'))).then(function (T) {
+          var t = T.clone();
+          t.userData = Object.assign({}, j.userData);
+          if (Array.isArray(j.repeat)) t.repeat.fromArray(j.repeat);
+          if (Array.isArray(j.offset)) t.offset.fromArray(j.offset);
+          if (Array.isArray(j.center)) t.center.fromArray(j.center);
+          if (typeof j.rotation === 'number') t.rotation = j.rotation;
+          if (Array.isArray(j.wrap)) { t.wrapS = j.wrap[0]; t.wrapT = j.wrap[1]; }
+          if (typeof j.flipY === 'boolean') t.flipY = j.flipY;
+          if (j.colorSpace) t.colorSpace = j.colorSpace;
+          t.needsUpdate = true;
+          slot[NAMES.materialTexSlot] = t;
+        }, function (e) { failed.push('texture:' + d.name + '.' + k + ':' + errMsg(e)); delete d[k]; }));
+      });
+      return d;
+    });
+    return Promise.all(jobs).then(function () { return out; });
+  }
+
   def('mat.restore', 'mat.state', function (S) {
     if (!S || !Array.isArray(S.materials) || !Array.isArray(S.assign)) throw new Error('mat.restore needs {materials, assign}');
     var cur = materialsNow();
@@ -1513,6 +1564,12 @@
       return { applied: ['materials(same)'], missing: [], failed: [] };
     }
     mementoGuard();
+    var failed = [];
+    return reviveTextures(S.materials, failed).then(function (defs) { return restoreMaterials(S, defs, failed); });
+  }, { async: true });
+
+  function restoreMaterials(S, defs, failed) {
+    mementoGuard(); // 加载贴图期间窗口可能被隐藏
     var missing = [];
     var uuid2id = {}, maxId = 0;
     S.materials.forEach(function (d) { uuid2id[d[NAMES.materialUuid]] = d[NAMES.materialId]; if (d[NAMES.materialId] > maxId) maxId = d[NAMES.materialId]; });
@@ -1530,7 +1587,7 @@
     var m = invokeOn('orig.snapshot', [], orig);
     var mats = {};
     Object.keys(m[NAMES.mementoMaterials]).forEach(function (k) { mats[k] = m[NAMES.mementoMaterials][k]; });
-    mats[NAMES.materialsList] = S.materials;
+    mats[NAMES.materialsList] = defs;
     mats[NAMES.materialsCounter] = Math.max(mats[NAMES.materialsCounter] || 0, maxId + 1);
     m[NAMES.mementoMaterials] = mats;
     var nodes = {};
@@ -1539,11 +1596,19 @@
     // 沿用 memento 原来的类型化数组类型
     nodes[NAMES.mementoNodeMaterials] = [new pair[0].constructor(keys), new pair[1].constructor(vals)];
     m[NAMES.mementoNodes] = nodes;
-    invokeOn('orig.restore', [m], orig);
+    // 实测(R34d): restore 中途抛错时指派已写入、材质没写入 → 物体指向不存在的材质。失败就用恢复前的快照整体退回。
+    var before = invokeOn('orig.snapshot', [], orig);
+    try {
+      invokeOn('orig.restore', [m], orig);
+    } catch (e) {
+      var rb;
+      try { invokeOn('orig.restore', [before], orig); rb = 'rolled back'; } catch (e2) { rb = 'rollback failed: ' + errMsg(e2); }
+      throw new Error(errMsg(e) + ' (' + rb + ')');
+    }
     // 实测(R34, 26.2.3): memento 恢复后数据已变, 但视口不会自己重画, 要等下一次交互才看到新颜色 → 主动请求一帧
     call0(viewport(), 'vp.render');
-    return { applied: ['materials:' + S.materials.length, 'assign:' + keys.length], missing: missing, failed: [] };
-  });
+    return { applied: ['materials:' + defs.length, 'assign:' + keys.length], missing: missing, failed: failed };
+  }
 
   def('err.last', 'err.hook', function () { return state.lastError; });
 
