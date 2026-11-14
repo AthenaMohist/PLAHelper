@@ -1811,6 +1811,17 @@ fn confirm_popup(
     id: &str,
     text: &str,
 ) -> Option<bool> {
+    confirm_popup_with(ctx, id, text, tr("确认删除", "Delete"), COL_RED)
+}
+
+/// R35: 带确认按钮文字与强调色的确认弹层(删除 = 红色 "Delete"; 更新 = 强调色 "Update")。
+fn confirm_popup_with(
+    ctx: &egui::Context,
+    id: &str,
+    text: &str,
+    confirm_label: &str,
+    accent: egui::Color32,
+) -> Option<bool> {
     let mut result = None;
     egui::Area::new(egui::Id::new(format!("confirm-{id}")))
         .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 24.0))
@@ -1820,15 +1831,15 @@ fn confirm_popup(
             egui::Frame::none()
                 .fill(egui::Color32::from_rgb(0x24, 0x24, 0x24))
                 .rounding(egui::Rounding::same(8.0))
-                .stroke(egui::Stroke::new(1.0, COL_RED))
+                .stroke(egui::Stroke::new(1.0, accent))
                 .inner_margin(egui::Margin::same(10.0))
                 .show(ui, |ui| {
                     ui.set_min_width(200.0);
                     ui.label(
-                        egui::RichText::new(text).small().color(COL_RED),
+                        egui::RichText::new(text).small().color(accent),
                     );
                     ui.horizontal(|ui| {
-                        if ui.button(tr("确认删除", "Delete")).clicked() {
+                        if ui.button(confirm_label).clicked() {
                             result = Some(true);
                         }
                         if ui.button(tr("取消", "Cancel")).clicked() {
@@ -4007,7 +4018,7 @@ impl eframe::App for PlaApp {
                                 "用当前文档覆盖「{stem}」? 原内容不可恢复(取的是最近一次 Ctrl+S 保存的文件)",
                                 "Overwrite \"{stem}\" with the current document? The old content cannot be recovered (uses the last Ctrl+S save)"
                             );
-                            match confirm_popup(ui.ctx(), "snap-upd", &text) {
+                            match confirm_popup_with(ui.ctx(), "snap-upd", &text, tr("确认更新", "Update"), COL_ACCENT) {
                                 Some(true) => {
                                     let hwnd = self.snap_target.as_ref().map(|t| t.hwnd);
                                     match pla_ui::snapshot::update_snapshot(&self.doc_key, &name, hwnd) {
@@ -4383,7 +4394,7 @@ impl eframe::App for PlaApp {
                                                 let (srect, sresp) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::click());
                                                 ui.painter().text(srect.center(), egui::Align2::CENTER_CENTER, if meta.fav { "★" } else { "☆" }, egui::FontId::proportional(13.0), if meta.fav { egui::Color32::from_rgb(255,200,60) } else { COL_MUTED });
                                                 if sresp.on_hover_text(if meta.fav { tr("取消收藏", "Unfavorite") } else { tr("收藏(置顶)", "Favorite (pin to top)") }).clicked() { fav = true; }
-                                                if pencil_button(ui).on_hover_text(tr("改名", "Rename")).clicked() { rn = true; }
+                                                if pencil_button(ui).on_hover_text(tr("改名", "Rename")).clicked() { rn = true; } if refresh_button(ui, 14.0).on_hover_text(tr("更新: 用当前状态覆盖这一项(需确认)", "Update: overwrite this item with the current state (confirm)")).clicked() { upd = true; }
                                                 let (drect, dresp) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::click());
                                                 let dcol = if dresp.hovered() { COL_RED } else { COL_MUTED };
                                                 let p = |x: f32, y: f32| egui::pos2(drect.left() + x, drect.top() + y);
@@ -4463,7 +4474,7 @@ impl eframe::App for PlaApp {
                         // R35: 更新确认 — 用当前选择(+ 相机 + 截图)覆盖这个选择集, 名字与收藏保留
                         if let Some(name) = self.sel_update_confirm.clone() {
                             let text = t!("用当前选择覆盖「{name}」? 原内容不可恢复", "Overwrite \"{name}\" with the current selection? The old content cannot be recovered");
-                            match confirm_popup(ui.ctx(), "sel-upd", &text) {
+                            match confirm_popup_with(ui.ctx(), "sel-upd", &text, tr("确认更新", "Update"), COL_ACCENT) {
                                 Some(true) => {
                                     if self.sel_cdp_members.is_empty() {
                                         self.set_notice((true, tr("实时选择为空 — 请先在视口里选中目标", "Live selection is empty — select something in the viewport first").into()));
@@ -4783,7 +4794,7 @@ impl eframe::App for PlaApp {
                                                 let (srect, sresp) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::click());
                                                 ui.painter().text(srect.center(), egui::Align2::CENTER_CENTER, if meta.fav { "★" } else { "☆" }, egui::FontId::proportional(13.0), if meta.fav { egui::Color32::from_rgb(255,200,60) } else { COL_MUTED });
                                                 if sresp.on_hover_text(if meta.fav { tr("取消收藏", "Unfavorite") } else { tr("收藏(置顶)", "Favorite (pin to top)") }).clicked() { fav = true; }
-                                                if pencil_button(ui).on_hover_text(tr("改名", "Rename")).clicked() { rn = true; }
+                                                if pencil_button(ui).on_hover_text(tr("改名", "Rename")).clicked() { rn = true; } if refresh_button(ui, 14.0).on_hover_text(tr("更新: 用当前状态覆盖这一项(需确认)", "Update: overwrite this item with the current state (confirm)")).clicked() { upd = true; }
                                                 let (drect, dresp) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::click());
                                                 let dcol = if dresp.hovered() { COL_RED } else { COL_MUTED };
                                                 let p = |x: f32, y: f32| egui::pos2(drect.left() + x, drect.top() + y);
@@ -4858,7 +4869,7 @@ impl eframe::App for PlaApp {
                         // R35: 更新确认 — 采集当前视口状态 + 缩略图, 覆盖这一项(名字与收藏保留)
                         if let Some(name) = self.vp_update_confirm.clone() {
                             let text = t!("用当前视口状态覆盖「{name}」? 原内容不可恢复", "Overwrite \"{name}\" with the current view state? The old content cannot be recovered");
-                            match confirm_popup(ui.ctx(), "vp-upd", &text) {
+                            match confirm_popup_with(ui.ctx(), "vp-upd", &text, tr("确认更新", "Update"), COL_ACCENT) {
                                 Some(true) => {
                                     let tmp = pla_ui::vpstate::vpstate_dir(&self.doc_key).join("__shot_tmp.png");
                                     let _ = std::fs::create_dir_all(tmp.parent().unwrap_or(std::path::Path::new(".")));
