@@ -39,6 +39,20 @@ pub async fn state_once(cdp_port: u16, hwnd: isize, geo_args: &Value) -> anyhow:
     state(&mut ws, &mut mid, geo_args).await
 }
 
+/// CLI 用: 调一个垫片接口(名字必须在 `shim::api::ALL` 里; 异步接口同样等结果)。
+pub async fn call_once(cdp_port: u16, hwnd: isize, name: &str, args: &Value) -> anyhow::Result<Value> {
+    if !api::ALL.contains(&name) {
+        anyhow::bail!("unknown shim api {name} (known: {})", api::ALL.join(", "));
+    }
+    let mut ws = tokio::time::timeout(Duration::from_secs(8), connect_page(cdp_port, hwnd))
+        .await
+        .map_err(|_| anyhow::anyhow!("connect timeout (8s)"))??;
+    let mut mid: u64 = 100;
+    eval_roundtrip(&mut ws, &mut mid, &shim::install_expr()).await?;
+    let raw = eval_roundtrip(&mut ws, &mut mid, &shim::call_expr(name, args)).await?;
+    Ok(shim::parse_reply(&raw)?)
+}
+
 /// 由 CLI 参数拼 `geo.query` 的参数: detail / of(逗号分隔的物体 id) / units。
 pub fn geo_args(detail: Option<&str>, of: Option<&str>, units: Option<&str>) -> Value {
     let mut a = serde_json::Map::new();

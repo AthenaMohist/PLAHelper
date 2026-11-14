@@ -57,6 +57,7 @@ pub fn cap_label(c: &str) -> &'static str {
         cap::CMD_EXEC => tr("带参数执行几何命令(N2 配方表)", "Execute geometry commands with parameters (N2 recipes)"),
         cap::GEO_READ => tr("几何查询(实体/面/边/顶点签名)", "Geometry query (solid/face/edge/vertex signatures)"),
         cap::HIST_WRITE => tr("事务回滚(撤到起点)", "Transaction rollback (undo to start)"),
+        cap::SNAP_READ => tr("吸附点(面心/边中点/圆心/顶点…)", "Snap points (face centres/edge midpoints/circle centres/vertices…)"),
         cap::BOOL_RUN => tr("布尔运算", "Boolean operations"),
         cap::ASSET_PLACE => tr("放置常用件", "Place common parts"),
         _ => "",

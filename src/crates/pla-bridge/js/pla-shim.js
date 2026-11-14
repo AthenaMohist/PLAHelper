@@ -123,6 +123,10 @@
     // 自建工厂命令的基类 Command: 取任一几何命令类的父类
     'cmd.factoryBaseHolder':   ['ed', 'commands.CornerBoxCommand'],
     // 几何工厂类(只在闭包里; 代理按需拍堆快照挂到 CFG.factoriesGlobal, 根 fac)
+    // ---- A2: 吸附点(测量 / 自由移动命令用的同一批点; SnapScene 按物体缓存, 新物体建完即有) ----
+    'ed.snapScene':            ['ed', 'snapScene'],
+    'snap.canonicals':         ['ss', 'canonicals'],
+    'snap.occurrences':        ['ss', 'occurrences'],
     'fac.cornerBox':           ['fac', 'CornerBoxFactory'],
     'fac.multiFillet':         ['fac', 'MultiFilletShellFactory']
   };
@@ -263,8 +267,30 @@
       vertices: 'GetVertices', vLeft: 'left', vRight: 'right', // edge.GetVertices() → { left, right }
       point: 'GetPoint', ident: 'GetIdentifier'
     },
-    // 顶点没有 Plasticity 拓扑 id(lookupTopologyItemById 不认) → 自拟 '<物体版本id>v<顶点标识>'
+    // 顶点没有 Plasticity 拓扑 id(lookupTopologyItemById 不认) → 自拟 '<物体版本id>v<顶点实体id>'(实体 id 取自吸附数据,
+    // 与面/边拓扑 id 里的数字同一套; 没有吸附数据时退回 Parasolid 标识)
     vertexIdTag: 'v',
+    // ---- A2: 吸附数据(SnapScene.canonicals: 'Item:<物体版本id>|<bool>' → { snapsForItem, positions, box }) ----
+    snapKeyPrefix: 'Item:',
+    snapItemKey: 'snapsForItem',
+    // 每类吸附点: 对外 kind → [snapsForItem 下的路径, 拓扑 id 字段, 拓扑类型, 位置字段, 方向字段, 方向的对外名]
+    snapKinds: {
+      faceCenter:    ['faces.centers', 'faceIds', 'face', 'positions', 'normals', 'normal'],
+      edgeMid:       ['edges.halves', 'edgeIds', 'edge', 'positions', 'tangents', 'tangent'],
+      circleCenter:  ['edges.circles', 'edgeIds', 'edge', 'centers', 'axes', 'axis'],
+      circleQuarter: ['edges.circles', 'edgeIds', 'edge', 'quarters', 'tangents', 'tangent'],
+      vertex:        ['shellVertices', 'vertexIds', 'vertex', 'positions', null, null],
+      bboxCorner:    ['bbox.corners', null, null, 'positions', 'normals', 'normal']
+    },
+    topoTag: { face: 'f', edge: 'e', vertex: 'v' },
+    // 实例变换(occurrence.transform: 16 个数, 列主序 = three.js Matrix4.elements)
+    occEntry: 'entry', occTransform: 'transform',
+    // 面积 / 体积 / 质心: 内核没有对外方法(26.2.3 只有 GetCentroid = 包围盒中心) → 用显示网格算:
+    // FaceGroup.mesh.geometry(position + index), groups = [起点, 数量] × 面(与 versionIds 同序)。曲面是近似(R3 圆角面 −0.3%)。
+    faceMesh: 'mesh', meshGroups: 'groups',
+    // 判定两平面"平行"的角度容差(度): 平行时 measure 额外给法向距离(壁厚); 平面的曲面类名
+    parallelTolDeg: 0.1,
+    planeSurface: 'Plane',
     // geo.query 每类最多返回的项数(超出如实报 truncated)
     queryLimit: 2000,
     // ---- A3: 事务回滚 ----
@@ -318,6 +344,7 @@
     'mat.set':     { todo: 'N1' },
     'geo.read':  { needs: ['geo.items', 'geo.lookupTopo', 'geo.lookupItem', 'ed.docUnit'] },
     'hist.write': { needs: ['ed.undoStack', 'exec.cancel'] },
+    'snap.read': { needs: ['geo.items', 'ed.docUnit', 'ed.snapScene', 'snap.canonicals'], optional: ['snap.occurrences'] },
     // 工厂类不列入: 首次使用前本来就没有(由代理按需挂上), 缺哪个在执行时按表键报
     'cmd.exec':    { needs: ['ed.enqueue', 'sig.commandEnded', 'exec.cancel', 'cmd.factoryBaseHolder', 'geo.items',
                              'geo.lookupTopo', 'geo.lookupItem', 'ed.docUnit', 'vp.camera'] },
@@ -370,6 +397,7 @@
       case 'ds': return get('ed.docSettings');
       case 'tex': return get('mat.textures');
       case 'fac': return W[CFG.factoriesGlobal];
+      case 'ss': return get('ed.snapScene');
     }
     return undefined;
   }
@@ -1362,6 +1390,15 @@
       var sid = itemIdOf(sv);
       var fe = groupEntries(sv, 'face', k), ee = groupEntries(sv, 'edge', k);
       out.solids.push({ id: sid, name: nameOf(sv), bbox: bboxOf(sv, k), faces: fe.length, edges: ee.length });
+      // 顶点优先取吸附数据(真顶点实体 id); 没有吸附数据才从边端点推(Parasolid 标识)
+      var edgeVerts = verts;
+      if (verts) {
+        var sp = snapPointsOf(sv, ['vertex'], k);
+        if (sp && sp.length) {
+          edgeVerts = null;
+          sp.forEach(function (p) { if (!verts.has(p.id)) verts.set(p.id, { id: p.id, solid: sid, point: p.pos }); });
+        }
+      }
       if (out.faces) fe.forEach(function (e) {
         if (!flt.cheap(e)) return;
         var o = faceSig(e, sid, k);
@@ -1371,7 +1408,7 @@
       });
       if (out.edges) ee.forEach(function (e) {
         if (!flt.cheap(e)) return;
-        var o = edgeSig(e, sid, k, verts);
+        var o = edgeSig(e, sid, k, edgeVerts);
         if (!flt.edge(o)) return;
         total.edges++;
         if (out.edges.length < limit) out.edges.push(o);
@@ -1382,6 +1419,197 @@
     Object.keys(total).forEach(function (w) { if (total[w] > out[w].length) tr[w] = total[w] - out[w].length; });
     if (Object.keys(tr).length) out.truncated = tr;
     return out;
+  });
+
+  // =====================================================================
+  // A2: 吸附点 + 测量(只读)。吸附点 = 测量 / 自由移动命令显示的那批点(面心、边中点、圆心、象限点、顶点、包围盒角),
+  // 直接读 SnapScene 按物体缓存的数据, 不进命令、不碰界面(X-ray 下可点到的内部点也在里面)。
+  // =====================================================================
+  function snapEntryOf(view) {
+    var C = get('snap.canonicals');
+    if (!C || typeof C.forEach !== 'function') return null;
+    var pre = NAMES.snapKeyPrefix + itemIdOf(view) + '|', hit = null;
+    C.forEach(function (e, key) { if (!hit && String(key).indexOf(pre) === 0) hit = e; });
+    return hit;
+  }
+
+  // 该物体缓存条目的实例变换(普通物体 = 单位阵 / 无); 实例化的物体可能有多个
+  function occTransformsOf(entry) {
+    var O = get('snap.occurrences'), out = [];
+    if (O) Array.from(O).forEach(function (o) { if (o && o[NAMES.occEntry] === entry) out.push(o[NAMES.occTransform] || null); });
+    return out.length ? out : [null];
+  }
+
+  function xfPoint(m, x, y, z) {
+    if (!m) return [x, y, z];
+    return [m[0] * x + m[4] * y + m[8] * z + m[12], m[1] * x + m[5] * y + m[9] * z + m[13], m[2] * x + m[6] * y + m[10] * z + m[14]];
+  }
+  function xfDir(m, x, y, z) {
+    var v = m ? [m[0] * x + m[4] * y + m[8] * z, m[1] * x + m[5] * y + m[9] * z, m[2] * x + m[6] * y + m[10] * z] : [x, y, z];
+    var l = Math.hypot(v[0], v[1], v[2]) || 1;
+    return [sig7(v[0] / l), sig7(v[1] / l), sig7(v[2] / l)];
+  }
+
+  // 物体的吸附点: [{kind, solid, pos(文档单位), id?(拓扑 id), normal|tangent|axis?}]; 没有吸附数据 → null
+  function snapPointsOf(view, kinds, k) {
+    var entry = snapEntryOf(view);
+    var sfi = entry && entry[NAMES.snapItemKey];
+    if (!sfi) return null;
+    var sid = itemIdOf(view), out = [];
+    occTransformsOf(entry).forEach(function (m) {
+      kinds.forEach(function (kind) {
+        var spec = NAMES.snapKinds[kind];
+        var blk = walk(sfi, spec[0]);
+        if (blk === MISS || !blk) return;
+        var P = blk[spec[3]];
+        if (!P || !P.length) return;
+        var ids = spec[1] ? blk[spec[1]] : null, D = spec[4] ? blk[spec[4]] : null;
+        var n = Math.floor(P.length / 3), per = ids && ids.length ? n / ids.length : 1;
+        for (var i = 0; i < n; i++) {
+          var p = xfPoint(m, P[i * 3], P[i * 3 + 1], P[i * 3 + 2]);
+          var o = { kind: kind, solid: sid, pos: [sig7(p[0] / k), sig7(p[1] / k), sig7(p[2] / k)] };
+          if (ids) o.id = sid + NAMES.topoTag[spec[2]] + ids[Math.floor(i / per)];
+          if (D && D.length) {
+            var j = D.length === P.length ? i : Math.floor(i / per);
+            if (j * 3 + 2 < D.length) o[spec[5]] = xfDir(m, D[j * 3], D[j * 3 + 1], D[j * 3 + 2]);
+          }
+          out.push(o);
+        }
+      });
+    });
+    return out;
+  }
+
+  // args = { of?, kinds?: [faceCenter|edgeMid|circleCenter|circleQuarter|vertex|bboxCorner], near?, tol?, units?, limit? }
+  // → { units, points: [...], noSnapData: [物体 id](缓存里没有的物体), truncated? }
+  def('geo.snaps', 'snap.read', function (a) {
+    a = a || {};
+    var U = unitOf(a), k = U.k;
+    var kinds = a.kinds !== undefined ? (Array.isArray(a.kinds) ? a.kinds : [a.kinds]) : Object.keys(NAMES.snapKinds);
+    kinds.forEach(function (x) { if (!NAMES.snapKinds[x]) throw new Error('unknown snap kind ' + x + ' (known: ' + Object.keys(NAMES.snapKinds).join(', ') + ')'); });
+    if (a.near !== undefined && (!Array.isArray(a.near) || a.near.length !== 3)) throw new Error('near must be [x,y,z]');
+    var tol = a.tol !== undefined ? Number(a.tol) : NAMES.pickTolerance;
+    var limit = a.limit !== undefined ? Math.max(0, Number(a.limit)) : NAMES.queryLimit;
+    var pool = a.of !== undefined ? (Array.isArray(a.of) ? a.of : [a.of]).reduce(function (acc, r) { return acc.concat(resolveSolids(r, {})); }, []) : solidViews();
+    var out = { units: U.unit, points: [], noSnapData: [] }, total = 0;
+    pool.forEach(function (sv) {
+      var pts = snapPointsOf(sv, kinds, k);
+      if (!pts) { out.noSnapData.push(itemIdOf(sv)); return; }
+      pts.forEach(function (p) {
+        if (a.near && Math.hypot(p.pos[0] - a.near[0], p.pos[1] - a.near[1], p.pos[2] - a.near[2]) > tol) return;
+        total++;
+        if (out.points.length < limit) out.points.push(p);
+      });
+    });
+    if (total > out.points.length) out.truncated = total - out.points.length;
+    return out;
+  });
+
+  // 测量参照 → { pos(米), dir?(单位向量), kind, planar? }。
+  // 参照: [x,y,z](文档单位; 角度测量里当方向) / 拓扑 id 字符串('<物体>f<n>' 面 → 面心 + 法向; 'e' 边 → 中点 + 方向; 'v' 顶点)
+  function measureRef(ref, k, asDir) {
+    var A = NAMES.geoApi;
+    if (Array.isArray(ref)) {
+      if (ref.length !== 3) throw new Error('point must be [x,y,z]');
+      if (asDir) { var l = Math.hypot(ref[0], ref[1], ref[2]); if (!(l > 0)) throw new Error('direction must be non-zero'); return { dir: ref.map(function (x) { return x / l; }), kind: 'vector' }; }
+      return { pos: ref.map(function (x) { return Number(x) * k; }), kind: 'point' };
+    }
+    var m = /^(\d+)([a-z])(\d+)$/.exec(String(ref));
+    if (!m) throw new Error('reference must be [x,y,z] or a topology id like 34f10088 / 34e10505 / 34v10495: ' + JSON.stringify(ref));
+    var tag = m[2], sv = viewOf('solid', m[1]);
+    if (!sv) throw new Error('solid not found: ' + m[1]);
+    var kind = tag === NAMES.topoTag.face ? 'face' : tag === NAMES.topoTag.edge ? 'edge' : tag === NAMES.topoTag.vertex ? 'vertex' : null;
+    if (!kind) throw new Error('unknown topology tag ' + tag);
+    var snapKind = { face: 'faceCenter', edge: 'edgeMid', vertex: 'vertex' }[kind];
+    var sp = (snapPointsOf(sv, [snapKind], 1) || []).filter(function (p) { return p.id === String(ref); })[0];
+    var r = { kind: kind };
+    if (sp) { r.pos = sp.pos; r.dir = sp.normal || sp.tangent || null; }
+    if (kind === 'vertex') { if (!sp) throw new Error('vertex not found (no snap data): ' + ref); return r; }
+    var model = modelOf(kind, String(ref));
+    if (!model) throw new Error(kind + ' not found: ' + ref);
+    if (kind === 'face') {
+      var surf = model[NAMES.surfaceGetter]()[A.surfaceKey];
+      r.planar = !!(surf && surf.constructor && surf.constructor.name === NAMES.planeSurface);
+      if (!sp) { var mp = model[A.midpoint](); var mpos = vecOut(mp[A.midPos], 1); r.pos = mpos; r.dir = dirOut(mp[A.midNormal]); }
+    } else {
+      var info = {};
+      try { radialInfo(model[A.curve]()[A.curveKey], info, 1); } catch (e) {}
+      if (info.direction) r.dir = info.direction; // 直线: 曲线方向优于吸附切向
+      if (!r.pos) { var lr = model[A.vertices](); var p0 = vecOut(lr[A.vLeft][A.point](), 1), p1 = vecOut(lr[A.vRight][A.point](), 1); r.pos = [(p0[0] + p1[0]) / 2, (p0[1] + p1[1]) / 2, (p0[2] + p1[2]) / 2]; }
+    }
+    return r;
+  }
+
+  // 物体的面积 / 体积 / 质心(显示网格; 曲面近似)。faces=true 时附逐面面积。
+  function massOf(view, k, withFaces) {
+    var fg = view[NAMES.shellGroups.face];
+    var mesh = fg && fg[NAMES.faceMesh];
+    var g = mesh && mesh.geometry;
+    var pos = g && g.attributes && g.attributes.position && g.attributes.position.array;
+    var idx = g && g.index && g.index.array;
+    if (!pos || !idx) throw new Error('no display mesh for solid ' + itemIdOf(view));
+    var me = mesh.matrixWorld && mesh.matrixWorld.elements;
+    var P = function (i) { var j = idx[i] * 3; return xfPoint(me, pos[j], pos[j + 1], pos[j + 2]); };
+    var grp = fg[NAMES.meshGroups] ? Array.from(fg[NAMES.meshGroups]) : [0, idx.length];
+    var ids = fg[NAMES.groupVersionIds] ? Array.from(fg[NAMES.groupVersionIds]) : [];
+    var area = 0, vol = 0, cx = 0, cy = 0, cz = 0, faces = [];
+    for (var f = 0; f * 2 + 1 < grp.length; f++) {
+      var fa = 0;
+      for (var i = grp[f * 2]; i + 2 < grp[f * 2] + grp[f * 2 + 1]; i += 3) {
+        var a = P(i), b = P(i + 1), c = P(i + 2);
+        var ux = b[0] - a[0], uy = b[1] - a[1], uz = b[2] - a[2], vx = c[0] - a[0], vy = c[1] - a[1], vz = c[2] - a[2];
+        fa += Math.hypot(uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx) / 2;
+        var v6 = (a[0] * (b[1] * c[2] - b[2] * c[1]) - a[1] * (b[0] * c[2] - b[2] * c[0]) + a[2] * (b[0] * c[1] - b[1] * c[0])) / 6;
+        vol += v6; cx += v6 * (a[0] + b[0] + c[0]) / 4; cy += v6 * (a[1] + b[1] + c[1]) / 4; cz += v6 * (a[2] + b[2] + c[2]) / 4;
+      }
+      area += fa;
+      if (withFaces) faces.push({ id: ids[f] !== undefined ? String(ids[f]) : null, area: sig7(fa / (k * k)) });
+    }
+    // 网格坐标是 Float32: 离原点 ~200 mm 处量 5 mm 宽的小面, 噪声已到第 6 位(实测 100 → 99.9999)
+    // → 网格量只保留 5 位有效数字(本来就是近似值)
+    var s6 = function (x) { var n = Number(Number(x).toPrecision(5)); return Math.abs(n) < 1e-12 ? 0 : n; };
+    var r = { id: itemIdOf(view), name: nameOf(view), volume: s6(Math.abs(vol) / (k * k * k)), area: s6(area / (k * k)),
+              centroid: vol ? [s6(cx / vol / k), s6(cy / vol / k), s6(cz / vol / k)] : null, method: 'mesh' };
+    if (withFaces) r.faces = faces.map(function (x) { return { id: x.id, area: s6(x.area) }; });
+    return r;
+  }
+
+  function angleDeg(u, v) { var d = u[0] * v[0] + u[1] * v[1] + u[2] * v[2]; return Math.acos(Math.max(-1, Math.min(1, d))) * 180 / Math.PI; }
+
+  // args = { op: 'distance', a, b } | { op: 'angle', a, b } | { op: 'mass', of?, faces? };  units? 可覆盖。
+  // distance → { distance, delta, a, b, normalDistance?(两平面平行时: 沿法向的距离 = 壁厚) }
+  // angle    → { angle(度, 0–180) }(面取法向, 边取方向, 数组当方向向量)
+  // mass     → { solids: [{id, name, volume, area, centroid, faces?, method: 'mesh'}] }
+  def('geo.measure', 'geo.read', function (a) {
+    a = a || {};
+    var U = unitOf(a), k = U.k;
+    var out = { units: U.unit, op: a.op };
+    if (a.op === 'distance') {
+      if (a.a === undefined || a.b === undefined) throw new Error('distance needs a and b');
+      var A1 = measureRef(a.a, k), B1 = measureRef(a.b, k);
+      var d = [B1.pos[0] - A1.pos[0], B1.pos[1] - A1.pos[1], B1.pos[2] - A1.pos[2]];
+      out.distance = sig7(Math.hypot(d[0], d[1], d[2]) / k);
+      out.delta = d.map(function (x) { return sig7(x / k); });
+      out.a = A1.pos.map(function (x) { return sig7(x / k); }); out.b = B1.pos.map(function (x) { return sig7(x / k); });
+      if (A1.planar && B1.planar && A1.dir && B1.dir) {
+        var ang = angleDeg(A1.dir, B1.dir);
+        if (ang <= NAMES.parallelTolDeg || ang >= 180 - NAMES.parallelTolDeg) out.normalDistance = sig7(Math.abs(d[0] * A1.dir[0] + d[1] * A1.dir[1] + d[2] * A1.dir[2]) / k);
+      }
+      return out;
+    }
+    if (a.op === 'angle') {
+      if (a.a === undefined || a.b === undefined) throw new Error('angle needs a and b');
+      var A2 = measureRef(a.a, k, true), B2 = measureRef(a.b, k, true);
+      if (!A2.dir || !B2.dir) throw new Error('angle needs directions (faces, straight edges or vectors)');
+      out.angle = sig7(angleDeg(A2.dir, B2.dir));
+      return out;
+    }
+    if (a.op === 'mass') {
+      var pool = a.of !== undefined ? (Array.isArray(a.of) ? a.of : [a.of]).reduce(function (acc, r) { return acc.concat(resolveSolids(r, {})); }, []) : solidViews();
+      out.solids = pool.map(function (sv) { try { return massOf(sv, k, !!a.faces); } catch (e) { return { id: itemIdOf(sv), err: errMsg(e) }; } });
+      return out;
+    }
+    throw new Error('op must be distance | angle | mass');
   });
 
   // ---- 视角 / 视口杂项 ----

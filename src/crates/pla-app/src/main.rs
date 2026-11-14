@@ -250,6 +250,7 @@ fn main() {
         println!("                                                --atomic = 某步失败时撤回本次全部步骤)");
         println!("  cdp-state [--hwnd N] [--detail solids|faces|edges|all] [--of id,id|名字] [--units U] [--out 文件]");
         println!("                                                A1 只读: 撤销深度 + 选择 + 几何签名(给大模型读的 JSON)");
+        println!("  cdp-call [--hwnd N] <接口名> [JSON 参数]        调任一垫片接口(geo.snaps / geo.measure / hist.* …)");
         println!("  doc-list / ping");
         return;
     }
@@ -411,6 +412,30 @@ fn main() {
                     let failed = ["history", "selection", "geometry"].iter().any(|k| v[*k].get("err").is_some());
                     std::process::exit(if failed { 1 } else { 0 });
                 }
+                Err(e) => { eprintln!("CDP ERROR: {e:#}"); std::process::exit(1); }
+            }
+        },
+        "cdp-call" => {
+            // 调任一垫片接口(如 geo.snaps / geo.measure / hist.begin), 参数为 JSON。
+            let mut hwnd: isize = 0;
+            let mut rest: Vec<String> = Vec::new();
+            let mut it = a.iter();
+            while let Some(x) = it.next() {
+                match x.as_str() {
+                    "--hwnd" => hwnd = it.next().and_then(|v| v.parse().ok()).unwrap_or(0),
+                    other => rest.push(other.to_string()),
+                }
+            }
+            let Some(name) = rest.first().cloned() else { eprintln!("用法: cdp-call [--hwnd N] <接口名> [JSON 参数]"); std::process::exit(2); };
+            let args: serde_json::Value = match rest.get(1) {
+                None => serde_json::Value::Null,
+                Some(s) => match serde_json::from_str(s) {
+                    Ok(v) => v,
+                    Err(e) => { eprintln!("参数不是合法 JSON: {e}"); std::process::exit(2); }
+                },
+            };
+            match rt.block_on(pla_bridge::query::call_once(9333, hwnd, &name, &args)) {
+                Ok(v) => println!("{}", serde_json::to_string_pretty(&v).unwrap()),
                 Err(e) => { eprintln!("CDP ERROR: {e:#}"); std::process::exit(1); }
             }
         },
