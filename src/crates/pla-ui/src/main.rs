@@ -4426,7 +4426,7 @@ impl eframe::App for PlaApp {
                                             let (del, fav, rn, upd) = ui.allocate_new_ui(egui::UiBuilder::new().max_rect(cell), |ui| item(ui, meta, cell_w, fav_img_h)).inner;
                                             if del { delete_ask = Some(meta.name.clone()); }
                                             if fav { fav_toggle = Some((meta.name.clone(), !meta.fav)); }
-                                            if rn { rename_start = Some(meta.name.clone()); }
+                                            if rn { rename_start = Some(meta.name.clone()); } if upd { update_ask = Some(meta.name.clone()); }
                                         }
                                     }
                                     ui.separator();
@@ -4441,7 +4441,7 @@ impl eframe::App for PlaApp {
                                         ui.add_space(4.0);
                                         if del { delete_ask = Some(meta.name.clone()); }
                                         if fav { fav_toggle = Some((meta.name.clone(), !meta.fav)); }
-                                        if rn { rename_start = Some(meta.name.clone()); }
+                                        if rn { rename_start = Some(meta.name.clone()); } if upd { update_ask = Some(meta.name.clone()); }
                                     }
                                 }
                             });
@@ -4825,7 +4825,7 @@ impl eframe::App for PlaApp {
                                             let (del, fav, rn, upd) = ui.allocate_new_ui(egui::UiBuilder::new().max_rect(cell), |ui| item(ui, meta, cell_w, fav_img_h)).inner;
                                             if del { delete_ask = Some(meta.name.clone()); }
                                             if fav { fav_toggle = Some((meta.name.clone(), !meta.fav)); }
-                                            if rn { rename_start = Some(meta.name.clone()); }
+                                            if rn { rename_start = Some(meta.name.clone()); } if upd { update_ask = Some(meta.name.clone()); }
                                         }
                                     }
                                     ui.separator();
@@ -4837,7 +4837,7 @@ impl eframe::App for PlaApp {
                                         ui.add_space(4.0);
                                         if del { delete_ask = Some(meta.name.clone()); }
                                         if fav { fav_toggle = Some((meta.name.clone(), !meta.fav)); }
-                                        if rn { rename_start = Some(meta.name.clone()); }
+                                        if rn { rename_start = Some(meta.name.clone()); } if upd { update_ask = Some(meta.name.clone()); }
                                     }
                                 }
                             });
