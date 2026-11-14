@@ -51,6 +51,17 @@ shader mode、render mode、x-ray、摄像机参数、网格线、各类显示�
 * 视口截面在 `shading.section`(Section, Object3D: position / quaternion 即截面平面位姿)、`shading.isSectioned`、
   `shading._sectionMode.tag`(none / …)。旧实现存的 `ed.sections.sections`(SectionDatabase)是另一回事(截面分析), 不是视口截面。
 
+## 材质状态(R34, 2026-11-14 白天实测, MT_screws 副本)
+
+* 数据: `ed.materials`(BasicMaterialDatabase)的 `snapshot()` = `{version, counter, materials:[glTF 风格定义]}`, 定义带稳定 `uuid`
+  与文档内 `id`; 指派在 `nodes.read.node2material`(nodeKey → materialId), 稳定 id 走 `node2id`。`db.get(id)` / `getMutable(id)`
+  返回同一个 three.js `MeshPhysicalMaterial`, 改它的 `color` 后 `snapshot()` 立刻反映(baseColorFactor 由材质实时导出)。
+* 恢复: memento 的 `materials` + `nodes.materials`(类型化数组对)换掉再 `originator.restore` —— 不进撤销栈、几何版本不变,
+  窗口可见时不抛错。往返实测: 存(1 材质/12 指派)→ 改色为红 + 去掉一个物体的指派 → 恢复 → 数据逐字节一致, 截图与改动前像素一致(MAD 0)。
+* **恢复后视口不自己重画**: 数据已变但画面停在旧颜色, 要等下一次交互; 垫片在 restore 后主动 `vp.render`(R34c)。
+* 找不到的物体(`node:<稳定id>`)/材质(`material:<uuid>`)如实列在 missing, 其余照常应用。
+* 自检(`pla-app cdp-selftest`)含 `mat.restore ← mat.save`: 原样恢复应识别为 `materials(same)`, 不碰 memento。
+
 ## 坑
 
 1. **`nodes.setHidden(item, true)` 只改集合, 场景不刷新**(scene.update / renderList.fullRecompute /

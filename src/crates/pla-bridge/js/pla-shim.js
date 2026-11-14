@@ -1540,6 +1540,8 @@
     nodes[NAMES.mementoNodeMaterials] = [new pair[0].constructor(keys), new pair[1].constructor(vals)];
     m[NAMES.mementoNodes] = nodes;
     invokeOn('orig.restore', [m], orig);
+    // 实测(R34, 26.2.3): memento 恢复后数据已变, 但视口不会自己重画, 要等下一次交互才看到新颜色 → 主动请求一帧
+    call0(viewport(), 'vp.render');
     return { applied: ['materials:' + S.materials.length, 'assign:' + keys.length], missing: missing, failed: [] };
   });
 

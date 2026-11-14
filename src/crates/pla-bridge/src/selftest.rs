@@ -394,6 +394,20 @@ pub async fn run(cdp_port: u16, inspector_port: u16, hwnd: Option<isize>) -> Rep
         },
         Err(e) => r.add(S_ROUNDTRIP, "vp.restore ← vp.save", Level::Fail, e),
     }
+    // R34 材质状态: 存一份 → 原样恢复 → 应识别为"没变化"(materials(same)), 不碰 memento、不改文档。
+    match call(ws, mid, api::MAT_SAVE, &Value::Null).await {
+        Ok(s0) => {
+            let n = (s0["materials"].as_array().map(|a| a.len()).unwrap_or(0), s0["assign"].as_array().map(|a| a.len()).unwrap_or(0));
+            match call(ws, mid, api::MAT_RESTORE, &s0).await {
+                Ok(res) if res["applied"] == serde_json::json!(["materials(same)"]) => {
+                    r.add(S_ROUNDTRIP, "mat.restore ← mat.save", Level::Pass, format!("材质 {} / 指派 {}; 原样识别为无变化", n.0, n.1))
+                }
+                Ok(res) => r.add(S_ROUNDTRIP, "mat.restore ← mat.save", Level::Fail, format!("原样恢复却被当成改动: {res}")),
+                Err(e) => r.add(S_ROUNDTRIP, "mat.restore ← mat.save", Level::Fail, e),
+            }
+        }
+        Err(e) => r.add(S_ROUNDTRIP, "mat.restore ← mat.save", Level::Fail, e),
+    }
     // 选择回环: 把当前选择经 sel.apply 原样恢复(选择命令进撤销历史: 撤销栈 +1 属预期, 守护段扣除)。
     let mut selection_commands = 0i64;
     match call(ws, mid, api::SEL_SNAPSHOT, &Value::Null).await {
