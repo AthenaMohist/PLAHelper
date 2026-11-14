@@ -95,6 +95,17 @@ CLI: `pla-app cdp-call [--hwnd N] geo.snaps|geo.measure|… '<JSON>'`(任一垫�
 真机(L 形支架 34): 底板 / 立板壁厚 `normalDistance` 均 5(面心直线距离 6.4); 顶面 ⟂ 立板内侧 90°;
 质心 (213.22, 10, 8.2533), 手算 ≈ (213.226, 10, 8.255); 整文档 31 实体质量 112 ms。
 
+## N3d 面签名与重新定位(2026-11-15)
+
+面 id(`<物体>f<n>`)每次几何修改都会变(实测 84f9483 → 85f9483), 物体版本 id 也变, 但大纲名(Box.006)不变。
+
+- `dim.signature {faces}` → 每面 `{id, solid, solidName, surface, center, normal, radius?, axis?, axisOrigin?, bbox}`(文档单位)。
+- `geo.resolve {faces: [签名]}` → 每个签名 `{id, score(中心偏差), gap(次优 − 最优), sig(当前签名)}`:
+  同名实体(没有同名 → 全部实体)→ 同曲面类型 → 法向平行(有轴的面比轴线平行)→ 中心最近。
+- 改尺寸后的跟踪: 被移动的面中心 = 旧中心 + 已知平移量(厚度 = 法向 × Δ, 距离 = 方向 × Δ), 用预测签名定位, 偏差 0;
+  半径 / 圆角的中心移动不好预测, 交给"最近匹配"。记录用定位到的当前签名刷新。
+- 存储: `<文档目录>/.pla/models/<doc_key>/dims.json`(`pla_ui::dims`)。这也是 A9 映射表的位置与核心机制。
+
 ## A5 指定视角截图(2026-11-15)
 
 垫片 `cam.view`(能力 `cam.write`): `{view?: front|back|left|right|top|bottom|iso(默认), of?, margin?: 1.15, maxWidth?: 960, keep?}`

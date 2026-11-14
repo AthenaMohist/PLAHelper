@@ -119,7 +119,7 @@ const PANEL_ENTITIES: [f32; 2] = [520.0, 560.0];
 /// R23: 选择集面板右侧 ENTITIES 列宽。
 const SEL_ENTITIES_COL_W: f32 = 220.0;
 /// N3 尺寸浮窗的默认外框(之后用户拖 / 拉的大小会记住)。
-const PANEL_DIM: [f32; 2] = [300.0, 200.0];
+const PANEL_DIM: [f32; 2] = [320.0, 340.0];
 const PANEL_SETTINGS: [f32; 2] = [300.0, 560.0];
 /// F2: CDP 能力面板(点工具栏状态点打开)。
 const PANEL_CAPS: [f32; 2] = [320.0, 600.0];
@@ -255,6 +255,20 @@ struct PlaApp {
     dim_side: u8,
     /// 上次发出的高亮(面 + 对面 + 候选数), 没变就不重发。
     dim_hl_key: String,
+    /// N3d: 本文档的尺寸记录(懒加载, 换文档重读)。
+    dims_list: Vec<pla_ui::dims::DimRecord>,
+    dims_loaded: bool,
+    /// 当前对应哪条记录(载入的或刚记录的)及其面 id; 选择换成别的面即清除。
+    dim_active: Option<String>,
+    dim_active_ids: Vec<String>,
+    /// 等回包: 记录签名 / 载入定位 / 改后刷新。
+    dim_pending: Option<DimPending>,
+    /// 载入后, 等 dim.face 回包时要切到的对面(拓扑 id)。
+    dim_pending_opp: Option<String>,
+    /// 最近一次应用(成功后刷新记录用)。
+    dim_last_apply: Option<DimApplied>,
+    /// 删除确认中的记录名。
+    dim_del_confirm: Option<String>,
     dim_busy: bool,
     hotkeys: HotkeyMap,
     /// 正在录制快捷键的动作名 (None = 未在录制)。
@@ -985,6 +999,122 @@ fn settings_card<R>(
             add(ui)
         })
         .inner
+}
+
+// ---- N3: 尺寸窗口的原生风格控件(参照 Plasticity 命令面板, 如 PUSH FACE: 信息卡片 / 分段选择 / 上标签下数值框 / Esc Cancel · OK ↵) ----
+
+/// 尺寸显示精度: 最多 3 位小数, 去掉末尾 0(用户 2026-11-15)。
+fn fmt3(x: f64) -> String {
+    let s = format!("{x:.3}");
+    let s = s.trim_end_matches('0').trim_end_matches('.');
+    if s == "-0" { "0".into() } else { s.to_string() }
+}
+
+/// 信息卡片: 圆角浅一级底, 主文字白色粗体 + 副文字灰色(同 PUSH FACE 的 "Select target shell or face / to match")。
+fn rz_info_card(ui: &mut egui::Ui, title: &str, subtitle: &str) {
+    egui::Frame::none()
+        .fill(COL_CARD)
+        .rounding(egui::Rounding::same(8.0))
+        .inner_margin(egui::Margin { left: 12.0, right: 10.0, top: 7.0, bottom: 7.0 })
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 18.0), egui::Sense::hover());
+            paint_text(ui.painter(), egui::pos2(rect.left(), rect.center().y), egui::Align2::LEFT_CENTER, title, 13.0, egui::Color32::WHITE, true);
+            if !subtitle.is_empty() {
+                ui.add(egui::Label::new(egui::RichText::new(subtitle).size(11.5).color(COL_MUTED)).wrap());
+            }
+        });
+}
+
+/// 小节标签(分段选择 / 数值框上方的灰色小字)。
+fn rz_label(ui: &mut egui::Ui, text: &str) {
+    ui.add_space(4.0);
+    ui.label(egui::RichText::new(text).size(12.0).color(COL_TEXT));
+}
+
+/// 分段选择(同 Moving | Fixed | None): 整宽圆角底, 等分; 选中段 = 浅一级底 + 白字。返回是否改了。
+fn rz_segmented(ui: &mut egui::Ui, id: &str, options: &[String], selected: &mut usize) -> bool {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 28.0), egui::Sense::hover());
+    ui.painter().rect_filled(rect, egui::Rounding::same(6.0), COL_FIELD);
+    let n = options.len().max(1);
+    let w = rect.width() / n as f32;
+    let mut changed = false;
+    for (i, label) in options.iter().enumerate() {
+        let r = egui::Rect::from_min_size(egui::pos2(rect.left() + w * i as f32, rect.top()), egui::vec2(w, rect.height()));
+        let resp = ui.interact(r, ui.id().with((id, i)), egui::Sense::click());
+        let on = i == *selected;
+        if on || resp.hovered() {
+            let fill = if on { COL_STEPPER } else { lerp_color(COL_FIELD, egui::Color32::WHITE, 0.06) };
+            ui.painter().rect_filled(r.shrink(2.0), egui::Rounding::same(5.0), fill);
+        }
+        let (shown, size, _) = fit_text(ui, label, w - 8.0, 12.5, 10.0);
+        ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, shown, egui::FontId::proportional(size), if on { egui::Color32::WHITE } else { COL_MUTED });
+        if resp.clicked() && !on {
+            *selected = i;
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// 圆角深色数值框(白字居中 + 单位); editable 时是输入框。返回 (Response 或 None, 回车提交)。
+fn rz_field(ui: &mut egui::Ui, buf: &mut String, units: &str, editable: bool) -> bool {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 28.0), egui::Sense::hover());
+    let fill = if editable { COL_FIELD } else { lerp_color(COL_FIELD, COL_CARD, 0.6) };
+    ui.painter().rect_filled(rect, egui::Rounding::same(6.0), fill);
+    let mut enter = false;
+    if editable {
+        let r = ui.put(
+            rect.shrink2(egui::vec2(8.0, 4.0)),
+            egui::TextEdit::singleline(buf)
+                .frame(false)
+                .horizontal_align(egui::Align::Center)
+                .font(egui::FontId::proportional(13.0))
+                .text_color(egui::Color32::WHITE),
+        );
+        enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+    } else {
+        paint_text(ui.painter(), rect.center(), egui::Align2::CENTER_CENTER, buf, 13.0, COL_TEXT, false);
+    }
+    if !units.is_empty() {
+        ui.painter().text(egui::pos2(rect.right() - 8.0, rect.center().y), egui::Align2::RIGHT_CENTER, units, egui::FontId::proportional(11.5), COL_MUTED);
+    }
+    enter
+}
+
+/// 键帽(底部 Esc / ↵ 提示)。
+fn rz_keycap(painter: &egui::Painter, pos: egui::Pos2, anchor: egui::Align2, key: &str) -> egui::Rect {
+    let font = egui::FontId::proportional(11.0);
+    let w = painter.layout_no_wrap(key.to_string(), font.clone(), COL_TEXT).size().x + 10.0;
+    let r = anchor.anchor_size(pos, egui::vec2(w, 18.0));
+    painter.rect_filled(r, egui::Rounding::same(4.0), COL_FIELD);
+    painter.text(r.center(), egui::Align2::CENTER_CENTER, key, font, COL_TEXT);
+    r
+}
+
+/// 底部操作行: 左 "Esc Cancel", 右 "OK ↵"(同 Plasticity 命令面板)。返回 (取消, 确定)。
+fn rz_footer(ui: &mut egui::Ui, ok_enabled: bool, busy: bool) -> (bool, bool) {
+    ui.add_space(6.0);
+    let (line, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
+    ui.painter().rect_filled(line, 0.0, COL_FIELD);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 30.0), egui::Sense::hover());
+    let p = ui.painter().clone();
+    // 左: Esc Cancel
+    let kc = rz_keycap(&p, egui::pos2(rect.left() + 2.0, rect.center().y), egui::Align2::LEFT_CENTER, "Esc");
+    let ct = p.text(egui::pos2(kc.right() + 8.0, rect.center().y), egui::Align2::LEFT_CENTER, tr("取消", "Cancel"), egui::FontId::proportional(12.5), COL_TEXT);
+    let cancel_r = kc.union(ct).expand(3.0);
+    let cancel = ui.interact(cancel_r, ui.id().with("rz-cancel"), egui::Sense::click()).clicked();
+    // 右: OK ↵
+    let kr = rz_keycap(&p, egui::pos2(rect.right() - 2.0, rect.center().y), egui::Align2::RIGHT_CENTER, "↵");
+    let ok_col = if ok_enabled { egui::Color32::WHITE } else { COL_GRAY_DOT };
+    let ok_txt = if busy { tr("修改中…", "Applying…") } else { "OK" };
+    let ot = paint_text(&p, egui::pos2(kr.left() - 8.0, rect.center().y), egui::Align2::RIGHT_CENTER, ok_txt, 12.5, ok_col, ok_enabled);
+    let ok_r = ot.union(kr).expand(3.0);
+    let ok_resp = ui.interact(ok_r, ui.id().with("rz-ok"), egui::Sense::click());
+    if ok_enabled && ok_resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    (cancel, ok_enabled && ok_resp.clicked())
 }
 
 /// 开关行: 整行可点; 返回 Response(changed = 本帧切换)。
@@ -2030,6 +2160,14 @@ impl PlaApp {
             dim_cand: 0,
             dim_side: 0,
             dim_hl_key: String::new(),
+            dims_list: Vec::new(),
+            dims_loaded: false,
+            dim_active: None,
+            dim_active_ids: Vec::new(),
+            dim_pending: None,
+            dim_pending_opp: None,
+            dim_last_apply: None,
+            dim_del_confirm: None,
             dim_busy: false,
             hotkeys: pla_ui::hotkey::load_binds().unwrap_or_default(),
             recording: None,
@@ -2168,16 +2306,101 @@ impl PlaApp {
                     if let Ok(v) = &result {
                         if let Some(x) = v["value"].as_f64() {
                             self.dim_target = x;
-                            self.dim_text = format!("{x}");
+                            self.dim_text = fmt3(x);
                         }
-                        // 当前对面 = 回包里选定的那个(默认第一个候选; 双选时 = 第二个面)
-                        let opp = v["opposite"].as_str().unwrap_or("");
-                        self.dim_cand = v["candidates"]
-                            .as_array()
-                            .and_then(|a| a.iter().position(|c| c["id"].as_str() == Some(opp)))
-                            .unwrap_or(0);
+                        // 当前对面 = 回包里选定的那个(默认第一个候选); N3d 载入记录时 = 记录里的对面
+                        let want = self.dim_pending_opp.take();
+                        let opp = want.as_deref().unwrap_or(v["opposite"].as_str().unwrap_or(""));
+                        let cands = v["candidates"].as_array().cloned().unwrap_or_default();
+                        self.dim_cand = cands.iter().position(|c| c["id"].as_str() == Some(opp)).unwrap_or(0);
+                        if let Some(x) = cands.get(self.dim_cand).and_then(|c| c["value"].as_f64()) {
+                            self.dim_text = fmt3(x);
+                        }
                     }
                     self.dim_info = Some(result);
+                }
+                // N3d: 面签名回包(记录 / 改后刷新之外的签名请求不会发)
+                pla_bridge::cdp::CdpEvent::CallResult { name, result } if name == pla_bridge::shim::api::DIM_SIGNATURE => {
+                    match (self.dim_pending.take(), result) {
+                        (Some(DimPending::Save(mut rec, n)), Ok(v)) => {
+                            let sigs = v["faces"].as_array().cloned().unwrap_or_default();
+                            if let Some(e) = sigs.iter().find_map(|s| s["err"].as_str().map(String::from)) {
+                                self.set_notice((true, t!("记录失败: {e}", "Save failed: {e}")));
+                            } else if sigs.len() < n {
+                                self.set_notice((true, tr("记录失败: 签名不全", "Save failed: incomplete signatures").into()));
+                            } else {
+                                rec.faces = sigs[..n].to_vec();
+                                rec.opposite = sigs.get(n).cloned();
+                                let ids: Vec<String> = rec.faces.iter().filter_map(|s| s["id"].as_str().map(String::from)).collect();
+                                match pla_ui::dims::add(&self.doc_key, rec) {
+                                    Ok(name) => {
+                                        self.dims_list = pla_ui::dims::load(&self.doc_key);
+                                        self.set_notice((false, t!("已记录尺寸 {name}", "Dimension saved as {name}")));
+                                        self.dim_active = Some(name);
+                                        self.dim_active_ids = ids;
+                                    }
+                                    Err(e) => self.set_notice((true, t!("记录失败: {e}", "Save failed: {e}"))),
+                                }
+                            }
+                        }
+                        (Some(_), Err(e)) => self.set_notice((true, t!("记录失败: {e}", "Save failed: {e}"))),
+                        (other, _) => self.dim_pending = other,
+                    }
+                }
+                // N3d: 按签名定位回包 → 载入(在 Plasticity 里选中)/ 改后刷新(写回当前签名)
+                pla_bridge::cdp::CdpEvent::CallResult { name, result } if name == pla_bridge::shim::api::GEO_RESOLVE => {
+                    let pending = self.dim_pending.take();
+                    let res = match &result {
+                        Ok(v) => v["faces"].as_array().cloned().unwrap_or_default(),
+                        Err(_) => Vec::new(),
+                    };
+                    let ids: Vec<Option<String>> = res.iter().map(|r| r["id"].as_str().map(String::from)).collect();
+                    let worst = res.iter().filter_map(|r| r["score"].as_f64()).fold(0.0f64, f64::max);
+                    match (pending, &result) {
+                        (Some(DimPending::Load(rec)), Ok(_)) => {
+                            let n = rec.faces.len();
+                            if ids.len() < n || ids.iter().take(n).any(|x| x.is_none()) {
+                                let why = res.iter().find_map(|r| r["err"].as_str().map(String::from)).unwrap_or_default();
+                                self.set_notice((true, t!("尺寸 {} 在当前模型里找不到对应的面: {why}", "Dimension {} not found in the current model: {why}", rec.name)));
+                            } else {
+                                let main: Vec<String> = ids.iter().take(n).flatten().cloned().collect();
+                                let entries: Vec<pla_bridge::cdp::ApplyEntry> = main
+                                    .iter()
+                                    .map(|id| pla_bridge::cdp::ApplyEntry { kind: "face".into(), id: id.clone(), key: None, camera: None })
+                                    .collect();
+                                self.send_apply(entries);
+                                self.dim_side = rec.side;
+                                self.dim_pending_opp = ids.get(n).cloned().flatten();
+                                self.dim_active = Some(rec.name.clone());
+                                self.dim_active_ids = main;
+                                // 偏差 > 1 个文档单位: 模型在别处被改过, 定位可能不准 —— 如实提示
+                                if worst > 1.0 {
+                                    self.set_notice((true, t!("已载入 {}, 但定位偏差 {} (模型改动较大, 请核对高亮的面)", "Loaded {}, but match offset is {} (model changed; check the highlighted faces)", rec.name, fmt3(worst))));
+                                } else {
+                                    self.set_notice((false, t!("已载入尺寸 {}", "Loaded dimension {}", rec.name)));
+                                }
+                            }
+                        }
+                        (Some(DimPending::Refresh(mut rec)), Ok(_)) => {
+                            let n = rec.faces.len();
+                            let sigs: Vec<serde_json::Value> = res.iter().map(|r| r["sig"].clone()).collect();
+                            if sigs.len() >= n && sigs.iter().take(n).all(|s| s.is_object()) {
+                                rec.faces = sigs[..n].to_vec();
+                                if let Some(o) = sigs.get(n).filter(|s| s.is_object()) {
+                                    rec.opposite = Some(o.clone());
+                                }
+                                self.dim_active_ids = ids.iter().take(n).flatten().cloned().collect();
+                                if let Err(e) = pla_ui::dims::update(&self.doc_key, &rec) {
+                                    pla_ui::diag::log(&format!("dims refresh failed: {e}"));
+                                }
+                                self.dims_list = pla_ui::dims::load(&self.doc_key);
+                            } else {
+                                pla_ui::diag::log("dims refresh: faces not found after apply");
+                            }
+                        }
+                        (Some(DimPending::Load(rec)), Err(e)) => self.set_notice((true, t!("载入尺寸 {} 失败: {e}", "Loading dimension {} failed: {e}", rec.name))),
+                        (other, _) => self.dim_pending = other,
+                    }
                 }
                 pla_bridge::cdp::CdpEvent::CallResult { name, result } => match result {
                     // 即时生效类调用成功时不打扰(面板上已显示"立即生效"); 失败如实提示。
@@ -2203,6 +2426,27 @@ impl PlaApp {
                         self.dim_busy = false;
                         self.dim_face = None;
                         self.dim_info = None;
+                        // N3d: 改的是某条记录 → 按"旧签名 + 已知平移量"预测新位置, 重新定位后刷新记录
+                        let ok = matches!(&r, Ok(v) if v["failed"].is_null());
+                        if let (true, Some(ap)) = (ok, self.dim_last_apply.take()) {
+                            if let Some(mut rec) = self.dims_list.iter().find(|x| x.name == ap.name).cloned() {
+                                let mut sigs: Vec<serde_json::Value> = rec.faces.clone();
+                                sigs.extend(rec.opposite.clone());
+                                for (s, m) in sigs.iter_mut().zip(ap.moves.iter()) {
+                                    if let Some(c) = s["center"].as_array().map(|a| a.iter().filter_map(|x| x.as_f64()).collect::<Vec<_>>()) {
+                                        if c.len() == 3 {
+                                            s["center"] = serde_json::json!([c[0] + m[0], c[1] + m[1], c[2] + m[2]]);
+                                        }
+                                    }
+                                }
+                                rec.value = ap.value;
+                                self.cdp.send(pla_bridge::cdp::CdpCmd::Call {
+                                    name: pla_bridge::shim::api::GEO_RESOLVE,
+                                    args: serde_json::json!({ "faces": sigs, "units": rec.units }),
+                                });
+                                self.dim_pending = Some(DimPending::Refresh(rec));
+                            }
+                        }
                     }
                 }
                 // R34: 材质状态采集回包 → 失败如实提示; 成功则暂存并补发缩略图(同视口状态的串行流程)。
@@ -2612,17 +2856,15 @@ impl PlaApp {
             },
             &mut win,
             |ui| {
-                section_header(ui, "DIMENSION");
-                // N3 改尺寸: Plasticity 里选中一个面(或两个: 第二个 = 指定的对面) → dim.face 读出可改尺寸
-                // (厚度 + 全部候选对面 / 半径 / 圆角半径) → 选对面、选改哪一侧、输目标值 → cmd.exec {atomic, …}, 一个撤销步。
+                // N3 改尺寸(原生风格: 节标题 / 信息卡片 / 分段选择 / 当前·目标数值框 / Esc Cancel · OK ↵)。
+                // 单选一个面 → dim.face(厚度 + 候选对面 / 半径 / 圆角半径); 多选 → dim.distance(约定: 第一个选的面 = 参考面)。
                 if let Some(why) = self.feature_block(Feature::DimFace) {
                     ui.label(egui::RichText::new(why).small().color(COL_RED));
                 }
                 let faces: Vec<String> =
                     self.live_sel.iter().filter(|it| it.kind == "face").map(|it| it.id.clone()).collect();
                 let only_faces = faces.len() == self.live_sel.len();
-                // 查询键: 单选 = "面"(dim.face: 厚度 / 半径 / 圆角半径);
-                // 多选 = "D:参考|动的…"(dim.distance; 约定: **第一个选的面 = 参考面**, 其余 = 要动的面 —— 用户 2026-11-15 确认)
+                // 查询键: 单选 = "面"; 多选 = "D:参考|动的…"(第一个选的面 = 参考面 —— 用户 2026-11-15 确认)
                 let cur = match faces.len() {
                     1 if only_faces => Some(faces[0].clone()),
                     n if n >= 2 && only_faces => Some(format!("D:{}", faces.join("|"))),
@@ -2647,14 +2889,11 @@ impl PlaApp {
                         }
                     }
                 }
-                let hint = |ui: &mut egui::Ui, s: &str| {
-                    ui.label(egui::RichText::new(s).small().color(COL_MUTED));
-                };
                 let info = match (&self.dim_face, &self.dim_info) {
                     (Some(_), Some(Ok(v))) => Some(v.clone()),
                     _ => None,
                 };
-                // 高亮: 厚度类 → 当前对面橙色、其余候选淡蓝; 其他情况清除
+                // 高亮: 厚度 → 当前对面橙、其余候选蓝; 距离 → 参考面绿、锚面橙; 其他清除
                 let (hl_key, hl_faces) = match &info {
                     Some(v) if v["kind"] == "thickness" => {
                         let cands = v["candidates"].as_array().cloned().unwrap_or_default();
@@ -2666,7 +2905,6 @@ impl PlaApp {
                             .collect();
                         (format!("{}#{idx}#{}", v["face"], cands.len()), list)
                     }
-                    // 距离: 参考面绿色, 锚(孔 / 平行面)橙色; 动的面本身已是 Plasticity 的选中色
                     Some(v) if v["kind"] == "distance" => (
                         format!("D{}#{}", v["reference"], v["anchorFace"]),
                         vec![
@@ -2677,25 +2915,50 @@ impl PlaApp {
                     _ => (String::new(), Vec::new()),
                 };
                 self.dim_set_highlight(hl_key, hl_faces);
-                match (self.dim_face.clone(), self.dim_info.clone()) {
-                    (None, _) => hint(ui, tr(
-                        "选一个面: 平面 = 厚度(到背对的平行面), 圆柱面 = 半径, 倒圆面 = 圆角半径。\n先选参考平面, 再 Shift 加选要动的面(可多个: 孔的圆柱 + 倒角 / 凸台侧面…) = 距离 / 孔位。",
-                        "Select one face: plane = thickness (to the opposite parallel face), cylinder = radius, fillet = fillet radius.\nSelect a reference plane first, then Shift-add the faces to move (several: hole + chamfer / boss sides…) = distance / hole position.",
-                    )),
-                    (Some(_), Some(Ok(v))) if v["kind"] == "distance" => {
-                        self.dim_distance_ui(ui, &v);
+                let units = |v: &serde_json::Value| -> String {
+                    match v["units"].as_str().unwrap_or("") {
+                        "millimeter" => "mm", "centimeter" => "cm", "meter" => "m", "inch" => "in", "foot" => "ft", u => u,
                     }
-                    (Some(_), None) => hint(ui, tr("读取中…", "Reading…")),
+                    .to_string()
+                };
+                // ---- 节标题 ----
+                let title = match &info {
+                    Some(v) => match v["kind"].as_str().unwrap_or("") {
+                        "thickness" => tr("厚度", "THICKNESS"),
+                        "radius" => tr("半径", "RADIUS"),
+                        "filletRadius" => tr("圆角半径", "FILLET RADIUS"),
+                        "distance" => tr("距离", "DISTANCE"),
+                        _ => tr("尺寸", "DIMENSION"),
+                    },
+                    None => tr("尺寸", "DIMENSION"),
+                };
+                let (trow, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 20.0), egui::Sense::hover());
+                paint_text(ui.painter(), egui::pos2(trow.left(), trow.center().y), egui::Align2::LEFT_CENTER, title, 12.0, COL_SECTION, true);
+                if let Some(v) = &info {
+                    let v = v.clone();
+                    self.dim_record_control(ui, trow, &v, &faces);
+                }
+                match (self.dim_face.clone(), self.dim_info.clone()) {
+                    (None, _) => rz_info_card(
+                        ui,
+                        tr("选择要改的面", "Select a face to resize"),
+                        tr(
+                            "一个面: 平面 = 厚度, 圆柱 = 半径, 倒圆 = 圆角半径。\n先选参考平面, 再 Shift 加选要动的面 = 距离 / 孔位。",
+                            "One face: plane = thickness, cylinder = radius, fillet = fillet radius.\nReference plane first, then Shift-add faces to move = distance / hole position.",
+                        ),
+                    ),
+                    (Some(_), None) => rz_info_card(ui, tr("读取中…", "Reading…"), ""),
                     (Some(_), Some(Err(e))) => {
-                        ui.label(egui::RichText::new(t!("读不到这个面的尺寸: {e}", "Cannot read this face: {e}")).small().color(COL_RED));
+                        rz_info_card(ui, tr("读不到这个面的尺寸", "Cannot read this face"), &e);
+                    }
+                    (Some(_), Some(Ok(v))) if v["kind"] == "distance" => {
+                        let u = units(&v);
+                        self.dim_distance_ui(ui, &v, &u, &faces);
                     }
                     (Some(_), Some(Ok(v))) => {
                         let face = v["face"].as_str().unwrap_or("").to_string();
                         let kind = v["kind"].as_str().unwrap_or("none");
-                        let units = match v["units"].as_str().unwrap_or("") {
-                            "millimeter" => "mm", "centimeter" => "cm", "meter" => "m", "inch" => "in", "foot" => "ft", u => u,
-                        }
-                        .to_string();
+                        let u = units(&v);
                         let cands = v["candidates"].as_array().cloned().unwrap_or_default();
                         // 厚度: 值与对面随当前候选; 其它: 回包里的值
                         let (value, opposite) = if kind == "thickness" && !cands.is_empty() {
@@ -2707,77 +2970,42 @@ impl PlaApp {
                         match (kind, value, v["op"].as_str(), v["offsetSign"].as_f64()) {
                             ("none", ..) | (_, None, ..) | (_, _, None, _) | (.., None) => {
                                 let surf = v["surface"].as_str().unwrap_or("?").to_string();
-                                hint(ui, &t!(
-                                    "这个面没有可改的尺寸(曲面 {surf}; 平面需要同一实体里有背对的平行面)",
-                                    "No editable dimension on this face (surface {surf}; a plane needs an opposite parallel face in the same solid)"
-                                ));
+                                rz_info_card(
+                                    ui,
+                                    tr("这个面没有可改的尺寸", "No editable dimension on this face"),
+                                    &t!("曲面 {surf}; 平面需要同一实体里有背对的平行面", "Surface {surf}; a plane needs an opposite parallel face in the same solid"),
+                                );
                             }
                             (_, Some(value), Some(op), Some(sign)) => {
-                                let label = match kind {
-                                    "thickness" => tr("厚度(到背对的平行面)", "Thickness (to the opposite parallel face)"),
-                                    "radius" if v["convex"] == true => tr("半径(凸台, 轴线不动)", "Radius (boss, axis fixed)"),
-                                    "radius" => tr("半径(孔, 轴线不动)", "Radius (hole, axis fixed)"),
-                                    "filletRadius" => tr("圆角半径(保持与两侧相切)", "Fillet radius (stays tangent)"),
-                                    _ => "",
+                                let (card_title, card_sub) = match kind {
+                                    "thickness" => (tr("到背对的平行面", "To the opposite parallel face"), t!("对面 {}/{}(橙)", "Opposite {}/{} (orange)", self.dim_cand.min(cands.len().saturating_sub(1)) + 1, cands.len())),
+                                    "radius" if v["convex"] == true => (tr("凸台", "Boss"), tr("轴线不动", "Axis stays").to_string()),
+                                    "radius" => (tr("孔", "Hole"), tr("轴线不动", "Axis stays").to_string()),
+                                    _ => (tr("倒圆", "Fillet"), tr("保持与两侧相切", "Stays tangent to both sides").to_string()),
                                 };
-                                ui.label(egui::RichText::new(label).color(COL_MUTED));
-                                // ---- 对面候选(橙 = 当前, 蓝 = 其它; 点数值或 ◀ ▶ 切换) ----
+                                rz_info_card(ui, card_title, &card_sub);
+                                // ---- 对面候选(分段选择, 橙 = 当前) ----
                                 if kind == "thickness" && cands.len() > 1 {
-                                    ui.horizontal_wrapped(|ui| {
-                                        let n = cands.len();
-                                        let i = self.dim_cand.min(n - 1);
-                                        ui.label(egui::RichText::new(t!("对面 {}/{n}", "Opposite {}/{n}", i + 1)).small());
-                                        let mut next = None;
-                                        if ui.small_button("◀").clicked() {
-                                            next = Some((i + n - 1) % n);
-                                        }
-                                        if ui.small_button("▶").clicked() {
-                                            next = Some((i + 1) % n);
-                                        }
-                                        for (j, c) in cands.iter().enumerate() {
-                                            let txt = format!("{}", c["value"].as_f64().unwrap_or(0.0));
-                                            let rt = egui::RichText::new(txt).small().color(if j == i { COL_ACCENT } else { COL_MUTED });
-                                            if ui.selectable_label(j == i, rt).clicked() {
-                                                next = Some(j);
-                                            }
-                                        }
-                                        if let Some(j) = next {
-                                            self.dim_cand = j;
-                                            let x = cands[j]["value"].as_f64().unwrap_or(0.0);
-                                            self.dim_text = format!("{x}");
-                                        }
-                                    });
+                                    rz_label(ui, tr("对面", "Opposite face"));
+                                    let labels: Vec<String> = cands.iter().map(|c| fmt3(c["value"].as_f64().unwrap_or(0.0))).collect();
+                                    let mut i = self.dim_cand.min(cands.len() - 1);
+                                    if rz_segmented(ui, "dim-opp", &labels, &mut i) {
+                                        self.dim_cand = i;
+                                        self.dim_text = fmt3(cands[i]["value"].as_f64().unwrap_or(0.0));
+                                    }
                                 }
-                                // ---- N3b 改哪一侧(只对厚度) ----
+                                // ---- N3b 改哪一侧 ----
                                 if kind == "thickness" {
-                                    ui.horizontal_wrapped(|ui| {
-                                        for (k, (zh, en)) in [("移动选中面", "Move selected"), ("移动对面", "Move opposite"), ("两侧各半", "Both halves")].iter().enumerate() {
-                                            ui.radio_value(&mut self.dim_side, k as u8, egui::RichText::new(tr(zh, en)).small());
-                                        }
-                                    });
+                                    rz_label(ui, tr("移动", "Move"));
+                                    let labels = vec![tr("选中面", "Selected").to_string(), tr("对面", "Opposite").to_string(), tr("两侧各半", "Both halves").to_string()];
+                                    let mut s = self.dim_side as usize;
+                                    if rz_segmented(ui, "dim-side", &labels, &mut s) {
+                                        self.dim_side = s as u8;
+                                    }
                                 }
-                                let mut enter = false;
-                                ui.horizontal(|ui| {
-                                    ui.label(t!("当前 {value} {units}  →", "Now {value} {units}  →"));
-                                    let r = ui.add(egui::TextEdit::singleline(&mut self.dim_text).desired_width(70.0));
-                                    ui.label(&units);
-                                    enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                                });
-                                let target = self.dim_text.trim().parse::<f64>().ok();
-                                if let Some(t) = target {
-                                    self.dim_target = t;
-                                }
-                                let changed = target.is_some_and(|t| (t - value).abs() > 1e-9);
-                                let valid = target.is_some_and(|t| t > 0.0);
-                                let can = changed && valid && !self.dim_busy;
-                                let btn = ui.add_enabled(
-                                    can,
-                                    egui::Button::new(if self.dim_busy { tr("修改中…", "Applying…") } else { tr("应用", "Apply") }),
-                                );
-                                // 右键(窗口内任意处)/ 回车 = 应用, 同 Plasticity 本体的右键确定
-                                let go = btn.clicked() || (can && (right_click_confirm(ui) || enter));
-                                if go && self.require_feature(Feature::DimFace) {
-                                    let delta = self.dim_target - value;
+                                if let Some(t) = self.dim_value_block(ui, value, &u, false) {
+                                    self.dim_note_apply(&v, &faces, value, t);
+                                    let delta = t - value;
                                     let (faces_arg, dist) = match (kind, self.dim_side, &opposite) {
                                         ("thickness", 1, Some(o)) => (serde_json::json!([o]), delta),
                                         ("thickness", 2, Some(o)) => (serde_json::json!([face, o]), delta / 2.0),
@@ -2789,13 +3017,14 @@ impl PlaApp {
                                     });
                                     self.cdp.send(pla_bridge::cdp::CdpCmd::Exec(script));
                                     self.dim_busy = true;
-                                    self.set_notice((false, t!("正在修改: {value} → {} {units}…", "Changing: {value} → {} {units}…", self.dim_target)));
+                                    self.set_notice((false, t!("正在修改: {} → {} {u}…", "Changing: {} → {} {u}…", fmt3(value), fmt3(t))));
                                 }
-                                hint(ui, tr("右键 / 回车 = 应用 · 一步可撤销(Ctrl+Z) · 失败自动撤回", "Right-click / Enter = apply · one undo step (Ctrl+Z) · rolled back on failure"));
                             }
                         }
                     }
                 }
+                // ---- N3d 已记录尺寸 ----
+                self.dim_saved_ui(ui);
             },
         );
         self.dim_win = win;
@@ -2806,38 +3035,230 @@ impl PlaApp {
         }
     }
 
-    /// N3c: 多选 = 参考面(第一个, 绿) → 动的面组(锚 = 孔轴线 / 最近的平行面 / 面中点, 橙); 改值 = 整组沿方向平移。
-    fn dim_distance_ui(&mut self, ui: &mut egui::Ui, v: &serde_json::Value) {
-        let units = match v["units"].as_str().unwrap_or("") {
-            "millimeter" => "mm", "centimeter" => "cm", "meter" => "m", "inch" => "in", "foot" => "ft", u => u,
+    /// N3d: 当前尺寸对应的面 id(单选 = [面]; 多选 = [参考, 动的…])与要记录的对面。
+    fn dim_current_faces(v: &serde_json::Value, cand: usize) -> (Vec<String>, Option<String>) {
+        if v["kind"] == "distance" {
+            let mut ids = vec![v["reference"].as_str().unwrap_or("").to_string()];
+            ids.extend(v["moving"].as_array().into_iter().flatten().filter_map(|x| x.as_str().map(String::from)));
+            return (ids, None);
         }
-        .to_string();
+        let face = v["face"].as_str().unwrap_or("").to_string();
+        let opp = (v["kind"] == "thickness")
+            .then(|| v["candidates"].as_array().and_then(|a| a.get(cand.min(a.len().saturating_sub(1)))).and_then(|c| c["id"].as_str().map(String::from)))
+            .flatten();
+        (vec![face], opp)
+    }
+
+    /// N3d: 标题行右侧 —— 当前选择正是某条记录 → 显示记录名; 否则 "＋ 记录"(可点)。
+    fn dim_record_control(&mut self, ui: &mut egui::Ui, row: egui::Rect, v: &serde_json::Value, sel: &[String]) {
+        if self.dim_active.is_some() && sel == self.dim_active_ids.as_slice() {
+            let name = self.dim_active.clone().unwrap_or_default();
+            paint_text(ui.painter(), egui::pos2(row.right(), row.center().y), egui::Align2::RIGHT_CENTER, &name, 12.0, COL_ACCENT, true);
+            return;
+        }
+        if !matches!(v["kind"].as_str(), Some("thickness" | "radius" | "filletRadius" | "distance")) || self.dim_pending.is_some() {
+            return;
+        }
+        let label = tr("＋ 记录", "+ Save");
+        let font = egui::FontId::proportional(12.0);
+        let w = ui.fonts(|f| f.layout_no_wrap(label.into(), font.clone(), COL_ACCENT).size().x);
+        let r = egui::Rect::from_min_max(egui::pos2(row.right() - w - 4.0, row.top()), row.max);
+        let resp = ui.interact(r, ui.id().with("dim-save"), egui::Sense::click());
+        ui.painter().text(egui::pos2(row.right(), row.center().y), egui::Align2::RIGHT_CENTER, label, font, if resp.hovered() { egui::Color32::WHITE } else { COL_ACCENT });
+        if resp.on_hover_text(tr("把这个尺寸记下来, 以后在下方列表里点它就能再改(面换了 id 也能找回)", "Save this dimension; click it in the list below later to edit again (found even after face ids change)")).clicked() {
+            let (ids, opp) = Self::dim_current_faces(v, self.dim_cand);
+            let n = ids.len();
+            let value = if v["kind"] == "thickness" {
+                v["candidates"].as_array().and_then(|a| a.get(self.dim_cand.min(a.len().saturating_sub(1)))).and_then(|c| c["value"].as_f64())
+            } else {
+                v["value"].as_f64()
+            };
+            let rec = pla_ui::dims::DimRecord {
+                name: String::new(),
+                mode: if v["kind"] == "distance" { "distance".into() } else { "face".into() },
+                kind: v["kind"].as_str().unwrap_or("").into(),
+                faces: Vec::new(),
+                opposite: None,
+                side: self.dim_side,
+                value: value.unwrap_or(0.0),
+                units: v["units"].as_str().unwrap_or("").into(),
+                created: 0,
+            };
+            let mut all = ids;
+            all.extend(opp);
+            self.cdp.send(pla_bridge::cdp::CdpCmd::Call {
+                name: pla_bridge::shim::api::DIM_SIGNATURE,
+                args: serde_json::json!({ "faces": all, "units": rec.units }),
+            });
+            self.dim_pending = Some(DimPending::Save(rec, n));
+        }
+    }
+
+    /// N3d: 应用前登记 —— 当前选择正是某条记录时, 记下各面(faces 之后 opposite)的平移量, 成功后据此刷新记录。
+    fn dim_note_apply(&mut self, v: &serde_json::Value, sel: &[String], value: f64, target: f64) {
+        self.dim_last_apply = None;
+        let Some(name) = self.dim_active.clone() else { return };
+        if sel != self.dim_active_ids.as_slice() {
+            // 选择已换成别的面: 不再关联这条记录
+            self.dim_active = None;
+            return;
+        }
+        let Some(rec) = self.dims_list.iter().find(|r| r.name == name).cloned() else { return };
+        let delta = target - value;
+        let vec3 = |x: &serde_json::Value| -> [f64; 3] {
+            let a: Vec<f64> = x.as_array().map(|a| a.iter().filter_map(|y| y.as_f64()).collect()).unwrap_or_default();
+            if a.len() == 3 { [a[0], a[1], a[2]] } else { [0.0; 3] }
+        };
+        let scale = |n: [f64; 3], s: f64| [n[0] * s, n[1] * s, n[2] * s];
+        let moves: Vec<[f64; 3]> = match v["kind"].as_str() {
+            Some("distance") => {
+                let d = vec3(&v["direction"]);
+                std::iter::once([0.0; 3]).chain((1..rec.faces.len()).map(|_| scale(d, delta))).collect()
+            }
+            Some("thickness") => {
+                let n_sel = rec.faces.first().map(|s| vec3(&s["normal"])).unwrap_or([0.0; 3]);
+                let n_opp = rec.opposite.as_ref().map(|s| vec3(&s["normal"])).unwrap_or([0.0; 3]);
+                match self.dim_side {
+                    1 => vec![[0.0; 3], scale(n_opp, delta)],
+                    2 => vec![scale(n_sel, delta / 2.0), scale(n_opp, delta / 2.0)],
+                    _ => vec![scale(n_sel, delta), [0.0; 3]],
+                }
+            }
+            // 半径 / 圆角: 面中心的移动不好预测, 交给"最近匹配"
+            _ => vec![[0.0; 3]; rec.faces.len() + rec.opposite.iter().count()],
+        };
+        let mut rec2 = rec;
+        rec2.side = self.dim_side;
+        if let Some(r) = self.dims_list.iter_mut().find(|r| r.name == rec2.name) {
+            r.side = rec2.side;
+        }
+        self.dim_last_apply = Some(DimApplied { name, moves, value: target });
+    }
+
+    /// N3d: 载入一条记录 —— 按签名在当前模型里重新定位, 回包后在 Plasticity 里按原顺序选中(参考面在前)。
+    fn dim_load(&mut self, rec: &pla_ui::dims::DimRecord) {
+        let mut sigs = rec.faces.clone();
+        sigs.extend(rec.opposite.clone());
+        self.cdp.send(pla_bridge::cdp::CdpCmd::Call {
+            name: pla_bridge::shim::api::GEO_RESOLVE,
+            args: serde_json::json!({ "faces": sigs, "units": rec.units }),
+        });
+        self.dim_pending = Some(DimPending::Load(rec.clone()));
+    }
+
+    /// N3d: 已记录尺寸列表(点 = 载入并选中; × = 删除, 需确认)。
+    fn dim_saved_ui(&mut self, ui: &mut egui::Ui) {
+        if !self.dims_loaded {
+            self.dims_list = pla_ui::dims::load(&self.doc_key);
+            self.dims_loaded = true;
+        }
+        ui.add_space(8.0);
+        let (row, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 20.0), egui::Sense::hover());
+        paint_text(ui.painter(), egui::pos2(row.left(), row.center().y), egui::Align2::LEFT_CENTER, tr("已记录", "SAVED"), 12.0, COL_SECTION, true);
+        if self.dims_list.is_empty() {
+            ui.label(egui::RichText::new(tr("还没有记录。改尺寸前点标题右侧的 ＋ 记录。", "Nothing saved yet. Click + Save at the top right before resizing.")).size(11.5).color(COL_MUTED));
+            return;
+        }
+        let mut load: Option<pla_ui::dims::DimRecord> = None;
+        let list = self.dims_list.clone();
+        egui::ScrollArea::vertical().id_salt("dims-list").max_height(160.0).show(ui, |ui| {
+            for rec in &list {
+                let (r, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 26.0), egui::Sense::click());
+                let active = self.dim_active.as_deref() == Some(rec.name.as_str());
+                let fill = if active { COL_STEPPER } else if resp.hovered() { lerp_color(COL_CARD, egui::Color32::WHITE, 0.06) } else { COL_CARD };
+                ui.painter().rect_filled(r, egui::Rounding::same(6.0), fill);
+                let kind = match rec.kind.as_str() {
+                    "thickness" => tr("厚度", "Thickness"),
+                    "radius" => tr("半径", "Radius"),
+                    "filletRadius" => tr("圆角", "Fillet"),
+                    "distance" => tr("距离", "Distance"),
+                    _ => "",
+                };
+                let u = match rec.units.as_str() { "millimeter" => "mm", "centimeter" => "cm", "meter" => "m", "inch" => "in", "foot" => "ft", x => x };
+                paint_text(ui.painter(), egui::pos2(r.left() + 10.0, r.center().y), egui::Align2::LEFT_CENTER, &rec.name, 12.0, if active { COL_ACCENT } else { egui::Color32::WHITE }, true);
+                ui.painter().text(egui::pos2(r.left() + 56.0, r.center().y), egui::Align2::LEFT_CENTER, kind, egui::FontId::proportional(12.0), COL_MUTED);
+                // 右: 值 + ×
+                let x = egui::Rect::from_center_size(egui::pos2(r.right() - 12.0, r.center().y), egui::vec2(18.0, 18.0));
+                let xr = ui.interact(x, ui.id().with(("dim-del", &rec.name)), egui::Sense::click());
+                ui.painter().text(x.center(), egui::Align2::CENTER_CENTER, "×", egui::FontId::proportional(14.0), if xr.hovered() { egui::Color32::WHITE } else { COL_MUTED });
+                ui.painter().text(egui::pos2(x.left() - 6.0, r.center().y), egui::Align2::RIGHT_CENTER, format!("{} {u}", fmt3(rec.value)), egui::FontId::proportional(12.0), COL_TEXT);
+                if xr.clicked() {
+                    self.dim_del_confirm = Some(rec.name.clone());
+                } else if resp.clicked() && self.dim_pending.is_none() && !self.dim_busy {
+                    load = Some(rec.clone());
+                }
+                ui.add_space(2.0);
+            }
+        });
+        if let Some(rec) = load {
+            self.dim_load(&rec);
+        }
+        if let Some(name) = self.dim_del_confirm.clone() {
+            match confirm_popup(ui.ctx(), "dim-del", &t!("删除尺寸记录 {name}?(不影响模型)", "Delete dimension {name}? (the model is not affected)")) {
+                Some(true) => {
+                    self.dim_del_confirm = None;
+                    match pla_ui::dims::delete(&self.doc_key, &name) {
+                        Ok(()) => {
+                            if self.dim_active.as_deref() == Some(name.as_str()) {
+                                self.dim_active = None;
+                            }
+                            self.dims_list = pla_ui::dims::load(&self.doc_key);
+                        }
+                        Err(e) => self.set_notice((true, t!("删除失败: {e}", "Delete failed: {e}"))),
+                    }
+                }
+                Some(false) => self.dim_del_confirm = None,
+                None => {}
+            }
+        }
+    }
+
+    /// 当前 / 目标两栏数值框 + 底部 Esc Cancel · OK ↵。右键(窗口内任意处)/ 回车 / OK = 应用; Esc / Cancel = 目标值复原。
+    /// 返回 Some(目标值) = 本帧要应用。"改过" 以显示精度判断(差 > 0.0005), 偏移量仍按真实值算 → 结果正好是输入值。
+    fn dim_value_block(&mut self, ui: &mut egui::Ui, value: f64, units: &str, allow_zero: bool) -> Option<f64> {
+        let mut enter = false;
+        let mut cur = fmt3(value);
+        ui.add_space(2.0);
+        ui.columns(2, |cols| {
+            rz_label(&mut cols[0], tr("当前", "Current"));
+            rz_field(&mut cols[0], &mut cur, units, false);
+            rz_label(&mut cols[1], tr("目标", "Target"));
+            enter = rz_field(&mut cols[1], &mut self.dim_text, units, true);
+        });
+        let target = self.dim_text.trim().parse::<f64>().ok();
+        let changed = target.is_some_and(|t| (t - value).abs() > 5e-4);
+        let valid = target.is_some_and(|t| t > 0.0 || (allow_zero && t >= 0.0));
+        let can = changed && valid && !self.dim_busy;
+        let esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
+        let (cancel, ok) = rz_footer(ui, can, self.dim_busy);
+        if cancel || esc {
+            self.dim_text = fmt3(value);
+        }
+        let go = ok || (can && (right_click_confirm(ui) || enter));
+        if go && self.require_feature(Feature::DimFace) { target } else { None }
+    }
+
+    /// N3c: 多选 = 参考面(第一个, 绿) → 动的面组(锚 = 孔轴线 / 最近的平行面 / 面中点, 橙); 改值 = 整组沿方向平移。
+    fn dim_distance_ui(&mut self, ui: &mut egui::Ui, v: &serde_json::Value, units: &str, sel: &[String]) {
         let Some(value) = v["value"].as_f64() else { return };
         let moving: Vec<serde_json::Value> = v["moving"].as_array().cloned().unwrap_or_default();
         let dir: Vec<f64> = v["direction"].as_array().map(|a| a.iter().filter_map(|x| x.as_f64()).collect()).unwrap_or_default();
         let anchor = match v["anchor"].as_str().unwrap_or("") {
-            "axis" => tr("孔 / 凸台轴线", "hole / boss axis"),
-            "plane" => tr("最近的平行面", "nearest parallel face"),
-            _ => tr("面中点(近似: 没有平行面或垂直的轴线)", "face midpoint (approx.: no parallel face or perpendicular axis)"),
+            "axis" => tr("量到孔 / 凸台轴线", "to the hole / boss axis"),
+            "plane" => tr("量到最近的平行面", "to the nearest parallel face"),
+            _ => tr("量到面中点(近似)", "to the face midpoint (approx.)"),
         };
         let n = moving.len();
-        ui.label(egui::RichText::new(tr("距离: 参考面(第一个选的, 绿) → 要动的面", "Distance: reference (first selected, green) → faces to move")).color(COL_MUTED));
-        ui.label(egui::RichText::new(t!("动 {n} 个面 · 量到: {anchor}(橙)", "Moving {n} faces · measured to: {anchor} (orange)")).small().color(COL_MUTED));
-        let mut enter = false;
-        ui.horizontal(|ui| {
-            ui.label(t!("当前 {value} {units}  →", "Now {value} {units}  →"));
-            let r = ui.add(egui::TextEdit::singleline(&mut self.dim_text).desired_width(70.0));
-            ui.label(&units);
-            enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-        });
-        let target = self.dim_text.trim().parse::<f64>().ok();
-        let changed = target.is_some_and(|t| (t - value).abs() > 1e-9);
-        let valid = target.is_some_and(|t| t >= 0.0) && dir.len() == 3;
-        let can = changed && valid && !self.dim_busy;
-        let btn = ui.add_enabled(can, egui::Button::new(if self.dim_busy { tr("修改中…", "Applying…") } else { tr("应用", "Apply") }));
-        let go = btn.clicked() || (can && (right_click_confirm(ui) || enter));
-        if go && self.require_feature(Feature::DimFace) {
-            let t = target.unwrap_or(value);
+        rz_info_card(
+            ui,
+            tr("距离", "Distance"),
+            &t!("参考面(绿, 第一个选的) → {n} 个面 · {anchor}(橙)", "Reference (green, first selected) → {n} faces · {anchor} (orange)"),
+        );
+        if dir.len() != 3 {
+            return;
+        }
+        if let Some(t) = self.dim_value_block(ui, value, units, true) {
+            self.dim_note_apply(v, sel, value, t);
             let delta = t - value;
             let script = serde_json::json!({
                 "atomic": true,
@@ -2845,9 +3266,8 @@ impl PlaApp {
             });
             self.cdp.send(pla_bridge::cdp::CdpCmd::Exec(script));
             self.dim_busy = true;
-            self.set_notice((false, t!("正在移动 {n} 个面: {value} → {t} {units}…", "Moving {n} faces: {value} → {t} {units}…")));
+            self.set_notice((false, t!("正在移动 {n} 个面: {} → {} {units}…", "Moving {n} faces: {} → {} {units}…", fmt3(value), fmt3(t))));
         }
-        ui.label(egui::RichText::new(tr("右键 / 回车 = 应用 · 一步可撤销(Ctrl+Z) · 失败自动撤回", "Right-click / Enter = apply · one undo step (Ctrl+Z) · rolled back on failure")).small().color(COL_MUTED));
     }
 
     /// N3: 在 Plasticity 里高亮面(对面 = primary, 其余候选 = candidate); key 没变不重发; 空 = 清除。
@@ -3159,10 +3579,18 @@ impl PlaApp {
         self.ms_wall.reset();
         self.ms_pending_state = None;
         self.ms_update_target = None;
-        // N3 改尺寸
+        // N3 改尺寸 / N3d 尺寸记录
         self.dim_face = None;
         self.dim_info = None;
         self.dim_busy = false;
+        self.dims_list.clear();
+        self.dims_loaded = false;
+        self.dim_active = None;
+        self.dim_active_ids.clear();
+        self.dim_pending = None;
+        self.dim_pending_opp = None;
+        self.dim_last_apply = None;
+        self.dim_del_confirm = None;
     }
 
     fn update_snap(&mut self, ctx: &egui::Context) {
@@ -3679,6 +4107,23 @@ fn header_extra_and_show(
         },
     );
     *open = flag;
+}
+
+/// N3d: 等垫片回包的尺寸记录操作。
+enum DimPending {
+    /// 记录: 模板 + 主面个数(签名列表里前 n 个是 faces, 之后一个是 opposite)。
+    Save(pla_ui::dims::DimRecord, usize),
+    /// 载入: 按签名定位后在 Plasticity 里选中。
+    Load(pla_ui::dims::DimRecord),
+    /// 改后刷新: 按预测签名定位, 用定位到的当前签名与新值写回。
+    Refresh(pla_ui::dims::DimRecord),
+}
+
+/// N3d: 最近一次应用 —— 记录里每个面(faces 之后 opposite)的平移量(文档单位)与新值。
+struct DimApplied {
+    name: String,
+    moves: Vec<[f64; 3]>,
+    value: f64,
 }
 
 /// 独立浮窗外框在 ui-prefs.json 里的键。

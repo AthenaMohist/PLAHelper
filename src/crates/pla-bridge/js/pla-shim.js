@@ -1897,6 +1897,63 @@
              reference: ref, moving: moving, op: 'moveFaces', units: U.unit };
   });
 
+  // =====================================================================
+  // N3d: 面的几何签名 + 按签名重新定位(面 id 每次修改都会变; 尺寸记录 / 选择集 / A9 映射表共用)。
+  // 签名 = { solidName, solid, surface, center, normal, radius?, axis?, axisOrigin?, bbox }(文档单位)。
+  // 定位: 同名实体(找不到同名 → 全部实体)里同曲面类型、法向(或轴线)平行的面, 取中心最近的; 返回偏差与次优差距。
+  // =====================================================================
+  function faceSigFull(id, k) {
+    var m = /^(\d+)[a-z]/.exec(id);
+    var sv = m && viewOf('solid', m[1]);
+    if (!sv) throw new Error('face not found: ' + id);
+    var e = groupEntries(sv, 'face', k).filter(function (x) { return x.id === id; })[0];
+    if (!e) throw new Error('face not found in its solid: ' + id);
+    var s = faceSig(e, itemIdOf(sv), k);
+    s.solidName = nameOf(sv);
+    return s;
+  }
+
+  // args = { faces: [拓扑 id…], units? } → { units, faces: [签名 | {id, err}] }
+  def('dim.signature', 'geo.read', function (a) {
+    a = a || {};
+    var U = unitOf(a);
+    var faces = (a.faces || []).map(String).map(function (id) {
+      try { return faceSigFull(id, U.k); } catch (e) { return { id: id, err: errMsg(e) }; }
+    });
+    return { units: U.unit, faces: faces };
+  });
+
+  // args = { faces: [签名…], units?, tol?(角度, 度; 默认 parallelTolDeg) }
+  // → { units, faces: [{ id | null, score(中心偏差, 文档单位), gap(次优 − 最优; null = 唯一), sig(当前签名), err? }] }
+  def('geo.resolve', 'geo.read', function (a) {
+    a = a || {};
+    var U = unitOf(a), k = U.k;
+    var cosTol = Math.cos(((a.tol !== undefined ? Number(a.tol) : NAMES.parallelTolDeg) * Math.PI) / 180);
+    var all = solidViews();
+    var out = (a.faces || []).map(function (sig) {
+      if (!sig || !Array.isArray(sig.center)) return { id: null, err: 'bad signature' };
+      var pool = all.filter(function (sv) { return sig.solidName && nameOf(sv) === sig.solidName; });
+      if (!pool.length) pool = all;
+      var best = null, second = null;
+      pool.forEach(function (sv) {
+        var sid = itemIdOf(sv);
+        groupEntries(sv, 'face', k).forEach(function (e) {
+          var f = faceSig(e, sid, k);
+          if (!f.center || f.surface !== sig.surface) return;
+          if (sig.axis && f.axis) { if (Math.abs(vdot(sig.axis, f.axis)) < cosTol) return; }
+          else if (sig.normal && f.normal) { if (vdot(sig.normal, f.normal) < cosTol) return; }
+          var sc = Math.hypot(f.center[0] - sig.center[0], f.center[1] - sig.center[1], f.center[2] - sig.center[2]);
+          if (!best || sc < best.sc) { second = best; best = { f: f, sc: sc, sv: sv }; }
+          else if (!second || sc < second.sc) second = { f: f, sc: sc };
+        });
+      });
+      if (!best) return { id: null, err: 'no matching face (solid ' + (sig.solidName || '?') + ', ' + sig.surface + ')' };
+      best.f.solidName = nameOf(best.sv);
+      return { id: best.f.id, score: sig7(best.sc), gap: second ? sig7(second.sc - best.sc) : null, sig: best.f };
+    });
+    return { units: U.unit, faces: out };
+  });
+
   // N3: 面高亮。args = { faces: [{id, role?: primary|candidate|source}] } —— 每次调用替换上一次; faces 为空 = 清除。
   // 做法: 从面所在实体的显示网格(FaceGroup.mesh + groups)拷出这个面的三角形, 用 gizmo 材质的克隆(改色、透过实体可见)
   // 建一个 Mesh 加到辅助场景(editor.helpers)。不动选择, 鼠标悬停也不会覆盖。

@@ -99,13 +99,16 @@ pub mod api {
     pub const VIEW_HIGHLIGHT: &str = "view.highlight";
     /// N3c: 参考面 → 一组动的面的距离(孔位 / 两面间距), 改值 = 整组平移。
     pub const DIM_DISTANCE: &str = "dim.distance";
+    /// N3d: 面的几何签名 / 按签名重新定位(面 id 每次修改都会变)。
+    pub const DIM_SIGNATURE: &str = "dim.signature";
+    pub const GEO_RESOLVE: &str = "geo.resolve";
 
     /// 全部接口名（契约测试用）。
     pub const ALL: &[&str] = &[
         CORE_PROBE, CORE_HEALTH, CORE_APIS, SEL_SNAPSHOT, HIST_STATE, CAM_GET, CAM_SET, CMD_DISPATCH,
         CMD_PING, ERR_LAST, TREE_LIST, SEL_CANCEL_COMMAND, SEL_CLEAR, SEL_APPLY, CAM_NAVIGATE, CAM_RENDER, CAM_THUMBNAIL, CAM_VP_RECT,
         CAM_SET_ORBIT_STEP, CAM_ROLL, KEYMAP_SET_BINDINGS, VP_SAVE, VP_RESTORE, MAT_SAVE, MAT_RESTORE, CMD_EXEC, CMD_FACTORIES,
-        GEO_QUERY, HIST_BEGIN, HIST_ROLLBACK, HIST_COMMIT, GEO_SNAPS, GEO_MEASURE, CAM_VIEW, DIM_FACE, VIEW_HIGHLIGHT, DIM_DISTANCE,
+        GEO_QUERY, HIST_BEGIN, HIST_ROLLBACK, HIST_COMMIT, GEO_SNAPS, GEO_MEASURE, CAM_VIEW, DIM_FACE, VIEW_HIGHLIGHT, DIM_DISTANCE, DIM_SIGNATURE, GEO_RESOLVE,
     ];
 }
 

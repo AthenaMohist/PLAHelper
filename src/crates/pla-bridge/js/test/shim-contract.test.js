@@ -1236,6 +1236,31 @@ const callAsync = async (name, args) => JSON.parse(await run(`window.__PLA__.cal
     assert.ok(/not an opposite parallel face/.test(call('dim.face', { face: top, opposite: top }).err));
   });
 
+  await ta('N3d dim.signature / geo.resolve: 签名 → 改几何(面 id 全变)→ 按预测签名重新定位到新面; 偏差 / 次优差距如实报', async () => {
+    const ed = ed3;
+    const r = (await callAsync('cmd.exec', { ops: [{ op: 'box', p1: [900, 0, 0], p2: [910, 20, 0], height: 5 }] })).v;
+    const id = r.results[0].items[0].id;
+    const top = call('geo.query', { detail: 'faces', of: [id], normal: [0, 0, 1] }).v.faces[0].id;
+    const sig = call('dim.signature', { faces: [top, '99999f1'] }).v.faces;
+    assert.strictEqual(sig[0].id, top);
+    assert.deepStrictEqual(JSON.parse(JSON.stringify([sig[0].surface, sig[0].center, sig[0].normal])), ['Plane', [905, 10, 5], [0, 0, 1]]);
+    assert.ok(/face not found/.test(sig[1].err));
+    // 顶面外偏 3 mm: 实体换新, 面 id 全变
+    const ex = (await callAsync('cmd.exec', { ops: [{ op: 'offsetFace', faces: [top], distance: 3 }] })).v;
+    const nid = ex.results[0].items[0].id;
+    assert.notStrictEqual(nid, id);
+    // 按预测签名(中心沿法向 +3)定位 → 新实体的顶面, 偏差 0
+    const pred = Object.assign({}, sig[0], { center: [905, 10, 8] });
+    const res = call('geo.resolve', { faces: [pred, sig[0], { surface: 'Plane', center: [1e6, 0, 0], normal: [0, 0, 1], solidName: 'nope' }, { bad: 1 }] }).v.faces;
+    const newTop = call('geo.query', { detail: 'faces', of: [nid], normal: [0, 0, 1] }).v.faces[0].id;
+    assert.deepStrictEqual([res[0].id, res[0].score], [newTop, 0]);
+    assert.strictEqual(res[1].id, newTop, '用旧签名也能找回(法向过滤 + 最近)');
+    assert.strictEqual(res[1].score, 3);
+    assert.ok(res[2].id && res[2].score > 1e5, '找不到同名实体 → 全部实体里最近的, 偏差很大如实报');
+    assert.strictEqual(res[3].err, 'bad signature');
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(res[0].sig.center)), [905, 10, 8], '回带当前签名(记录据此刷新)');
+  });
+
   await ta('N3c dim.distance: 参考面(第一个) → 动的面组; 平面锚 → 法向距离 + 方向; moveFaces 同时设 move 与 matrix; 参数错如实报', async () => {
     const ed = ed3;
     const r = (await callAsync('cmd.exec', { ops: [{ op: 'box', p1: [0, 0, 0], p2: [10, 20, 0], height: 5 }] })).v;
