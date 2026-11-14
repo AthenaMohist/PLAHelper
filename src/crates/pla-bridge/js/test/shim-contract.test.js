@@ -821,6 +821,11 @@ const callAsync = async (name, args) => JSON.parse(await run(`window.__PLA__.cal
   class Plane { GetInfo() { return {}; } }
   class Line { constructor(d) { this.d = d; } GetInfo() { return { origin: v3(0, 0, 0), direction: this.d }; } }
   class Vertex { constructor(p, ident) { this.p = p; this.ident = ident; } GetPoint() { return v3(...this.p); } GetIdentifier() { return this.ident; } }
+  // 仿 three.js(只要垫片用到的部分): 显示网格 / 几何 / 属性 / 材质 —— 高亮要用它们的构造函数拷面
+  class FakeAttr { constructor(array, itemSize) { this.array = array; this.itemSize = itemSize; this.count = array.length / itemSize; } }
+  class FakeGeo { constructor() { this.attributes = {}; this.index = null; } setAttribute(k, v) { this.attributes[k] = v; } dispose() { this.disposed = true; } }
+  class FakeMesh { constructor(geometry, material) { this.geometry = geometry; this.material = material; this.renderOrder = 0; } }
+  class FakeMat { constructor() { this.color = { hex: 0, set(h) { this.hex = h; } }; this.opacity = 1; } clone() { return new FakeMat(); } dispose() {} }
   function mkFactories(ed) {
     const Command = ed._Command;
     let nextVid = 100, nextTopo = 9000;
@@ -877,7 +882,10 @@ const callAsync = async (name, args) => JSON.parse(await run(`window.__PLA__.cal
           groups.push(idx.length, 6);
           idx.push(base, base + 1, base + 2, base, base + 2, base + 3);
         });
-        this.faces.mesh = { geometry: { attributes: { position: { array: Float32Array.from(pos) } }, index: { array: Uint32Array.from(idx) } } };
+        const geo = new FakeGeo();
+        geo.setAttribute('position', new FakeAttr(Float32Array.from(pos), 3));
+        geo.index = { array: Uint32Array.from(idx) };
+        this.faces.mesh = new FakeMesh(geo, null);
         this.faces.groups = groups;
         // 吸附缓存: 面心(+法向)、边中点(+切向)、顶点(实体 id 自成一套, 与拓扑 id 的数字同源)
         const vEnts = new Map();
@@ -1179,6 +1187,36 @@ const callAsync = async (name, args) => JSON.parse(await run(`window.__PLA__.cal
     assert.strictEqual(call('cam.view', { view: 'iso' }).ok, true);
     assert.ok(/view must be one of/.test(call('cam.view', { view: 'side' }).err));
     vp.camMode = 'orthographic';
+  });
+
+  await ta('N3 view.highlight: 拷面三角形成叠加网格(角色 → 颜色, 透过实体可见)加进辅助场景; 每次替换上次; 空 = 清除', async () => {
+    const ed = ed3;
+    ed.helpers = { items: [], add(m) { this.items.push(m); }, remove(m) { this.items = this.items.filter((x) => x !== m); } };
+    ed.gizmos = { yellow: { mesh: new FakeMat() } };
+    const r = (await callAsync('cmd.exec', { ops: [{ op: 'box', p1: [0, 0, 0], p2: [10, 20, 0], height: 5 }] })).v;
+    const id = r.results[0].items[0].id;
+    const top = call('geo.query', { detail: 'faces', of: [id], normal: [0, 0, 1] }).v.faces[0].id;
+    const bot = call('geo.query', { detail: 'faces', of: [id], normal: [0, 0, -1] }).v.faces[0].id;
+    const h = call('view.highlight', { faces: [{ id: bot, role: 'primary' }, { id: top, role: 'candidate' }, { id: '99999f1' }] });
+    assert.strictEqual(h.ok, true, JSON.stringify(h));
+    assert.deepStrictEqual(h.v.shown, [bot, top]);
+    assert.ok(/99999f1/.test(h.v.failed[0]), '查不到的面如实报');
+    assert.strictEqual(ed.helpers.items.length, 2);
+    const m0 = ed.helpers.items[0];
+    assert.strictEqual(m0.geometry.attributes.position.array.length, 6 * 3, '一个面 2 个三角形 = 6 个顶点');
+    assert.ok(m0.material.color.hex === 0xff8c1a && m0.material.depthTest === false, '主色 + 透过实体可见');
+    assert.ok(m0.renderOrder > 0);
+    // 再次调用替换上次; 空 = 清除
+    call('view.highlight', { faces: [{ id: top }] });
+    assert.strictEqual(ed.helpers.items.length, 1);
+    assert.strictEqual(m0.geometry.disposed, true, '旧网格释放');
+    call('view.highlight', { faces: [] });
+    assert.strictEqual(ed.helpers.items.length, 0);
+    // dim.face 的候选列表 + 指定对面
+    const d = call('dim.face', { face: top }).v;
+    assert.deepStrictEqual(d.candidates.map((c) => [c.id, c.value, c.overlap]), [[bot, 5, true]]);
+    assert.strictEqual(call('dim.face', { face: top, opposite: bot }).v.value, 5);
+    assert.ok(/not an opposite parallel face/.test(call('dim.face', { face: top, opposite: top }).err));
   });
 
   await ta('N3 dim.face: 平面 → 厚度(背对平行面) + 偏移系数; 来自选择或显式 id; offsetFace 改厚度后再读 = 新值', async () => {

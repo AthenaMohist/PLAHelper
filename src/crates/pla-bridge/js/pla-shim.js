@@ -123,6 +123,11 @@
     // 自建工厂命令的基类 Command: 取任一几何命令类的父类
     'cmd.factoryBaseHolder':   ['ed', 'commands.CornerBoxCommand'],
     // 几何工厂类(只在闭包里; 代理按需拍堆快照挂到 CFG.factoriesGlobal, 根 fac)
+    // ---- N3: 面高亮(叠加在辅助场景里的自建网格; 不动选择、不受鼠标悬停覆盖) ----
+    'ed.helpers':              ['ed', 'helpers'],
+    'helpers.add':             ['helpers', 'add'],
+    'helpers.remove':          ['helpers', 'remove'],
+    'gizmo.meshMaterial':      ['ed', 'gizmos.yellow.mesh', 'gizmos.default.mesh'],
     // ---- A2: 吸附点(测量 / 自由移动命令用的同一批点; SnapScene 按物体缓存, 新物体建完即有) ----
     'ed.snapScene':            ['ed', 'snapScene'],
     'snap.canonicals':         ['ss', 'canonicals'],
@@ -306,6 +311,13 @@
     // 判定两平面"平行"的角度容差(度): 平行时 measure 额外给法向距离(壁厚); 平面的曲面类名
     parallelTolDeg: 0.1,
     planeSurface: 'Plane',
+    // ---- N3: 面高亮的样式(角色 → 颜色 / 不透明度); 透过实体可见(depthTest 关), 画在最上层 ----
+    highlightStyles: {
+      primary:   { color: 0xff8c1a, opacity: 0.55 },   // 当前选中的对面
+      candidate: { color: 0x3aa0ff, opacity: 0.25 },   // 其它候选
+      source:    { color: 0x5ad16a, opacity: 0.35 }    // 选中面(可选; Plasticity 自己已有选中色)
+    },
+    highlightRenderOrder: 999,
     // geo.query 每类最多返回的项数(超出如实报 truncated)
     queryLimit: 2000,
     // ---- A3: 事务回滚 ----
@@ -366,6 +378,7 @@
     'geo.read':  { needs: ['geo.items', 'geo.lookupTopo', 'geo.lookupItem', 'ed.docUnit'] },
     'hist.write': { needs: ['ed.undoStack', 'exec.cancel'] },
     'snap.read': { needs: ['geo.items', 'ed.docUnit', 'ed.snapScene', 'snap.canonicals'], optional: ['snap.occurrences'] },
+    'view.highlight': { needs: ['geo.items', 'geo.lookupTopo', 'ed.helpers', 'helpers.add', 'helpers.remove', 'gizmo.meshMaterial'] },
     // 工厂类不列入: 首次使用前本来就没有(由代理按需挂上), 缺哪个在执行时按表键报
     'cmd.exec':    { needs: ['ed.enqueue', 'sig.commandEnded', 'exec.cancel', 'cmd.factoryBaseHolder', 'geo.items',
                              'geo.lookupTopo', 'geo.lookupItem', 'ed.docUnit', 'vp.camera'] },
@@ -419,6 +432,7 @@
       case 'tex': return get('mat.textures');
       case 'fac': return W[CFG.factoriesGlobal];
       case 'ss': return get('ed.snapScene');
+      case 'helpers': return get('ed.helpers');
     }
     return undefined;
   }
@@ -1787,7 +1801,8 @@
     var overlap = function (b1, b2) {
       return [ax[1], ax[2]].every(function (j) { return Math.min(b1[1][j], b2[1][j]) - Math.max(b1[0][j], b2[0][j]) > -1e-9; });
     };
-    var best = null;
+    // 全部候选: 背对的平行平面, 在选中面"后方"(d > 0); 排序 = 投影重叠的在前, 再按距离近 → 远
+    var cands = [];
     entries.forEach(function (e) {
       if (e.id === id) return;
       var o = faceSig(e, sid, k);
@@ -1795,13 +1810,73 @@
       if (vdot(o.normal, n) > -cosTol) return;
       var d = vdot([f.center[0] - o.center[0], f.center[1] - o.center[1], f.center[2] - o.center[2]], n);
       if (!(d > 1e-9)) return;
-      var ov = overlap(me.bbox, e.bbox);
-      if (!best || (ov && !best.ov) || (ov === best.ov && d < best.d)) best = { id: e.id, d: d, ov: ov };
+      cands.push({ id: e.id, value: sig7(d), overlap: overlap(me.bbox, e.bbox), center: o.center });
     });
+    cands.sort(function (p, q) { return (q.overlap - p.overlap) || (p.value - q.value); });
     out.normal = n;
-    if (!best) return out;
-    out.kind = 'thickness'; out.value = sig7(best.d); out.opposite = best.id; out.overlap = best.ov; out.op = 'offsetFace'; out.offsetSign = 1;
+    out.candidates = cands;
+    if (!cands.length) return out;
+    // 指定对面(界面切换候选 / Plasticity 里同时选了第二个面)
+    var pick = cands[0];
+    if (a.opposite !== undefined) {
+      pick = cands.filter(function (c) { return c.id === String(a.opposite); })[0];
+      if (!pick) throw new Error('not an opposite parallel face of ' + id + ': ' + a.opposite);
+    }
+    out.kind = 'thickness'; out.value = pick.value; out.opposite = pick.id; out.overlap = pick.overlap; out.op = 'offsetFace'; out.offsetSign = 1;
     return out;
+  });
+
+  // N3: 面高亮。args = { faces: [{id, role?: primary|candidate|source}] } —— 每次调用替换上一次; faces 为空 = 清除。
+  // 做法: 从面所在实体的显示网格(FaceGroup.mesh + groups)拷出这个面的三角形, 用 gizmo 材质的克隆(改色、透过实体可见)
+  // 建一个 Mesh 加到辅助场景(editor.helpers)。不动选择, 鼠标悬停也不会覆盖。
+  function clearHighlight() {
+    (state.highlights || []).forEach(function (m) {
+      try { invokeOn('helpers.remove', [m]); } catch (e) {}
+      try { m.geometry.dispose(); m.material.dispose(); } catch (e2) {}
+    });
+    state.highlights = [];
+  }
+
+  function faceMeshCopy(id, style) {
+    var m = /^(\d+)[a-z]/.exec(id);
+    var sv = m && viewOf('solid', m[1]);
+    if (!sv) throw new Error('face not found: ' + id);
+    var fg = sv[NAMES.shellGroups.face], src = fg && fg[NAMES.faceMesh];
+    var ids = fg ? Array.from(fg[NAMES.groupVersionIds] || []).map(String) : [];
+    var fi = ids.indexOf(String(id));
+    var grp = fg && fg[NAMES.meshGroups];
+    if (!src || fi < 0 || !grp) throw new Error('no display mesh for face ' + id);
+    var g = src.geometry, pos = g.attributes.position.array, idx = g.index && g.index.array;
+    var start = grp[fi * 2], count = grp[fi * 2 + 1];
+    var out = new Float32Array(count * 3);
+    for (var i = 0; i < count; i++) {
+      var vi = idx ? idx[start + i] : start + i;
+      out[i * 3] = pos[vi * 3]; out[i * 3 + 1] = pos[vi * 3 + 1]; out[i * 3 + 2] = pos[vi * 3 + 2];
+    }
+    var geo = new g.constructor();
+    geo.setAttribute('position', new g.attributes.position.constructor(out, 3));
+    var mat = need('gizmo.meshMaterial').clone();
+    mat.color.set(style.color); mat.opacity = style.opacity; mat.transparent = true;
+    mat.depthTest = false; mat.depthWrite = false; mat.side = 2; // DoubleSide
+    var mesh = new src.constructor(geo, mat);
+    mesh.renderOrder = NAMES.highlightRenderOrder;
+    if (src.matrixWorld) { mesh.matrixAutoUpdate = false; mesh.matrix.copy(src.matrixWorld); mesh.matrixWorld.copy(src.matrixWorld); }
+    return mesh;
+  }
+
+  def('view.highlight', 'view.highlight', function (a) {
+    a = a || {};
+    clearHighlight();
+    var shown = [], failed = [];
+    (a.faces || []).forEach(function (f) {
+      var id = String(f && f.id !== undefined ? f.id : f);
+      var style = NAMES.highlightStyles[(f && f.role) || 'primary'];
+      if (!style) { failed.push(id + ': unknown role'); return; }
+      try { var mesh = faceMeshCopy(id, style); invokeOn('helpers.add', [mesh]); state.highlights.push(mesh); shown.push(id); }
+      catch (e) { failed.push(id + ': ' + errMsg(e)); }
+    });
+    call0(viewport(), 'vp.render');
+    return { shown: shown, failed: failed };
   });
 
   def('cam.vpRect', 'cam.read', function () {
@@ -2573,6 +2648,7 @@
     },
     dispose: function () {
       disposeHooks();
+      try { clearHighlight(); } catch (e) {} // 热替换时别把高亮网格留在场景里
       if (W.__PLA__ === self) delete W.__PLA__;
     }
   };

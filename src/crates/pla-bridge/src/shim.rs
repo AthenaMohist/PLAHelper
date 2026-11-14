@@ -95,13 +95,15 @@ pub mod api {
     pub const CAM_VIEW: &str = "cam.view";
     /// N3: 面的可改尺寸(平面厚度 / 圆柱半径 + 偏移系数)。
     pub const DIM_FACE: &str = "dim.face";
+    /// N3: 面高亮(叠加网格, 不动选择; 空列表 = 清除)。
+    pub const VIEW_HIGHLIGHT: &str = "view.highlight";
 
     /// 全部接口名（契约测试用）。
     pub const ALL: &[&str] = &[
         CORE_PROBE, CORE_HEALTH, CORE_APIS, SEL_SNAPSHOT, HIST_STATE, CAM_GET, CAM_SET, CMD_DISPATCH,
         CMD_PING, ERR_LAST, TREE_LIST, SEL_CANCEL_COMMAND, SEL_CLEAR, SEL_APPLY, CAM_NAVIGATE, CAM_RENDER, CAM_THUMBNAIL, CAM_VP_RECT,
         CAM_SET_ORBIT_STEP, CAM_ROLL, KEYMAP_SET_BINDINGS, VP_SAVE, VP_RESTORE, MAT_SAVE, MAT_RESTORE, CMD_EXEC, CMD_FACTORIES,
-        GEO_QUERY, HIST_BEGIN, HIST_ROLLBACK, HIST_COMMIT, GEO_SNAPS, GEO_MEASURE, CAM_VIEW, DIM_FACE,
+        GEO_QUERY, HIST_BEGIN, HIST_ROLLBACK, HIST_COMMIT, GEO_SNAPS, GEO_MEASURE, CAM_VIEW, DIM_FACE, VIEW_HIGHLIGHT,
     ];
 }
 
@@ -132,13 +134,15 @@ pub mod cap {
     pub const HIST_WRITE: &str = "hist.write";
     /// A2: 吸附点读取(SnapScene)。
     pub const SNAP_READ: &str = "snap.read";
+    /// N3: 面高亮(辅助场景叠加网格)。
+    pub const VIEW_HIGHLIGHT: &str = "view.highlight";
     pub const BOOL_RUN: &str = "bool.run";
     pub const ASSET_PLACE: &str = "asset.place";
 
     /// 全部能力名（契约测试用）。
     pub const ALL: &[&str] = &[
         EDITOR, SEL_READ, SEL_WRITE, HIST_READ, CAM_READ, CAM_WRITE, CAM_NAV, CAM_STEP, CAM_ROLL, SEL_APPLY,
-        VP_STATE, KEYMAP, CMD_DISPATCH, ERR_HOOK, TREE, MAT_STATE, MAT_SET, CMD_EXEC, GEO_READ, HIST_WRITE, SNAP_READ, BOOL_RUN, ASSET_PLACE,
+        VP_STATE, KEYMAP, CMD_DISPATCH, ERR_HOOK, TREE, MAT_STATE, MAT_SET, CMD_EXEC, GEO_READ, HIST_WRITE, SNAP_READ, VIEW_HIGHLIGHT, BOOL_RUN, ASSET_PLACE,
     ];
 }
 
