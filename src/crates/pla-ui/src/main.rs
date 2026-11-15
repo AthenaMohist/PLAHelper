@@ -253,6 +253,8 @@ struct PlaApp {
     dim_cand: usize,
     /// N3b 改哪一侧: 0 = 移动选中面, 1 = 移动对面, 2 = 两侧各一半。
     dim_side: u8,
+    /// N3c 对称: 动的面分在参考面两侧时 0 = 整体平移, 1 = 以参考面为对称面向两侧移动(距离记录的 side 存它)。
+    dim_sym: u8,
     /// 上次发出的高亮(面 + 对面 + 候选数), 没变就不重发。
     dim_hl_key: String,
     /// N3d: 本文档的尺寸记录(懒加载, 换文档重读)。
@@ -284,8 +286,6 @@ struct PlaApp {
     dims_pngs: std::collections::HashMap<String, Vec<u8>>,
     /// 记录 / 更新后等视口截图回包的记录名。
     dims_thumb_pending: Option<String>,
-    /// 条目里直接改数值: 载入完成后要应用的目标值。
-    dim_pending_target: Option<f64>,
     dim_busy: bool,
     hotkeys: HotkeyMap,
     /// 正在录制快捷键的动作名 (None = 未在录制)。
@@ -885,8 +885,6 @@ struct InfoHint {
     lines: Vec<InfoLine>,
     /// 发起悬停的面板屏幕矩形(逻辑 pt)— 三级面板贴其右侧, 放不下则左侧。
     panel: egui::Rect,
-    /// 悬停行的屏幕 y(逻辑 pt)。
-    row_y: f32,
 }
 
 thread_local! {
@@ -896,8 +894,8 @@ thread_local! {
         std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
-/// 悬停时登记三级面板(由根视口在面板旁渲染)。
-fn hover_info(ui: &egui::Ui, rect: egui::Rect, hovered: bool, title: &'static str, lines: Vec<InfoLine>) {
+/// 悬停时登记三级面板(由根视口在面板旁渲染)。面板顶部对齐窗口顶部(不跟随悬停行), 行的位置 `_row` 不再参与定位。
+fn hover_info(ui: &egui::Ui, _row: egui::Rect, hovered: bool, title: &'static str, lines: Vec<InfoLine>) {
     if !hovered {
         return;
     }
@@ -905,7 +903,7 @@ fn hover_info(ui: &egui::Ui, rect: egui::Rect, hovered: bool, title: &'static st
         return;
     };
     INFO_HINT.with(|h| {
-        *h.borrow_mut() = Some(InfoHint { title, lines, panel: inner, row_y: inner.min.y + rect.min.y });
+        *h.borrow_mut() = Some(InfoHint { title, lines, panel: inner });
     });
 }
 
@@ -1088,11 +1086,15 @@ fn dim_help_lines() -> Vec<InfoLine> {
             "Convention: with several faces, the FIRST selected face is the REFERENCE (green, fixed); faces Shift-added after it move (several: hole + chamfer, boss sides…) → distance / hole position; the group is translated.",
         )),
         info_text(tr("移动: 选中面 / 对面 / 两侧各半(厚度)。", "Move: selected / opposite / both halves (thickness).")),
+        info_text(tr(
+            "对称: 要动的面分在参考面两侧时, 可选\"整体平移\"或\"对称(以参考面)\"—— 对称 = 与锚面同侧的往外 / 往里 Δ, 另一侧反向 Δ。",
+            "Symmetric: when the moving faces lie on both sides of the reference, choose \"Translate all\" or \"Symmetric (about reference)\" — the anchor side moves by Δ, the other side by −Δ.",
+        )),
         info_key(tr("右键 / Enter", "Right-click / Enter"), tr("应用(一步可撤销, 失败自动撤回)", "Apply (one undo step; rolled back on failure)")),
         info_key("Esc", tr("目标值复原", "Reset the target value")),
         info_text(tr(
-            "记录: 标题右侧 ＋ 记录 → 下方列表。点条目 = 载入并选中这些面(面换了 id 也能找回); 直接改条目里的数值再 Enter = 应用。★ 收藏、✎ 改名、↻ 用当前尺寸更新、管理 = 批量删除。",
-            "Saved: + Save at the top right → list below. Click an entry to load and select its faces (found even after face ids change); edit its value and press Enter to apply. ★ favourite, ✎ rename, ↻ update from the current dimension, Manage = batch delete.",
+            "记录: 标题右侧 ＋ 记录 → 下方列表。点条目 = 载入并选中这些面(面换了 id 也能找回), 并在 Plasticity 里建一个同名测量(厚度 / 距离; 条目改名测量跟着改); 直接改条目里的数值再 Enter = 应用。★ 收藏、笔 = 改名、↻ 用当前尺寸更新、管理 = 批量删除。",
+            "Saved: + Save at the top right → list below. Click an entry to load and select its faces (found even after face ids change) and create a Plasticity measurement with the same name (thickness / distance; renaming the entry renames it); edit its value and press Enter to apply. ★ favourite, pencil = rename, ↻ update from the current dimension, Manage = batch delete.",
         )),
     ]
 }
@@ -1361,18 +1363,32 @@ fn drag_row<T: egui::emath::Numeric>(
     changed
 }
 
+/// 改名图标: 斜放的笔(笔杆 + 笔尖), 约 12 pt 见方, 以 c 为中心。
+fn paint_pencil(p: &egui::Painter, c: egui::Pos2, col: egui::Color32) {
+    let d = egui::vec2(1.0, -1.0).normalized();
+    let n = egui::vec2(d.y, -d.x);
+    let tail = c + d * 5.0;
+    let base = c - d * 2.5;
+    p.line_segment([base, tail], egui::Stroke::new(2.6_f32, col));
+    let tip = base - d * 3.0;
+    p.add(egui::Shape::convex_polygon(vec![base + n * 1.3, base - n * 1.3, tip], col, egui::Stroke::NONE));
+}
+
 /// 渲染三级面板(由根视口在所有面板之后调用, 与 HUD 同理: 面板本帧写入的悬停才能本帧显示)。
 fn show_info_popup(ctx: &egui::Context, h: InfoHint) {
     const W: f32 = 320.0;
     let key = h.title;
     let height = INFO_HEIGHT.with(|m| m.borrow().get(key).copied()).unwrap_or(120.0);
-    let monitor_w = ctx.input(|i| i.viewport().monitor_size).map_or(f32::MAX, |s| s.x);
+    let monitor = ctx.input(|i| i.viewport().monitor_size);
+    let monitor_w = monitor.map_or(f32::MAX, |s| s.x);
     let x = if h.panel.right() + 8.0 + W <= monitor_w {
         h.panel.right() + 8.0
     } else {
         h.panel.left() - 8.0 - W
     };
-    let y = (h.row_y - 10.0).max(h.panel.top());
+    // 顶部与面板标题栏对齐(用户 2026-11-15: 跟着行走会被挤出屏幕底部看不见); 仍放不下再往上收
+    let monitor_h = monitor.map_or(f32::MAX, |s| s.y);
+    let y = h.panel.top().min(monitor_h - height).max(0.0);
     let (hide, reveal) = viewport_reveal(ctx, key);
     let mut builder = egui::ViewportBuilder::default()
         .with_decorations(false)
@@ -2255,6 +2271,7 @@ impl PlaApp {
             dim_text: String::new(),
             dim_cand: 0,
             dim_side: 0,
+            dim_sym: 0,
             dim_hl_key: String::new(),
             dims_list: Vec::new(),
             dims_loaded: false,
@@ -2274,7 +2291,6 @@ impl PlaApp {
             dims_row_focus: false,
             dims_pngs: Default::default(),
             dims_thumb_pending: None,
-            dim_pending_target: None,
             dim_busy: false,
             hotkeys: pla_ui::hotkey::load_binds().unwrap_or_default(),
             recording: None,
@@ -2484,7 +2500,72 @@ impl PlaApp {
                         }
                     }
                 }
-                // N3d: 按签名定位回包 → 载入(在 Plasticity 里选中)/ 改后刷新(写回当前签名)
+                // N3d: 一条记录的定位 + 尺寸回包 → 载入(在 Plasticity 里选中 + 建同名本体测量)/ 条目里改值(直接应用)
+                pla_bridge::cdp::CdpEvent::CallResult { name, result } if name == pla_bridge::shim::api::DIM_RECORD => {
+                    let pending = self.dim_pending.take();
+                    let (rec, target) = match pending {
+                        Some(DimPending::Load(r)) => (r, None),
+                        Some(DimPending::Apply(r, t)) => (r, Some(t)),
+                        other => {
+                            self.dim_pending = other;
+                            continue;
+                        }
+                    };
+                    match result {
+                        Err(e) => {
+                            let what = if target.is_some() { tr("修改", "Changing") } else { tr("载入", "Loading") };
+                            self.set_notice((true, t!("{what}尺寸 {} 失败: {e}", "{what} dimension {} failed: {e}", rec.name)));
+                        }
+                        Ok(v) => {
+                            let ids: Vec<String> = v["ids"].as_array().into_iter().flatten().filter_map(|x| x.as_str().map(String::from)).collect();
+                            let info = v["info"].clone();
+                            let worst = v["worst"].as_f64().unwrap_or(0.0);
+                            if rec.mode == "distance" { self.dim_sym = rec.side; } else { self.dim_side = rec.side; }
+                            self.dim_active = Some(rec.name.clone());
+                            self.dim_active_ids = ids.clone();
+                            // 当前对面 = 记录里的对面(找不到就用默认对面, 如实提示)
+                            let opp = v["opposite"].as_str().map(String::from);
+                            let cands = info["candidates"].as_array().cloned().unwrap_or_default();
+                            self.dim_cand = opp.as_deref().and_then(|o| cands.iter().position(|c| c["id"].as_str() == Some(o))).unwrap_or(0);
+                            self.dim_measure_for(&rec.name, &info);
+                            let warn = if v["oppositeLost"] == true {
+                                Some(tr("记录的对面找不到了, 用的是默认对面", "the saved opposite face is gone; using the default one").to_string())
+                            } else if worst > 1.0 {
+                                // 偏差 > 1 个文档单位: 模型在别处被改过, 定位可能不准 —— 如实提示
+                                Some(t!("定位偏差 {} (模型改动较大, 请核对高亮的面)", "match offset {} (model changed; check the highlighted faces)", fmt3(worst)))
+                            } else {
+                                None
+                            };
+                            match target {
+                                Some(t) if !self.dim_busy => {
+                                    self.dim_apply(&info, &ids, t);
+                                    if let Some(w) = warn {
+                                        self.set_notice((true, t!("正在修改 {}: {w}", "Changing {}: {w}", rec.name)));
+                                    }
+                                }
+                                Some(_) => self.set_notice((true, tr("上一次修改还没完成, 稍后再改", "The previous change is still running; try again shortly").into())),
+                                None => {
+                                    let entries: Vec<pla_bridge::cdp::ApplyEntry> = ids
+                                        .iter()
+                                        .map(|id| pla_bridge::cdp::ApplyEntry { kind: "face".into(), id: id.clone(), key: None, camera: None })
+                                        .collect();
+                                    self.send_apply(entries);
+                                    self.dim_pending_opp = opp;
+                                    match warn {
+                                        Some(w) => self.set_notice((true, t!("已载入 {}, 但{w}", "Loaded {}, but {w}", rec.name))),
+                                        None => self.set_notice((false, t!("已载入尺寸 {}", "Loaded dimension {}", rec.name))),
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // N3e: 本体测量回包: 成功只记日志(大纲里能看到); 失败如实提示(尺寸记录本身不受影响)
+                pla_bridge::cdp::CdpEvent::CallResult { name, result } if name == pla_bridge::shim::api::DIM_MEASURE => match result {
+                    Ok(v) => pla_ui::diag::log(&format!("dim.measure ok: {v}")),
+                    Err(e) => self.set_notice((true, t!("本体测量没建成(尺寸记录不受影响): {e}", "Plasticity measurement not created (the record is fine): {e}"))),
+                },
+                // N3d: 改后刷新: 按预测签名定位, 写回当前签名与新值
                 pla_bridge::cdp::CdpEvent::CallResult { name, result } if name == pla_bridge::shim::api::GEO_RESOLVE => {
                     let pending = self.dim_pending.take();
                     let res = match &result {
@@ -2492,33 +2573,7 @@ impl PlaApp {
                         Err(_) => Vec::new(),
                     };
                     let ids: Vec<Option<String>> = res.iter().map(|r| r["id"].as_str().map(String::from)).collect();
-                    let worst = res.iter().filter_map(|r| r["score"].as_f64()).fold(0.0f64, f64::max);
                     match (pending, &result) {
-                        (Some(DimPending::Load(rec)), Ok(_)) => {
-                            let n = rec.faces.len();
-                            if ids.len() < n || ids.iter().take(n).any(|x| x.is_none()) {
-                                let why = res.iter().find_map(|r| r["err"].as_str().map(String::from)).unwrap_or_default();
-                                self.dim_pending_target = None;
-                                self.set_notice((true, t!("尺寸 {} 在当前模型里找不到对应的面: {why}", "Dimension {} not found in the current model: {why}", rec.name)));
-                            } else {
-                                let main: Vec<String> = ids.iter().take(n).flatten().cloned().collect();
-                                let entries: Vec<pla_bridge::cdp::ApplyEntry> = main
-                                    .iter()
-                                    .map(|id| pla_bridge::cdp::ApplyEntry { kind: "face".into(), id: id.clone(), key: None, camera: None })
-                                    .collect();
-                                self.send_apply(entries);
-                                self.dim_side = rec.side;
-                                self.dim_pending_opp = ids.get(n).cloned().flatten();
-                                self.dim_active = Some(rec.name.clone());
-                                self.dim_active_ids = main;
-                                // 偏差 > 1 个文档单位: 模型在别处被改过, 定位可能不准 —— 如实提示
-                                if worst > 1.0 {
-                                    self.set_notice((true, t!("已载入 {}, 但定位偏差 {} (模型改动较大, 请核对高亮的面)", "Loaded {}, but match offset is {} (model changed; check the highlighted faces)", rec.name, fmt3(worst))));
-                                } else {
-                                    self.set_notice((false, t!("已载入尺寸 {}", "Loaded dimension {}", rec.name)));
-                                }
-                            }
-                        }
                         (Some(DimPending::Refresh(mut rec)), Ok(_)) => {
                             let n = rec.faces.len();
                             let sigs: Vec<serde_json::Value> = res.iter().map(|r| r["sig"].clone()).collect();
@@ -2533,10 +2588,17 @@ impl PlaApp {
                                 }
                                 self.dims_list = pla_ui::dims::load(&self.doc_key);
                             } else {
+                                // 面没找回来: 至少把新值写进记录(列表显示与模型一致), 签名留旧的
                                 pla_ui::diag::log("dims refresh: faces not found after apply");
+                                let _ = pla_ui::dims::update(&self.doc_key, &rec);
+                                self.dims_list = pla_ui::dims::load(&self.doc_key);
                             }
                         }
-                        (Some(DimPending::Load(rec)), Err(e)) => self.set_notice((true, t!("载入尺寸 {} 失败: {e}", "Loading dimension {} failed: {e}", rec.name))),
+                        (Some(DimPending::Refresh(rec)), Err(e)) => {
+                            pla_ui::diag::log(&format!("dims refresh resolve failed: {e}"));
+                            let _ = pla_ui::dims::update(&self.doc_key, &rec);
+                            self.dims_list = pla_ui::dims::load(&self.doc_key);
+                        }
                         (other, _) => self.dim_pending = other,
                     }
                 }
@@ -3056,14 +3118,6 @@ impl PlaApp {
                     _ => (String::new(), Vec::new()),
                 };
                 self.dim_set_highlight(hl_key, hl_faces);
-                // N3d: 条目里直接改了数值 → 载入完成(选择 = 记录的面、尺寸已读到)后自动应用
-                if let (Some(t), Some(v)) = (self.dim_pending_target, &info) {
-                    if self.dim_active.is_some() && faces == self.dim_active_ids && !self.dim_busy && self.dim_pending_opp.is_none() {
-                        self.dim_pending_target = None;
-                        let v = v.clone();
-                        self.dim_apply(&v, &faces, t);
-                    }
-                }
                 let units = |v: &serde_json::Value| -> String {
                     match v["units"].as_str().unwrap_or("") {
                         "millimeter" => "mm", "centimeter" => "cm", "meter" => "m", "inch" => "in", "foot" => "ft", u => u,
@@ -3228,7 +3282,7 @@ impl PlaApp {
             kind: v["kind"].as_str().unwrap_or("").into(),
             faces: Vec::new(),
             opposite: None,
-            side: self.dim_side,
+            side: if v["kind"] == "distance" { self.dim_sym } else { self.dim_side },
             value: value.unwrap_or(0.0),
             units: v["units"].as_str().unwrap_or("").into(),
             created: 0,
@@ -3259,7 +3313,25 @@ impl PlaApp {
             }
             self.dim_note_apply(v, sel, value, target);
             let d = target - value;
-            (value, serde_json::json!({ "atomic": true, "ops": [{ "op": "moveFaces", "faces": v["moving"], "move": [dir[0] * d, dir[1] * d, dir[2] * d] }] }))
+            let mv = |s: f64| serde_json::json!([dir[0] * d * s, dir[1] * d * s, dir[2] * d * s]);
+            if Self::dim_symmetric(v, self.dim_sym) {
+                // 对称: 与锚同侧的面 +d, 另一侧 −d(跨在参考面上的不动)。第二步按位置挑面(第一步之后面 id 已变)
+                let moving = v["moving"].as_array().cloned().unwrap_or_default();
+                let sides = v["sides"].as_array().cloned().unwrap_or_default();
+                let centers = v["boxCenters"].as_array().cloned().unwrap_or_default();
+                let near: Vec<serde_json::Value> = (0..moving.len())
+                    .filter(|&i| sides.get(i).and_then(|s| s.as_i64()) == Some(-1))
+                    .filter_map(|i| centers.get(i).filter(|c| c.is_array()).map(|c| serde_json::json!({ "near": c, "tol": 0.01 })))
+                    .collect();
+                let same: Vec<serde_json::Value> =
+                    (0..moving.len()).filter(|&i| sides.get(i).and_then(|s| s.as_i64()) == Some(1)).map(|i| moving[i].clone()).collect();
+                (value, serde_json::json!({ "atomic": true, "ops": [
+                    { "op": "moveFaces", "faces": same, "move": mv(1.0) },
+                    { "op": "moveFaces", "faces": near, "move": mv(-1.0) },
+                ] }))
+            } else {
+                (value, serde_json::json!({ "atomic": true, "ops": [{ "op": "moveFaces", "faces": v["moving"], "move": mv(1.0) }] }))
+            }
         } else {
             let cands = v["candidates"].as_array().cloned().unwrap_or_default();
             let (value, opposite) = if kind == "thickness" && !cands.is_empty() {
@@ -3285,7 +3357,12 @@ impl PlaApp {
         self.set_notice((false, t!("正在修改: {} → {} {units}…", "Changing: {} → {} {units}…", fmt3(value), fmt3(target))));
     }
 
-    /// N3d: 应用前登记 —— 当前选择正是某条记录时, 记下各面(faces 之后 opposite)的平移量, 成功后据此刷新记录。
+    /// N3c: 距离尺寸按"对称"改(动的面分在参考面两侧且选了对称)。
+    fn dim_symmetric(v: &serde_json::Value, sym: u8) -> bool {
+        v["kind"] == "distance" && v["mixed"] == true && sym == 1
+    }
+
+    /// N3d: 应用前登记 ——当前选择正是某条记录时, 记下各面(faces 之后 opposite)的平移量, 成功后据此刷新记录。
     fn dim_note_apply(&mut self, v: &serde_json::Value, sel: &[String], value: f64, target: f64) {
         self.dim_last_apply = None;
         let Some(name) = self.dim_active.clone() else { return };
@@ -3304,7 +3381,14 @@ impl PlaApp {
         let moves: Vec<[f64; 3]> = match v["kind"].as_str() {
             Some("distance") => {
                 let d = vec3(&v["direction"]);
-                std::iter::once([0.0; 3]).chain((1..rec.faces.len()).map(|_| scale(d, delta))).collect()
+                let sym = Self::dim_symmetric(v, self.dim_sym);
+                let sides = v["sides"].as_array().cloned().unwrap_or_default();
+                std::iter::once([0.0; 3])
+                    .chain((1..rec.faces.len()).map(|i| {
+                        let s = if sym { sides.get(i - 1).and_then(|x| x.as_f64()).unwrap_or(0.0) } else { 1.0 };
+                        scale(d, delta * s)
+                    }))
+                    .collect()
             }
             Some("thickness") => {
                 let n_sel = rec.faces.first().map(|s| vec3(&s["normal"])).unwrap_or([0.0; 3]);
@@ -3319,7 +3403,7 @@ impl PlaApp {
             _ => vec![[0.0; 3]; rec.faces.len() + rec.opposite.iter().count()],
         };
         let mut rec2 = rec;
-        rec2.side = self.dim_side;
+        rec2.side = if v["kind"] == "distance" { self.dim_sym } else { self.dim_side };
         if let Some(r) = self.dims_list.iter_mut().find(|r| r.name == rec2.name) {
             r.side = rec2.side;
         }
@@ -3328,13 +3412,31 @@ impl PlaApp {
 
     /// N3d: 载入一条记录 —— 按签名在当前模型里重新定位, 回包后在 Plasticity 里按原顺序选中(参考面在前)。
     fn dim_load(&mut self, rec: &pla_ui::dims::DimRecord) {
-        let mut sigs = rec.faces.clone();
-        sigs.extend(rec.opposite.clone());
+        self.dim_record_call(rec, DimPending::Load(rec.clone()));
+    }
+
+    /// N3d: 一条记录 → dim.record(按签名定位 + 读当前尺寸, 一次往返), 回包按 pending 载入或直接应用。
+    fn dim_record_call(&mut self, rec: &pla_ui::dims::DimRecord, pending: DimPending) {
         self.cdp.send(pla_bridge::cdp::CdpCmd::Call {
-            name: pla_bridge::shim::api::GEO_RESOLVE,
-            args: serde_json::json!({ "faces": sigs, "units": rec.units }),
+            name: pla_bridge::shim::api::DIM_RECORD,
+            args: serde_json::json!({ "mode": rec.mode, "faces": rec.faces, "opposite": rec.opposite, "units": rec.units }),
         });
-        self.dim_pending = Some(DimPending::Load(rec.clone()));
+        self.dim_pending = Some(pending);
+    }
+
+    /// N3e: 记录对应的本体测量(两面面心之间, 名字 = 记录名; 同名已有则不重复建)。半径 / 圆角没有配对面 → 不建。
+    fn dim_measure_for(&mut self, name: &str, info: &serde_json::Value) {
+        let pair = match info["kind"].as_str() {
+            Some("thickness") => (info["face"].as_str(), info["opposite"].as_str()),
+            Some("distance") => (info["reference"].as_str(), info["anchorFace"].as_str()),
+            _ => (None, None),
+        };
+        if let (Some(a), Some(b)) = pair {
+            self.cdp.send(pla_bridge::cdp::CdpCmd::Call {
+                name: pla_bridge::shim::api::DIM_MEASURE,
+                args: serde_json::json!({ "faces": [a, b], "name": name }),
+            });
+        }
     }
 
     /// N3d: 已记录尺寸列表。交互同快照墙: ★ 收藏(置顶)、✎ / 双击名字改名、↻ 用当前尺寸更新(确认)、管理 = 勾选批量删除;
@@ -3419,7 +3521,13 @@ impl PlaApp {
             let btn = |ui: &mut egui::Ui, cx: f32, glyph: &str, tip: &str, key: &str| -> bool {
                 let br = egui::Rect::from_center_size(egui::pos2(cx, cy), egui::vec2(18.0, 18.0));
                 let b = ui.interact(br, ui.id().with((key, glyph)), egui::Sense::click());
-                ui.painter().text(br.center(), egui::Align2::CENTER_CENTER, glyph, egui::FontId::proportional(13.0), if b.hovered() { egui::Color32::WHITE } else { COL_MUTED });
+                let col = if b.hovered() { egui::Color32::WHITE } else { COL_MUTED };
+                if glyph == "✎" {
+                    // 界面字体里没有 ✎(显示成方块, 用户 2026-11-15) → 画一支笔
+                    paint_pencil(ui.painter(), br.center(), col);
+                } else {
+                    ui.painter().text(br.center(), egui::Align2::CENTER_CENTER, glyph, egui::FontId::proportional(13.0), col);
+                }
                 b.on_hover_text(tip).clicked()
             };
             let key = rec.name.as_str();
@@ -3450,7 +3558,8 @@ impl PlaApp {
                     Ok(t) if t >= 0.0 && (t - rec.value).abs() > 5e-4 => acts.push(Act::Value(rec.clone(), t)),
                     _ => *buf = fmt3(rec.value),
                 }
-            } else if !focused && te.lost_focus() {
+            } else if !focused {
+                // 没在编辑: 永远显示记录里的值(不缓存旧输入 —— 否则改完后记录已更新, 框里还停在旧数, 用户 2026-11-15 图1)
                 *buf = fmt3(rec.value);
             }
             // 名字 / 改名
@@ -3523,8 +3632,7 @@ impl PlaApp {
                 Act::Load(rec) => self.dim_load(&rec),
                 Act::Value(rec, t) => {
                     self.dims_vals.remove(&rec.name);
-                    self.dim_pending_target = Some(t);
-                    self.dim_load(&rec);
+                    self.dim_record_call(&rec, DimPending::Apply(rec.clone(), t));
                 }
                 Act::Fav(name, fav) => {
                     if let Err(e) = pla_ui::dims::set_fav(&self.doc_key, &name, fav) {
@@ -3550,6 +3658,11 @@ impl PlaApp {
                                 if self.dim_active.as_deref() == Some(old.as_str()) {
                                     self.dim_active = Some(new.clone());
                                 }
+                                // N3e: 同名本体测量跟着改名(没有就什么也不做)
+                                self.cdp.send(pla_bridge::cdp::CdpCmd::Call {
+                                    name: pla_bridge::shim::api::DIM_MEASURE,
+                                    args: serde_json::json!({ "rename": { "from": old, "to": new } }),
+                                });
                                 self.dims_list = pla_ui::dims::load(&self.doc_key);
                             }
                             Err(e) => self.set_notice((true, t!("改名失败: {e}", "Rename failed: {e}"))),
@@ -3669,6 +3782,15 @@ impl PlaApp {
         );
         if dir.len() != 3 {
             return;
+        }
+        // 对称: 动的面分在参考面两侧时可选 —— 整体平移 / 以参考面为对称面向两侧移动(用户 2026-11-15)
+        if v["mixed"] == true {
+            rz_label(ui, tr("动的面在参考面两侧", "Moving faces on both sides of the reference"));
+            let labels = vec![tr("整体平移", "Translate all").to_string(), tr("对称(以参考面)", "Symmetric (about reference)").to_string()];
+            let mut s = self.dim_sym as usize;
+            if rz_segmented(ui, "dim-sym", &labels, &mut s) {
+                self.dim_sym = s as u8;
+            }
         }
         if let Some(t) = self.dim_value_block(ui, value, units, true) {
             self.dim_apply(v, sel, t);
@@ -4004,7 +4126,7 @@ impl PlaApp {
         self.dims_vals.clear();
         self.dims_pngs.clear();
         self.dims_thumb_pending = None;
-        self.dim_pending_target = None;
+        self.dim_sym = 0;
     }
 
     fn update_snap(&mut self, ctx: &egui::Context) {
@@ -4527,8 +4649,10 @@ fn header_extra_and_show(
 enum DimPending {
     /// 记录: 模板 + 主面个数(签名列表里前 n 个是 faces, 之后一个是 opposite)+ 是否"更新"已有记录(保留名字 / 收藏 / 创建时间)。
     Save(pla_ui::dims::DimRecord, usize, bool),
-    /// 载入: 按签名定位后在 Plasticity 里选中。
+    /// 载入: dim.record 定位 + 读尺寸后在 Plasticity 里选中, 并建同名本体测量。
     Load(pla_ui::dims::DimRecord),
+    /// 条目里直接改数值: dim.record 回包后直接按读到的尺寸应用(不等 Plasticity 选择回传)。
+    Apply(pla_ui::dims::DimRecord, f64),
     /// 改后刷新: 按预测签名定位, 用定位到的当前签名与新值写回。
     Refresh(pla_ui::dims::DimRecord),
 }

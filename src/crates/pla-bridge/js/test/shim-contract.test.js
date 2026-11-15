@@ -1259,6 +1259,17 @@ const callAsync = async (name, args) => JSON.parse(await run(`window.__PLA__.cal
     assert.ok(res[2].id && res[2].score > 1e5, '找不到同名实体 → 全部实体里最近的, 偏差很大如实报');
     assert.strictEqual(res[3].err, 'bad signature');
     assert.deepStrictEqual(JSON.parse(JSON.stringify(res[0].sig.center)), [905, 10, 8], '回带当前签名(记录据此刷新)');
+    // dim.record: 一次调用 = 定位 + 读尺寸(记录的对面优先; 对面找不到 → 默认对面 + oppositeLost)
+    const newBot = call('geo.query', { detail: 'faces', of: [nid], normal: [0, 0, -1] }).v.faces[0].id;
+    const botSig = call('dim.signature', { faces: [newBot] }).v.faces[0];
+    const rr = call('dim.record', { mode: 'face', faces: [pred], opposite: botSig }).v;
+    assert.deepStrictEqual([rr.ids, rr.opposite, rr.info.kind, rr.info.value, rr.worst], [[newTop], newBot, 'thickness', 8, 0]);
+    const lostOpp = call('dim.record', { mode: 'face', faces: [pred], opposite: Object.assign({}, botSig, { normal: [0, 0, 1], center: [905, 10, 8] }) }).v;
+    assert.strictEqual(lostOpp.oppositeLost, true, '记录的"对面"现在不是候选 → 用默认对面, 如实标出');
+    assert.strictEqual(lostOpp.info.value, 8);
+    assert.ok(/face not found in the current model/.test(call('dim.record', { mode: 'face', faces: [{ bad: 1 }] }).err));
+    const rd = call('dim.record', { mode: 'distance', faces: [botSig, pred] }).v;
+    assert.deepStrictEqual([rd.info.kind, rd.info.value], ['distance', 8]);
   });
 
   await ta('N3c dim.distance: 参考面(第一个) → 动的面组; 平面锚 → 法向距离 + 方向; moveFaces 同时设 move 与 matrix; 参数错如实报', async () => {
@@ -1278,6 +1289,14 @@ const callAsync = async (name, args) => JSON.parse(await run(`window.__PLA__.cal
     assert.strictEqual(ex.failed, null, JSON.stringify(ex.failed));
     assert.deepStrictEqual(ed.lastMove.move.map((x) => Math.round(x * 1e9) / 1e9), [0, 0, 0.003], '3 mm → 0.003 m');
     assert.deepStrictEqual(ed.lastMove.matrix.map((x) => Math.round(x * 1e9) / 1e9), [0, 0, 0.003], '平移矩阵同时设');
+    assert.deepStrictEqual([d.mixed, d.sides], [false, [1]], '只在一侧 → 不给对称选项');
+    // 对称: 参考面 x=10(另一实体), 动的面 x=5 / x=20 分在两侧 → mixed; 锚 = 最近的 x=5, 方向 −x
+    const r2 = (await callAsync('cmd.exec', { ops: [{ op: 'box', p1: [5, 0, 0], p2: [20, 20, 0], height: 5 }] })).v;
+    const id2 = r2.results[0].items[0].id;
+    const g = (n) => call('geo.query', { detail: 'faces', of: [id2], normal: n }).v.faces[0].id;
+    const sx = call('dim.distance', { reference: side, moving: [g([-1, 0, 0]), g([1, 0, 0])] }).v;
+    assert.deepStrictEqual([sx.value, sx.anchorFace, sx.mixed, sx.sides], [5, g([-1, 0, 0]), true, [1, -1]]);
+    assert.deepStrictEqual(JSON.parse(JSON.stringify([sx.direction, sx.boxCenters])), [[-1, 0, 0], [[5, 10, 2.5], [20, 10, 2.5]]], '方向 = 参考 → 锚; 包围盒中心供第二步按位置挑面');
     // 参数错
     assert.ok(/needs \{reference, moving/.test(call('dim.distance', { reference: bot }).err));
     assert.ok(/also in moving/.test(call('dim.distance', { reference: bot, moving: [bot] }).err));

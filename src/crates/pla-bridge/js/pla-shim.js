@@ -136,7 +136,12 @@
     'fac.multiFillet':         ['fac', 'MultiFilletShellFactory'],
     'fac.offsetFace':          ['fac', 'OffsetFaceFactory'],
     'fac.refillet':            ['fac', 'RefilletFaceFactory'],
-    'fac.moveFaces':           ['fac', 'MultiMoveFaceFactory']
+    'fac.moveFaces':           ['fac', 'MultiMoveFaceFactory'],
+    // ---- N3e: 本体测量(Measure Distance 的同一工厂; 名字在 nodes 表里, 不在测量记录上 —— 实测 2026-11-15) ----
+    'ed.measurements':         ['ed', 'measurements'],
+    'meas.snapshot':           ['meas', 'snapshot'],
+    'nodes.setName':           ['nodes', 'setName'],
+    'fac.p2pMeasure':          ['fac', 'PointToPointMeasurementFactory']
   };
 
   // 选择集里的各类 id 集合：[对外的 kind, Selection 上的集合名]。sel.ids.<kind> 表键由此生成。
@@ -351,7 +356,14 @@
                    params: { faces: ['faces', 'faces'], move: [null, 'translation'] } }
     },
     // translation 类型参数写到工厂的哪两个字段(Vector3.set + Matrix4.makeTranslation)
-    translationFields: { vector: 'move', matrix: 'matrix' }
+    translationFields: { vector: 'move', matrix: 'matrix' },
+    // ---- N3e: 本体测量(know-how/geometry-query.md) ----
+    // 两点测量工厂: p1(点, 吸附对象) / p2(点, 吸附对象)(Measure Distance 实录); 量的方向 = orientation(四元数)把
+    // axis 转到哪 —— 设成参考面法向, 标签值 = 两面法向距离(实测 16.02 = dim.face 候选值)。
+    // 测量记录列表 = snapshot().<list>; 名字: nodes.getName / setName(nodes.item2key(测量记录))。
+    measure: { list: 'repo.measurements', p1: 'p1', p2: 'p2', orientation: 'orientation', axis: [1, 0, 0],
+               faceSnapClass: 'FaceCenterPointSnap', snapLookup: 'lookup', snapPos: 'position', lookupMax: 4000,
+               snapTolM: 1e-5 }
   };
 
   // =====================================================================
@@ -390,6 +402,9 @@
     // 工厂类不列入: 首次使用前本来就没有(由代理按需挂上), 缺哪个在执行时按表键报
     'cmd.exec':    { needs: ['ed.enqueue', 'sig.commandEnded', 'exec.cancel', 'cmd.factoryBaseHolder', 'geo.items',
                              'geo.lookupTopo', 'geo.lookupItem', 'ed.docUnit', 'vp.camera'] },
+    'measure.write': { needs: ['ed.measurements', 'meas.snapshot', 'ed.nodes', 'nodes.item2key', 'nodes.getName', 'nodes.setName',
+                               'ed.snapScene', 'snap.canonicals', 'ed.enqueue', 'sig.commandEnded', 'exec.cancel', 'cmd.factoryBaseHolder',
+                               'geo.items', 'geo.lookupTopo', 'geo.lookupItem', 'ed.docUnit'] },
     'bool.run':    { todo: 'N4' },
     'asset.place': { todo: 'N5' }
   };
@@ -441,6 +456,7 @@
       case 'fac': return W[CFG.factoriesGlobal];
       case 'ss': return get('ed.snapScene');
       case 'helpers': return get('ed.helpers');
+      case 'meas': return get('ed.measurements');
     }
     return undefined;
   }
@@ -1894,8 +1910,21 @@
     if (!anchor) throw new Error('cannot locate moving faces');
     var s = vdot([anchor[0] - r.center[0], anchor[1] - r.center[1], anchor[2] - r.center[2]], n);
     var dir = s >= 0 ? n : [-n[0], -n[1], -n[2]];
+    // 对称: 每个动的面在参考平面哪一侧(+1 = 与锚同侧, −1 = 另一侧, 0 = 跨在平面上)。两侧都有 → mixed,
+    // 界面可选"整体平移"或"以参考面为对称面向两侧移动"。位置取轴线点(带轴线且轴 ⟂ n)或面中点。
+    // boxCenters: 各面包围盒中心(文档单位) —— 两步移动时第二步按位置挑面(第一步之后面 id 已变)。
+    var eps = 1e-6;
+    var sides = ms.map(function (m) {
+      var p = (typeof m.radius === 'number' && m.axis && m.axisOrigin && Math.abs(vdot(m.axis, n)) <= sinTol) ? m.axisOrigin : m.center;
+      if (!p) return 0;
+      var t = vdot([p[0] - r.center[0], p[1] - r.center[1], p[2] - r.center[2]], dir);
+      return t > eps ? 1 : t < -eps ? -1 : 0;
+    });
+    var mixed = sides.indexOf(1) >= 0 && sides.indexOf(-1) >= 0;
     return { kind: 'distance', value: sig7(Math.abs(s)), anchor: kind, anchorFace: anchorFace, direction: dir.map(sig7),
-             reference: ref, moving: moving, op: 'moveFaces', units: U.unit };
+             reference: ref, moving: moving, sides: sides, mixed: mixed,
+             boxCenters: ms.map(function (m) { return m.bbox ? boxCenter(m.bbox) : null; }),
+             op: 'moveFaces', units: U.unit };
   });
 
   // =====================================================================
@@ -1954,6 +1983,115 @@
     });
     return { units: U.unit, faces: out };
   });
+
+  // N3d: 一条尺寸记录 → 一次调用里按签名定位 + 读当前尺寸(不经过 Plasticity 选择, 改值不用等选择回传)。
+  // args = { mode: 'face'|'distance', faces: [签名…](distance: 参考在前), opposite?: 签名, units? }
+  // → { ids, opposite: id|null, oppositeLost?: true(记录的对面找不到 / 不再是候选 → 用默认对面), worst(最大中心偏差), info(= dim.face / dim.distance) }
+  def('dim.record', 'geo.read', function (a) {
+    a = a || {};
+    var sigs = Array.isArray(a.faces) ? a.faces : [];
+    if (!sigs.length) throw new Error('dim.record needs {faces: [signature…]}');
+    var n = sigs.length;
+    var res = API['geo.resolve'].fn({ faces: a.opposite ? sigs.concat([a.opposite]) : sigs, units: a.units }).faces;
+    var lost = res.slice(0, n).filter(function (r) { return !r.id; })[0];
+    if (lost) throw new Error('face not found in the current model: ' + (lost.err || '?'));
+    var ids = res.slice(0, n).map(function (r) { return r.id; });
+    var worst = res.reduce(function (m, r) { return typeof r.score === 'number' ? Math.max(m, r.score) : m; }, 0);
+    var out = { ids: ids, opposite: null, worst: worst };
+    if (a.mode === 'distance') {
+      if (n < 2) throw new Error('distance record needs a reference and at least one moving face');
+      out.info = API['dim.distance'].fn({ reference: ids[0], moving: ids.slice(1), units: a.units });
+      return out;
+    }
+    var opp = a.opposite && res[n] && res[n].id;
+    if (opp) {
+      try { out.info = API['dim.face'].fn({ face: ids[0], opposite: opp, units: a.units }); out.opposite = opp; }
+      catch (e) { out.oppositeLost = true; }
+    } else if (a.opposite) out.oppositeLost = true;
+    if (!out.info) { out.info = API['dim.face'].fn({ face: ids[0], units: a.units }); out.opposite = out.info.opposite || null; }
+    return out;
+  });
+
+  // N3e: 本体测量(Plasticity 自己的 Distance 测量, 大纲里可见、随文件保存)。
+  // 两个面的面心吸附点之间建一个两点测量, 量的方向 = normal(默认第一个面的法向) → 标签值 = 两面法向距离;
+  // 名字写进 nodes 表(大纲显示的就是它)。同名测量已存在 → 不重复建(exists)。
+  // args = { faces: [拓扑 id, 拓扑 id], name, normal?: [x,y,z] } | { rename: { from, to } } | { find: 名字 }
+  // → { created | exists | renamed | found: bool, name }
+  function measureRecords() {
+    var snap = invokeOn('meas.snapshot', []);
+    var list = walk(snap, NAMES.measure.list);
+    return list === MISS || !list ? [] : Array.from(list);
+  }
+  function measureNamed(name) {
+    return measureRecords().filter(function (m) {
+      try { return invokeOn('nodes.getName', [invokeOn('nodes.item2key', [m])]) === name; } catch (e) { return false; }
+    })[0] || null;
+  }
+  // 面 → 它的面心吸附对象(SnapScene 缓存里与面中点重合的 FaceCenterPointSnap) + 位置(米)
+  function faceCenterSnap(faceId) {
+    var MS = NAMES.measure;
+    var m = /^(\d+)[a-z]/.exec(String(faceId));
+    var sv = m && viewOf('solid', m[1]);
+    if (!sv) throw new Error('face not found: ' + faceId);
+    var sig = faceSigFull(String(faceId), 1);
+    if (!sig.center) throw new Error('no midpoint for face ' + faceId);
+    var entry = snapEntryOf(sv);
+    if (!entry || typeof entry[MS.snapLookup] !== 'function') throw new Error('no snap data for the solid of ' + faceId);
+    var best = null, bd = Infinity;
+    for (var i = 0; i < MS.lookupMax; i++) {
+      var s;
+      try { s = entry[MS.snapLookup](i); } catch (e) { break; }
+      if (!s) break;
+      if (!s.constructor || s.constructor.name !== MS.faceSnapClass) continue;
+      var p = s[MS.snapPos];
+      var d = Math.hypot(p.x - sig.center[0], p.y - sig.center[1], p.z - sig.center[2]);
+      if (d < bd) { bd = d; best = s; }
+    }
+    if (!best || bd > MS.snapTolM) throw new Error('no face-center snap point for ' + faceId + (best ? ' (nearest ' + bd + ' m)' : ''));
+    return { snap: best, normal: sig.normal };
+  }
+  def('dim.measure', 'measure.write', function (a) {
+    a = a || {};
+    var Cls = factoryCommandClass();
+    var run = function (build) {
+      var cmd = new Cls(editor(), build);
+      return runCommand(cmd, NAMES.cmdTimeoutMs).then(function (how) {
+        if (cmd.plaErr || how !== 'ended') throw new Error(cmd.plaErr || how);
+        return cmd.plaResult;
+      });
+    };
+    if (a.find !== undefined) return Promise.resolve({ found: !!measureNamed(String(a.find)), name: String(a.find) });
+    if (a.rename) {
+      var from = String(a.rename.from || ''), to = String(a.rename.to || '');
+      if (!from || !to) throw new Error('rename needs {from, to}');
+      var rec = measureNamed(from);
+      if (!rec) return Promise.resolve({ renamed: false, name: from });
+      return run(function () { invokeOn('nodes.setName', [invokeOn('nodes.item2key', [rec]), to]); return null; })
+        .then(function () { return { renamed: true, name: to }; });
+    }
+    var name = String(a.name || '');
+    var faces = Array.isArray(a.faces) ? a.faces.map(String) : [];
+    if (!name || faces.length !== 2) throw new Error('dim.measure needs {faces: [id, id], name}');
+    if (measureNamed(name)) return Promise.resolve({ exists: true, name: name });
+    if (!W[CFG.factoriesGlobal]) throw new Error(CFG.needFactoriesErr);
+    var Fac = need('fac.p2pMeasure');
+    var A = faceCenterSnap(faces[0]), B = faceCenterSnap(faces[1]);
+    var n = Array.isArray(a.normal) && a.normal.length === 3 ? a.normal : A.normal;
+    if (!n) throw new Error('no measuring direction (first face has no normal)');
+    var MS = NAMES.measure;
+    return run(function (cmd) {
+      var f = new Fac(cmd.editor);
+      f[NAMES.facResource](cmd);
+      f[MS.p1](A.snap[MS.snapPos].clone(), A.snap);
+      f[MS.p2](B.snap[MS.snapPos].clone(), B.snap);
+      var V = A.snap[MS.snapPos].constructor;
+      f[MS.orientation].setFromUnitVectors(new V(MS.axis[0], MS.axis[1], MS.axis[2]), new V(n[0], n[1], n[2]).normalize());
+      return Promise.resolve(f[NAMES.facCommit]()).then(function (m) {
+        invokeOn('nodes.setName', [invokeOn('nodes.item2key', [m]), name]);
+        return m;
+      });
+    }).then(function () { return { created: true, name: name }; });
+  }, { async: true });
 
   // N3: 面高亮。args = { faces: [{id, role?: primary|candidate|source}] } —— 每次调用替换上一次; faces 为空 = 清除。
   // 做法: 从面所在实体的显示网格(FaceGroup.mesh + groups)拷出这个面的三角形, 用 gizmo 材质的克隆(改色、透过实体可见)

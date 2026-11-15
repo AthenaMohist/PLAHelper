@@ -369,7 +369,16 @@ async fn session_loop(
         match cmd_rx.try_recv() {
             Ok(CdpCmd::Shutdown) => return Err(anyhow::anyhow!("shutdown")),
             Ok(CdpCmd::Call { name, args }) => {
-                let result = shim_call(ws, &mut mid, name, args).await.map_err(|e| e.to_string());
+                let mut result = shim_call(ws, &mut mid, name, args.clone()).await;
+                // 要用几何工厂的调用(如 dim.measure)第一次报 need-factories → 让代理挂一次再重试(同 cmd.exec)
+                let need_fac = matches!(&result, Err(e) if matches!(e.downcast_ref::<shim::ShimErr>(), Some(shim::ShimErr::Exc(m)) if m == shim::NEED_FACTORIES_ERR));
+                if need_fac {
+                    result = match crate::exec::ensure_factories(ws, &mut mid, false).await {
+                        Ok(_) => shim_call(ws, &mut mid, name, args).await,
+                        Err(e) => Err(e),
+                    };
+                }
+                let result = result.map_err(|e| e.to_string());
                 let _ = ev_tx.send(CdpEvent::CallResult { name, result });
             }
             Ok(CdpCmd::ProbeCaps) => {

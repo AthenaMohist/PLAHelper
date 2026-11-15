@@ -105,6 +105,22 @@ CLI: `pla-app cdp-call [--hwnd N] geo.snaps|geo.measure|… '<JSON>'`(任一垫�
 - 改尺寸后的跟踪: 被移动的面中心 = 旧中心 + 已知平移量(厚度 = 法向 × Δ, 距离 = 方向 × Δ), 用预测签名定位, 偏差 0;
   半径 / 圆角的中心移动不好预测, 交给"最近匹配"。记录用定位到的当前签名刷新。
 - 存储: `<文档目录>/.pla/models/<doc_key>/dims.json`(`pla_ui::dims`)。这也是 A9 映射表的位置与核心机制。
+- `dim.record {mode, faces: [签名], opposite?: 签名}` = 定位 + `dim.face`/`dim.distance` 一次调用(条目里直接改值用它, 不经过 Plasticity 选择);
+  记录的对面不再是候选 → 默认对面 + `oppositeLost`。
+
+## N3e 本体测量(Plasticity 自己的 Distance, 2026-11-15)
+
+用户手动 Measure Distance 一次, 给 `PointToPointMeasurementFactory` 原型套透明记录器抓到的调用:
+`p1(Vector3 点, ShellVertexSnap)` → `p2(点, 吸附对象)` → `doCommit()` → `calculate()`。只传一个参数(或直接设 start/end)都报 "Didn't expect to get here"。
+
+- 吸附对象取 `snapScene.canonicals` 条目的 `lookup(i)`(按索引: 先面心 `FaceCenterPointSnap`, 再边点、圆心、顶点)。面心吸附 → 测量目标
+  `{landmark: 6, topologyId: 面实体 id, bodyId}`; 顶点 → landmark 0。目标挂在拓扑实体上: 改厚度后面 id 变了测量仍在、值跟着变(16.02 → 17.02)。
+- 量的方向: 工厂 `orientation`(四元数)把 x 轴转到哪就量哪个方向的分量(`direction` getter)。`setFromUnitVectors((1,0,0), 参考面法向)`
+  → 标签值 = 两面法向距离(副本 16.02 mm = `dim.face` 候选值)。
+- **名字不在测量记录上**: 记录 `userData.name` 是模板 `"Distance.$$$"`, 改它大纲不变。大纲名在 `nodes` 表:
+  `nodes.getName/setName(nodes.item2key(测量记录), 名字)`(深搜 'PLA_RN' 找到 `nodes.store…node2name`)。大纲里双击改名走的也是它。
+- 垫片 `dim.measure`(能力 `measure.write`): `{faces: [面, 面], name, normal?}` 同名已有 → `exists` 不重复建; `{rename: {from, to}}`; `{find}`。
+  建测量和改名都包在自建命令里(进撤销栈)。
 
 ## A5 指定视角截图(2026-11-15)
 

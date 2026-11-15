@@ -58,6 +58,7 @@ pub fn cap_label(c: &str) -> &'static str {
         cap::GEO_READ => tr("几何查询(实体/面/边/顶点签名)", "Geometry query (solid/face/edge/vertex signatures)"),
         cap::HIST_WRITE => tr("事务回滚(撤到起点)", "Transaction rollback (undo to start)"),
         cap::VIEW_HIGHLIGHT => tr("面高亮(叠加显示)", "Face highlight (overlay)"),
+        cap::MEASURE_WRITE => tr("本体测量(建 Distance 测量并命名)", "Plasticity measurements (create named Distance)"),
         cap::SNAP_READ => tr("吸附点(面心/边中点/圆心/顶点…)", "Snap points (face centres/edge midpoints/circle centres/vertices…)"),
         cap::BOOL_RUN => tr("布尔运算", "Boolean operations"),
         cap::ASSET_PLACE => tr("放置常用件", "Place common parts"),
