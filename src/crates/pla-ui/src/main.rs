@@ -255,6 +255,8 @@ struct PlaApp {
     dim_side: u8,
     /// N3c 对称: 动的面分在参考面两侧时 0 = 整体平移, 1 = 以参考面为对称面向两侧移动(距离记录的 side 存它)。
     dim_sym: u8,
+    /// 对面是圆柱时的测量点: None = 自动 / 0 最近 / 1 轴心 / 2 最远(CYL_POINTS)。
+    dim_cyl: Option<u8>,
     /// 上次发出的高亮(面 + 对面 + 候选数), 没变就不重发。
     dim_hl_key: String,
     /// N3d: 本文档的尺寸记录(懒加载, 换文档重读)。
@@ -284,6 +286,9 @@ struct PlaApp {
     dims_row_focus: bool,
     /// 正在编辑数值的条目(右键确认用: 右键按下时文本框已失焦, 见 dim_saved_ui)。
     dims_edit_row: Option<String>,
+    /// 右键确认扩展到 Plasticity 窗口: 已让垫片 arm / 上次看到的页面右键计数(−1 = 还没读到)。
+    rc_armed: bool,
+    rc_seen: i64,
     /// 缩略图缓存(名字 → PNG 字节)。
     dims_pngs: std::collections::HashMap<String, Vec<u8>>,
     /// 记录 / 更新后等视口截图回包的记录名。
@@ -1365,6 +1370,17 @@ fn drag_row<T: egui::emath::Numeric>(
     changed
 }
 
+/// 圆柱对面的测量点(与垫片 dim.face 候选的 values 键同名; 下标 = 界面分段 / 记录 cyl)。
+const CYL_POINTS: [&str; 3] = ["near", "axis", "far"];
+
+/// 厚度候选的量值: 圆柱候选且选了测量点 → values[点]; 否则候选默认值(圆柱 = 自动点)。
+fn cand_value(c: &serde_json::Value, cyl: Option<u8>) -> Option<f64> {
+    match cyl {
+        Some(i) if c["values"].is_object() => c["values"][CYL_POINTS[(i as usize).min(2)]].as_f64(),
+        _ => c["value"].as_f64(),
+    }
+}
+
 /// 改名图标: 斜放的笔(笔杆 + 笔尖), 约 12 pt 见方, 以 c 为中心。
 fn paint_pencil(p: &egui::Painter, c: egui::Pos2, col: egui::Color32) {
     let d = egui::vec2(1.0, -1.0).normalized();
@@ -2066,7 +2082,16 @@ fn vector_icon_button(
 /// 确认弹层(删除 / 更新)、改名输入、尺寸面板的应用。面板是各自的视口, 只看本视口内的右键。
 /// 有自己右键菜单的地方(笔记、工具栏按钮)不接。
 fn right_click_confirm(ui: &egui::Ui) -> bool {
-    ui.input(|i| i.pointer.secondary_clicked())
+    // 调用本身 = "这里正等着确认"(各处都只在等待确认时才调用) → 下一帧让 Plasticity 窗口里的右键也算数
+    RC_WANT.set(true);
+    ui.input(|i| i.pointer.secondary_clicked()) || RC_EXT.get()
+}
+
+thread_local! {
+    /// 本帧有地方在等右键确认(right_click_confirm 被调用过)。
+    static RC_WANT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// 本帧收到了 Plasticity 窗口里的右键(垫片计数增加)。
+    static RC_EXT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// R8b: 通用删除确认弹层 — 覆盖在面板视口顶部居中(egui::Area + 新 layer)。
@@ -2274,6 +2299,7 @@ impl PlaApp {
             dim_cand: 0,
             dim_side: 0,
             dim_sym: 0,
+            dim_cyl: None,
             dim_hl_key: String::new(),
             dims_list: Vec::new(),
             dims_loaded: false,
@@ -2292,6 +2318,8 @@ impl PlaApp {
             dims_vals: Default::default(),
             dims_row_focus: false,
             dims_edit_row: None,
+            rc_armed: false,
+            rc_seen: -1,
             dims_pngs: Default::default(),
             dims_thumb_pending: None,
             dim_busy: false,
@@ -2367,6 +2395,16 @@ impl PlaApp {
                     if snap.undo_len >= 0 {
                         self.cdp_undo = snap.undo_len;
                     }
+                    // Plasticity 窗口里的右键确认(只在 arm 时计数): 增加 = 本帧算一次右键
+                    if snap.rclick >= 0 {
+                        if self.rc_seen >= 0 && snap.rclick > self.rc_seen && self.rc_armed {
+                            RC_EXT.set(true);
+                        } else if snap.rclick < self.rc_seen {
+                            // 计数变小 = 垫片重新注入(arm 状态丢了)→ 下一帧按需重新 arm
+                            self.rc_armed = false;
+                        }
+                        self.rc_seen = snap.rclick;
+                    }
                     // v6(R7-31l): 持续跟踪最新相机(保存选择集时随集存储)。
                     if snap.camera.is_some() {
                         self.sel_camera = snap.camera.clone();
@@ -2436,10 +2474,14 @@ impl PlaApp {
                         }
                         // 当前对面 = 回包里选定的那个(默认第一个候选); N3d 载入记录时 = 记录里的对面
                         let want = self.dim_pending_opp.take();
+                        if want.is_none() {
+                            // 新选择(不是载入记录): 圆柱测量点回到自动
+                            self.dim_cyl = None;
+                        }
                         let opp = want.as_deref().unwrap_or(v["opposite"].as_str().unwrap_or(""));
                         let cands = v["candidates"].as_array().cloned().unwrap_or_default();
                         self.dim_cand = cands.iter().position(|c| c["id"].as_str() == Some(opp)).unwrap_or(0);
-                        if let Some(x) = cands.get(self.dim_cand).and_then(|c| c["value"].as_f64()) {
+                        if let Some(x) = cands.get(self.dim_cand).and_then(|c| cand_value(c, self.dim_cyl)) {
                             self.dim_text = fmt3(x);
                         }
                     }
@@ -2523,7 +2565,9 @@ impl PlaApp {
                             let ids: Vec<String> = v["ids"].as_array().into_iter().flatten().filter_map(|x| x.as_str().map(String::from)).collect();
                             let info = v["info"].clone();
                             let worst = v["worst"].as_f64().unwrap_or(0.0);
-                            if rec.mode == "distance" { self.dim_sym = rec.side; } else { self.dim_side = rec.side; }
+                            self.dim_side = rec.side;
+                            self.dim_sym = rec.sym;
+                            self.dim_cyl = rec.cyl;
                             self.dim_active = Some(rec.name.clone());
                             self.dim_active_ids = ids.clone();
                             // 当前对面 = 记录里的对面(找不到就用默认对面, 如实提示)
@@ -3176,11 +3220,7 @@ impl PlaApp {
                         let u = units(&v);
                         let cands = v["candidates"].as_array().cloned().unwrap_or_default();
                         // 厚度: 值随当前候选; 其它: 回包里的值(应用时 dim_apply 自己再取对面)
-                        let value = if kind == "thickness" && !cands.is_empty() {
-                            cands[self.dim_cand.min(cands.len() - 1)]["value"].as_f64()
-                        } else {
-                            v["value"].as_f64()
-                        };
+                        let value = self.dim_value_of(&v);
                         match (kind, value, v["op"].as_str(), v["offsetSign"].as_f64()) {
                             ("none", ..) | (_, None, ..) | (_, _, None, _) | (.., None) => {
                                 let surf = v["surface"].as_str().unwrap_or("?").to_string();
@@ -3203,11 +3243,22 @@ impl PlaApp {
                                 // ---- 对面候选(分段选择, 橙 = 当前) ----
                                 if kind == "thickness" && cands.len() > 1 {
                                     rz_label(ui, tr("对面候选(量得的距离)", "Opposite face candidates (measured distance)"));
-                                    let labels: Vec<String> = cands.iter().map(|c| fmt3(c["value"].as_f64().unwrap_or(0.0))).collect();
+                                    let labels: Vec<String> = cands.iter().map(|c| fmt3(cand_value(c, self.dim_cyl).unwrap_or(0.0))).collect();
                                     let mut i = self.dim_cand.min(cands.len() - 1);
                                     if rz_candidates(ui, &labels, &mut i) {
                                         self.dim_cand = i;
-                                        self.dim_text = fmt3(cands[i]["value"].as_f64().unwrap_or(0.0));
+                                        self.dim_text = fmt3(cand_value(&cands[i], self.dim_cyl).unwrap_or(0.0));
+                                    }
+                                }
+                                // ---- 对面是圆柱: 测量点 最近 / 轴心 / 最远(用户 2026-11-15) ----
+                                if let Some(c) = cands.get(self.dim_cand.min(cands.len().saturating_sub(1))).filter(|c| c["values"].is_object()) {
+                                    rz_label(ui, tr("圆柱测量点", "Cylinder measure point"));
+                                    let labels = vec![tr("最近点", "Nearest").to_string(), tr("轴心", "Axis").to_string(), tr("最远点", "Farthest").to_string()];
+                                    let auto = CYL_POINTS.iter().position(|p| c["point"].as_str() == Some(*p)).unwrap_or(0);
+                                    let mut s = self.dim_cyl.map_or(auto, |x| x as usize);
+                                    if rz_segmented(ui, "dim-cyl", &labels, &mut s) {
+                                        self.dim_cyl = Some(s as u8);
+                                        self.dim_text = fmt3(cand_value(c, self.dim_cyl).unwrap_or(0.0));
                                     }
                                 }
                                 // ---- N3b 改哪一侧 ----
@@ -3281,18 +3332,16 @@ impl PlaApp {
     fn dim_request_save(&mut self, v: &serde_json::Value, update: Option<String>) {
         let (ids, opp) = Self::dim_current_faces(v, self.dim_cand);
         let n = ids.len();
-        let value = if v["kind"] == "thickness" {
-            v["candidates"].as_array().and_then(|a| a.get(self.dim_cand.min(a.len().saturating_sub(1)))).and_then(|c| c["value"].as_f64())
-        } else {
-            v["value"].as_f64()
-        };
+        let value = self.dim_value_of(v);
         let rec = pla_ui::dims::DimRecord {
             name: update.clone().unwrap_or_default(),
             mode: if v["kind"] == "distance" { "distance".into() } else { "face".into() },
             kind: v["kind"].as_str().unwrap_or("").into(),
             faces: Vec::new(),
             opposite: None,
-            side: if v["kind"] == "distance" { self.dim_sym } else { self.dim_side },
+            side: self.dim_side,
+            sym: self.dim_sym,
+            cyl: self.dim_cyl,
             value: value.unwrap_or(0.0),
             units: v["units"].as_str().unwrap_or("").into(),
             created: 0,
@@ -3340,13 +3389,22 @@ impl PlaApp {
                     { "op": "moveFaces", "faces": near, "move": mv(-1.0) },
                 ] }))
             } else {
-                (value, serde_json::json!({ "atomic": true, "ops": [{ "op": "moveFaces", "faces": v["moving"], "move": mv(1.0) }] }))
+                // 移动侧(用户 2026-11-15, 跨实体也要): 0 动的面 +d / 1 参考面 −d / 2 两边各半(第二步按包围盒中心挑参考面)
+                let ops = match self.dim_side {
+                    1 => serde_json::json!([{ "op": "moveFaces", "faces": [v["reference"]], "move": mv(-1.0) }]),
+                    2 => serde_json::json!([
+                        { "op": "moveFaces", "faces": v["moving"], "move": mv(0.5) },
+                        { "op": "moveFaces", "faces": [{ "near": v["referenceBoxCenter"], "tol": 0.01 }], "move": mv(-0.5) },
+                    ]),
+                    _ => serde_json::json!([{ "op": "moveFaces", "faces": v["moving"], "move": mv(1.0) }]),
+                };
+                (value, serde_json::json!({ "atomic": true, "ops": ops }))
             }
         } else {
             let cands = v["candidates"].as_array().cloned().unwrap_or_default();
             let (value, opposite) = if kind == "thickness" && !cands.is_empty() {
                 let c = &cands[self.dim_cand.min(cands.len() - 1)];
-                (c["value"].as_f64(), c["id"].as_str().map(String::from))
+                (cand_value(c, self.dim_cyl), c["id"].as_str().map(String::from))
             } else {
                 (v["value"].as_f64(), None)
             };
@@ -3389,6 +3447,15 @@ impl PlaApp {
         self.set_notice((false, t!("正在修改: {} → {} {units}…", "Changing: {} → {} {units}…", fmt3(value), fmt3(target))));
     }
 
+    /// 当前尺寸值: 厚度 = 当前对面候选(圆柱按选的测量点); 其它 = 回包里的值。
+    fn dim_value_of(&self, v: &serde_json::Value) -> Option<f64> {
+        let cands = v["candidates"].as_array();
+        match cands {
+            Some(c) if v["kind"] == "thickness" && !c.is_empty() => cand_value(&c[self.dim_cand.min(c.len() - 1)], self.dim_cyl),
+            _ => v["value"].as_f64(),
+        }
+    }
+
     /// N3c: 距离尺寸按"对称"改(动的面分在参考面两侧且选了对称)。
     fn dim_symmetric(v: &serde_json::Value, sym: u8) -> bool {
         v["kind"] == "distance" && v["mixed"] == true && sym == 1
@@ -3415,9 +3482,11 @@ impl PlaApp {
                 let d = vec3(&v["direction"]);
                 let sym = Self::dim_symmetric(v, self.dim_sym);
                 let sides = v["sides"].as_array().cloned().unwrap_or_default();
-                std::iter::once([0.0; 3])
+                // 参考面 / 动的面各自的平移系数(对称时不动参考面)
+                let (kr, km) = if sym { (0.0, 1.0) } else { match self.dim_side { 1 => (-1.0, 0.0), 2 => (-0.5, 0.5), _ => (0.0, 1.0) } };
+                std::iter::once(scale(d, delta * kr))
                     .chain((1..rec.faces.len()).map(|i| {
-                        let s = if sym { sides.get(i - 1).and_then(|x| x.as_f64()).unwrap_or(0.0) } else { 1.0 };
+                        let s = if sym { sides.get(i - 1).and_then(|x| x.as_f64()).unwrap_or(0.0) } else { km };
                         scale(d, delta * s)
                     }))
                     .collect()
@@ -3435,10 +3504,11 @@ impl PlaApp {
             // 半径 / 圆角: 面中心的移动不好预测, 交给"最近匹配"
             _ => vec![[0.0; 3]; rec.faces.len() + rec.opposite.iter().count()],
         };
-        let mut rec2 = rec;
-        rec2.side = if v["kind"] == "distance" { self.dim_sym } else { self.dim_side };
-        if let Some(r) = self.dims_list.iter_mut().find(|r| r.name == rec2.name) {
-            r.side = rec2.side;
+        // 应用时的选项写回记录(刷新时一起存)
+        if let Some(r) = self.dims_list.iter_mut().find(|r| r.name == rec.name) {
+            r.side = self.dim_side;
+            r.sym = self.dim_sym;
+            r.cyl = self.dim_cyl;
         }
         self.dim_last_apply = Some(DimApplied { name, moves, value: target });
     }
@@ -3595,7 +3665,9 @@ impl PlaApp {
             let enter = te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             let rclick = editing && right_click_confirm(ui);
             if (enter || rclick) && !busy {
+                // 确认 = 应用并强制退出编辑(右键点在框上时焦点不会自己丢, 不退出的话框里不会刷新成新值 —— 用户 2026-11-15)
                 self.dims_edit_row = None;
+                ui.memory_mut(|m| m.surrender_focus(te.id));
                 match buf.trim().parse::<f64>() {
                     Ok(t) if t >= 0.0 && (t - rec.value).abs() > 5e-4 => acts.push(Act::Value(rec.clone(), t)),
                     _ => *buf = fmt3(rec.value),
@@ -3836,6 +3908,15 @@ impl PlaApp {
             let mut s = self.dim_sym as usize;
             if rz_segmented(ui, "dim-sym", &labels, &mut s) {
                 self.dim_sym = s as u8;
+            }
+        }
+        // 移动哪一边(对称时两侧都动, 不显示): 动的面 / 参考面 / 两边各半(跨实体同样适用, 用户 2026-11-15)
+        if !Self::dim_symmetric(v, self.dim_sym) {
+            rz_label(ui, tr("移动", "Move"));
+            let labels = vec![tr("动的面", "Moving faces").to_string(), tr("参考面", "Reference").to_string(), tr("两边各半", "Both halves").to_string()];
+            let mut s = self.dim_side as usize;
+            if rz_segmented(ui, "dim-dside", &labels, &mut s) {
+                self.dim_side = s as u8;
             }
         }
         if let Some(t) = self.dim_value_block(ui, value, units, true) {
@@ -4173,6 +4254,7 @@ impl PlaApp {
         self.dims_pngs.clear();
         self.dims_thumb_pending = None;
         self.dim_sym = 0;
+        self.dim_cyl = None;
         self.dims_edit_row = None;
     }
 
@@ -5047,6 +5129,14 @@ impl eframe::App for PlaApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // F7: Plasticity 以 CDP 模式运行而代理没起时自动拉起(内部 3s 节流)。
         self.proxy.tick();
+        // 右键确认扩展到 Plasticity 窗口: 上一帧有等待确认的地方(调用过 right_click_confirm)→ 让垫片吃掉页面右键并计数;
+        // 没有 → 解除, 完全不碰 Plasticity 的右键。本帧的"外部右键"由下面 poll_bridge 收到计数增加时置位。
+        let want = RC_WANT.replace(false);
+        RC_EXT.set(false);
+        if want != self.rc_armed && self.cdp_caps.is_some() {
+            self.rc_armed = want;
+            self.cdp.send(pla_bridge::cdp::CdpCmd::Call { name: pla_bridge::shim::api::UI_RCLICK, args: serde_json::json!({ "arm": want }) });
+        }
         self.poll_bridge();
         self.update_snap(ctx);
         self.update_topmost();

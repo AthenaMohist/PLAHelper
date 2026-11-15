@@ -357,6 +357,9 @@
     },
     // translation 类型参数写到工厂的哪两个字段(Vector3.set + Matrix4.makeTranslation)
     translationFields: { vector: 'move', matrix: 'matrix' },
+    // ---- 右键确认扩展到 Plasticity 窗口(ui.rightClick): 捕获这些事件, 右键松开计一次; contextmenu 只吃不计 ----
+    rightClick: { events: ['pointerdown', 'pointerup', 'mousedown', 'mouseup', 'contextmenu'], button: 2,
+                  countOn: 'pointerup', menuEvent: 'contextmenu' },
     // ---- N3e: 本体测量(know-how/geometry-query.md) ----
     // 两点测量工厂: p1(点, 吸附对象) / p2(点, 吸附对象)(Measure Distance 实录); 量的方向 = orientation(四元数)把
     // axis 转到哪 —— 设成参考面法向, 标签值 = 两面法向距离(实测 16.02 = dim.face 候选值)。
@@ -714,7 +717,27 @@
       });
     });
     var size = get('sel.size', s);
-    return { size: typeof size === 'number' ? size : -1, items: items };
+    // rclick: 助手"右键确认"在 Plasticity 窗口里被点的次数(见 ui.rightClick; 随轮询带回, 助手看到增加 = 确认)
+    return { size: typeof size === 'number' ? size : -1, items: items, rclick: state.rc ? state.rc.count : 0 };
+  });
+
+  // 右键确认扩展到整个 Plasticity 窗口(用户 2026-11-15)。助手有等待确认的操作时 arm = true:
+  // 页面里的右键(捕获阶段)被吃掉 —— 不弹 Plasticity 菜单、不结束它的命令 —— 只记一次数; arm = false 时完全不碰右键。
+  // args = { arm: bool } → { armed, count }
+  def('ui.rightClick', null, function (a) {
+    var R = NAMES.rightClick;
+    if (!state.rc) {
+      var rc = state.rc = { armed: false, count: 0 };
+      var h = function (e) {
+        if (!rc.armed || (e.type !== R.menuEvent && e.button !== R.button)) return;
+        e.preventDefault(); e.stopImmediatePropagation();
+        if (e.type === R.countOn) rc.count++;
+      };
+      R.events.forEach(function (t) { W.addEventListener(t, h, true); });
+      state.disposables.push({ dispose: function () { R.events.forEach(function (t) { W.removeEventListener(t, h, true); }); state.rc = null; } });
+    }
+    if (a && a.arm !== undefined) state.rc.armed = !!a.arm;
+    return { armed: state.rc.armed, count: state.rc.count };
   });
 
   def('hist.state', 'hist.read', function () {
@@ -1863,12 +1886,16 @@
         var cvx = vdot(w, o.normal) > 0;
         var depth = vdot([f.center[0] - o.axisOrigin[0], f.center[1] - o.axisOrigin[1], f.center[2] - o.axisOrigin[2]], n);
         d = cvx ? depth + o.radius : depth - o.radius;
+        // 三个测量点都给(界面可切: 最近 / 轴心 / 最远); point = 自动选的那个
+        var cylVals = { near: sig7(depth - o.radius), axis: sig7(depth), far: sig7(depth + o.radius) }, cylPoint = cvx ? 'far' : 'near';
         var ext = o.bbox ? alongN(o.bbox) : null, at = vdot(f.center, n) - d, eps = 1e-6 * Math.max(1, Math.abs(at));
         if (ext && (at < ext[0] - eps || at > ext[1] + eps)) return;
       } else return;
       if (!(d > 1e-9)) return;
-      cands.push({ id: e.id, value: sig7(d), overlap: overlap(me.bbox, e.bbox), center: o.center, surface: o.surface,
-                   boxCenter: e.bbox ? boxCenter(e.bbox) : null });
+      var cand = { id: e.id, value: sig7(d), overlap: overlap(me.bbox, e.bbox), center: o.center, surface: o.surface,
+                   boxCenter: e.bbox ? boxCenter(e.bbox) : null };
+      if (cylVals) { cand.values = cylVals; cand.point = cylPoint; cylVals = null; }
+      cands.push(cand);
     });
     // 平面在圆柱前(默认对面保持以前的平面, 圆柱是加进来的备选), 同类内重叠优先、再近 → 远
     var isPlane = function (c) { return c.surface === NAMES.planeSurface ? 1 : 0; };
@@ -1978,6 +2005,7 @@
     return { kind: 'distance', value: sig7(Math.abs(s)), anchor: kind, anchorFace: anchorFace, direction: dir.map(sig7),
              reference: ref, moving: moving, sides: sides, mixed: mixed,
              boxCenters: ms.map(function (m) { return m.bbox ? boxCenter(m.bbox) : null; }),
+             referenceBoxCenter: r.bbox ? boxCenter(r.bbox) : null,
              op: 'moveFaces', units: U.unit };
   });
 

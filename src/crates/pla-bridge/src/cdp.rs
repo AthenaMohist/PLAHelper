@@ -176,6 +176,8 @@ pub struct SelectionSnapshot {
     /// v6(R7-31l): 当前相机 JSON 字符串({px..qw}); UI 保存选择集时随集存储,
     /// 应用时还原(按图索骥)。None = 读取失败。
     pub camera: Option<String>,
+    /// Plasticity 窗口里的"助手右键确认"累计次数(ui.rightClick arm 时才计; −1 = 读不到)。
+    pub rclick: i64,
 }
 
 /// 实体树节点（平铺, indent 表层级）。
@@ -767,6 +769,7 @@ fn selection_from_batch(raw: &str) -> SelectionSnapshot {
                 size: -1,
                 undo_len: -1,
                 geo_ver: -1,
+                rclick: -1,
                 ..Default::default()
             }
         }
@@ -812,6 +815,7 @@ fn selection_from_batch(raw: &str) -> SelectionSnapshot {
             e["msg"].as_str().map(|m| (m.to_string(), e["stack"].as_str().unwrap_or("").to_string()))
         }),
         camera: cam.filter(|c| c.is_object()).map(|c| c.to_string()),
+        rclick: sel["rclick"].as_i64().unwrap_or(-1),
     }
 }
 

@@ -29,9 +29,15 @@ pub struct DimRecord {
     /// face 模式的厚度: 所选对面的签名。
     #[serde(default)]
     pub opposite: Option<Value>,
-    /// N3b 改哪一侧(0 选中面 / 1 对面 / 2 两侧各半)。
+    /// N3b 改哪一侧(厚度: 0 选中面 / 1 对面 / 2 两侧各半; 距离: 0 动的面 / 1 参考面 / 2 两边各半)。
     #[serde(default)]
     pub side: u8,
+    /// N3c 距离: 1 = 以参考面为对称面向两侧移动(动的面分在两侧时)。
+    #[serde(default)]
+    pub sym: u8,
+    /// 对面是圆柱时的测量点: None = 自动(孔 = 最近, 凸 = 最远) / 0 最近 / 1 轴心 / 2 最远。
+    #[serde(default)]
+    pub cyl: Option<u8>,
     /// 最近一次读到 / 改成的值(文档单位)。
     pub value: f64,
     #[serde(default)]
@@ -170,6 +176,8 @@ mod tests {
             faces: vec![json!({ "surface": "Plane", "center": [1, 2, 3], "normal": [0, 0, 1] })],
             opposite: None,
             side: 0,
+            sym: 0,
+            cyl: None,
             value: 5.0,
             units: "millimeter".into(),
             created: 0,

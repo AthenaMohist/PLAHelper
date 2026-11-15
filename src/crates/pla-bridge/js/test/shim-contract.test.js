@@ -278,8 +278,17 @@ const body = {
   dispatchEvent(ev) { if (ev.type === 'edit:undo' && currentEd && currentEd._undo) setTimeout(() => currentEd._undo(), 5); return true; },
 };
 class CustomEvent { constructor(type, init) { this.type = type; this.bubbles = !!(init && init.bubbles); } }
+// window 级事件监听(ui.rightClick 的捕获监听)
+const winListeners = [];
+function fireWin(type, button) {
+  const ev = { type, button, prevented: false, stopped: false, preventDefault() { this.prevented = true; }, stopImmediatePropagation() { this.stopped = true; } };
+  winListeners.filter((l) => l.type === type).forEach((l) => l.fn(ev));
+  return ev;
+}
 const ctx = vm.createContext({
   CustomEvent,
+  addEventListener(type, fn, cap) { winListeners.push({ type, fn, cap }); },
+  removeEventListener(type, fn) { const i = winListeners.findIndex((l) => l.type === type && l.fn === fn); if (i >= 0) winListeners.splice(i, 1); },
   setTimeout,
   clearTimeout,
   document: {
@@ -308,6 +317,18 @@ t('install', () => {
 t('接口名与 Rust 一一对应', () => {
   const js = call('core.apis').v.slice().sort();
   assert.deepStrictEqual(js, RUST_APIS.slice().sort());
+});
+
+t('ui.rightClick: arm 时吃掉页面右键并计数(松开计一次, 菜单只吃不计); 解除后完全不碰; 左键不碰', () => {
+  assert.deepStrictEqual(call('ui.rightClick', { arm: true }).v, { armed: true, count: 0 });
+  assert.ok(winListeners.every((l) => l.cap === true), '捕获阶段');
+  const down = fireWin('pointerdown', 2), up = fireWin('pointerup', 2), menu = fireWin('contextmenu', 2);
+  assert.ok(down.prevented && up.prevented && up.stopped && menu.prevented);
+  assert.strictEqual(fireWin('pointerup', 0).prevented, false, '左键不碰');
+  assert.strictEqual(call('ui.rightClick', {}).v.count, 1);
+  call('ui.rightClick', { arm: false });
+  assert.strictEqual(fireWin('pointerup', 2).prevented, false);
+  assert.deepStrictEqual(call('ui.rightClick', {}).v, { armed: false, count: 1 });
 });
 
 t('无 editor 时返回 cap:editor, 不抛异常', () => {
