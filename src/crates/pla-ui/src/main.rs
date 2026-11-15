@@ -1111,8 +1111,9 @@ fn rgb_hex(c: u32) -> egui::Color32 {
     egui::Color32::from_rgb((c >> 16) as u8, (c >> 8) as u8, c as u8)
 }
 
-/// 对面候选: ◀ [色块 + 距离 | …] ▶。色块 = Plasticity 里的高亮色(当前 = 橙, 其它 = 蓝)。返回是否换了。
-fn rz_candidates(ui: &mut egui::Ui, values: &[String], selected: &mut usize) -> bool {
+/// 对面候选: ◀ [色块 + 距离 | …] ▶。色块 = Plasticity 里的高亮色(当前 = 橙, 其它 = 蓝);
+/// round[i] = 该候选是圆柱面 → 色块画成同心圆(用户 2026-11-15)。返回是否换了。
+fn rz_candidates(ui: &mut egui::Ui, values: &[String], round: &[bool], selected: &mut usize) -> bool {
     let n = values.len().max(1);
     let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 28.0), egui::Sense::hover());
     let aw = 24.0;
@@ -1148,7 +1149,14 @@ fn rz_candidates(ui: &mut egui::Ui, values: &[String], selected: &mut usize) -> 
         let tw = ui.fonts(|f| f.layout_no_wrap(label.clone(), font.clone(), COL_TEXT).size().x);
         let total = 10.0 + 5.0 + tw;
         let x0 = r.center().x - total / 2.0;
-        ui.painter().rect_filled(egui::Rect::from_min_size(egui::pos2(x0, r.center().y - 5.0), egui::vec2(10.0, 10.0)), egui::Rounding::same(2.0), swatch);
+        if round.get(i).copied().unwrap_or(false) {
+            // 圆柱: 外圈描边 + 实心小圆心(同心圆)
+            let c = egui::pos2(x0 + 5.0, r.center().y);
+            ui.painter().circle_stroke(c, 5.0, egui::Stroke::new(1.5_f32, swatch));
+            ui.painter().circle_filled(c, 2.2, swatch);
+        } else {
+            ui.painter().rect_filled(egui::Rect::from_min_size(egui::pos2(x0, r.center().y - 5.0), egui::vec2(10.0, 10.0)), egui::Rounding::same(2.0), swatch);
+        }
         ui.painter().text(egui::pos2(x0 + 15.0, r.center().y), egui::Align2::LEFT_CENTER, label, font, if on { egui::Color32::WHITE } else { COL_MUTED });
         if resp.clicked() && !on {
             *selected = i;
@@ -3245,7 +3253,8 @@ impl PlaApp {
                                     rz_label(ui, tr("对面候选(量得的距离)", "Opposite face candidates (measured distance)"));
                                     let labels: Vec<String> = cands.iter().map(|c| fmt3(cand_value(c, self.dim_cyl).unwrap_or(0.0))).collect();
                                     let mut i = self.dim_cand.min(cands.len() - 1);
-                                    if rz_candidates(ui, &labels, &mut i) {
+                                    let round: Vec<bool> = cands.iter().map(|c| c["values"].is_object()).collect();
+                                    if rz_candidates(ui, &labels, &round, &mut i) {
                                         self.dim_cand = i;
                                         self.dim_text = fmt3(cand_value(&cands[i], self.dim_cyl).unwrap_or(0.0));
                                     }
