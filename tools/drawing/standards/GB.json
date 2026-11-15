@@ -1,0 +1,71 @@
+{
+ "name": "GB",
+ "label": "国标(按用户 OYM 零件图格式, 2026-11-16)",
+ "projection": "First angle",
+ "units": "mm",
+ "fonts": { "cn": "FangSong", "latin": "FangSong", "title": 5.0, "text": 3.5, "small": 2.5, "dim": 3.5 },
+ "lines": { "frame": 0.7, "thin": 0.35, "visible": 0.5, "hidden": 0.25, "center": 0.25 },
+ "dims": {
+  "decimals": 2, "strip_zeros": true, "gap": 8.0, "step": 7.0,
+  "diameter": "⌀", "through": "贯穿", "depth": "↧", "counterbore": "⌴", "countersink": "⌵",
+  "key_mark": "*", "count_format": "{n} x "
+ },
+ "general_tolerance": "±0.05",
+ "roughness_default": "6.3",
+ "paper": {
+  "A3": [420, 297], "A2": [594, 420], "A1": [841, 594], "A0": [1189, 841]
+ },
+ "frame": { "outer": 5, "zone_band": 5, "zones_x": "ABCDEFG", "zones_y": 8 },
+ "comment_layout": "单位 mm, 按 A3 横向(420×297)量的; anchor br = 跟着右下角走, bl = 跟着左下角走(大图幅时平移)。cells 只画框和标签, field = 可编辑字段名(FreeCAD freecad:editable)。",
+ "title_block": {
+  "row_h": 9,
+  "rows_top": 238,
+  "boxes": [
+   { "anchor": "bl", "x": 10, "y": 238, "w": 90, "h": 54, "kind": "tech" },
+   { "anchor": "br", "x": 100, "y": 238, "w": 186, "h": 27, "kind": "rev" },
+   { "anchor": "br", "x": 100, "y": 265, "w": 315, "h": 27, "kind": "title" }
+  ],
+  "rev": {
+   "x": [100, 115, 148, 205, 235, 255, 286],
+   "header": ["编号", "ECN编号", "变更内容/原因", "变更图区", "责任人", "日期"],
+   "rows": 2,
+   "fields": ["no", "ecn", "desc", "zone", "by", "date"]
+  },
+  "cells": [
+   { "x": 100, "y": 265, "w": 15, "label": "料号" },  { "x": 115, "y": 265, "w": 35, "field": "pn" },
+   { "x": 150, "y": 265, "w": 13, "label": "材质" },  { "x": 163, "y": 265, "w": 32, "field": "material" },
+   { "x": 195, "y": 265, "w": 13, "label": "表处" },  { "x": 208, "y": 265, "w": 78, "field": "finish" },
+   { "x": 286, "y": 265, "w": 22, "label": "项目名称" }, { "x": 308, "y": 265, "w": 73, "field": "project" },
+   { "x": 381, "y": 265, "w": 34, "kind": "projection" },
+
+   { "x": 100, "y": 274, "w": 15, "label": "名称" },  { "x": 115, "y": 274, "w": 35, "field": "name" },
+   { "x": 150, "y": 274, "w": 13, "label": "重量" },  { "x": 163, "y": 274, "w": 32, "field": "weight" },
+   { "x": 195, "y": 274, "w": 13, "label": "硬度" },  { "x": 208, "y": 274, "w": 47, "field": "hardness" },
+   { "x": 255, "y": 274, "w": 14, "label": "设计" },  { "x": 269, "y": 274, "w": 17, "field": "designer" },
+   { "x": 286, "y": 274, "w": 17, "label": "日期" },  { "x": 303, "y": 274, "w": 31, "field": "design_date" },
+   { "x": 334, "y": 274, "w": 16, "label": "版本" },  { "x": 350, "y": 274, "w": 15, "field": "version" },
+   { "x": 365, "y": 274, "w": 50, "h": 18, "kind": "logo", "field": "logo" },
+
+   { "x": 100, "y": 283, "w": 15, "label": "图号" },  { "x": 115, "y": 283, "w": 35, "field": "drawing_no" },
+   { "x": 150, "y": 283, "w": 13, "label": "比例" },  { "x": 163, "y": 283, "w": 32, "field": "scale" },
+   { "x": 195, "y": 283, "w": 13, "label": "数量" },  { "x": 208, "y": 283, "w": 15, "field": "qty" },
+   { "x": 223, "y": 283, "w": 12, "label": "纸张" },  { "x": 235, "y": 283, "w": 20, "field": "paper" },
+   { "x": 255, "y": 283, "w": 14, "label": "审核" },  { "x": 269, "y": 283, "w": 17, "field": "reviewer" },
+   { "x": 286, "y": 283, "w": 17, "label": "日期" },  { "x": 303, "y": 283, "w": 31, "field": "review_date" },
+   { "x": 334, "y": 283, "w": 31, "field": "" }
+  ]
+ },
+ "roughness": { "x": 380, "y": 16 },
+ "tech_requirements": [
+  "1.未注尺寸参照3D图；",
+  "2.关键尺寸用*表示；",
+  "3.未注公差±0.05 mm，±0.05°，未注圆角倒角R1 C1",
+  "或参考以下标准：",
+  "线性尺寸:GB/T1804-f（精密级），",
+  "形位公差:GB/T1184-H（精密级）",
+  "4.未注锐边倒角C0.1，均匀一致,去毛刺披锋；",
+  "棱角处打磨圆润",
+  "5.表面光洁，不得有料纹、刀纹油污等脏物；不得有：碰",
+  "伤、刮伤、接刀台阶、过切；"
+ ]
+}
