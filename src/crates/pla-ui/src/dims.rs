@@ -47,6 +47,192 @@ pub struct DimRecord {
     /// 收藏(列表里置顶)。
     #[serde(default)]
     pub fav: bool,
+    /// P2: 稳定 id(改名不变; 旧数据载入时补上)。
+    #[serde(default)]
+    pub id: String,
+    /// P2: 父级(组 / 以后的特征)的 id; None = 顶层。
+    #[serde(default)]
+    pub parent: Option<String>,
+    /// P2: "manual" = 用户记录 / 挂入; "auto" = 特征工具生成(删特征时一起删)。
+    #[serde(default = "origin_manual")]
+    pub origin: String,
+}
+
+fn origin_manual() -> String {
+    "manual".into()
+}
+
+/// P2: 用户建的组(文件夹)。组里的尺寸可折叠查看、整组操作; 以后组可带驱动值(P4 联动)。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Group {
+    pub id: String,
+    /// G001…(可改名)。
+    pub name: String,
+    #[serde(default)]
+    pub parent: Option<String>,
+    #[serde(default)]
+    pub fav: bool,
+    #[serde(default)]
+    pub collapsed: bool,
+    #[serde(default)]
+    pub created: u64,
+}
+
+/// P2: 文件格式 v2 = { version, dims, groups, next_id }。v1 = 只有尺寸的数组(载入时迁移)。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DimsFile {
+    #[serde(default)]
+    pub version: u32,
+    #[serde(default)]
+    pub dims: Vec<DimRecord>,
+    #[serde(default)]
+    pub groups: Vec<Group>,
+    /// 下一个 id 序号(id = d<n> / g<n>)。
+    #[serde(default)]
+    pub next_id: u64,
+}
+
+const FILE_VERSION: u32 = 2;
+const GROUP_PREFIX: &str = "G";
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+impl DimsFile {
+    fn new_id(&mut self, tag: char) -> String {
+        self.next_id += 1;
+        format!("{tag}{}", self.next_id)
+    }
+
+    /// 补齐缺的 id、清掉指向不存在父级的引用; 返回是否改过(改过要写回)。
+    fn normalize(&mut self) -> bool {
+        let mut changed = self.version != FILE_VERSION;
+        self.version = FILE_VERSION;
+        for i in 0..self.dims.len() {
+            if self.dims[i].id.is_empty() {
+                let id = self.new_id('d');
+                self.dims[i].id = id;
+                changed = true;
+            }
+        }
+        for i in 0..self.groups.len() {
+            if self.groups[i].id.is_empty() {
+                let id = self.new_id('g');
+                self.groups[i].id = id;
+                changed = true;
+            }
+        }
+        let gids: Vec<String> = self.groups.iter().map(|g| g.id.clone()).collect();
+        for d in &mut self.dims {
+            if d.parent.as_ref().is_some_and(|p| !gids.contains(p)) {
+                d.parent = None;
+                changed = true;
+            }
+        }
+        changed
+    }
+}
+
+/// 读整个文件(v1 数组自动迁移成 v2 并写回; 没有文件 → 空)。
+pub fn load_file(doc_key: &str) -> DimsFile {
+    let raw = std::fs::read_to_string(path(doc_key)).ok();
+    let txt = raw.as_deref().map(|s| s.trim_start_matches('\u{feff}')).unwrap_or("");
+    let mut f = if txt.trim_start().starts_with('[') {
+        DimsFile { dims: serde_json::from_str(txt).unwrap_or_default(), ..Default::default() }
+    } else {
+        serde_json::from_str::<DimsFile>(txt).unwrap_or_default()
+    };
+    if f.normalize() && raw.is_some() {
+        let _ = save_file(doc_key, &f);
+    }
+    f
+}
+
+/// 写整个文件(先写临时文件再改名, 不留半截文件)。
+pub fn save_file(doc_key: &str, f: &DimsFile) -> Result<(), String> {
+    let p = path(doc_key);
+    if let Some(dir) = p.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let tmp = p.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(f).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &p).map_err(|e| e.to_string())
+}
+
+/// 全部组。
+pub fn load_groups(doc_key: &str) -> Vec<Group> {
+    load_file(doc_key).groups
+}
+
+/// 新建组(自动命名 G001…), 返回 id。
+pub fn add_group(doc_key: &str) -> Result<String, String> {
+    let mut f = load_file(doc_key);
+    let max = f.groups.iter().filter_map(|g| g.name.strip_prefix(GROUP_PREFIX).and_then(|n| n.parse::<u32>().ok())).max().unwrap_or(0);
+    let id = f.new_id('g');
+    f.groups.push(Group { id: id.clone(), name: format!("{GROUP_PREFIX}{:03}", max + 1), parent: None, fav: false, collapsed: false, created: now_secs() });
+    save_file(doc_key, &f)?;
+    Ok(id)
+}
+
+/// 组改名(组之间不重名)。
+pub fn rename_group(doc_key: &str, id: &str, new: &str) -> Result<(), String> {
+    let new = new.trim();
+    if new.is_empty() {
+        return Err("empty name".into());
+    }
+    let mut f = load_file(doc_key);
+    if f.groups.iter().any(|g| g.name == new && g.id != id) {
+        return Err(format!("group {new} already exists"));
+    }
+    f.groups.iter_mut().find(|g| g.id == id).ok_or(format!("no group {id}"))?.name = new.to_string();
+    save_file(doc_key, &f)
+}
+
+/// 改组的收藏 / 折叠。
+pub fn set_group_flags(doc_key: &str, id: &str, fav: Option<bool>, collapsed: Option<bool>) -> Result<(), String> {
+    let mut f = load_file(doc_key);
+    let g = f.groups.iter_mut().find(|g| g.id == id).ok_or(format!("no group {id}"))?;
+    if let Some(x) = fav {
+        g.fav = x;
+    }
+    if let Some(x) = collapsed {
+        g.collapsed = x;
+    }
+    save_file(doc_key, &f)
+}
+
+/// 删组: 组内的尺寸(手动挂入的)回到组的父级(顶层); 自动生成的子项(P3 特征)也只解除挂靠 —— 组不是特征。
+pub fn delete_group(doc_key: &str, id: &str) -> Result<(), String> {
+    let mut f = load_file(doc_key);
+    let Some(pos) = f.groups.iter().position(|g| g.id == id) else { return Err(format!("no group {id}")) };
+    let up = f.groups[pos].parent.clone();
+    f.groups.remove(pos);
+    for d in &mut f.dims {
+        if d.parent.as_deref() == Some(id) {
+            d.parent = up.clone();
+        }
+    }
+    save_file(doc_key, &f)
+}
+
+/// 把若干尺寸(按名字)挂到组下(None = 移到顶层)。
+pub fn set_parent(doc_key: &str, names: &[String], parent: Option<&str>) -> Result<usize, String> {
+    let mut f = load_file(doc_key);
+    if let Some(p) = parent {
+        if !f.groups.iter().any(|g| g.id == p) {
+            return Err(format!("no group {p}"));
+        }
+    }
+    let mut n = 0;
+    for d in &mut f.dims {
+        if names.contains(&d.name) {
+            d.parent = parent.map(String::from);
+            n += 1;
+        }
+    }
+    save_file(doc_key, &f)?;
+    Ok(n)
 }
 
 /// 记录的缩略图(记录 / 更新时截的视口, 悬停详情里显示): `<目录>/<名字>.png`。
@@ -104,23 +290,17 @@ fn path(doc_key: &str) -> PathBuf {
     STORE.dir(doc_key).join(FILE)
 }
 
-/// 读全部记录(没有文件 / 读不了 → 空)。
+/// 读全部尺寸记录(没有文件 / 读不了 → 空)。
 pub fn load(doc_key: &str) -> Vec<DimRecord> {
-    std::fs::read_to_string(path(doc_key))
-        .ok()
-        .and_then(|s| serde_json::from_str::<Vec<DimRecord>>(s.trim_start_matches('\u{feff}')).ok())
-        .unwrap_or_default()
+    load_file(doc_key).dims
 }
 
-/// 写全部记录(先写临时文件再改名, 不留半截文件)。
+/// 写全部尺寸记录(组原样保留; 新记录补 id)。
 pub fn save(doc_key: &str, list: &[DimRecord]) -> Result<(), String> {
-    let p = path(doc_key);
-    if let Some(dir) = p.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    }
-    let tmp = p.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec_pretty(list).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-    std::fs::rename(&tmp, &p).map_err(|e| e.to_string())
+    let mut f = load_file(doc_key);
+    f.dims = list.to_vec();
+    f.normalize();
+    save_file(doc_key, &f)
 }
 
 /// 下一个自动名: D + 三位序号(取现有最大号 + 1)。
@@ -135,14 +315,15 @@ pub fn next_name(list: &[DimRecord]) -> String {
 
 /// 新增一条(自动命名), 返回名字。
 pub fn add(doc_key: &str, mut rec: DimRecord) -> Result<String, String> {
-    let mut list = load(doc_key);
-    rec.name = next_name(&list);
+    let mut f = load_file(doc_key);
+    rec.name = next_name(&f.dims);
     if rec.created == 0 {
-        rec.created = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        rec.created = now_secs();
     }
+    rec.id = f.new_id('d');
     let name = rec.name.clone();
-    list.push(rec);
-    save(doc_key, &list)?;
+    f.dims.push(rec);
+    save_file(doc_key, &f)?;
     Ok(name)
 }
 
@@ -182,7 +363,49 @@ mod tests {
             units: "millimeter".into(),
             created: 0,
             fav: false,
+            id: String::new(),
+            parent: None,
+            origin: "manual".into(),
         }
+    }
+
+    #[test]
+    fn v1_migration_and_groups() {
+        let doc = format!("__test_dims_grp_{}", std::process::id());
+        let _ = std::fs::remove_dir_all(STORE.dir(&doc));
+        // v1 = 只有尺寸的数组, 没有 id / parent / origin
+        std::fs::create_dir_all(STORE.dir(&doc)).unwrap();
+        let mut a = rec("thickness");
+        a.name = "D001".into();
+        let mut v = serde_json::to_value(vec![a]).unwrap();
+        for k in ["id", "parent", "origin"] {
+            v[0].as_object_mut().unwrap().remove(k);
+        }
+        std::fs::write(path(&doc), serde_json::to_vec(&v).unwrap()).unwrap();
+        let f = load_file(&doc);
+        assert_eq!((f.version, f.dims.len(), f.dims[0].id.as_str(), f.dims[0].origin.as_str()), (2, 1, "d1", "manual"));
+        assert!(std::fs::read_to_string(path(&doc)).unwrap().contains("\"version\": 2"), "迁移后写回");
+        // 组: 新建 / 挂入 / 改名 / 折叠 / 删组(子项回顶层); 尺寸增删不影响组
+        let g = add_group(&doc).unwrap();
+        assert_eq!(load_groups(&doc)[0].name, "G001");
+        add(&doc, rec("radius")).unwrap();
+        assert_eq!(set_parent(&doc, &["D001".into(), "D002".into()], Some(&g)).unwrap(), 2);
+        assert!(set_parent(&doc, &["D001".into()], Some("g999")).is_err());
+        rename_group(&doc, &g, "外壳壁厚").unwrap();
+        set_group_flags(&doc, &g, Some(true), Some(true)).unwrap();
+        let gg = &load_groups(&doc)[0];
+        assert_eq!((gg.name.as_str(), gg.fav, gg.collapsed), ("外壳壁厚", true, true));
+        let mut l = load(&doc);
+        l[0].value = 9.0;
+        save(&doc, &l).unwrap();
+        assert_eq!(load_groups(&doc).len(), 1, "存尺寸不丢组");
+        assert!(load(&doc).iter().all(|d| d.parent.as_deref() == Some(g.as_str())));
+        delete_group(&doc, &g).unwrap();
+        assert!(load_groups(&doc).is_empty());
+        assert!(load(&doc).iter().all(|d| d.parent.is_none()), "删组: 子项回顶层");
+        let ids: Vec<String> = load(&doc).iter().map(|d| d.id.clone()).collect();
+        assert!(ids[0] != ids[1] && !ids[1].is_empty(), "id 唯一");
+        let _ = std::fs::remove_dir_all(STORE.dir(&doc));
     }
 
     #[test]

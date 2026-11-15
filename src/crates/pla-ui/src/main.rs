@@ -261,6 +261,16 @@ struct PlaApp {
     dim_tab: u8,
     dim_tab_doc: String,
     dim_tab_dot: bool,
+    /// P2 记录列表: 组; 搜索词; 筛选(0 全部 / 1 尺寸 / 2 收藏); 按实体分组视图 + 其中收起的实体名;
+    /// 组改名(id + 输入); 待确认删除的组 id。
+    dims_groups: Vec<pla_ui::dims::Group>,
+    rec_search: String,
+    rec_filter: u8,
+    rec_by_solid: bool,
+    rec_solid_closed: std::collections::HashSet<String>,
+    grp_rename: Option<String>,
+    grp_rename_buf: String,
+    grp_del_confirm: Option<String>,
     /// 上次发出的高亮(面 + 对面 + 候选数), 没变就不重发。
     dim_hl_key: String,
     /// N3d: 本文档的尺寸记录(懒加载, 换文档重读)。
@@ -1423,6 +1433,38 @@ fn drag_row<T: egui::emath::Numeric>(
     changed
 }
 
+/// P2 记录"移到组"菜单的选择。
+enum MoveChoice {
+    /// 移到某组(None = 顶层)。
+    To(Option<String>),
+    /// 新建组并移入。
+    NewGroup,
+}
+
+/// P2: 点 resp 弹出"移到组"菜单(各组 / 新建组并移入 / 移出组)。current = 条目当前所在组(不列它; 有组时给"移出组")。
+fn move_menu(ui: &mut egui::Ui, resp: &egui::Response, key: &str, groups: &[pla_ui::dims::Group], current: Option<&str>) -> Option<MoveChoice> {
+    let pid = ui.id().with(("move-menu", key));
+    if resp.clicked() {
+        ui.memory_mut(|m| m.toggle_popup(pid));
+    }
+    let mut out = None;
+    egui::popup::popup_below_widget(ui, pid, resp, egui::PopupCloseBehavior::CloseOnClick, |ui| {
+        ui.set_min_width(150.0);
+        for g in groups.iter().filter(|g| Some(g.id.as_str()) != current) {
+            if ui.button(&g.name).clicked() {
+                out = Some(MoveChoice::To(Some(g.id.clone())));
+            }
+        }
+        if ui.button(tr("＋ 新建组并移入", "+ New group and move in")).clicked() {
+            out = Some(MoveChoice::NewGroup);
+        }
+        if current.is_some() && ui.button(tr("移出组(回到顶层)", "Remove from group (top level)")).clicked() {
+            out = Some(MoveChoice::To(None));
+        }
+    });
+    out
+}
+
 /// 参数化面板: 文档上次停留的标签(0 操作 / 1 记录), prefs "dim_tabs" = {doc_key: n}。
 fn prefs_dim_tab(doc: &str) -> u8 {
     pla_ui::prefs::load_value("dim_tabs").and_then(|v| v[doc].as_u64()).map_or(0, |x| x.min(1) as u8)
@@ -2369,6 +2411,14 @@ impl PlaApp {
             dim_tab: 0,
             dim_tab_doc: String::new(),
             dim_tab_dot: false,
+            dims_groups: Vec::new(),
+            rec_search: String::new(),
+            rec_filter: 0,
+            rec_by_solid: false,
+            rec_solid_closed: Default::default(),
+            grp_rename: None,
+            grp_rename_buf: String::new(),
+            grp_del_confirm: None,
             dim_hl_key: String::new(),
             dims_list: Vec::new(),
             dims_loaded: false,
@@ -2574,6 +2624,10 @@ impl PlaApp {
                                     if let Some(old) = self.dims_list.iter().find(|r| r.name == rec.name) {
                                         rec.fav = old.fav;
                                         rec.created = old.created;
+                                        // 层级身份也保留(id / 所在组 / 来源)
+                                        rec.id = old.id.clone();
+                                        rec.parent = old.parent.clone();
+                                        rec.origin = old.origin.clone();
                                     }
                                     pla_ui::dims::update(&self.doc_key, &rec).map(|_| rec.name.clone())
                                 } else {
@@ -2581,7 +2635,7 @@ impl PlaApp {
                                 };
                                 match saved {
                                     Ok(name) => {
-                                        self.dims_list = pla_ui::dims::load(&self.doc_key);
+                                        self.dims_reload();
                                         self.dims_vals.remove(&name);
                                         self.set_notice((false, if update { t!("已更新尺寸 {name}", "Dimension {name} updated") } else { t!("已记录尺寸 {name}", "Dimension saved as {name}") }));
                                         // 缩略图: 当前视口(带高亮)截一张, 悬停详情里显示
@@ -2702,18 +2756,18 @@ impl PlaApp {
                                 if let Err(e) = pla_ui::dims::update(&self.doc_key, &rec) {
                                     pla_ui::diag::log(&format!("dims refresh failed: {e}"));
                                 }
-                                self.dims_list = pla_ui::dims::load(&self.doc_key);
+                                self.dims_reload();
                             } else {
                                 // 面没找回来: 至少把新值写进记录(列表显示与模型一致), 签名留旧的
                                 pla_ui::diag::log("dims refresh: faces not found after apply");
                                 let _ = pla_ui::dims::update(&self.doc_key, &rec);
-                                self.dims_list = pla_ui::dims::load(&self.doc_key);
+                                self.dims_reload();
                             }
                         }
                         (Some(DimPending::Refresh(rec)), Err(e)) => {
                             pla_ui::diag::log(&format!("dims refresh resolve failed: {e}"));
                             let _ = pla_ui::dims::update(&self.doc_key, &rec);
-                            self.dims_list = pla_ui::dims::load(&self.doc_key);
+                            self.dims_reload();
                         }
                         (other, _) => self.dim_pending = other,
                     }
@@ -3248,7 +3302,7 @@ impl PlaApp {
                         self.dim_tab_dot = false;
                     }
                     if !self.dims_loaded {
-                        self.dims_list = pla_ui::dims::load(&self.doc_key);
+                        self.dims_reload();
                         self.dims_loaded = true;
                     }
                     let n = self.dims_list.len();
@@ -3415,7 +3469,14 @@ impl PlaApp {
         (vec![face], opp)
     }
 
-    /// N3d: 「操作」标题行右侧 —— 当前选择正是某条记录 → 显示记录名(保存按钮在「记录」标签, 用户 2026-11-15)。
+    /// P2: 从文件重读尺寸记录与组(任何增删改之后)。
+    fn dims_reload(&mut self) {
+        let f = pla_ui::dims::load_file(&self.doc_key);
+        self.dims_list = f.dims;
+        self.dims_groups = f.groups;
+    }
+
+    /// N3d: 「操作」标题行右侧 ——当前选择正是某条记录 → 显示记录名(保存按钮在「记录」标签, 用户 2026-11-15)。
     fn dim_record_control(&mut self, ui: &mut egui::Ui, row: egui::Rect, sel: &[String]) {
         if self.dim_active.is_some() && sel == self.dim_active_ids.as_slice() {
             let name = self.dim_active.clone().unwrap_or_default();
@@ -3470,6 +3531,9 @@ impl PlaApp {
             units: v["units"].as_str().unwrap_or("").into(),
             created: 0,
             fav: false,
+            id: String::new(),
+            parent: None,
+            origin: "manual".into(),
         };
         let mut all = ids;
         all.extend(opp);
@@ -3672,7 +3736,7 @@ impl PlaApp {
     /// 悬停 = 三级面板显示详细信息与缩略图(条目本身不放截图)。cur = 当前编辑区读到的尺寸(更新用)。
     fn dim_saved_ui(&mut self, ui: &mut egui::Ui, cur: Option<serde_json::Value>) {
         if !self.dims_loaded {
-            self.dims_list = pla_ui::dims::load(&self.doc_key);
+            self.dims_reload();
             self.dims_loaded = true;
         }
         ui.add_space(8.0);
@@ -3695,18 +3759,6 @@ impl PlaApp {
             self.dims_row_focus = false;
             return;
         }
-        let list = pla_ui::dims::sorted(self.dims_list.clone());
-        if self.dims_manage {
-            let names: Vec<String> = list.iter().map(|r| r.name.clone()).collect();
-            let (del, done) = manage_bar(ui, &names, &mut self.dims_selected, tr("删除勾选的尺寸记录(不影响模型)", "Delete the checked records (the model is not affected)"));
-            if del {
-                self.dims_batch_confirm = true;
-            }
-            if done {
-                self.dims_manage = false;
-                self.dims_selected.clear();
-            }
-        }
         enum Act {
             Load(pla_ui::dims::DimRecord),
             Value(pla_ui::dims::DimRecord, f64),
@@ -3716,15 +3768,191 @@ impl PlaApp {
             RenameCancel,
             Update(String),
             Delete(String),
+            // P2 层级
+            Move(Vec<String>, Option<String>),
+            MoveNewGroup(Vec<String>),
+            NewGroup,
+            GroupCollapse(String, bool),
+            GroupFav(String, bool),
+            GroupRenameStart(String),
+            GroupRenameCommit(String),
+            GroupDelete(String),
+            SolidToggle(String),
         }
         let mut acts: Vec<Act> = Vec::new();
+        // ---- 工具行: 搜索 · 筛选(全部 / 尺寸 / ★) · 按实体 · ＋组 ----
+        {
+            let (row, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 24.0), egui::Sense::hover());
+            let sw = (row.width() * 0.42).max(110.0);
+            let sr = egui::Rect::from_min_size(row.min, egui::vec2(sw, row.height()));
+            ui.painter().rect_filled(sr, egui::Rounding::same(5.0), COL_FIELD);
+            ui.put(
+                sr.shrink2(egui::vec2(6.0, 3.0)),
+                egui::TextEdit::singleline(&mut self.rec_search).frame(false).font(egui::FontId::proportional(12.0)).hint_text(tr("搜索名字…", "Search names…")),
+            );
+            let mut x = sr.right() + 6.0;
+            let chip = |ui: &mut egui::Ui, x: &mut f32, label: &str, on: bool, key: &str| -> bool {
+                let font = egui::FontId::proportional(11.5);
+                let w = ui.fonts(|f| f.layout_no_wrap(label.into(), font.clone(), COL_TEXT).size().x) + 12.0;
+                let r = egui::Rect::from_min_size(egui::pos2(*x, row.top() + 2.0), egui::vec2(w, row.height() - 4.0));
+                let b = ui.interact(r, ui.id().with(("rec-chip", key)), egui::Sense::click());
+                let fill = if on { COL_STEPPER } else if b.hovered() { lerp_color(COL_CARD, egui::Color32::WHITE, 0.08) } else { COL_CARD };
+                ui.painter().rect_filled(r, egui::Rounding::same(9.0), fill);
+                ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, label, font, if on { egui::Color32::WHITE } else { COL_MUTED });
+                *x = r.right() + 4.0;
+                b.clicked()
+            };
+            for (i, label) in [tr("全部", "All"), tr("尺寸", "Dims"), "★"].iter().enumerate() {
+                if chip(ui, &mut x, label, self.rec_filter as usize == i, label) {
+                    self.rec_filter = i as u8;
+                }
+            }
+            if chip(ui, &mut x, tr("按实体", "By solid"), self.rec_by_solid, "by-solid") {
+                self.rec_by_solid = !self.rec_by_solid;
+            }
+            // ＋组: 靠右
+            let label = tr("＋组", "+Group");
+            let font = egui::FontId::proportional(12.0);
+            let w = ui.fonts(|f| f.layout_no_wrap(label.into(), font.clone(), COL_ACCENT).size().x);
+            let gr = egui::Rect::from_min_max(egui::pos2(row.right() - w - 4.0, row.top()), row.max);
+            let g = ui.interact(gr, ui.id().with("rec-new-group"), egui::Sense::click());
+            ui.painter().text(egui::pos2(row.right(), row.center().y), egui::Align2::RIGHT_CENTER, label, font, if g.hovered() { egui::Color32::WHITE } else { COL_ACCENT });
+            if g.on_hover_text(tr("新建一个组(文件夹); 条目右侧 ⋯ 可移入", "New group (folder); move entries in with ⋯ on the right")).clicked() {
+                acts.push(Act::NewGroup);
+            }
+            ui.add_space(4.0);
+        }
+        // ---- 行: 组 / 尺寸(带缩进层级) ----
+        enum Row {
+            Group { id: String, name: String, fav: bool, collapsed: bool, count: usize, virt: bool },
+            Dim(pla_ui::dims::DimRecord, u8),
+        }
+        let q = self.rec_search.trim().to_lowercase();
+        let keep = |d: &pla_ui::dims::DimRecord| -> bool { (self.rec_filter != 2 || d.fav) && (q.is_empty() || d.name.to_lowercase().contains(&q)) };
+        let dims_sorted = pla_ui::dims::sorted(self.dims_list.clone());
+        let mut rows: Vec<Row> = Vec::new();
+        if !q.is_empty() || self.rec_filter == 2 {
+            // 搜索 / 只看收藏: 平铺结果
+            rows.extend(dims_sorted.iter().filter(|d| keep(d)).map(|d| Row::Dim(d.clone(), 0)));
+        } else if self.rec_by_solid {
+            // 按实体分组(纯视图, 不改存储)
+            let mut solids: Vec<String> = Vec::new();
+            for d in &dims_sorted {
+                let s = d.faces.first().and_then(|f| f["solidName"].as_str()).unwrap_or("?").to_string();
+                if !solids.contains(&s) {
+                    solids.push(s);
+                }
+            }
+            solids.sort();
+            for s in solids {
+                let kids: Vec<&pla_ui::dims::DimRecord> = dims_sorted.iter().filter(|d| d.faces.first().and_then(|f| f["solidName"].as_str()).unwrap_or("?") == s).collect();
+                let collapsed = self.rec_solid_closed.contains(&s);
+                rows.push(Row::Group { id: s.clone(), name: s.clone(), fav: false, collapsed, count: kids.len(), virt: true });
+                if !collapsed {
+                    rows.extend(kids.into_iter().map(|d| Row::Dim(d.clone(), 1)));
+                }
+            }
+        } else {
+            let mut groups = self.dims_groups.clone();
+            groups.sort_by(|a, b| b.fav.cmp(&a.fav).then_with(|| a.name.cmp(&b.name)));
+            for g in &groups {
+                let kids: Vec<&pla_ui::dims::DimRecord> = dims_sorted.iter().filter(|d| d.parent.as_deref() == Some(g.id.as_str())).collect();
+                rows.push(Row::Group { id: g.id.clone(), name: g.name.clone(), fav: g.fav, collapsed: g.collapsed, count: kids.len(), virt: false });
+                if !g.collapsed {
+                    rows.extend(kids.into_iter().map(|d| Row::Dim(d.clone(), 1)));
+                }
+            }
+            rows.extend(dims_sorted.iter().filter(|d| d.parent.is_none()).map(|d| Row::Dim(d.clone(), 0)));
+        }
+        if self.dims_manage {
+            let names: Vec<String> = dims_sorted.iter().map(|r| r.name.clone()).collect();
+            let (del, done) = manage_bar(ui, &names, &mut self.dims_selected, tr("删除勾选的尺寸记录(不影响模型)", "Delete the checked records (the model is not affected)"));
+            if del {
+                self.dims_batch_confirm = true;
+            }
+            if done {
+                self.dims_manage = false;
+                self.dims_selected.clear();
+            }
+            // 勾选的一起移到组
+            if !self.dims_selected.is_empty() {
+                let b = ui.add(egui::Button::new(egui::RichText::new(t!("移到组… ({})", "Move to group… ({})", self.dims_selected.len())).size(12.0)));
+                let sel: Vec<String> = self.dims_selected.iter().cloned().collect();
+                // current = Some("") → 列出全部组, 也给"移出组"
+                match move_menu(ui, &b, "dims-batch-move", &self.dims_groups, Some("")) {
+                    Some(MoveChoice::To(p)) => acts.push(Act::Move(sel, p)),
+                    Some(MoveChoice::NewGroup) => acts.push(Act::MoveNewGroup(sel)),
+                    None => {}
+                }
+            }
+        }
         let mut focus_any = false;
         let busy = self.dim_pending.is_some() || self.dim_busy;
-        for rec in &list {
+        for row in &rows {
+            let (rec, depth) = match row {
+                Row::Dim(d, depth) => (d, *depth),
+                Row::Group { id, name, fav, collapsed, count, virt } => {
+                    // 组行: ▸/▾ 折叠 · 名字(双击改名) · 条数 · ★ · ×
+                    let (r, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 26.0), egui::Sense::click());
+                    let hot = ui.rect_contains_pointer(r);
+                    ui.painter().rect_filled(r, egui::Rounding::same(6.0), if hot { lerp_color(COL_FIELD, egui::Color32::WHITE, 0.05) } else { COL_FIELD });
+                    let cy = r.center().y;
+                    let tri = egui::pos2(r.left() + 12.0, cy);
+                    let pts = if *collapsed {
+                        vec![tri + egui::vec2(-2.5, -4.0), tri + egui::vec2(-2.5, 4.0), tri + egui::vec2(3.5, 0.0)]
+                    } else {
+                        vec![tri + egui::vec2(-4.0, -2.5), tri + egui::vec2(4.0, -2.5), tri + egui::vec2(0.0, 3.5)]
+                    };
+                    ui.painter().add(egui::Shape::convex_polygon(pts, COL_MUTED, egui::Stroke::NONE));
+                    let name_r = egui::Rect::from_min_max(egui::pos2(r.left() + 24.0, cy - 10.0), egui::pos2(r.right() - 64.0, cy + 10.0));
+                    if !virt && self.grp_rename.as_deref() == Some(id.as_str()) {
+                        ui.painter().rect_filled(name_r, egui::Rounding::same(5.0), COL_STEPPER);
+                        let e = ui.put(name_r.shrink2(egui::vec2(4.0, 2.0)), egui::TextEdit::singleline(&mut self.grp_rename_buf).frame(false).font(egui::FontId::proportional(12.5)));
+                        e.request_focus();
+                        focus_any = true;
+                        let (en, esc) = ui.input(|i| (i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Escape)));
+                        if en || right_click_confirm(ui) {
+                            acts.push(Act::GroupRenameCommit(id.clone()));
+                        } else if esc {
+                            self.grp_rename = None;
+                        }
+                    } else {
+                        let label = if *virt { t!("{name} · 实体", "{name} · solid") } else { name.clone() };
+                        let (shown, size, _) = fit_text(ui, &label, name_r.width() - 40.0, 12.5, 10.5);
+                        let tr_ = paint_text(ui.painter(), egui::pos2(name_r.left(), cy), egui::Align2::LEFT_CENTER, &shown, size, egui::Color32::WHITE, true);
+                        ui.painter().text(egui::pos2(tr_.right() + 6.0, cy), egui::Align2::LEFT_CENTER, format!("{count}"), egui::FontId::proportional(11.0), COL_MUTED);
+                        if !virt && ui.interact(name_r, ui.id().with(("grp-name", id)), egui::Sense::click()).double_clicked() {
+                            acts.push(Act::GroupRenameStart(id.clone()));
+                        }
+                    }
+                    if !virt {
+                        let small = |ui: &mut egui::Ui, cx: f32, glyph: &str, col: egui::Color32, tip: &str| -> bool {
+                            let br = egui::Rect::from_center_size(egui::pos2(cx, cy), egui::vec2(18.0, 18.0));
+                            let b = ui.interact(br, ui.id().with(("grp-btn", id, glyph)), egui::Sense::click());
+                            ui.painter().text(br.center(), egui::Align2::CENTER_CENTER, glyph, egui::FontId::proportional(13.0), if b.hovered() { egui::Color32::WHITE } else { col });
+                            b.on_hover_text(tip).clicked()
+                        };
+                        if small(ui, r.right() - 12.0, "×", COL_MUTED, tr("删除组(组内尺寸回到顶层, 不影响模型; 需确认)", "Delete group (its entries go to the top level; model unaffected; confirm)")) {
+                            acts.push(Act::GroupDelete(id.clone()));
+                        }
+                        let star_col = if *fav { egui::Color32::from_rgb(255, 200, 60) } else { COL_MUTED };
+                        if small(ui, r.right() - 32.0, if *fav { "★" } else { "☆" }, star_col, tr("收藏(置顶)", "Favourite (pinned)")) {
+                            acts.push(Act::GroupFav(id.clone(), !fav));
+                        }
+                    }
+                    if resp.clicked() {
+                        acts.push(if *virt { Act::SolidToggle(id.clone()) } else { Act::GroupCollapse(id.clone(), !collapsed) });
+                    }
+                    ui.add_space(2.0);
+                    continue;
+                }
+            };
             let (r, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 28.0), egui::Sense::click());
             let active = self.dim_active.as_deref() == Some(rec.name.as_str());
             let hot = ui.rect_contains_pointer(r);
             let fill = if active { COL_STEPPER } else if hot { lerp_color(COL_CARD, egui::Color32::WHITE, 0.06) } else { COL_CARD };
+            // 子项缩进: 卡片左边留出层级缩进
+            let r = egui::Rect::from_min_max(egui::pos2(r.left() + depth as f32 * 14.0, r.top()), r.max);
             ui.painter().rect_filled(r, egui::Rounding::same(6.0), fill);
             let cy = r.center().y;
             let mut x = r.left() + 6.0;
@@ -3768,9 +3996,24 @@ impl PlaApp {
             if btn(ui, r.right() - 52.0, "✎", tr("改名(也可双击名字)", "Rename (or double-click the name)"), key) {
                 acts.push(Act::RenameStart(rec.name.clone()));
             }
+            // ⋯ 移到组(弹出菜单: 各组 / 新建组并移入 / 移出组)
+            {
+                let br = egui::Rect::from_center_size(egui::pos2(r.right() - 72.0, cy), egui::vec2(18.0, 18.0));
+                let b = ui.interact(br, ui.id().with(("dims-move-btn", key)), egui::Sense::click());
+                let col = if b.hovered() { egui::Color32::WHITE } else { COL_MUTED };
+                for dx in [-4.0f32, 0.0, 4.0] {
+                    ui.painter().circle_filled(br.center() + egui::vec2(dx, 0.0), 1.4, col);
+                }
+                let b = b.on_hover_text(tr("移到组…", "Move to group…"));
+                match move_menu(ui, &b, &format!("dims-move-{key}"), &self.dims_groups, rec.parent.as_deref()) {
+                    Some(MoveChoice::To(p)) => acts.push(Act::Move(vec![rec.name.clone()], p)),
+                    Some(MoveChoice::NewGroup) => acts.push(Act::MoveNewGroup(vec![rec.name.clone()])),
+                    None => {}
+                }
+            }
             let u = match rec.units.as_str() { "millimeter" => "mm", "centimeter" => "cm", "meter" => "m", "inch" => "in", "foot" => "ft", x => x };
             let unit_w = 22.0;
-            let fr = egui::Rect::from_min_max(egui::pos2(r.right() - 64.0 - 66.0 - unit_w, cy - 11.0), egui::pos2(r.right() - 64.0 - unit_w, cy + 11.0));
+            let fr = egui::Rect::from_min_max(egui::pos2(r.right() - 84.0 - 66.0 - unit_w, cy - 11.0), egui::pos2(r.right() - 84.0 - unit_w, cy + 11.0));
             ui.painter().rect_filled(fr, egui::Rounding::same(5.0), COL_FIELD);
             let buf = self.dims_vals.entry(rec.name.clone()).or_insert_with(|| fmt3(rec.value));
             let te = ui.put(
@@ -3880,7 +4123,7 @@ impl PlaApp {
                     if let Err(e) = pla_ui::dims::set_fav(&self.doc_key, &name, fav) {
                         self.set_notice((true, t!("收藏失败: {e}", "Favourite failed: {e}")));
                     }
-                    self.dims_list = pla_ui::dims::load(&self.doc_key);
+                    self.dims_reload();
                 }
                 Act::RenameStart(name) => {
                     self.dims_rename_buf = name.clone();
@@ -3905,7 +4148,7 @@ impl PlaApp {
                                     name: pla_bridge::shim::api::DIM_MEASURE,
                                     args: serde_json::json!({ "rename": { "from": old, "to": new } }),
                                 });
-                                self.dims_list = pla_ui::dims::load(&self.doc_key);
+                                self.dims_reload();
                             }
                             Err(e) => self.set_notice((true, t!("改名失败: {e}", "Rename failed: {e}"))),
                         }
@@ -3913,6 +4156,71 @@ impl PlaApp {
                 }
                 Act::Update(name) => self.dims_update_confirm = Some(name),
                 Act::Delete(name) => self.dim_del_confirm = Some(name),
+                // ---- P2 层级 ----
+                Act::Move(names, parent) => {
+                    if let Err(e) = pla_ui::dims::set_parent(&self.doc_key, &names, parent.as_deref()) {
+                        self.set_notice((true, t!("移动失败: {e}", "Move failed: {e}")));
+                    }
+                    self.dims_reload();
+                }
+                Act::MoveNewGroup(names) => {
+                    match pla_ui::dims::add_group(&self.doc_key).and_then(|g| pla_ui::dims::set_parent(&self.doc_key, &names, Some(&g)).map(|_| g)) {
+                        Ok(g) => {
+                            self.dims_reload();
+                            // 新组直接进入改名
+                            self.grp_rename_buf = self.dims_groups.iter().find(|x| x.id == g).map(|x| x.name.clone()).unwrap_or_default();
+                            self.grp_rename = Some(g);
+                        }
+                        Err(e) => self.set_notice((true, t!("新建组失败: {e}", "New group failed: {e}"))),
+                    }
+                }
+                Act::NewGroup => match pla_ui::dims::add_group(&self.doc_key) {
+                    Ok(g) => {
+                        self.dims_reload();
+                        self.grp_rename_buf = self.dims_groups.iter().find(|x| x.id == g).map(|x| x.name.clone()).unwrap_or_default();
+                        self.grp_rename = Some(g);
+                    }
+                    Err(e) => self.set_notice((true, t!("新建组失败: {e}", "New group failed: {e}"))),
+                },
+                Act::GroupCollapse(id, c) => {
+                    let _ = pla_ui::dims::set_group_flags(&self.doc_key, &id, None, Some(c));
+                    self.dims_reload();
+                }
+                Act::GroupFav(id, f) => {
+                    let _ = pla_ui::dims::set_group_flags(&self.doc_key, &id, Some(f), None);
+                    self.dims_reload();
+                }
+                Act::GroupRenameStart(id) => {
+                    self.grp_rename_buf = self.dims_groups.iter().find(|x| x.id == id).map(|x| x.name.clone()).unwrap_or_default();
+                    self.grp_rename = Some(id);
+                }
+                Act::GroupRenameCommit(id) => {
+                    self.grp_rename = None;
+                    if let Err(e) = pla_ui::dims::rename_group(&self.doc_key, &id, &self.grp_rename_buf) {
+                        self.set_notice((true, t!("组改名失败: {e}", "Group rename failed: {e}")));
+                    }
+                    self.dims_reload();
+                }
+                Act::GroupDelete(id) => self.grp_del_confirm = Some(id),
+                Act::SolidToggle(s) => {
+                    if !self.rec_solid_closed.remove(&s) {
+                        self.rec_solid_closed.insert(s);
+                    }
+                }
+            }
+        }
+        if let Some(id) = self.grp_del_confirm.clone() {
+            let name = self.dims_groups.iter().find(|g| g.id == id).map(|g| g.name.clone()).unwrap_or_default();
+            match confirm_popup(ui.ctx(), "grp-del", &t!("删除组 {name}?(组内尺寸回到顶层, 不影响模型)", "Delete group {name}? (its entries go to the top level; the model is not affected)")) {
+                Some(true) => {
+                    self.grp_del_confirm = None;
+                    if let Err(e) = pla_ui::dims::delete_group(&self.doc_key, &id) {
+                        self.set_notice((true, t!("删除组失败: {e}", "Delete group failed: {e}")));
+                    }
+                    self.dims_reload();
+                }
+                Some(false) => self.grp_del_confirm = None,
+                None => {}
             }
         }
         // ---- 确认弹层(右键 = 确认, Esc = 取消) ----
@@ -3949,7 +4257,7 @@ impl PlaApp {
                             }
                             self.dims_selected.clear();
                             self.dims_manage = false;
-                            self.dims_list = pla_ui::dims::load(&self.doc_key);
+                            self.dims_reload();
                         }
                         Err(e) => self.set_notice((true, t!("删除失败: {e}", "Delete failed: {e}"))),
                     }
@@ -3969,7 +4277,7 @@ impl PlaApp {
                             }
                             self.dims_pngs.remove(&name);
                             self.dims_vals.remove(&name);
-                            self.dims_list = pla_ui::dims::load(&self.doc_key);
+                            self.dims_reload();
                         }
                         Err(e) => self.set_notice((true, t!("删除失败: {e}", "Delete failed: {e}"))),
                     }
@@ -4380,6 +4688,11 @@ impl PlaApp {
         self.dim_sym = 0;
         self.dim_cyl = None;
         self.dims_edit_row = None;
+        self.dims_groups.clear();
+        self.rec_search.clear();
+        self.rec_solid_closed.clear();
+        self.grp_rename = None;
+        self.grp_del_confirm = None;
     }
 
     fn update_snap(&mut self, ctx: &egui::Context) {
