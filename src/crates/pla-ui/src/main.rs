@@ -288,6 +288,8 @@ struct PlaApp {
     hole_preset_checked: Option<Instant>,
     hole_preset_err: Option<String>,
     hole_preset_rename: Option<String>,
+    /// P4: 进行中的组联动。
+    link_run: Option<LinkRun>,
     /// P3: 手动记录的尺寸落在某个孔的面上 → 询问"挂到孔下?"(尺寸名, 孔 id, 孔名)。
     attach_prompt: Option<(String, String, String)>,
     /// 上次发出的高亮(面 + 对面 + 候选数), 没变就不重发。
@@ -1133,6 +1135,10 @@ fn dim_help_lines() -> Vec<InfoLine> {
         info_text(tr(
             "打孔(「操作」→ 打孔): 选一个平面(孔的入口), 再 Shift 加选草图点(曲线端点 / 圆 = 圆心)定孔位, 一点一孔, 不选点 = 面中点; 再加选别的实体 = 组合孔: 沉头在入口实体, 中间实体是过孔, 最后一个实体是底孔(盲孔深度从它的入口算)。规格来自「规格方案」(JSON, 可切换 / 改名 / 新建 / 编辑, 保存即生效)。打完每个孔在「记录」里生成 H00n, 下面挂半径 / 深度等子尺寸, 可直接改; 手动记录的尺寸若量的是孔的面, 会问要不要挂到孔下。",
             "Hole (Operate → Hole): select a plane (the entry), Shift-add sketch points (curve ends / circles = centres) for positions, one hole each, none = face midpoint; Shift-add more solids for a stacked hole: counterbore in the entry solid, clearance through the middle ones, tap hole in the last (blind depth from its entry). Sizes come from the size table (JSON: switch / rename / new / edit, applies on save). Each hole appears in Records as H00n with radius / depth dimensions you can edit; a manually saved dimension on a hole face offers to attach to it.",
+        )),
+        info_text(tr(
+            "组联动: 「记录」里建组(＋组)、把尺寸移进去(⋯ → 移到组), 组行右侧填驱动值 + Enter / 右键 = 组里跟随(●)的尺寸逐条改成这个值; 点 ●/○ 切换跟随 / 独立。任何一条失败, 本次已改的全部撤回(每条是一个撤销步)。",
+            "Group linking: in Records create a group (+Group), move dimensions in (⋯ → Move to group), type a driving value on the group row + Enter / right-click = every following (●) dimension is changed to it; click ●/○ to follow / go independent. If any one fails, the whole run is rolled back (each change is one undo step).",
         )),
         info_key(tr("右键 / Enter", "Right-click / Enter"), tr("应用(一步可撤销, 失败自动撤回)", "Apply (one undo step; rolled back on failure)")),
         info_key("Esc", tr("目标值复原", "Reset the target value")),
@@ -2489,6 +2495,7 @@ impl PlaApp {
             hole_preset_err: None,
             hole_preset_rename: None,
             attach_prompt: None,
+            link_run: None,
             dim_hl_key: String::new(),
             dims_list: Vec::new(),
             dims_loaded: false,
@@ -2698,6 +2705,7 @@ impl PlaApp {
                                         rec.id = old.id.clone();
                                         rec.parent = old.parent.clone();
                                         rec.origin = old.origin.clone();
+                                        rec.follow = old.follow;
                                     }
                                     pla_ui::dims::update(&self.doc_key, &rec).map(|_| rec.name.clone())
                                 } else {
@@ -2759,6 +2767,7 @@ impl PlaApp {
                         Err(e) => {
                             let what = if target.is_some() { tr("修改", "Changing") } else { tr("载入", "Loading") };
                             self.set_notice((true, t!("{what}尺寸 {} 失败: {e}", "{what} dimension {} failed: {e}", rec.name)));
+                            self.link_fail(&format!("{}: {e}", rec.name));
                         }
                         Ok(v) => {
                             let ids: Vec<String> = v["ids"].as_array().into_iter().flatten().filter_map(|x| x.as_str().map(String::from)).collect();
@@ -2788,8 +2797,15 @@ impl PlaApp {
                                     if let Some(w) = warn {
                                         self.set_notice((true, t!("正在修改 {}: {w}", "Changing {}: {w}", rec.name)));
                                     }
+                                    // 读到的尺寸没法应用(dim_apply 没发命令)→ 联动不能停在半路
+                                    if !self.dim_busy {
+                                        self.link_fail(&t!("{} 读到的尺寸无法应用", "{}: the dimension read cannot be applied", rec.name));
+                                    }
                                 }
-                                Some(_) => self.set_notice((true, tr("上一次修改还没完成, 稍后再改", "The previous change is still running; try again shortly").into())),
+                                Some(_) => {
+                                    self.set_notice((true, tr("上一次修改还没完成, 稍后再改", "The previous change is still running; try again shortly").into()));
+                                    self.link_fail(tr("上一次修改还没完成", "the previous change is still running"));
+                                }
                                 None => {
                                     let entries: Vec<pla_bridge::cdp::ApplyEntry> = ids
                                         .iter()
@@ -2818,7 +2834,7 @@ impl PlaApp {
                             let units = v["units"].as_str().unwrap_or("").to_string();
                             let rec = |mode: &str, kind: &str, faces: Vec<serde_json::Value>, value: f64| pla_ui::dims::DimRecord {
                                 name: String::new(), mode: mode.into(), kind: kind.into(), faces, opposite: None, side: 0, sym: 0, cyl: None,
-                                value, units: units.clone(), created: 0, fav: false, id: String::new(), parent: None, origin: "auto".into(),
+                                value, units: units.clone(), created: 0, fav: false, id: String::new(), parent: None, origin: "auto".into(), follow: false,
                             };
                             let num = |k: &str| spec[k].as_f64().unwrap_or(0.0);
                             let depth = v["depth"].as_f64().unwrap_or(0.0);
@@ -2897,11 +2913,14 @@ impl PlaApp {
                                 let _ = pla_ui::dims::update(&self.doc_key, &rec);
                                 self.dims_reload();
                             }
+                            // P4: 联动中 → 下一条
+                            self.link_next();
                         }
                         (Some(DimPending::Refresh(rec)), Err(e)) => {
                             pla_ui::diag::log(&format!("dims refresh resolve failed: {e}"));
                             let _ = pla_ui::dims::update(&self.doc_key, &rec);
                             self.dims_reload();
+                            self.link_next();
                         }
                         (other, _) => self.dim_pending = other,
                     }
@@ -2932,6 +2951,14 @@ impl PlaApp {
                         self.dim_info = None;
                         // N3d: 改的是某条记录 → 按"旧签名 + 已知平移量"预测新位置, 重新定位后刷新记录
                         let ok = matches!(&r, Ok(v) if v["failed"].is_null());
+                        // P4 联动: 这一条失败 → 撤回整次; 成功但不刷新记录(没对应记录)→ 直接下一条
+                        if !ok {
+                            let why = match &r { Ok(v) => v["failed"]["err"].as_str().unwrap_or("?").to_string(), Err(e) => e.clone() };
+                            self.link_fail(&why);
+                        } else if self.dim_last_apply.as_ref().map_or(true, |ap| !self.dims_list.iter().any(|x| x.name == ap.name)) {
+                            self.dim_last_apply = None;
+                            self.link_next();
+                        }
                         if let (true, Some(ap)) = (ok, self.dim_last_apply.take()) {
                             if let Some(mut rec) = self.dims_list.iter().find(|x| x.name == ap.name).cloned() {
                                 let mut sigs: Vec<serde_json::Value> = rec.faces.clone();
@@ -3640,6 +3667,62 @@ impl PlaApp {
         })
     }
 
+    /// P4 组联动: 组驱动值改成 target → 组里跟随的尺寸逐条改成 target(每条走"按签名定位 + 读 + 应用 + 刷新记录"同一条路);
+    /// 整个过程包在事务里(hist.begin … commit), 任何一条失败 → 撤回本次已改的全部(hist.rollback)。每条是一个撤销步。
+    fn link_start(&mut self, gid: &str, target: f64) {
+        if self.link_run.is_some() || self.dim_busy || self.dim_pending.is_some() {
+            self.set_notice((true, tr("上一次修改还没完成, 稍后再改", "The previous change is still running; try again shortly").into()));
+            return;
+        }
+        let Some(g) = self.dims_groups.iter().find(|g| g.id == gid).cloned() else { return };
+        if let Err(e) = pla_ui::dims::set_group_value(&self.doc_key, gid, Some(target)) {
+            self.set_notice((true, t!("组值保存失败: {e}", "Saving the group value failed: {e}")));
+            return;
+        }
+        self.dims_reload();
+        let queue: std::collections::VecDeque<String> = pla_ui::dims::sorted(self.dims_list.clone())
+            .into_iter()
+            .filter(|d| d.parent.as_deref() == Some(gid) && d.follow && (d.value - target).abs() > 5e-4)
+            .map(|d| d.name)
+            .collect();
+        if queue.is_empty() {
+            self.set_notice((false, t!("组 {} = {}: 跟随的尺寸都已是这个值", "Group {} = {}: following dimensions already match", g.name, fmt3(target))));
+            return;
+        }
+        if !self.require_feature(Feature::DimFace) {
+            return;
+        }
+        self.cdp.send(pla_bridge::cdp::CdpCmd::Call { name: pla_bridge::shim::api::HIST_BEGIN, args: serde_json::Value::Null });
+        let total = queue.len();
+        self.link_run = Some(LinkRun { group: g.name, target, queue, total });
+        self.link_next();
+    }
+
+    /// P4: 联动的下一条(没有了 → 提交事务)。
+    fn link_next(&mut self) {
+        let Some(run) = self.link_run.as_mut() else { return };
+        let next = run.queue.pop_front();
+        let (gname, target, total) = (run.group.clone(), run.target, run.total);
+        match next.and_then(|n| self.dims_list.iter().find(|d| d.name == n).cloned()) {
+            Some(rec) => {
+                self.set_notice((false, t!("组 {gname} 联动: {} → {}…", "Group {gname}: {} → {}…", rec.name, fmt3(target))));
+                self.dim_record_call(&rec, DimPending::Apply(rec.clone(), target));
+            }
+            None => {
+                self.link_run = None;
+                self.cdp.send(pla_bridge::cdp::CdpCmd::Call { name: pla_bridge::shim::api::HIST_COMMIT, args: serde_json::Value::Null });
+                self.set_notice((false, t!("组 {gname}: {total} 处已改为 {}", "Group {gname}: {total} dimension(s) set to {}", fmt3(target))));
+            }
+        }
+    }
+
+    /// P4: 联动中某条失败 → 撤回本次已改的全部。
+    fn link_fail(&mut self, why: &str) {
+        let Some(run) = self.link_run.take() else { return };
+        self.cdp.send(pla_bridge::cdp::CdpCmd::Call { name: pla_bridge::shim::api::HIST_ROLLBACK, args: serde_json::Value::Null });
+        self.set_notice((true, t!("组 {} 联动失败, 已撤回本次全部修改: {why}", "Group {} linking failed; all changes of this run rolled back: {why}", run.group)));
+    }
+
     /// P2: 从文件重读尺寸记录与组(任何增删改之后)。
     fn dims_reload(&mut self) {
         let f = pla_ui::dims::load_file(&self.doc_key);
@@ -3978,6 +4061,7 @@ impl PlaApp {
             id: String::new(),
             parent: None,
             origin: "manual".into(),
+            follow: false,
         };
         let mut all = ids;
         all.extend(opp);
@@ -4222,6 +4306,9 @@ impl PlaApp {
             GroupRenameCommit(String),
             GroupDelete(String),
             SolidToggle(String),
+            // P4 联动
+            GroupValue(String, f64),
+            Follow(String, bool),
         }
         let mut acts: Vec<Act> = Vec::new();
         // ---- 工具行: 搜索 · 筛选(全部 / 尺寸 / ★) · 按实体 · ＋组 ----
@@ -4334,7 +4421,7 @@ impl PlaApp {
             }
         }
         let mut focus_any = false;
-        let busy = self.dim_pending.is_some() || self.dim_busy;
+        let busy = self.dim_pending.is_some() || self.dim_busy || self.link_run.is_some();
         for row in &rows {
             let (rec, depth) = match row {
                 Row::Dim(d, depth) => (d, *depth),
@@ -4360,7 +4447,8 @@ impl PlaApp {
                     } else {
                         r.left() + 24.0
                     };
-                    let name_r = egui::Rect::from_min_max(egui::pos2(name_left, cy - 10.0), egui::pos2(r.right() - 64.0, cy + 10.0));
+                    let name_right = if !virt && !hole { r.right() - 118.0 } else { r.right() - 64.0 };
+                    let name_r = egui::Rect::from_min_max(egui::pos2(name_left, cy - 10.0), egui::pos2(name_right, cy + 10.0));
                     if !virt && self.grp_rename.as_deref() == Some(id.as_str()) {
                         ui.painter().rect_filled(name_r, egui::Rounding::same(5.0), COL_STEPPER);
                         let e = ui.put(name_r.shrink2(egui::vec2(4.0, 2.0)), egui::TextEdit::singleline(&mut self.grp_rename_buf).frame(false).font(egui::FontId::proportional(12.5)));
@@ -4396,6 +4484,44 @@ impl PlaApp {
                             acts.push(Act::GroupFav(id.clone(), !fav));
                         }
                     }
+                    // P4 组驱动值(用户组): 输入 + Enter / 右键 = 组里跟随的尺寸全部改成这个值
+                    if !virt && !hole {
+                        let gval = self.dims_groups.iter().find(|g| &g.id == id).and_then(|g| g.value);
+                        let units = self.dims_list.iter().find(|d| d.parent.as_deref() == Some(id.as_str())).map(|d| d.units.clone()).unwrap_or_default();
+                        let u = match units.as_str() { "millimeter" => "mm", "centimeter" => "cm", "meter" => "m", "inch" => "in", "foot" => "ft", x => x };
+                        let fr = egui::Rect::from_min_max(egui::pos2(r.right() - 112.0, cy - 10.0), egui::pos2(r.right() - 64.0, cy + 10.0));
+                        ui.painter().rect_filled(fr, egui::Rounding::same(5.0), COL_STEPPER);
+                        let key = format!("g:{id}");
+                        let shown = gval.map(fmt3).unwrap_or_default();
+                        let buf = self.dims_vals.entry(key.clone()).or_insert_with(|| shown.clone());
+                        let te = ui.put(
+                            fr.shrink2(egui::vec2(4.0, 2.0)),
+                            egui::TextEdit::singleline(buf).frame(false).horizontal_align(egui::Align::Center).font(egui::FontId::proportional(12.5)).text_color(egui::Color32::WHITE).hint_text("—"),
+                        );
+                        ui.painter().text(egui::pos2(fr.right() + 3.0, cy), egui::Align2::LEFT_CENTER, u, egui::FontId::proportional(11.0), COL_MUTED);
+                        let focused = te.has_focus();
+                        if focused {
+                            self.dims_edit_row = Some(key.clone());
+                        }
+                        let editing = focused || self.dims_edit_row.as_deref() == Some(key.as_str());
+                        focus_any |= editing;
+                        let enter = te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        let rclick = editing && right_click_confirm(ui);
+                        if (enter || rclick) && !busy {
+                            self.dims_edit_row = None;
+                            ui.memory_mut(|m| m.surrender_focus(te.id));
+                            match buf.trim().parse::<f64>() {
+                                Ok(t) if t > 0.0 => acts.push(Act::GroupValue(id.clone(), t)),
+                                _ => *buf = shown.clone(),
+                            }
+                        } else if !focused && editing && ui.input(|i| i.pointer.primary_pressed() || i.key_pressed(egui::Key::Escape)) {
+                            self.dims_edit_row = None;
+                            *buf = shown.clone();
+                        } else if !editing {
+                            *buf = shown.clone();
+                        }
+                        te.on_hover_text(tr("组的驱动值: 改它 = 组里跟随(●)的尺寸全部改成这个值(任何一条失败整次撤回)", "Group driving value: setting it changes every following (●) dimension in the group (all rolled back if one fails)"));
+                    }
                     if resp.clicked() {
                         acts.push(if *virt { Act::SolidToggle(id.clone()) } else { Act::GroupCollapse(id.clone(), !collapsed) });
                     }
@@ -4429,6 +4555,22 @@ impl PlaApp {
                 acts.push(Act::Fav(rec.name.clone(), !rec.fav));
             }
             x += 20.0;
+            // P4 在用户组里: 跟随(●)/ 独立(○)组的驱动值
+            if rec.parent.as_ref().is_some_and(|p| self.dims_groups.iter().any(|g| &g.id == p && g.kind == "group")) {
+                let tr_ = egui::Rect::from_min_size(egui::pos2(x, cy - 8.0), egui::vec2(16.0, 16.0));
+                let t = ui.interact(tr_, ui.id().with(("dims-follow", &rec.name)), egui::Sense::click());
+                let col = if t.hovered() { egui::Color32::WHITE } else if rec.follow { COL_ACCENT } else { COL_MUTED };
+                if rec.follow {
+                    ui.painter().circle_filled(tr_.center(), 4.5, col);
+                } else {
+                    ui.painter().circle_stroke(tr_.center(), 4.5, egui::Stroke::new(1.3_f32, col));
+                }
+                let tip = if rec.follow { tr("跟随组的驱动值(点一下改为独立)", "Follows the group value (click: independent)") } else { tr("独立, 不随组值改(点一下改为跟随)", "Independent of the group value (click: follow)") };
+                if t.on_hover_text(tip).clicked() {
+                    acts.push(Act::Follow(rec.name.clone(), !rec.follow));
+                }
+                x += 16.0;
+            }
             // 右侧从右往左: × ↻ ✎ 数值框
             let btn = |ui: &mut egui::Ui, cx: f32, glyph: &str, tip: &str, key: &str| -> bool {
                 let br = egui::Rect::from_center_size(egui::pos2(cx, cy), egui::vec2(18.0, 18.0));
@@ -4658,6 +4800,16 @@ impl PlaApp {
                     self.dims_reload();
                 }
                 Act::GroupDelete(id) => self.grp_del_confirm = Some(id),
+                Act::GroupValue(id, t) => {
+                    self.dims_vals.remove(&format!("g:{id}"));
+                    self.link_start(&id, t);
+                }
+                Act::Follow(name, f) => {
+                    if let Err(e) = pla_ui::dims::set_follow(&self.doc_key, &name, f) {
+                        self.set_notice((true, t!("设置失败: {e}", "Setting failed: {e}")));
+                    }
+                    self.dims_reload();
+                }
                 Act::SolidToggle(s) => {
                     if !self.rec_solid_closed.remove(&s) {
                         self.rec_solid_closed.insert(s);
@@ -5171,6 +5323,7 @@ impl PlaApp {
         self.grp_del_confirm = None;
         self.hole_pending = None;
         self.attach_prompt = None;
+        self.link_run = None;
     }
 
     fn update_snap(&mut self, ctx: &egui::Context) {
@@ -5687,6 +5840,14 @@ fn header_extra_and_show(
         },
     );
     *open = flag;
+}
+
+/// P4: 一次组联动(组名、目标值、待改的尺寸名队列、总条数)。
+struct LinkRun {
+    group: String,
+    target: f64,
+    queue: std::collections::VecDeque<String>,
+    total: usize,
 }
 
 /// N3d: 等垫片回包的尺寸记录操作。

@@ -56,6 +56,9 @@ pub struct DimRecord {
     /// P2: "manual" = 用户记录 / 挂入; "auto" = 特征工具生成(删特征时一起删)。
     #[serde(default = "origin_manual")]
     pub origin: String,
+    /// P4: 在组里时是否跟随组的驱动值(移入组默认跟随, 移出即独立)。
+    #[serde(default)]
+    pub follow: bool,
 }
 
 fn origin_manual() -> String {
@@ -82,6 +85,9 @@ pub struct Group {
     /// P3: 特征参数(孔: type / d / depth / cbD / cbDepth / cskD / std / usage …), 悬停详情与以后"按规格重做"用。
     #[serde(default)]
     pub spec: Option<Value>,
+    /// P4: 组的驱动值(文档单位); 改它 = 组里跟随的尺寸全部改成这个值。None = 还没设。
+    #[serde(default)]
+    pub value: Option<f64>,
 }
 
 fn kind_group() -> String {
@@ -180,7 +186,7 @@ pub fn add_group(doc_key: &str) -> Result<String, String> {
     let mut f = load_file(doc_key);
     let max = f.groups.iter().filter_map(|g| g.name.strip_prefix(GROUP_PREFIX).and_then(|n| n.parse::<u32>().ok())).max().unwrap_or(0);
     let id = f.new_id('g');
-    f.groups.push(Group { id: id.clone(), name: format!("{GROUP_PREFIX}{:03}", max + 1), parent: None, fav: false, collapsed: false, created: now_secs(), kind: kind_group(), spec: None });
+    f.groups.push(Group { id: id.clone(), name: format!("{GROUP_PREFIX}{:03}", max + 1), parent: None, fav: false, collapsed: false, created: now_secs(), kind: kind_group(), spec: None, value: None });
     save_file(doc_key, &f)?;
     Ok(id)
 }
@@ -201,7 +207,7 @@ pub fn add_feature(doc_key: &str, kind: &str, spec: Value, children: Vec<(String
     let max = f.groups.iter().filter(|g| g.kind == kind).filter_map(|g| g.name.strip_prefix(pre).and_then(|n| n.parse::<u32>().ok())).max().unwrap_or(0);
     let name = format!("{pre}{:03}", max + 1);
     let id = f.new_id('g');
-    f.groups.push(Group { id: id.clone(), name: name.clone(), parent: None, fav: false, collapsed: false, created: now_secs(), kind: kind.into(), spec: Some(spec) });
+    f.groups.push(Group { id: id.clone(), name: name.clone(), parent: None, fav: false, collapsed: false, created: now_secs(), kind: kind.into(), spec: Some(spec), value: None });
     for (suffix, mut rec) in children {
         let mut nm = format!("{name}.{suffix}");
         let mut k = 2;
@@ -285,15 +291,32 @@ pub fn set_parent(doc_key: &str, names: &[String], parent: Option<&str>) -> Resu
             return Err(format!("no group {p}"));
         }
     }
+    // 移入用户组 = 默认跟随组的驱动值(P4); 移入特征 / 移出 = 独立
+    let into_group = parent.is_some_and(|p| f.groups.iter().any(|g| g.id == p && g.kind == "group"));
     let mut n = 0;
     for d in &mut f.dims {
         if names.contains(&d.name) {
             d.parent = parent.map(String::from);
+            d.follow = into_group;
             n += 1;
         }
     }
     save_file(doc_key, &f)?;
     Ok(n)
+}
+
+/// P4: 设组的驱动值。
+pub fn set_group_value(doc_key: &str, id: &str, value: Option<f64>) -> Result<(), String> {
+    let mut f = load_file(doc_key);
+    f.groups.iter_mut().find(|g| g.id == id).ok_or(format!("no group {id}"))?.value = value;
+    save_file(doc_key, &f)
+}
+
+/// P4: 尺寸是否跟随所在组的驱动值。
+pub fn set_follow(doc_key: &str, name: &str, follow: bool) -> Result<(), String> {
+    let mut f = load_file(doc_key);
+    f.dims.iter_mut().find(|d| d.name == name).ok_or(format!("no dimension named {name}"))?.follow = follow;
+    save_file(doc_key, &f)
 }
 
 /// 记录的缩略图(记录 / 更新时截的视口, 悬停详情里显示): `<目录>/<名字>.png`。
@@ -427,6 +450,7 @@ mod tests {
             id: String::new(),
             parent: None,
             origin: "manual".into(),
+            follow: false,
         }
     }
 
@@ -461,6 +485,12 @@ mod tests {
         save(&doc, &l).unwrap();
         assert_eq!(load_groups(&doc).len(), 1, "存尺寸不丢组");
         assert!(load(&doc).iter().all(|d| d.parent.as_deref() == Some(g.as_str())));
+        // P4: 移入用户组默认跟随; 组驱动值; 单条改独立
+        assert!(load(&doc).iter().all(|d| d.follow), "移入组 = 跟随");
+        set_group_value(&doc, &g, Some(2.5)).unwrap();
+        assert_eq!(load_groups(&doc)[0].value, Some(2.5));
+        set_follow(&doc, "D002", false).unwrap();
+        assert!(!load(&doc).iter().find(|d| d.name == "D002").unwrap().follow);
         delete_group(&doc, &g).unwrap();
         assert!(load_groups(&doc).is_empty());
         assert!(load(&doc).iter().all(|d| d.parent.is_none()), "删组: 子项回顶层");
