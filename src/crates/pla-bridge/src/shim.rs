@@ -120,6 +120,8 @@ pub mod api {
     /// C0: 配置 = 可见性 + 材质指派(抓取 / 恢复; 抓取时附可见实体清单供 BOM)。
     pub const CFG_SAVE: &str = "cfg.save";
     pub const CFG_RESTORE: &str = "cfg.restore";
+    /// B1/B2: BOM 扫描(按配置 members 或当前可见; 相同件按几何指纹归并, 镜像件单列, 组路径)。
+    pub const BOM_SCAN: &str = "bom.scan";
 
     /// 全部接口名（契约测试用）。
     pub const ALL: &[&str] = &[
@@ -127,7 +129,7 @@ pub mod api {
         CMD_PING, ERR_LAST, TREE_LIST, SEL_CANCEL_COMMAND, SEL_CLEAR, SEL_APPLY, CAM_NAVIGATE, CAM_RENDER, CAM_THUMBNAIL, CAM_VP_RECT,
         CAM_SET_ORBIT_STEP, CAM_ROLL, KEYMAP_SET_BINDINGS, VP_SAVE, VP_RESTORE, MAT_SAVE, MAT_RESTORE, CMD_EXEC, CMD_FACTORIES,
         GEO_QUERY, HIST_BEGIN, HIST_ROLLBACK, HIST_COMMIT, GEO_SNAPS, GEO_MEASURE, CAM_VIEW, DIM_FACE, VIEW_HIGHLIGHT, DIM_DISTANCE, DIM_SIGNATURE, GEO_RESOLVE,
-        DIM_RECORD, DIM_MEASURE, DIM_FACES, UI_RCLICK, HOLE_MAKE, CFG_SAVE, CFG_RESTORE,
+        DIM_RECORD, DIM_MEASURE, DIM_FACES, UI_RCLICK, HOLE_MAKE, CFG_SAVE, CFG_RESTORE, BOM_SCAN,
     ];
 }
 
@@ -164,13 +166,15 @@ pub mod cap {
     pub const MEASURE_WRITE: &str = "measure.write";
     /// C0: 配置(可见性 + 材质指派)。
     pub const CFG_STATE: &str = "cfg.state";
+    /// B1/B2: BOM(实体指纹 + 组路径 + 材质)。
+    pub const BOM_READ: &str = "bom.read";
     pub const BOOL_RUN: &str = "bool.run";
     pub const ASSET_PLACE: &str = "asset.place";
 
     /// 全部能力名（契约测试用）。
     pub const ALL: &[&str] = &[
         EDITOR, SEL_READ, SEL_WRITE, HIST_READ, CAM_READ, CAM_WRITE, CAM_NAV, CAM_STEP, CAM_ROLL, SEL_APPLY,
-        VP_STATE, KEYMAP, CMD_DISPATCH, ERR_HOOK, TREE, MAT_STATE, MAT_SET, CMD_EXEC, GEO_READ, HIST_WRITE, SNAP_READ, VIEW_HIGHLIGHT, MEASURE_WRITE, CFG_STATE, BOOL_RUN, ASSET_PLACE,
+        VP_STATE, KEYMAP, CMD_DISPATCH, ERR_HOOK, TREE, MAT_STATE, MAT_SET, CMD_EXEC, GEO_READ, HIST_WRITE, SNAP_READ, VIEW_HIGHLIGHT, MEASURE_WRITE, CFG_STATE, BOM_READ, BOOL_RUN, ASSET_PLACE,
     ];
 }
 

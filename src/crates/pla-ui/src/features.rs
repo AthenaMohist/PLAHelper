@@ -50,6 +50,7 @@ pub fn cap_label(c: &str) -> &'static str {
         cap::VP_STATE => tr("视口显示状态(视角/着色/隐藏/网格…)", "Viewport display state (view/shading/hidden/grid…)"),
         cap::MAT_STATE => tr("材质与颜色状态(定义 + 指派)", "Material & colour state (definitions + assignments)"),
         cap::CFG_STATE => tr("配置(可见性 + 材质指派)", "Configurations (visibility + material assignments)"),
+        cap::BOM_READ => tr("BOM(零件指纹 + 组 + 材质)", "BOM (part fingerprints + groups + materials)"),
         cap::KEYMAP => tr("改按键绑定(运行时)", "Change keybindings (runtime)"),
         cap::CMD_DISPATCH => tr("注册 / 派发命令", "Register / dispatch commands"),
         cap::ERR_HOOK => tr("捕获命令报错", "Capture command errors"),
@@ -89,6 +90,7 @@ pub enum Feature {
     DimFace,
     CfgSave,
     CfgApply,
+    Bom,
 }
 
 impl Feature {
@@ -109,6 +111,7 @@ impl Feature {
         Feature::DimFace,
         Feature::CfgSave,
         Feature::CfgApply,
+        Feature::Bom,
     ];
 
     pub fn label(self) -> &'static str {
@@ -129,6 +132,7 @@ impl Feature {
             Feature::DimFace => tr("参数化(改尺寸 / 记录)", "Parametric (resize / records)"),
             Feature::CfgSave => tr("保存配置", "Save configuration"),
             Feature::CfgApply => tr("应用配置", "Apply configuration"),
+            Feature::Bom => tr("BOM(物料清单)", "BOM (bill of materials)"),
         }
     }
 
@@ -137,7 +141,7 @@ impl Feature {
             Feature::SelMirror | Feature::SelSave | Feature::SelApply => Group::Selection,
             Feature::VpSave | Feature::VpApply | Feature::MatSave | Feature::MatApply | Feature::OrbitStepLive | Feature::Roll => Group::View,
             Feature::ArrowKeysLive => Group::Input,
-            Feature::AutoSnapSteps | Feature::ErrorDisplay | Feature::EntityTree | Feature::DimFace | Feature::CfgSave | Feature::CfgApply => Group::Document,
+            Feature::AutoSnapSteps | Feature::ErrorDisplay | Feature::EntityTree | Feature::DimFace | Feature::CfgSave | Feature::CfgApply | Feature::Bom => Group::Document,
         }
     }
 
@@ -161,6 +165,7 @@ impl Feature {
             Feature::DimFace => &[cap::GEO_READ, cap::CMD_EXEC, cap::HIST_WRITE],
             // C0: 配置 = 可见性 + 材质指派
             Feature::CfgSave | Feature::CfgApply => &[cap::CFG_STATE],
+            Feature::Bom => &[cap::BOM_READ],
         }
     }
 }

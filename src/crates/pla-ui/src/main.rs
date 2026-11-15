@@ -94,12 +94,13 @@ const ROUNDING: f32 = 10.0;
 /// 工具栏按钮列(横向排列, 顺序即产品顺序)。
 /// R7-5: 手动快照移入快照墙头部(图标钮); R7-11: 刷新实体移入选择集窗口头部 —
 /// 一级工具栏只留面板开关类按钮。R8-1: 加视口状态。
-const TOOLBAR_ACTIONS: [Action; 8] = [
+const TOOLBAR_ACTIONS: [Action; 9] = [
     Action::ToggleSnapshots,
     Action::ToggleEntities,
     Action::ToggleVpState,
     Action::ToggleMatState,
     Action::ToggleConfig,
+    Action::ToggleBom,
     Action::ToggleDim,
     Action::ToggleNotes,
     Action::ToggleSettings,
@@ -175,6 +176,16 @@ struct PlaApp {
     show_snapshots: bool,
     show_entities: bool,
     show_dim: bool,
+    /// B1/B2 BOM 浮窗: 位置记忆; 范围(None = 当前可见, Some(配置名)); 最近结果及其范围; 扫描中; 等回包的范围;
+    /// "每个配置各出一份"的待扫队列与已导出的文件。
+    show_bom: bool,
+    bom_win: FloatWin,
+    bom_scope: Option<String>,
+    bom_result: Option<Result<serde_json::Value, String>>,
+    bom_result_scope: Option<String>,
+    bom_busy: bool,
+    bom_pending_scope: Option<Option<String>>,
+    bom_batch: Option<(std::collections::VecDeque<String>, Vec<String>)>,
     show_settings: bool,
     /// F2: CDP 能力面板(点工具栏状态点开关)。
     show_caps: bool,
@@ -2423,6 +2434,14 @@ impl PlaApp {
             show_snapshots: false,
             show_entities: false,
             show_dim: false,
+            show_bom: false,
+            bom_win: FloatWin::load(BOM_RECT_KEY),
+            bom_scope: None,
+            bom_result: None,
+            bom_result_scope: None,
+            bom_busy: false,
+            bom_pending_scope: None,
+            bom_batch: None,
             show_settings: false,
             show_caps: false,
             show_notes: false,
@@ -2837,6 +2856,33 @@ impl PlaApp {
                                 }
                             }
                         }
+                    }
+                }
+                // B1/B2 BOM 扫描回包: 批量模式 → 导出这一份再扫下一个配置; 否则显示
+                pla_bridge::cdp::CdpEvent::CallResult { name, result } if name == pla_bridge::shim::api::BOM_SCAN => {
+                    self.bom_busy = false;
+                    let scope = self.bom_pending_scope.take().flatten();
+                    if let Some((mut queue, mut done)) = self.bom_batch.take() {
+                        let label = Self::bom_scope_label(&scope);
+                        match &result {
+                            Ok(v) => match pla_ui::bom::export(&self.doc_key, &label, v) {
+                                Ok(_) => done.push(label),
+                                Err(e) => self.set_notice((true, t!("{label} 导出失败: {e}", "{label} export failed: {e}"))),
+                            },
+                            Err(e) => self.set_notice((true, t!("{label} 扫描失败: {e}", "{label} scan failed: {e}"))),
+                        }
+                        self.bom_result = Some(result);
+                        self.bom_result_scope = scope;
+                        match queue.pop_front() {
+                            Some(next) => {
+                                self.bom_batch = Some((queue, done));
+                                self.bom_scan(Some(next));
+                            }
+                            None => self.set_notice((false, t!("已导出 {} 份 BOM(打开文件夹查看)", "{} BOM file(s) exported (open the folder)", done.len()))),
+                        }
+                    } else {
+                        self.bom_result = Some(result);
+                        self.bom_result_scope = scope;
                     }
                 }
                 // C0 配置采集回包 → 截图 → 落盘(同材质状态的串行流程)
@@ -3335,6 +3381,16 @@ impl PlaApp {
                     self.dim_set_highlight(String::new(), Vec::new());
                 }
             }
+            Action::ToggleBom => {
+                // B1/B2: 独立浮窗(同参数化), 打开时按当前范围扫描一次
+                self.show_bom = !self.show_bom;
+                if self.show_bom {
+                    let scope = self.bom_scope.clone();
+                    self.bom_scan(scope);
+                } else {
+                    self.bom_win.closed();
+                }
+            }
             Action::ToggleNotes => {
                 // R30: 不调用 close_secondary_panels_except — 笔记与其他面板并存。
                 self.show_notes = !self.show_notes;
@@ -3792,6 +3848,153 @@ impl PlaApp {
         let Some(run) = self.link_run.take() else { return };
         self.cdp.send(pla_bridge::cdp::CdpCmd::Call { name: pla_bridge::shim::api::HIST_ROLLBACK, args: serde_json::Value::Null });
         self.set_notice((true, t!("组 {} 联动失败, 已撤回本次全部修改: {why}", "Group {} linking failed; all changes of this run rolled back: {why}", run.group)));
+    }
+
+    /// B1/B2: 按范围扫一次 BOM(None = 当前可见; Some(配置名) = 该配置抓取时的可见实体, 不用切换显示)。
+    fn bom_scan(&mut self, scope: Option<String>) {
+        let args = match &scope {
+            None => serde_json::json!({}),
+            Some(cf) => match pla_ui::configs::STORE.load(&self.doc_key, cf) {
+                Some(st) => serde_json::json!({ "members": pla_ui::configs::members(&st).into_iter().map(|m| m.0).collect::<Vec<_>>() }),
+                None => {
+                    self.set_notice((true, t!("配置 {cf} 的数据缺失", "Configuration {cf} has no data")));
+                    return;
+                }
+            },
+        };
+        self.cdp.send(pla_bridge::cdp::CdpCmd::Call { name: pla_bridge::shim::api::BOM_SCAN, args });
+        self.bom_busy = true;
+        self.bom_pending_scope = Some(scope);
+    }
+
+    fn bom_scope_label(scope: &Option<String>) -> String {
+        match scope {
+            None => tr("当前可见", "Currently visible").to_string(),
+            Some(s) => t!("配置 {s}", "Configuration {s}"),
+        }
+    }
+
+    /// B1/B2 BOM 浮窗: 范围(当前可见 / 某个配置)→ 相同零件合并计数的清单; 导出 CSV; 每个配置各出一份。
+    fn show_bom_window(&mut self, ctx: &egui::Context) {
+        let default = Self::default_float_rect(ctx, 460.0, 420.0);
+        let mut win = std::mem::take(&mut self.bom_win);
+        let configs: Vec<String> = pla_ui::configs::STORE.list(&self.doc_key).into_iter().map(|m| m.name).collect();
+        let open = floating_window(
+            ctx,
+            FloatSpec {
+                id: "panel-bom",
+                prefs_key: BOM_RECT_KEY,
+                title: tr("BOM", "BOM"),
+                subtitle: String::new(),
+                close_tip: tr("关闭", "Close"),
+                default_rect: default,
+                min_size: egui::vec2(NotesDrag::MIN_W, NotesDrag::MIN_H),
+                resizable: true,
+                fit_height: true,
+            },
+            &mut win,
+            |ui| {
+                if let Some(why) = self.feature_block(Feature::Bom) {
+                    ui.label(egui::RichText::new(why).small().color(COL_RED));
+                }
+                // ---- 范围 + 操作 ----
+                let mut rescan: Option<Option<String>> = None;
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(tr("范围", "Scope")).color(COL_MUTED));
+                    egui::ComboBox::from_id_salt("bom-scope").width(160.0).selected_text(Self::bom_scope_label(&self.bom_scope)).show_ui(ui, |ui| {
+                        if ui.selectable_label(self.bom_scope.is_none(), Self::bom_scope_label(&None)).clicked() {
+                            rescan = Some(None);
+                        }
+                        for c in &configs {
+                            let s = Some(c.clone());
+                            if ui.selectable_label(self.bom_scope == s, Self::bom_scope_label(&s)).clicked() {
+                                rescan = Some(s);
+                            }
+                        }
+                    });
+                    if ui.add_enabled(!self.bom_busy, egui::Button::new(tr("重新扫描", "Rescan"))).clicked() {
+                        rescan = Some(self.bom_scope.clone());
+                    }
+                });
+                ui.horizontal(|ui| {
+                    let have = matches!(self.bom_result, Some(Ok(_)));
+                    if ui.add_enabled(have && !self.bom_busy, egui::Button::new(tr("导出 CSV", "Export CSV"))).clicked() {
+                        if let Some(Ok(v)) = &self.bom_result {
+                            let label = Self::bom_scope_label(&self.bom_result_scope);
+                            match pla_ui::bom::export(&self.doc_key, &label, v) {
+                                Ok(p) => self.set_notice((false, t!("已导出 {}", "Exported {}", p.display()))),
+                                Err(e) => self.set_notice((true, t!("导出失败: {e}", "Export failed: {e}"))),
+                            }
+                        }
+                    }
+                    let tip = tr("对每个已存的配置各扫一次并各导出一份 CSV(不切换显示)", "Scan every saved configuration and export one CSV each (no display switching)");
+                    if ui.add_enabled(!configs.is_empty() && !self.bom_busy, egui::Button::new(tr("每个配置各出一份", "One per configuration"))).on_hover_text(tip).clicked() {
+                        let mut q: std::collections::VecDeque<String> = configs.iter().cloned().collect();
+                        if let Some(first) = q.pop_front() {
+                            self.bom_batch = Some((q, Vec::new()));
+                            self.bom_scan(Some(first));
+                        }
+                    }
+                    if ui.button(tr("打开文件夹", "Open folder")).clicked() {
+                        if let Err(e) = pla_ui::bom::STORE.open_dir(&self.doc_key) {
+                            self.set_notice((true, e));
+                        }
+                    }
+                });
+                if let Some(s) = rescan {
+                    self.bom_scope = s.clone();
+                    self.bom_scan(s);
+                }
+                ui.add_space(4.0);
+                // ---- 结果 ----
+                match &self.bom_result {
+                    _ if self.bom_busy => {
+                        ui.label(egui::RichText::new(tr("扫描中…(大文档需要几秒)", "Scanning… (a few seconds for large documents)")).color(COL_MUTED));
+                    }
+                    None => {
+                        ui.label(egui::RichText::new(tr("还没有结果", "No result yet")).color(COL_MUTED));
+                    }
+                    Some(Err(e)) => {
+                        ui.label(egui::RichText::new(t!("扫描失败: {e}", "Scan failed: {e}")).color(COL_RED));
+                    }
+                    Some(Ok(v)) => {
+                        let v = v.clone();
+                        let (kinds, total) = pla_ui::bom::totals(&v);
+                        ui.label(egui::RichText::new(t!("{}: {kinds} 种零件 / 共 {total} 件", "{}: {kinds} distinct parts / {total} in total", Self::bom_scope_label(&self.bom_result_scope))).strong());
+                        if let Some(sk) = v["skipped"].as_array().filter(|a| !a.is_empty()) {
+                            let names: Vec<&str> = sk.iter().filter_map(|x| x["name"].as_str()).collect();
+                            ui.label(egui::RichText::new(t!("{} 个实体没算进来(读不到网格): {}", "{} solid(s) skipped (no mesh): {}", sk.len(), names.join(", "))).size(11.0).color(COL_RED));
+                        }
+                        egui::Grid::new("bom-grid").striped(true).num_columns(5).spacing([10.0, 4.0]).show(ui, |ui| {
+                            for h in [tr("序号", "No."), tr("名称", "Name"), tr("数量", "Qty"), tr("材料", "Material"), tr("组 / 备注", "Group / remarks")] {
+                                ui.label(egui::RichText::new(h).color(COL_MUTED).size(11.5));
+                            }
+                            ui.end_row();
+                            for (i, l) in v["lines"].as_array().into_iter().flatten().enumerate() {
+                                ui.label(format!("{}", i + 1));
+                                let members: Vec<String> = l["members"].as_array().into_iter().flatten().map(|m| {
+                                    let path = m["path"].as_array().map(|p| p.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(" / ")).unwrap_or_default();
+                                    if path.is_empty() { m["name"].as_str().unwrap_or("").to_string() } else { format!("{} · {path}", m["name"].as_str().unwrap_or("")) }
+                                }).collect();
+                                ui.label(l["name"].as_str().unwrap_or("")).on_hover_text(members.join("\n"));
+                                ui.label(egui::RichText::new(format!("{}", l["qty"].as_u64().unwrap_or(0))).strong());
+                                ui.label(l["material"].as_str().unwrap_or("—"));
+                                let rm = pla_ui::bom::remark(l);
+                                let g = l["path"].as_str().unwrap_or("");
+                                let text = match (g.is_empty(), rm.is_empty()) { (true, true) => String::new(), (false, true) => g.to_string(), (true, false) => rm, (false, false) => format!("{g} · {rm}") };
+                                ui.label(egui::RichText::new(text).size(11.0).color(COL_MUTED));
+                                ui.end_row();
+                            }
+                        });
+                    }
+                }
+            },
+        );
+        self.bom_win = win;
+        if !open {
+            self.show_bom = false;
+            self.bom_win.closed();
+        }
     }
 
     /// P2: 从文件重读尺寸记录与组(任何增删改之后)。
@@ -5409,6 +5612,12 @@ impl PlaApp {
         self.cfg_wall.reset();
         self.cfg_pending_state = None;
         self.cfg_update_target = None;
+        self.bom_result = None;
+        self.bom_result_scope = None;
+        self.bom_scope = None;
+        self.bom_busy = false;
+        self.bom_pending_scope = None;
+        self.bom_batch = None;
         // N3 改尺寸 / N3d 尺寸记录
         self.dim_face = None;
         self.dim_info = None;
@@ -5989,6 +6198,7 @@ struct DimApplied {
 /// 独立浮窗外框在 ui-prefs.json 里的键。
 const NOTES_RECT_KEY: &str = "notes_rect";
 const DIM_RECT_KEY: &str = "dim_rect";
+const BOM_RECT_KEY: &str = "bom_rect";
 
 /// 独立浮窗(笔记 / 尺寸)的状态: 位置记忆 + 自管拖动/调大小会话。
 #[derive(Default)]
@@ -6449,6 +6659,7 @@ impl eframe::App for PlaApp {
                             Action::ToggleMatState => self.show_matstate,
                             Action::ToggleConfig => self.show_config,
                             Action::ToggleDim => self.show_dim,
+                            Action::ToggleBom => self.show_bom,
                             Action::ToggleSettings => self.show_settings,
                             Action::ToggleNotes => self.show_notes,
                             _ => false,
@@ -7926,6 +8137,9 @@ impl eframe::App for PlaApp {
         }
         if self.show_dim {
             self.show_dim_window(ctx);
+        }
+        if self.show_bom {
+            self.show_bom_window(ctx);
         }
 
         // ---- R15: 设置项悬停三级面板(面板本帧登记, 本帧渲染; 不悬停即关闭) ----

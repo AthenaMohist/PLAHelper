@@ -1366,6 +1366,34 @@ const callAsync = async (name, args) => JSON.parse(await run(`window.__PLA__.cal
     assert.ok(/counterbore diameter must be larger/.test(call('hole.make', { face: top3, d: 5, type: 'counterbore', cbD: 4, cbDepth: 1 }).err));
   });
 
+  await ta('B1/B2 bom.scan: 按 members 取范围; 指纹与位置 / 朝向无关(10×20×5 与 20×10×5 同一种); 尺寸不同分开; 数量 / 体积 / 材质', async () => {
+    const ed = ed3;
+    const mk = async (p1, p2, h) => (await callAsync('cmd.exec', { ops: [{ op: 'box', p1, p2, height: h }] })).v.results[0].items[0].id;
+    const ids = [await mk([2000, 0, 0], [2010, 20, 0], 5), await mk([2100, 50, 0], [2110, 70, 0], 5), await mk([2200, 0, 0], [2220, 10, 0], 5), await mk([2300, 0, 0], [2310, 20, 0], 6), await mk([2400, 0, 0], [2410, 20, 0], 5)];
+    // 假机的实体没有节点 id: 给它们挂上 nodeKey → 稳定 id(仿 nodes.node2id)
+    const sids = ids.map((vid, i) => {
+      const view = ed.geo.items.find((it) => it.view.userData && it.view.userData.versionId === vid).view;
+      view.id = 9000 + i;
+      ed.nodes.read.node2id.set('k' + view.id, 'sid' + i);
+      return 'sid' + i;
+    });
+    ['k9000', 'k9001', 'k9002'].forEach((k) => ed.nodes.read.node2material.set(k, 1));
+    // 范围 = 前 4 个(第 5 个不在配置里)
+    const r = call('bom.scan', { members: sids.slice(0, 4) });
+    assert.ok(r.ok, JSON.stringify(r));
+    const lines = r.v.lines;
+    assert.strictEqual(lines.length, 2, JSON.stringify(lines.map((l) => [l.name, l.qty, l.volume])));
+    const big = lines.find((l) => l.qty === 3), tall = lines.find((l) => l.qty === 1);
+    assert.ok(big && tall, '10×20×5 ×2 + 20×10×5 合成一种, 10×20×6 单独');
+    assert.strictEqual(big.volume, 1000);
+    assert.strictEqual(tall.volume, 1200);
+    assert.deepStrictEqual(big.faces, { Plane: 6 });
+    assert.strictEqual(big.chiral, 0, '盒子没有手性');
+    assert.ok(big.members.every((m) => sids.slice(0, 4).includes(m.id)), '第 5 个不在范围里');
+    assert.strictEqual(big.material, 'Steel', '材质取指派');
+    assert.deepStrictEqual(r.v.skipped, []);
+  });
+
   await ta('N3d dim.signature / geo.resolve: 签名 → 改几何(面 id 全变)→ 按预测签名重新定位到新面; 偏差 / 次优差距如实报', async () => {
     const ed = ed3;
     const r = (await callAsync('cmd.exec', { ops: [{ op: 'box', p1: [900, 0, 0], p2: [910, 20, 0], height: 5 }] })).v;

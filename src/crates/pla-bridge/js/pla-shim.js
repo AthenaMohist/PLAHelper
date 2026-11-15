@@ -107,6 +107,9 @@
     'mat.textures':            ['ed', 'materials.textures'],
     // 材质库本体(根 mats): snapshot() = { version, counter, materials }, 与 memento 的 materials 段同形; 有命令进行中也能读
     'ed.materialsDb':          ['ed', 'materials'],
+    // 组(大纲里的文件夹 = 部件 / 子装配): getParent(nodeKey) → 组对象; 组名 = nodes.getName(item2key(组))
+    'ed.groupsDb':             ['ed', 'groups'],
+    'groups.getParent':        ['groupsDb', 'getParent'],
     'mats.snapshot':           ['mats', 'snapshot'],
     'tex.get':                 ['tex', 'get'],
     'ds.snapshot':             ['ds', 'snapshot'],
@@ -376,6 +379,9 @@
     cylinderFields: { center: 'center', point: 'point', radius: 'radius', baseAxis: [0, 0, 1] },
     // translation 类型参数写到工厂的哪两个字段(Vector3.set + Matrix4.makeTranslation)
     translationFields: { vector: 'move', matrix: 'matrix' },
+    // ---- B1/B2 BOM: 指纹比较的相对容差(网格近似, 旋转后的复制件有 Float32 噪声); 手性阈值(相对 面积 × 尺度³);
+    //      组: 根组 id 与组对象的 id 字段(ed.groups.getParent(nodeKey) → Groups_Group{id…}, 根 = 0) ----
+    bom: { relTol: 2e-3, chiralEps: 1e-3, groupId: 'id', rootGroupId: 0 },
     // ---- 右键确认扩展到 Plasticity 窗口(ui.rightClick): 捕获这些事件, 右键松开计一次; contextmenu 只吃不计 ----
     rightClick: { events: ['pointerdown', 'pointerup', 'mousedown', 'mouseup', 'contextmenu'], button: 2,
                   countOn: 'pointerup', menuEvent: 'contextmenu' },
@@ -416,6 +422,8 @@
     'err.hook':  { needs: ['ed.errorSignal'] },
     'tree':      { needs: [], dom: true },
     'mat.state': { needs: ['ed.originator', 'nodes.state'], optional: ['mat.textures', 'tex.get', 'mats.snapshot'] },
+    // B1/B2 BOM: 实体 + 显示网格 + 稳定 id; 组路径 / 材质缺了只降级
+    'bom.read': { needs: ['geo.items', 'geo.lookupTopo', 'nodes.state', 'nodes.item2key', 'nodes.getName', 'ed.docUnit'], optional: ['ed.groupsDb', 'groups.getParent', 'mats.snapshot', 'ed.originator'] },
     // C0 配置: 可见性 + 材质指派(与 vp.state 的可见性段、mat.state 同一批内部结构)
     'cfg.state': { needs: ['ed.originator', 'nodes.state', 'ed.nodes', 'nodes.item2key', 'nodes.getName', 'geo.items'], optional: ['mat.textures', 'tex.get', 'nodes.isolate', 'nodes.unisolate', 'mats.snapshot'] },
     'mat.set':     { todo: 'N1' },
@@ -482,6 +490,7 @@
       case 'helpers': return get('ed.helpers');
       case 'meas': return get('ed.measurements');
       case 'mats': return get('ed.materialsDb');
+      case 'groupsDb': return get('ed.groupsDb');
     }
     return undefined;
   }
@@ -3213,6 +3222,151 @@
       return { applied: applied.concat(r.applied), missing: missing.concat(r.missing), failed: failed.concat(r.failed) };
     }, function (e) { failed.push('mat:' + errMsg(e)); return { applied: applied, missing: missing, failed: failed }; });
   }, { async: true });
+
+  // ---- B1/B2 BOM(PRD-bom-drawings §2): 范围 = 配置的 members(或当前可见实体); 相同零件 = 几何指纹相同(与位置 / 朝向无关);
+  //      镜像件(手性相反)单列; 组 = 层级路径。指纹全部由显示网格算(同 geo.measure mass)。 ----
+  // 3×3 对称阵特征分解(Jacobi): → { vals, vecs(列向量) }
+  function eig3(A) {
+    var a = [[A[0][0], A[0][1], A[0][2]], [A[1][0], A[1][1], A[1][2]], [A[2][0], A[2][1], A[2][2]]];
+    var v = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
+    for (var sweep = 0; sweep < 50; sweep++) {
+      var off = Math.abs(a[0][1]) + Math.abs(a[0][2]) + Math.abs(a[1][2]);
+      if (off < 1e-30) break;
+      for (var p = 0; p < 2; p++) for (var q = p + 1; q < 3; q++) {
+        if (Math.abs(a[p][q]) < 1e-300) continue;
+        var th = (a[q][q] - a[p][p]) / (2 * a[p][q]);
+        var t = (th >= 0 ? 1 : -1) / (Math.abs(th) + Math.sqrt(th * th + 1));
+        var c = 1 / Math.sqrt(t * t + 1), s = t * c;
+        for (var k = 0; k < 3; k++) { var akp = a[k][p], akq = a[k][q]; a[k][p] = c * akp - s * akq; a[k][q] = s * akp + c * akq; }
+        for (var k2 = 0; k2 < 3; k2++) { var apk = a[p][k2], aqk = a[q][k2]; a[p][k2] = c * apk - s * aqk; a[q][k2] = s * apk + c * aqk; }
+        for (var k3 = 0; k3 < 3; k3++) { var vkp = v[k3][p], vkq = v[k3][q]; v[k3][p] = c * vkp - s * vkq; v[k3][q] = s * vkp + c * vkq; }
+      }
+    }
+    return { vals: [a[0][0], a[1][1], a[2][2]], vecs: [[v[0][0], v[1][0], v[2][0]], [v[0][1], v[1][1], v[2][1]], [v[0][2], v[1][2], v[2][2]]] };
+  }
+
+  // 一个实体的几何指纹(文档单位): 体积、面积、各曲面类型面数、主二阶矩(√(λ/V), 长度量纲, 升序)、手性(+1 / −1 / 0 = 对称或分不清)
+  function partPrint(view, k) {
+    var fg = view[NAMES.shellGroups.face], mesh = fg && fg[NAMES.faceMesh], g = mesh && mesh.geometry;
+    var pos = g && g.attributes && g.attributes.position && g.attributes.position.array, idx = g && g.index && g.index.array;
+    if (!pos || !idx) throw new Error('no display mesh for solid ' + itemIdOf(view));
+    var me = mesh.matrixWorld && mesh.matrixWorld.elements;
+    var P = function (i) { var j = idx[i] * 3; return xfPoint(me, pos[j], pos[j + 1], pos[j + 2]); };
+    var o = P(0);   // 以网格上一点为原点, 减小 Float32 / 大坐标的误差
+    var vol = 0, area = 0, m = [0, 0, 0], C = [[0, 0, 0], [0, 0, 0], [0, 0, 0]], tris = [];
+    for (var i = 0; i + 2 < idx.length; i += 3) {
+      var a = P(i), b = P(i + 1), c = P(i + 2);
+      a = [a[0] - o[0], a[1] - o[1], a[2] - o[2]]; b = [b[0] - o[0], b[1] - o[1], b[2] - o[2]]; c = [c[0] - o[0], c[1] - o[1], c[2] - o[2]];
+      var det = a[0] * (b[1] * c[2] - b[2] * c[1]) - a[1] * (b[0] * c[2] - b[2] * c[0]) + a[2] * (b[0] * c[1] - b[1] * c[0]);
+      vol += det / 6;
+      var sx = a[0] + b[0] + c[0], sy = a[1] + b[1] + c[1], sz = a[2] + b[2] + c[2];
+      m[0] += det / 6 * sx / 4; m[1] += det / 6 * sy / 4; m[2] += det / 6 * sz / 4;
+      var S = [sx, sy, sz], pts = [a, b, c];
+      for (var r = 0; r < 3; r++) for (var q = 0; q < 3; q++) {
+        C[r][q] += det / 120 * (pts[0][r] * pts[0][q] + pts[1][r] * pts[1][q] + pts[2][r] * pts[2][q] + S[r] * S[q]);
+      }
+      var ux = b[0] - a[0], uy = b[1] - a[1], uz = b[2] - a[2], vx = c[0] - a[0], vy = c[1] - a[1], vz = c[2] - a[2];
+      var ta = Math.hypot(uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx) / 2;
+      area += ta;
+      tris.push([sx / 3, sy / 3, sz / 3, ta]);
+    }
+    if (vol < 0) { vol = -vol; m = m.map(function (x) { return -x; }); C = C.map(function (row) { return row.map(function (x) { return -x; }); }); }
+    var cen = vol > 0 ? [m[0] / vol, m[1] / vol, m[2] / vol] : [0, 0, 0];
+    // 平移到质心(平行轴)
+    for (var r2 = 0; r2 < 3; r2++) for (var q2 = 0; q2 < 3; q2++) C[r2][q2] -= vol * cen[r2] * cen[q2];
+    var E = eig3(C);
+    var order = [0, 1, 2].sort(function (x, y) { return E.vals[x] - E.vals[y]; });
+    var e1 = E.vecs[order[0]], e2 = E.vecs[order[1]], e3 = vcross(e1, e2);   // 右手系
+    var moments = order.map(function (j) { return vol > 0 ? Math.sqrt(Math.max(0, E.vals[j]) / vol) / k : 0; });
+    // 手性: 主轴系里表面三阶矩之积的符号(翻任一轴的方向, 为保持右手系另一轴也翻, 积不变; 镜像 → 积变号)
+    var s = [0, 0, 0];
+    tris.forEach(function (t) {
+      var d = [t[0] - cen[0], t[1] - cen[1], t[2] - cen[2]];
+      var p1 = vdot(d, e1), p2 = vdot(d, e2), p3 = vdot(d, e3);
+      s[0] += t[3] * p1 * p1 * p1; s[1] += t[3] * p2 * p2 * p2; s[2] += t[3] * p3 * p3 * p3;
+    });
+    var L = Math.max(moments[2] * k, 1e-12), eps = NAMES.bom.chiralEps * area * L * L * L;
+    var chiral = Math.abs(s[0]) > eps && Math.abs(s[1]) > eps && Math.abs(s[2]) > eps ? (s[0] * s[1] * s[2] > 0 ? 1 : -1) : 0;
+    // 各曲面类型面数
+    var counts = {};
+    groupEntries(view, 'face', 1).forEach(function (e) { var md = modelOf('face', e.id); var t; try { t = md[NAMES.surfaceGetter]()[NAMES.surfaceInnerKey].constructor.name; } catch (x) { t = '?'; } counts[t] = (counts[t] || 0) + 1; });
+    var s5 = function (x) { return Number(Number(x).toPrecision(5)); };
+    return { volume: s5(vol / (k * k * k)), area: s5(area / (k * k)), moments: moments.map(s5), faces: counts, chiral: chiral };
+  }
+
+  // 两个指纹是不是同一种零件(手性另判)
+  function samePrint(a, b) {
+    var T = NAMES.bom.relTol;
+    var close = function (x, y) { return Math.abs(x - y) <= T * Math.max(Math.abs(x), Math.abs(y), 1e-12); };
+    if (!close(a.volume, b.volume) || !close(a.area, b.area)) return false;
+    for (var i = 0; i < 3; i++) if (!close(a.moments[i], b.moments[i]) && Math.abs(a.moments[i] - b.moments[i]) > T * a.moments[2]) return false;
+    var ka = Object.keys(a.faces).sort(), kb = Object.keys(b.faces).sort();
+    return ka.join() === kb.join() && ka.every(function (t) { return a.faces[t] === b.faces[t]; });
+  }
+
+  // 物体所在组的路径(外 → 内; 不含根组)
+  function groupPath(nodeKey) {
+    var out = [], G = get('ed.groupsDb');
+    if (!G) return out;
+    var k = nodeKey;
+    for (var guard = 0; guard < 32; guard++) {
+      var g;
+      try { g = invokeOn('groups.getParent', [k], G); } catch (e) { break; }
+      if (!g || g[NAMES.bom.groupId] === NAMES.bom.rootGroupId) break;
+      var gk = invokeOn('nodes.item2key', [g]);
+      out.unshift(invokeOn('nodes.getName', [gk]));
+      k = gk;
+    }
+    return out;
+  }
+
+  // args = { members?: [稳定 id](配置; 省略 = 当前可见实体), units? }
+  // → { units, lines: [{ name, names, qty, members: [{id, name, path}], path, material, volume, area, faces, chiral, mirrorOf? }], skipped: [{id, name, err}] }
+  def('bom.scan', 'bom.read', function (a) {
+    a = a || {};
+    var U = unitOf(a), k = U.k;
+    var st = need('nodes.state'), id2key = new Map();
+    st[NAMES.node2id].forEach(function (id, key) { id2key.set(id, key); });
+    var want = new Set(Array.isArray(a.members) ? a.members.map(String) : visibleSolids().map(function (x) { return x.id; }));
+    var pool = solidViews().filter(function (v) { return want.has(st[NAMES.node2id].get(invokeOn('nodes.item2key', [v]))); });
+    // 材质: 稳定 id → 材质名
+    var matName = {};
+    try {
+      var mn = materialsNow(), byUuid = {};
+      mn.materials.forEach(function (d) { byUuid[d[NAMES.materialUuid]] = d.name; });
+      mn.assign.forEach(function (p) { matName[p[0]] = byUuid[p[1]] || null; });
+    } catch (e) {}
+    var parts = [], skipped = [];
+    pool.forEach(function (v) {
+      var key = invokeOn('nodes.item2key', [v]), sid = st[NAMES.node2id].get(key), nm = nameOf(v);
+      try { parts.push({ id: sid, name: nm, path: groupPath(key), fp: partPrint(v, k), material: matName[sid] || null }); }
+      catch (e) { skipped.push({ id: sid, name: nm, err: errMsg(e) }); }
+    });
+    // 归并: 指纹相同且手性相同(或有一方分不清) → 同一行; 指纹相同手性相反 → 镜像件单列
+    var lines = [];
+    parts.forEach(function (p) {
+      var hit = lines.filter(function (l) { return samePrint(l.fp, p.fp) && (l.fp.chiral === p.fp.chiral || l.fp.chiral === 0 || p.fp.chiral === 0); })[0];
+      if (hit) { hit.members.push(p); return; }
+      lines.push({ fp: p.fp, members: [p] });
+    });
+    lines.forEach(function (l, i) {
+      var twin = lines.filter(function (o, j) { return j !== i && samePrint(o.fp, l.fp) && o.fp.chiral === -l.fp.chiral && l.fp.chiral !== 0; })[0];
+      if (twin) l.mirrorOf = lines.indexOf(twin);
+    });
+    var common = function (arr) { var c = {}; arr.forEach(function (x) { c[x] = (c[x] || 0) + 1; }); return Object.keys(c).sort(function (x, y) { return c[y] - c[x]; })[0]; };
+    var out = lines.map(function (l) {
+      var names = l.members.map(function (p) { return p.name; });
+      var paths = l.members.map(function (p) { return p.path.join(' / '); });
+      return { name: common(names), names: names.filter(function (x, i) { return names.indexOf(x) === i; }), qty: l.members.length,
+               members: l.members.map(function (p) { return { id: p.id, name: p.name, path: p.path }; }),
+               path: common(paths) || '', material: common(l.members.map(function (p) { return p.material || ''; })) || null,
+               volume: l.fp.volume, area: l.fp.area, faces: l.fp.faces, chiral: l.fp.chiral, mirrorOf: l.mirrorOf };
+    });
+    // mirrorOf 指向排序前的下标 → 换成名字, 再按 组路径 → 名字 排
+    out.forEach(function (l) { if (l.mirrorOf !== undefined) l.mirrorOf = out[l.mirrorOf].name; });
+    out.sort(function (x, y) { return x.path < y.path ? -1 : x.path > y.path ? 1 : (x.name < y.name ? -1 : x.name > y.name ? 1 : 0); });
+    return { units: U.unit, lines: out, skipped: skipped };
+  });
 
   def('err.last', 'err.hook', function () { return state.lastError; });
 

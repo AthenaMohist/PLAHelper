@@ -1,3 +1,4 @@
+pub mod bom;
 pub mod bridge_thread;
 pub mod cdp_mode;
 pub mod configs;
