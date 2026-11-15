@@ -528,9 +528,118 @@ def place_linear(vname, axis, side, name, value):
     placer.take(text_rect(p[0], p[1], fmt(value)))
 
 
-# 外形: 主视 宽(上)、高(左); 厚度标在左视(上)。第一角里主视下面是俯视, 所以宽标在上面
-place_linear("Front", "x", "top", "LenW", Wm)
-place_linear("Front", "y", "left", "LenH", Hm)
+# ---------------------------------------------------------------- 孔位: 坐标式(ordinate)尺寸, 照用户 OYM 图
+# TechDraw 没有坐标尺寸类型 → 自己画: 视图边外一小段引出线(装饰线) + 数值文字; 基准 = 视图左下角, 0 也标。
+# Y 值在主视左边(横排, 右对齐), X 值在主视上边(竖排)。相邻值在页面上挤 → 引出线长短交替错开。
+ORD = std.get("ordinate", {"tick": 5.0, "gap": 1.0, "min_sep": 4.2})
+ord_extra = {"left": 0.0, "top": 0.0}
+
+
+def spread(pos, sep):
+    """一维标签散开: 期望位置 pos(已排序)→ 实际位置, 相邻至少 sep, 整体尽量不偏(迭代推开)。"""
+    out = list(pos)
+    for _ in range(200):
+        moved = False
+        for i in range(1, len(out)):
+            d = out[i] - out[i - 1]
+            if d < sep - 1e-6:
+                push = (sep - d) / 2
+                out[i - 1] -= push
+                out[i] += push
+                moved = True
+        if not moved:
+            break
+    return out
+
+
+def ordinates(vname):
+    """坐标尺寸: 只取孔中心(不取圆角弧心), 基准 = 视图左下角, 末值 = 外形尺寸(所以不再另标总长 / 总宽)。
+    引出线: 视图边外一小段 → 斜折到散开后的文字位置; 线用 3D 装饰线(模型坐标), 不受视图 2D 坐标朝向影响。"""
+    v, r = views[vname], R[vname]
+    bw_, bh_, bd_ = VAX[vname]
+    pts = []
+    for h in holes:
+        if hole_view(h) == vname:
+            at = V(*h["at"])
+            pts.append(((at - bb.Center).dot(bw_), (at - bb.Center).dot(bh_)))
+    if not pts:
+        return False
+    cxp, cyp = (r[0] + r[2]) / 2, (r[1] + r[3]) / 2
+    hw, hh_ = ext(bw_) / 2, ext(bh_) / 2  # 模型单位, 以包围盒中心为原点
+    fs = std["fonts"]["dim"]
+    lw = std["lines"]["thin"]
+    tick, gap, jog = ORD["tick"], ORD["gap"], 4.0  # 页面毫米
+
+    def p3(x, y):
+        """视图横 x / 竖 y(模型单位, 中心原点)→ 3D 点。"""
+        return bb.Center + bw_ * x + bh_ * y
+
+    def uniq(vals):
+        out = []
+        for val in sorted(vals):
+            if not out or abs(val - out[-1]) > 0.01:
+                out.append(val)
+        return out
+
+    def line(xa, ya, xb, yb):
+        v.makeCosmeticLine3D(p3(xa, ya), p3(xb, yb), 1, lw, (0.0, 0.0, 0.0))
+
+    # Y: 左边, 文字横排
+    ys = uniq([-hh_, hh_] + [p[1] for p in pts])
+    got = spread([cyp + y * scale for y in ys], fs + 0.8)
+    wmax = 0.0
+    for y, pg in zip(ys, got):
+        xa = -hw - gap / scale
+        xb = xa - tick / scale
+        line(xa, y, xb, y)
+        line(xb, y, xb - jog / scale, (pg - cyp) / scale)
+        txt = fmt(y + hh_)
+        w = text_rect(0, 0, txt)[2] * 2
+        tx = r[0] - gap - tick - jog - 1.0 - w / 2
+        a = doc.addObject("TechDraw::DrawViewAnnotation", "OrdY")
+        page.addView(a)
+        a.Text = [txt]
+        a.TextSize = fs
+        a.Font = std["fonts"]["latin"]
+        a.X, a.Y = tx, pg
+        placer.take((tx - w / 2, pg - fs * 0.6, tx + w / 2, pg + fs * 0.6))
+        wmax = max(wmax, w)
+    ord_extra["left"] = gap + tick + jog + 1.0 + wmax + 2
+    # X: 上边, 文字竖排
+    xs = uniq([-hw, hw] + [p[0] for p in pts])
+    got = spread([cxp + x * scale for x in xs], fs + 0.8)
+    hmax = 0.0
+    for x, pg in zip(xs, got):
+        ya = hh_ + gap / scale
+        yb = ya + tick / scale
+        line(x, ya, x, yb)
+        line(x, yb, (pg - cxp) / scale, yb + jog / scale)
+        txt = fmt(x + hw)
+        w = text_rect(0, 0, txt)[2] * 2
+        ty = r[3] + gap + tick + jog + 1.0 + w / 2
+        a = doc.addObject("TechDraw::DrawViewAnnotation", "OrdX")
+        page.addView(a)
+        a.Text = [txt]
+        a.TextSize = fs
+        a.Font = std["fonts"]["latin"]
+        a.Rotation = 90
+        a.X, a.Y = pg, ty
+        placer.take((pg - fs * 0.6, ty - w / 2, pg + fs * 0.6, ty + w / 2))
+        hmax = max(hmax, w)
+    ord_extra["top"] = gap + tick + jog + 1.0 + hmax + 2
+    rep["ordinates"] = {"view": vname, "x": [fmt(x + hw) for x in xs], "y": [fmt(y + hh_) for y in ys]}
+    return True
+
+
+
+
+has_ord = bool(spec.get("ordinate", True)) and any(hole_view(h) == "Front" for h in holes) and ordinates("Front")
+
+# 外形: 主视 宽(上)、高(左); 厚度标在左视(上)。第一角里主视下面是俯视, 所以宽标在上面。
+# 有坐标尺寸时末值就是总长 / 总宽, 不再重复标。
+if not has_ord:
+    place_linear("Front", "x", "top", "LenW", Wm)
+    place_linear("Front", "y", "left", "LenH", Hm)
 place_linear("Left", "x", "top", "LenD", Dm)
 
 
