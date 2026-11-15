@@ -7,12 +7,13 @@ use std::path::PathBuf;
 
 use pla_bridge::i18n::Lang;
 
+/// exe 所在目录(偏好、孔规格等用户可改的配置都放这里)。
+pub fn data_dir() -> PathBuf {
+    std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())).unwrap_or_else(|| PathBuf::from("."))
+}
+
 fn prefs_path() -> PathBuf {
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("ui-prefs.json")
+    data_dir().join("ui-prefs.json")
 }
 
 fn load_all() -> serde_json::Value {

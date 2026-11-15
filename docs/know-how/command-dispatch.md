@@ -129,6 +129,10 @@
 - `BooleanFactory`(targets / tools / operationType 默认 15902)也可单独做布尔, 打孔用不上。
 - 配方: `cylinder {center, axis, radius, height, bool, targets}`(参数类型 vecset / axisQuat, 配方标记 radiusPoint)、`chamfer {edges, distance}`(negLength)。
   垫片 `hole.make` 组合这几步, 一次原子执行。
+- 草图曲线 = `Wire` 物体(视图 `vertices` 组: `ids` + `points.geometry.attributes.position`(米); `segments` 组: `positions` / `bboxes`;
+  模型 `WireBody`)。曲线端点的拓扑 id = `<wire 版本 id>v<顶点实体 id>`(如 `51v12645`), `lookupTopologyItemById` → `{view: CurveVertex, model: Vertex}`,
+  `Vertex.GetPoint()` 给坐标; 选择里在 `curveVertexIds`(Set)。闭合曲线(圆)没有端点(vertices.length = 0)。
+- 组合孔: 每步只减一个实体(一个圆柱可以很长, 只要 targets 只有那个实体就只挖它), 引用链 `$sN` 跟踪各实体的最新产物。
 
 ## 加一个新操作
 

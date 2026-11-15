@@ -366,6 +366,9 @@
       chamfer: { fac: 'fac.multiFillet', required: ['edges', 'distance'],
                  params: { edges: ['edges', 'edges'], distance: ['distance', 'negLength'] } }
     },
+    // N4b 打孔位置: 选择里可当孔位的类型(曲线端点 / 整条曲线); Wire 视图上的端点组(ids + Points 几何)与线段组
+    holePointKinds: { vertex: 'curveVertex', curve: 'curve' },
+    wire: { vertices: 'vertices', vertexPositions: 'points.geometry.attributes.position.array', segments: 'segments' },
     // N4 圆柱工厂的实例字段: 圆心 / 半径点(Vector3)、半径 setter; 朝向四元数把 baseAxis 转到圆柱轴
     cylinderFields: { center: 'center', point: 'point', radius: 'radius', baseAxis: [0, 0, 1] },
     // translation 类型参数写到工厂的哪两个字段(Vector3.set + Matrix4.makeTranslation)
@@ -2244,9 +2247,7 @@
   // N4 打孔。在平面上 at 处(默认面中点; 会投影到面所在平面)打孔, 一次原子执行(失败整体撤回):
   // 孔 = 圆柱 subtract(轴 = 入口面法向的反向; 通孔深度 = 实体包围盒对角线 + 1); 柱形沉头 = 再减一个大而浅的圆柱;
   // 锥形沉头(90°) = 孔口边倒角 (cskD − d) / 2(第二步按位置挑边: 孔口圆的包围盒中心就是 at)。
-  // args = { face, at?: [x,y,z], offset?: [u, v](相对 at / 面中点, 沿 planeAxes), type: 'simple'|'counterbore'|'countersink',
-  //          d, depth?(省略 = 通孔), cbD?, cbDepth?, cskD?, units? }
-  // → { solid, at, normal, through, faces: { entry, wall, bottom?, cbWall?, cbFloor?, csk? }(签名, 文档单位), units }
+  // (参数与回包见 hole.make 定义处)
   // 平面内的两条偏移轴: u = 与法向最不平行的世界轴(法向近 Z → X; 近 X → Y; 否则 X)投影到平面, v = n × u。
   // 返回 { u, v, uName, vName }(名字 = 与之最接近的世界轴, 带符号, 界面标签用)
   function planeAxes(n) {
@@ -2258,6 +2259,41 @@
     return { u: u.map(sig7), v: v.map(sig7), uName: nameOf(u), vName: nameOf(v) };
   }
 
+  // N4b 打孔位置: 选择里的草图点 → 文档单位坐标(用户 2026-11-15: 用草图端点定孔位, 选几个点打几个孔)。
+  // curveVertex = 曲线端点(lookupTopologyItemById → Vertex.GetPoint); curve = 整条曲线: 有端点 → 各端点, 闭合(圆等)→ 包围盒中心(= 圆心)。
+  function sketchPoints(refs, k) {
+    var HK = NAMES.holePointKinds, Wn = NAMES.wire, out = [];
+    (refs || []).forEach(function (r) {
+      var kind = String(r && r.kind), id = String(r && r.id);
+      if (kind === HK.vertex) {
+        var t = invokeOn('geo.lookupTopo', [id]);
+        var m = t && t[NAMES.lookupModelKey];
+        if (!m) throw new Error('curve point not found: ' + id);
+        var p = m[NAMES.geoApi.point]();
+        out.push([p.x / k, p.y / k, p.z / k]);
+      } else if (kind === HK.curve) {
+        var v = viewOf('curve', id);
+        if (!v) throw new Error('curve not found: ' + id);
+        var vg = v[Wn.vertices], pos = vg ? walk(vg, Wn.vertexPositions) : MISS;
+        if (vg && vg.length && pos !== MISS && pos) {
+          for (var i = 0; i < vg.length; i++) out.push([pos[i * 3] / k, pos[i * 3 + 1] / k, pos[i * 3 + 2] / k]);
+        } else {
+          var bx = v[Wn.segments] && v[Wn.segments][NAMES.groupBboxes];
+          if (!bx || !bx.length) throw new Error('curve has no geometry: ' + id);
+          var mn = [Infinity, Infinity, Infinity], mx = [-Infinity, -Infinity, -Infinity];
+          for (var j = 0; j + 5 < bx.length; j += 6) for (var q = 0; q < 3; q++) { mn[q] = Math.min(mn[q], bx[j + q]); mx[q] = Math.max(mx[q], bx[j + 3 + q]); }
+          out.push([(mn[0] + mx[0]) / 2 / k, (mn[1] + mx[1]) / 2 / k, (mn[2] + mx[2]) / 2 / k]);
+        }
+      } else throw new Error('hole points must be curve points or curves (got ' + kind + ')');
+    });
+    return out;
+  }
+
+  // args = { face, points?: [{kind: curveVertex|curve, id}](省略 = at / 面中点 + offset), stack?: [实体 id…](组合孔, 按选择顺序),
+  //          type: simple|counterbore|countersink, d(入口实体 / 中间实体的孔径), tapD?(组合孔: 最后一个实体的孔径),
+  //          depth?(省略 = 通孔; 组合孔 = 最后一个实体里的深度), cbD?, cbDepth?, cskD?, at?, offset?, units? }
+  // 组合孔(用户 2026-11-15): 沉头只在入口面所在实体; 入口实体与中间实体 = d 的贯穿孔; 最后一个实体 = tapD(盲孔深度从它的入口算)。
+  // → { holes: [{ at, t0?, faces: { entry, wall, bottom?, cbWall?, cbFloor?, csk?, tapWall?, tapEntry? } }], solids, through, depth, normal, units }
   def('hole.make', 'cmd.exec', function (a) {
     a = a || {};
     var U = unitOf(a), k = U.k;
@@ -2268,49 +2304,98 @@
     var f = faceSigFull(String(a.face || ''), k);
     if (f.surface !== NAMES.planeSurface || !f.normal || !f.center) throw new Error('holes go on a plane face (got ' + (f.surface || '?') + ')');
     var n = f.normal, c = f.center;
-    var at = Array.isArray(a.at) && a.at.length === 3 ? a.at.map(Number) : c.slice();
-    // offset = [沿 u, 沿 v](planeAxes; 界面"距面中心"的两个偏移)
-    if (Array.isArray(a.offset) && a.offset.length === 2) {
-      var ax2 = planeAxes(n), ou = Number(a.offset[0]) || 0, ov = Number(a.offset[1]) || 0;
-      at = [at[0] + ax2.u[0] * ou + ax2.v[0] * ov, at[1] + ax2.u[1] * ou + ax2.v[1] * ov, at[2] + ax2.u[2] * ou + ax2.v[2] * ov];
+    // 位置: 草图点; 没有就 at / 面中点 + offset(沿 planeAxes)
+    var pts = sketchPoints(a.points, k);
+    if (!pts.length) {
+      var at0 = Array.isArray(a.at) && a.at.length === 3 ? a.at.map(Number) : c.slice();
+      if (Array.isArray(a.offset) && a.offset.length === 2) {
+        var ax2 = planeAxes(n), ou = Number(a.offset[0]) || 0, ov = Number(a.offset[1]) || 0;
+        at0 = [at0[0] + ax2.u[0] * ou + ax2.v[0] * ov, at0[1] + ax2.u[1] * ou + ax2.v[1] * ov, at0[2] + ax2.u[2] * ou + ax2.v[2] * ov];
+      }
+      pts = [at0];
     }
-    var off = vdot([at[0] - c[0], at[1] - c[1], at[2] - c[2]], n);
-    at = [at[0] - n[0] * off, at[1] - n[1] * off, at[2] - n[2] * off];
-    var sv = viewOf('solid', /^(\d+)/.exec(String(a.face))[1]);
-    var bb = bboxOf(sv, k);
+    pts = pts.map(function (p) { var o = vdot([p[0] - c[0], p[1] - c[1], p[2] - c[2]], n); return [p[0] - n[0] * o, p[1] - n[1] * o, p[2] - n[2] * o]; });
+    // 实体: 入口(面所在) + 组合孔的其余实体(按顺序, 最后一个 = 螺纹 / 底孔)
+    var A = itemIdOf(viewOf('solid', /^(\d+)/.exec(String(a.face))[1]));
+    var stack = (Array.isArray(a.stack) ? a.stack : []).map(String).filter(function (s) { return s !== String(A); });
+    stack.forEach(function (s) { if (!viewOf('solid', s)) throw new Error('solid not found: ' + s); });
+    var last = stack.length ? stack[stack.length - 1] : null, mids = stack.slice(0, -1);
+    var tapD = last ? num(a.tapD, 'tapD') : null;
+    var boxes = [A].concat(stack).map(function (s) { return bboxOf(viewOf('solid', s), k); });
+    var mn = [Infinity, Infinity, Infinity], mx = [-Infinity, -Infinity, -Infinity];
+    boxes.forEach(function (b) { for (var q = 0; q < 3; q++) { mn[q] = Math.min(mn[q], b[0][q]); mx[q] = Math.max(mx[q], b[1][q]); } });
+    var long = Math.hypot(mx[0] - mn[0], mx[1] - mn[1], mx[2] - mn[2]) + 1;
     var through = a.depth === undefined || a.depth === null;
-    var depth = through ? Math.hypot(bb[1][0] - bb[0][0], bb[1][1] - bb[0][1], bb[1][2] - bb[0][2]) + 1 : num(a.depth, 'depth');
+    var depth = through ? long : num(a.depth, 'depth');
     var axis = n.map(function (x) { return x === 0 ? 0 : -x; });   // 不出 −0
-    var ops = [{ op: 'cylinder', id: 'hole', center: at, axis: axis, radius: d / 2, height: depth, bool: 'subtract', targets: [itemIdOf(sv)] }];
+    var cbD, cbDepth, cskD;
     if (type === 'counterbore') {
-      var cbD = num(a.cbD, 'cbD'), cbDepth = num(a.cbDepth, 'cbDepth');
+      cbD = num(a.cbD, 'cbD'); cbDepth = num(a.cbDepth, 'cbDepth');
       if (cbD <= d) throw new Error('counterbore diameter must be larger than the hole');
-      ops.push({ op: 'cylinder', id: 'cb', center: at, axis: axis, radius: cbD / 2, height: cbDepth, bool: 'subtract', targets: ['$hole'] });
     } else if (type === 'countersink') {
-      var cskD = num(a.cskD, 'cskD');
+      cskD = num(a.cskD, 'cskD');
       if (cskD <= d) throw new Error('countersink diameter must be larger than the hole');
-      ops.push({ op: 'chamfer', edges: [{ near: at, tol: d / 4 }], distance: (cskD - d) / 2 });
     }
+    // 实体在孔轴上的入口深度(相对孔口, 沿 axis): 包围盒 8 角投影的最小值(≥ 0; 叠放的板材是准的)
+    var entryDepth = function (s, p) {
+      var b = bboxOf(viewOf('solid', s), k), t = Infinity;
+      for (var i = 0; i < 8; i++) { var q = [(i & 1 ? b[1] : b[0])[0], (i & 2 ? b[1] : b[0])[1], (i & 4 ? b[1] : b[0])[2]]; t = Math.min(t, vdot([q[0] - p[0], q[1] - p[1], q[2] - p[2]], axis)); }
+      return Math.max(0, t);
+    };
+    // 步骤: 每步只减一个实体; ref = 该实体当前的引用(上一步产物 '$sN')
+    var ops = [], meta = [], ref = {};
+    [A].concat(stack).forEach(function (s) { ref[s] = s; });
+    var step = function (o, s) { o.id = 's' + ops.length; if (o.op === 'cylinder') { o.bool = 'subtract'; o.targets = [ref[s]]; } ops.push(o); meta.push(s); ref[s] = '$' + o.id; };
+    var cyl = function (p, r, h) { return { op: 'cylinder', center: p, axis: axis, radius: r, height: h }; };
+    var holes = pts.map(function (p) {
+      var hole = { at: p };
+      if (!last) step(cyl(p, d / 2, depth), A);
+      else {
+        step(cyl(p, d / 2, long), A);
+        mids.forEach(function (m) { step(cyl(p, d / 2, long), m); });
+        hole.t0 = entryDepth(last, p);
+        step(cyl(p, tapD / 2, through ? long : hole.t0 + depth), last);
+      }
+      if (type === 'counterbore') step(cyl(p, cbD / 2, cbDepth), A);
+      if (type === 'countersink') step({ op: 'chamfer', edges: [{ near: p, tol: d / 4 }], distance: (cskD - d) / 2 }, A);
+      return hole;
+    });
     return API['cmd.exec'].fn({ atomic: true, ops: ops, units: U.unit }).then(function (r) {
       if (r.failed) throw new Error('step ' + r.failed.index + ' (' + r.failed.op + '): ' + r.failed.err + (r.rolledBack !== undefined ? ' — rolled back' : ''));
-      var last = r.results[r.results.length - 1];
-      var sid = last && last.items[0] && last.items[0].id;
-      var nv = sid !== undefined && viewOf('solid', sid);
-      if (!nv) throw new Error('hole made but the result solid was not found');
-      var sigs = groupEntries(nv, 'face', k).map(function (e) { var s = faceSig(e, sid, k); s.solidName = nameOf(nv); return s; });
-      var tol = Math.max(1e-3, d * 1e-3);
-      var distToAxis = function (s) {
-        var w = [at[0] - s.axisOrigin[0], at[1] - s.axisOrigin[1], at[2] - s.axisOrigin[2]], al = vdot(w, s.axis);
-        return Math.hypot(w[0] - al * s.axis[0], w[1] - al * s.axis[1], w[2] - al * s.axis[2]);
+      // 各实体的最终产物
+      var fin = {};
+      meta.forEach(function (s, i) { var it = r.results[i] && r.results[i].items[0]; if (it && it.id !== undefined) fin[s] = it.id; });
+      var sigCache = {};
+      var sigsOf = function (s) {
+        var id = fin[s] !== undefined ? fin[s] : s;
+        if (sigCache[id]) return sigCache[id];
+        var nv = viewOf('solid', id);
+        if (!nv) throw new Error('hole made but the result solid was not found');
+        return (sigCache[id] = groupEntries(nv, 'face', k).map(function (e) { var sg = faceSig(e, id, k); sg.solidName = nameOf(nv); return sg; }));
       };
-      var cylOf = function (r) { return sigs.filter(function (s) { return typeof s.radius === 'number' && s.axis && s.axisOrigin && s.surface !== 'Cone' && Math.abs(s.radius - r) < tol && Math.abs(Math.abs(vdot(s.axis, n)) - 1) < 1e-4 && distToAxis(s) < tol; })[0]; };
-      // 朝外(= +n)的平面, 中心在 at 下方 h 处(孔底 / 沉头台阶)
-      var floorAt = function (h) { return sigs.filter(function (s) { return s.surface === NAMES.planeSurface && s.normal && vdot(s.normal, n) > 0.9999 && Math.abs(vdot([at[0] - s.center[0], at[1] - s.center[1], at[2] - s.center[2]], n) - h) < tol; }).sort(function (p, q) { return Math.hypot(p.center[0] - at[0], p.center[1] - at[1], p.center[2] - at[2]) - Math.hypot(q.center[0] - at[0], q.center[1] - at[1], q.center[2] - at[2]); })[0]; };
-      var faces = { entry: floorAt(0), wall: cylOf(d / 2) };
-      if (!through) faces.bottom = floorAt(depth);
-      if (type === 'counterbore') { faces.cbWall = cylOf(a.cbD / 2); faces.cbFloor = floorAt(a.cbDepth); }
-      if (type === 'countersink') faces.csk = sigs.filter(function (s) { return s.surface === 'Cone' && s.axis && s.axisOrigin && distToAxis(s) < tol; })[0];
-      return { solid: sid, at: at.map(sig7), normal: n, through: through, depth: sig7(depth), faces: faces, units: U.unit };
+      var tol = Math.max(1e-3, d * 1e-3);
+      holes.forEach(function (h) {
+        var at = h.at;
+        var distToAxis = function (s) {
+          var w = [at[0] - s.axisOrigin[0], at[1] - s.axisOrigin[1], at[2] - s.axisOrigin[2]], al = vdot(w, s.axis);
+          return Math.hypot(w[0] - al * s.axis[0], w[1] - al * s.axis[1], w[2] - al * s.axis[2]);
+        };
+        var cylOf = function (s, rr) { return sigsOf(s).filter(function (g) { return typeof g.radius === 'number' && g.axis && g.axisOrigin && g.surface !== 'Cone' && Math.abs(g.radius - rr) < tol && Math.abs(Math.abs(vdot(g.axis, n)) - 1) < 1e-4 && distToAxis(g) < tol; })[0]; };
+        // 朝外(= +n)的平面, 中心在孔口下方 hh 处(入口 / 孔底 / 沉头台阶), 取离孔轴最近的
+        var floorAt = function (s, hh) { return sigsOf(s).filter(function (g) { return g.surface === NAMES.planeSurface && g.normal && vdot(g.normal, n) > 0.9999 && Math.abs(vdot([at[0] - g.center[0], at[1] - g.center[1], at[2] - g.center[2]], n) - hh) < tol; }).sort(function (p, q) { return Math.hypot(p.center[0] - at[0], p.center[1] - at[1], p.center[2] - at[2]) - Math.hypot(q.center[0] - at[0], q.center[1] - at[1], q.center[2] - at[2]); })[0]; };
+        var fc = { entry: floorAt(A, 0), wall: cylOf(A, d / 2) };
+        if (!last && !through) fc.bottom = floorAt(A, depth);
+        if (last) {
+          fc.tapWall = cylOf(last, tapD / 2);
+          if (!through) { fc.tapEntry = floorAt(last, h.t0); fc.bottom = floorAt(last, h.t0 + depth); }
+        }
+        if (type === 'counterbore') { fc.cbWall = cylOf(A, cbD / 2); fc.cbFloor = floorAt(A, cbDepth); }
+        if (type === 'countersink') fc.csk = sigsOf(A).filter(function (g) { return g.surface === 'Cone' && g.axis && g.axisOrigin && distToAxis(g) < tol; })[0];
+        h.faces = fc;
+        h.at = at.map(sig7);
+        if (h.t0 !== undefined) h.t0 = sig7(h.t0);
+      });
+      return { holes: holes, solids: fin, stack: stack, through: through, depth: sig7(depth), normal: n, units: U.unit };
     });
   }, { async: true });
 

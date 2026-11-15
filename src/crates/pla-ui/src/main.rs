@@ -271,16 +271,23 @@ struct PlaApp {
     grp_rename: Option<String>,
     grp_rename_buf: String,
     grp_del_confirm: Option<String>,
-    /// P3「操作」模式: 0 改尺寸 / 1 打孔。打孔表单: 规格(HOLE_STD 下标, None = 自定义)、用途(0 过孔 / 1 螺纹底孔)、
-    /// 类型(HOLE_TYPES 下标)、通孔; 数值输入(d / 深 / 沉头 D / 沉头深 / 锥沉 D)与偏移(u, v); 等回包的孔参数。
+    /// P3「操作」模式: 0 改尺寸 / 1 打孔。打孔表单: 规格(当前方案 hole_sizes 的下标, None = 自定义)、用途(0 过孔 / 1 螺纹底孔)、
+    /// 类型(HOLE_TYPES 下标)、通孔; 数值输入(std_hole_vals 的 6 项); 等回包的孔参数。
     dim_mode: u8,
     hole_std: Option<usize>,
     hole_usage: u8,
     hole_type: u8,
     hole_through: bool,
-    hole_vals: [String; 5],
-    hole_off: [String; 2],
+    hole_vals: [String; 6],
     hole_pending: Option<serde_json::Value>,
+    /// N4b 孔规格方案(hole_presets): 方案名列表、当前方案、其规格、文件修改时间 / 上次检查(热生效)、读错、改名输入。
+    hole_presets: Vec<String>,
+    hole_preset: String,
+    hole_sizes: Vec<pla_ui::hole_presets::HoleSize>,
+    hole_preset_mtime: Option<std::time::SystemTime>,
+    hole_preset_checked: Option<Instant>,
+    hole_preset_err: Option<String>,
+    hole_preset_rename: Option<String>,
     /// P3: 手动记录的尺寸落在某个孔的面上 → 询问"挂到孔下?"(尺寸名, 孔 id, 孔名)。
     attach_prompt: Option<(String, String, String)>,
     /// 上次发出的高亮(面 + 对面 + 候选数), 没变就不重发。
@@ -1124,8 +1131,8 @@ fn dim_help_lines() -> Vec<InfoLine> {
             "Symmetric: when the moving faces lie on both sides of the reference, choose \"Translate all\" or \"Symmetric (about reference)\" — the anchor side moves by Δ, the other side by −Δ.",
         )),
         info_text(tr(
-            "打孔(「操作」→ 打孔): 选一个平面, 选规格(M2–M12, 过孔 / 螺纹底孔)、类型(简单 / 柱形沉头 / 锥形沉头 90°)、通孔或盲孔, 偏移 = 距面中点。打完在「记录」里生成孔 H00n, 下面挂半径 / 深度等子尺寸, 可直接改; 手动记录的尺寸若量的是孔的面, 会问要不要挂到孔下。",
-            "Hole (Operate → Hole): select a plane, pick a size (M2–M12, clearance / tap drill), type (simple / counterbore / 90° countersink), through or blind; offsets are from the face midpoint. The hole appears in Records as H00n with radius / depth dimensions you can edit; a manually saved dimension on a hole face offers to attach to it.",
+            "打孔(「操作」→ 打孔): 选一个平面(孔的入口), 再 Shift 加选草图点(曲线端点 / 圆 = 圆心)定孔位, 一点一孔, 不选点 = 面中点; 再加选别的实体 = 组合孔: 沉头在入口实体, 中间实体是过孔, 最后一个实体是底孔(盲孔深度从它的入口算)。规格来自「规格方案」(JSON, 可切换 / 改名 / 新建 / 编辑, 保存即生效)。打完每个孔在「记录」里生成 H00n, 下面挂半径 / 深度等子尺寸, 可直接改; 手动记录的尺寸若量的是孔的面, 会问要不要挂到孔下。",
+            "Hole (Operate → Hole): select a plane (the entry), Shift-add sketch points (curve ends / circles = centres) for positions, one hole each, none = face midpoint; Shift-add more solids for a stacked hole: counterbore in the entry solid, clearance through the middle ones, tap hole in the last (blind depth from its entry). Sizes come from the size table (JSON: switch / rename / new / edit, applies on save). Each hole appears in Records as H00n with radius / depth dimensions you can edit; a manually saved dimension on a hole face offers to attach to it.",
         )),
         info_key(tr("右键 / Enter", "Right-click / Enter"), tr("应用(一步可撤销, 失败自动撤回)", "Apply (one undo step; rolled back on failure)")),
         info_key("Esc", tr("目标值复原", "Reset the target value")),
@@ -1494,36 +1501,24 @@ fn prefs_save_dim_tab(doc: &str, tab: u8) {
     }
 }
 
-/// N4 公制螺钉孔规格表: (规格, 过孔 d(ISO 273 中等), 螺纹底孔 d, 柱形沉头 D, 柱形沉头深(ISO 4762 头高 + 余量), 锥形沉头 D(90°, ISO 10642))。
-const HOLE_STD: [(&str, f64, f64, f64, f64, f64); 9] = [
-    ("M2", 2.4, 1.6, 4.4, 2.3, 4.4),
-    ("M2.5", 2.9, 2.05, 5.5, 2.8, 5.5),
-    ("M3", 3.4, 2.5, 6.5, 3.3, 6.7),
-    ("M4", 4.5, 3.3, 8.0, 4.4, 9.0),
-    ("M5", 5.5, 4.2, 10.0, 5.4, 11.2),
-    ("M6", 6.6, 5.0, 11.0, 6.5, 13.4),
-    ("M8", 9.0, 6.8, 15.0, 8.6, 17.9),
-    ("M10", 11.0, 8.5, 18.0, 10.8, 22.4),
-    ("M12", 13.5, 10.2, 20.0, 13.0, 26.9),
-];
-
-/// 孔特征一行摘要: "M4 柱形沉头 · 通孔" / "Ø3 简单孔 · 深 5"。
+/// 孔特征一行摘要: "M4 柱形沉头 · 通孔" / "Ø3 简单孔 · 深 5" / 组合孔加 "· 组合 3 件"。
 fn hole_summary(spec: Option<&serde_json::Value>) -> String {
     let Some(s) = spec else { return String::new() };
     let size = s["std"].as_str().map(String::from).unwrap_or_else(|| format!("Ø{}", fmt3(s["d"].as_f64().unwrap_or(0.0))));
     let tap = if s["usage"] == "tap" { tr(" 底孔", " tap") } else { "" };
+    let combo = s["stack"].as_array().filter(|a| !a.is_empty()).map(|a| t!(" · 组合 {} 件", " · stack of {}", a.len() + 1)).unwrap_or_default();
     let depth = match s["depth"].as_f64() {
         Some(d) => t!("深 {}", "depth {}", fmt3(d)),
         None => tr("通孔", "through").to_string(),
     };
-    format!("{size}{tap} {} · {depth}", hole_type_label(s["type"].as_str().unwrap_or("")))
+    format!("{size}{tap} {} · {depth}{combo}", hole_type_label(s["type"].as_str().unwrap_or("")))
 }
 
-/// 规格 + 用途 → 表单数值 [d, 盲孔深(默认 2d), 柱形沉头 D, 柱形沉头深, 锥形沉头 D]。
-fn std_hole_vals(i: usize, usage: u8) -> [String; 5] {
-    let (_, clear, tap, cbd, cbh, cskd) = HOLE_STD[i.min(HOLE_STD.len() - 1)];
-    let d = if usage == 1 { tap } else { clear };
-    [fmt3(d), fmt3(d * 2.0), fmt3(cbd), fmt3(cbh), fmt3(cskd)]
+/// 规格 + 用途 → 表单数值 [d, 盲孔深(默认 2 × 孔径), 柱形沉头 D, 柱形沉头深, 锥形沉头 D, 组合孔底孔径(= 螺纹底孔)]。
+/// 单实体: 用途决定 d(过孔 / 螺纹底孔); 组合孔固定 d = 过孔、底孔 = 螺纹底孔。
+fn std_hole_vals(s: &pla_ui::hole_presets::HoleSize, usage: u8) -> [String; 6] {
+    let d = if usage == 1 { s.tap } else { s.clearance };
+    [fmt3(d), fmt3(d * 2.0), fmt3(s.cb_d), fmt3(s.cb_depth), fmt3(s.csk_d), fmt3(s.tap)]
 }
 
 /// N4 孔类型(与垫片 hole.make 的 type 同名; 下标 = 界面分段)。
@@ -2480,13 +2475,19 @@ impl PlaApp {
             grp_rename_buf: String::new(),
             grp_del_confirm: None,
             dim_mode: 0,
-            hole_std: Some(3),
+            hole_std: None,
             hole_usage: 0,
             hole_type: 0,
             hole_through: true,
-            hole_vals: std_hole_vals(3, 0),
-            hole_off: [String::from("0"), String::from("0")],
+            hole_vals: Default::default(),
             hole_pending: None,
+            hole_presets: Vec::new(),
+            hole_preset: pla_ui::prefs::load_value("hole_preset").and_then(|v| v.as_str().map(String::from)).unwrap_or_default(),
+            hole_sizes: Vec::new(),
+            hole_preset_mtime: None,
+            hole_preset_checked: None,
+            hole_preset_err: None,
+            hole_preset_rename: None,
             attach_prompt: None,
             dim_hl_key: String::new(),
             dims_list: Vec::new(),
@@ -2815,35 +2816,50 @@ impl PlaApp {
                         Err(e) => self.set_notice((true, t!("打孔失败(已撤回): {e}", "Hole failed (rolled back): {e}"))),
                         Ok(v) => {
                             let units = v["units"].as_str().unwrap_or("").to_string();
-                            let f = &v["faces"];
                             let rec = |mode: &str, kind: &str, faces: Vec<serde_json::Value>, value: f64| pla_ui::dims::DimRecord {
                                 name: String::new(), mode: mode.into(), kind: kind.into(), faces, opposite: None, side: 0, sym: 0, cyl: None,
                                 value, units: units.clone(), created: 0, fav: false, id: String::new(), parent: None, origin: "auto".into(),
                             };
                             let num = |k: &str| spec[k].as_f64().unwrap_or(0.0);
-                            let mut kids: Vec<(String, pla_ui::dims::DimRecord)> = Vec::new();
-                            if f["wall"].is_object() {
-                                kids.push((tr("半径", "R").into(), rec("face", "radius", vec![f["wall"].clone()], num("d") / 2.0)));
-                            }
-                            if f["entry"].is_object() && f["bottom"].is_object() {
-                                kids.push((tr("深度", "Depth").into(), rec("distance", "distance", vec![f["entry"].clone(), f["bottom"].clone()], v["depth"].as_f64().unwrap_or(0.0))));
-                            }
-                            if f["cbWall"].is_object() {
-                                kids.push((tr("沉头半径", "BoreR").into(), rec("face", "radius", vec![f["cbWall"].clone()], num("cbD") / 2.0)));
-                            }
-                            if f["entry"].is_object() && f["cbFloor"].is_object() {
-                                kids.push((tr("沉头深度", "BoreDepth").into(), rec("distance", "distance", vec![f["entry"].clone(), f["cbFloor"].clone()], num("cbDepth"))));
-                            }
-                            let mut spec = spec.clone();
-                            spec["at"] = v["at"].clone();
-                            spec["normal"] = v["normal"].clone();
-                            spec["solidName"] = f["wall"]["solidName"].clone();
-                            match pla_ui::dims::add_feature(&self.doc_key, "hole", spec, kids) {
-                                Ok((_, hn)) => {
-                                    self.dims_reload();
-                                    self.set_notice((false, t!("已打孔 {hn}(在「记录」标签, 子尺寸可直接改)", "Hole {hn} made (see Records; its dimensions can be edited)")));
+                            let depth = v["depth"].as_f64().unwrap_or(0.0);
+                            let mut made: Vec<String> = Vec::new();
+                            let mut errs: Vec<String> = Vec::new();
+                            // 每个孔位一个孔特征 H00n
+                            for h in v["holes"].as_array().cloned().unwrap_or_default() {
+                                let f = &h["faces"];
+                                let mut kids: Vec<(String, pla_ui::dims::DimRecord)> = Vec::new();
+                                if f["wall"].is_object() {
+                                    kids.push((tr("半径", "R").into(), rec("face", "radius", vec![f["wall"].clone()], num("d") / 2.0)));
                                 }
-                                Err(e) => self.set_notice((true, t!("孔已打, 但记录失败: {e}", "Hole made, but saving the record failed: {e}"))),
+                                if f["tapWall"].is_object() {
+                                    kids.push((tr("底孔半径", "TapR").into(), rec("face", "radius", vec![f["tapWall"].clone()], num("tapD") / 2.0)));
+                                }
+                                // 深度: 单实体 = 入口 → 孔底; 组合孔 = 最后一件的入口 → 孔底
+                                let top = if f["tapEntry"].is_object() { &f["tapEntry"] } else { &f["entry"] };
+                                if top.is_object() && f["bottom"].is_object() {
+                                    kids.push((tr("深度", "Depth").into(), rec("distance", "distance", vec![top.clone(), f["bottom"].clone()], depth)));
+                                }
+                                if f["cbWall"].is_object() {
+                                    kids.push((tr("沉头半径", "BoreR").into(), rec("face", "radius", vec![f["cbWall"].clone()], num("cbD") / 2.0)));
+                                }
+                                if f["entry"].is_object() && f["cbFloor"].is_object() {
+                                    kids.push((tr("沉头深度", "BoreDepth").into(), rec("distance", "distance", vec![f["entry"].clone(), f["cbFloor"].clone()], num("cbDepth"))));
+                                }
+                                let mut s = spec.clone();
+                                s["at"] = h["at"].clone();
+                                s["normal"] = v["normal"].clone();
+                                s["solidName"] = f["wall"]["solidName"].clone();
+                                match pla_ui::dims::add_feature(&self.doc_key, "hole", s, kids) {
+                                    Ok((_, hn)) => made.push(hn),
+                                    Err(e) => errs.push(e),
+                                }
+                            }
+                            self.dims_reload();
+                            match (made.len(), errs.first()) {
+                                (_, Some(e)) => self.set_notice((true, t!("孔已打, 但记录失败: {e}", "Holes made, but saving records failed: {e}"))),
+                                (0, None) => self.set_notice((true, tr("打孔回包里没有孔(模型可能已改, 请核对)", "The reply listed no holes (check the model)").into())),
+                                (1, None) => self.set_notice((false, t!("已打孔 {}(在「记录」标签, 子尺寸可直接改)", "Hole {} made (see Records; its dimensions can be edited)", made[0]))),
+                                (n, None) => self.set_notice((false, t!("已打 {n} 个孔 {}…{}(在「记录」标签)", "{n} holes made {}…{} (see Records)", made[0], made[n - 1]))),
                             }
                         }
                     }
@@ -3356,8 +3372,10 @@ impl PlaApp {
                     self.live_sel.iter().filter(|it| it.kind == "face").map(|it| it.id.clone()).collect();
                 let only_faces = faces.len() == self.live_sel.len();
                 // 查询键: 单选 = "面"; 多选 = "D:参考|动的…"(第一个选的面 = 参考面 —— 用户 2026-11-15 确认)
+                // 打孔模式: 只要恰好一个面就读它(同时选的草图点 / 实体是孔位与组合孔的其余实体)
+                let hole_mode = self.dim_mode == 1 && self.dim_tab == 0;
                 let cur = match faces.len() {
-                    1 if only_faces => Some(faces[0].clone()),
+                    1 if only_faces || hole_mode => Some(faces[0].clone()),
                     n if n >= 2 && only_faces => Some(format!("D:{}", faces.join("|"))),
                     _ => None,
                 };
@@ -3637,52 +3655,175 @@ impl PlaApp {
         }
     }
 
-    /// P3 打孔表单(「操作」→ 打孔): 选一个平面 → 规格 / 用途 / 类型 / 深度 / 数值 / 偏移 → OK(回车 / 右键)= 垫片 hole.make,
-    /// 一次原子执行(失败整体撤回); 成功后在「记录」里生成孔特征 + 自动子尺寸。
+    /// N4b: 孔规格方案 —— 列表 / 当前方案的规格; 每秒查一次文件修改时间, 改了就重读(热生效; 读错如实报, 保留上一次能用的)。
+    fn hole_presets_tick(&mut self) {
+        let due = self.hole_preset_checked.map_or(true, |t| t.elapsed() >= Duration::from_secs(1));
+        if !due {
+            return;
+        }
+        self.hole_preset_checked = Some(Instant::now());
+        let dir = pla_ui::hole_presets::dir();
+        self.hole_presets = pla_ui::hole_presets::list_in(&dir);
+        if !self.hole_presets.contains(&self.hole_preset) {
+            self.hole_preset = self.hole_presets.first().cloned().unwrap_or_default();
+            self.hole_preset_mtime = None;
+        }
+        let m = pla_ui::hole_presets::mtime_in(&dir, &self.hole_preset);
+        if m.is_some() && m == self.hole_preset_mtime && !self.hole_sizes.is_empty() {
+            return;
+        }
+        self.hole_preset_mtime = m;
+        match pla_ui::hole_presets::load_in(&dir, &self.hole_preset) {
+            Ok(s) => {
+                let keep = self.hole_std.and_then(|i| self.hole_sizes.get(i)).map(|x| x.size.clone());
+                self.hole_sizes = s;
+                self.hole_preset_err = None;
+                // 规格按名字保留(没有就 M4 / 第一个), 数值跟着新方案刷新
+                let want = keep.or_else(|| Some("M4".to_string()));
+                let i = want.and_then(|w| self.hole_sizes.iter().position(|x| x.size == w)).unwrap_or(0);
+                if self.hole_std.is_some() || self.hole_vals[0].is_empty() {
+                    self.hole_std = Some(i);
+                    self.hole_vals = std_hole_vals(&self.hole_sizes[i], self.hole_usage);
+                }
+            }
+            Err(e) => self.hole_preset_err = Some(e),
+        }
+    }
+
+    fn hole_preset_select(&mut self, name: String) {
+        self.hole_preset = name;
+        self.hole_preset_mtime = None;
+        self.hole_preset_checked = None;
+        let _ = pla_ui::prefs::save_value("hole_preset", serde_json::json!(self.hole_preset));
+    }
+
+    /// P3/N4b 打孔表单(「操作」→ 打孔)。选择 = 一个平面(入口)+ 可选的草图点(曲线端点 / 圆; 一点一孔, 没有 = 面中点)
+    /// + 可选的其它实体(组合孔, 按选择顺序, 最后一个 = 底孔)。规格方案 / 规格 / 用途 / 类型 / 深度 / 数值 → OK(回车 / 右键)= 垫片 hole.make,
+    /// 一次原子执行(失败整体撤回); 成功后每个孔在「记录」里生成孔特征 + 自动子尺寸。
     fn hole_ui(&mut self, ui: &mut egui::Ui, info: Option<&serde_json::Value>, faces: &[String]) {
+        self.hole_presets_tick();
         let plane = info.filter(|v| faces.len() == 1 && v["surface"] == "Plane" && v["axes"].is_object()).cloned();
         let u = match plane.as_ref().and_then(|v| v["units"].as_str()).unwrap_or("millimeter") {
             "millimeter" => "mm", "centimeter" => "cm", "meter" => "m", "inch" => "in", "foot" => "ft", x => x,
         }
         .to_string();
+        // 孔位: 选择里的草图点 / 曲线; 组合孔: 选择里的实体(去掉入口面所在实体, 垫片也会再去一次)
+        let points: Vec<serde_json::Value> = self
+            .live_sel
+            .iter()
+            .filter(|it| it.kind == "curveVertex" || it.kind == "curve")
+            .map(|it| serde_json::json!({ "kind": it.kind, "id": it.id }))
+            .collect();
+        let entry_solid = plane.as_ref().and_then(|v| v["solid"].as_i64()).map(|x| x.to_string());
+        let stack: Vec<String> = self.live_sel.iter().filter(|it| it.kind == "solid" && Some(&it.id) != entry_solid.as_ref()).map(|it| it.id.clone()).collect();
+        let combo = !stack.is_empty();
         match &plane {
             None => rz_info_card(
                 ui,
-                tr("选一个平面", "Select a plane face"),
-                tr("孔打在选中的平面上: 位置 = 面中点 + 下面的偏移, 方向 = 垂直于面往里。", "The hole goes into the selected plane: position = face midpoint + the offsets below, direction = into the face."),
+                tr("选一个平面(孔的入口)", "Select a plane face (the hole entry)"),
+                tr(
+                    "再 Shift 加选草图点(曲线端点 / 圆)= 孔位, 一点一孔; 不选点 = 面中点。\n再加选别的实体 = 组合孔(最后一个实体 = 底孔)。",
+                    "Shift-add sketch points (curve ends / circles) = hole positions, one hole each; none = face midpoint.\nShift-add more solids = stacked hole (the last solid gets the tap hole).",
+                ),
             ),
-            Some(_) => rz_info_card(ui, tr("在选中的平面上打孔", "Hole in the selected plane"), tr("位置 = 面中点 + 偏移; 一步可撤销, 失败自动撤回", "Position = face midpoint + offset; one undo step, rolled back on failure")),
+            Some(_) => {
+                let n = points.len();
+                let where_ = if n == 0 { tr("面中点 1 个孔", "1 hole at the face midpoint").to_string() } else { t!("{n} 处草图点位", "{n} sketch point position(s)") };
+                let sub = if combo {
+                    t!("{where_} · 组合孔: 入口实体 + {} 件(最后一件 = 底孔)", "{where_} · stacked: entry solid + {} (last = tap hole)", stack.len())
+                } else {
+                    where_
+                };
+                rz_info_card(ui, tr("在选中的平面上打孔", "Hole in the selected plane"), &sub);
+            }
         }
-        // ---- 规格(公制螺钉) + 用途 ----
+        // ---- 规格方案(JSON 文件; 下拉切换 · 改名 · 新建 · 编辑) ----
+        rz_label(ui, tr("规格方案", "Size table"));
+        ui.horizontal(|ui| {
+            if let Some(buf) = self.hole_preset_rename.as_mut() {
+                let e = ui.add(egui::TextEdit::singleline(buf).desired_width(150.0));
+                e.request_focus();
+                let (en, esc) = ui.input(|i| (i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Escape)));
+                if en || right_click_confirm(ui) {
+                    let new = buf.trim().to_string();
+                    self.hole_preset_rename = None;
+                    match pla_ui::hole_presets::rename_in(&pla_ui::hole_presets::dir(), &self.hole_preset, &new) {
+                        Ok(()) => self.hole_preset_select(new),
+                        Err(e) => self.set_notice((true, t!("方案改名失败: {e}", "Rename failed: {e}"))),
+                    }
+                } else if esc {
+                    self.hole_preset_rename = None;
+                }
+                return;
+            }
+            let mut pick: Option<String> = None;
+            egui::ComboBox::from_id_salt("hole-preset").width(150.0).selected_text(self.hole_preset.clone()).show_ui(ui, |ui| {
+                for p in &self.hole_presets {
+                    if ui.selectable_label(*p == self.hole_preset, p).clicked() {
+                        pick = Some(p.clone());
+                    }
+                }
+            });
+            if let Some(p) = pick {
+                self.hole_preset_select(p);
+            }
+            if ui.small_button(tr("改名", "Rename")).on_hover_text(tr("改方案名(= 改文件名)", "Rename the table (= its file name)")).clicked() {
+                self.hole_preset_rename = Some(self.hole_preset.clone());
+            }
+            if ui.small_button(tr("＋ 新建", "+ New")).on_hover_text(tr("复制当前方案成一个新方案", "Copy the current table into a new one")).clicked() {
+                match pla_ui::hole_presets::create_in(&pla_ui::hole_presets::dir(), &self.hole_preset) {
+                    Ok(n) => self.hole_preset_select(n),
+                    Err(e) => self.set_notice((true, t!("新建方案失败: {e}", "New table failed: {e}"))),
+                }
+            }
+            if ui.small_button(tr("编辑", "Edit")).on_hover_text(tr("用系统默认程序打开 JSON; 保存后自动生效", "Open the JSON in the default app; changes apply on save")).clicked() {
+                let p = pla_ui::hole_presets::path_in(&pla_ui::hole_presets::dir(), &self.hole_preset);
+                if let Err(e) = std::process::Command::new("cmd").args(["/C", "start", "", &p.display().to_string()]).spawn() {
+                    self.set_notice((true, t!("打不开 {}: {e}", "Cannot open {}: {e}", p.display())));
+                }
+            }
+        });
+        if let Some(e) = &self.hole_preset_err {
+            ui.label(egui::RichText::new(t!("方案读取出错(仍用上一次的): {e}", "Table read error (still using the last good one): {e}")).size(11.0).color(COL_RED));
+        }
+        // ---- 规格 + 用途 ----
         rz_label(ui, tr("规格", "Size"));
         ui.horizontal(|ui| {
-            let cur = self.hole_std.map_or(tr("自定义", "Custom").to_string(), |i| HOLE_STD[i].0.to_string());
+            let cur = self.hole_std.and_then(|i| self.hole_sizes.get(i)).map_or(tr("自定义", "Custom").to_string(), |s| s.size.clone());
             let mut pick: Option<Option<usize>> = None;
             egui::ComboBox::from_id_salt("hole-std").width(90.0).selected_text(cur).show_ui(ui, |ui| {
                 if ui.selectable_label(self.hole_std.is_none(), tr("自定义", "Custom")).clicked() {
                     pick = Some(None);
                 }
-                for (i, s) in HOLE_STD.iter().enumerate() {
-                    if ui.selectable_label(self.hole_std == Some(i), s.0).clicked() {
+                for (i, s) in self.hole_sizes.iter().enumerate() {
+                    if ui.selectable_label(self.hole_std == Some(i), &s.size).clicked() {
                         pick = Some(Some(i));
                     }
                 }
             });
             if let Some(p) = pick {
                 self.hole_std = p;
-                if let Some(i) = p {
-                    self.hole_vals = std_hole_vals(i, self.hole_usage);
+                if let Some(s) = p.and_then(|i| self.hole_sizes.get(i)) {
+                    self.hole_vals = std_hole_vals(s, self.hole_usage);
                 }
             }
         });
-        if self.hole_std.is_some() {
+        // 用途只对单实体孔有意义(组合孔固定: 过孔 + 底孔)
+        if self.hole_std.is_some() && !combo {
             let labels = vec![tr("过孔", "Clearance").to_string(), tr("螺纹底孔", "Tap drill").to_string()];
             let mut s = self.hole_usage as usize;
             if rz_segmented(ui, "hole-usage", &labels, &mut s) {
                 self.hole_usage = s as u8;
-                if let Some(i) = self.hole_std {
-                    self.hole_vals = std_hole_vals(i, self.hole_usage);
+                if let Some(sz) = self.hole_std.and_then(|i| self.hole_sizes.get(i)) {
+                    self.hole_vals = std_hole_vals(sz, self.hole_usage);
                 }
+            }
+        }
+        // 组合孔: d 一律按过孔
+        if combo && self.hole_usage == 1 {
+            self.hole_usage = 0;
+            if let Some(sz) = self.hole_std.and_then(|i| self.hole_sizes.get(i)) {
+                self.hole_vals = std_hole_vals(sz, 0);
             }
         }
         // ---- 类型 / 深度 ----
@@ -3692,7 +3833,7 @@ impl PlaApp {
         if rz_segmented(ui, "hole-type", &labels, &mut s) {
             self.hole_type = s as u8;
         }
-        rz_label(ui, tr("深度", "Depth"));
+        rz_label(ui, if combo { tr("底孔深度(最后一件)", "Tap hole depth (last solid)") } else { tr("深度", "Depth") });
         let labels = vec![tr("通孔", "Through").to_string(), tr("盲孔", "Blind").to_string()];
         let mut s = if self.hole_through { 0 } else { 1 };
         if rz_segmented(ui, "hole-through", &labels, &mut s) {
@@ -3703,13 +3844,22 @@ impl PlaApp {
         let before = self.hole_vals.clone();
         let ty = HOLE_TYPES[self.hole_type as usize];
         ui.columns(2, |cols| {
-            rz_label(&mut cols[0], tr("孔径", "Diameter"));
+            rz_label(&mut cols[0], if combo { tr("过孔径", "Clearance dia.") } else { tr("孔径", "Diameter") });
             enter |= rz_field(&mut cols[0], &mut self.hole_vals[0], &u, true);
-            if !self.hole_through {
+            if combo {
+                rz_label(&mut cols[1], tr("底孔径", "Tap dia."));
+                enter |= rz_field(&mut cols[1], &mut self.hole_vals[5], &u, true);
+            } else if !self.hole_through {
                 rz_label(&mut cols[1], tr("孔深", "Depth"));
                 enter |= rz_field(&mut cols[1], &mut self.hole_vals[1], &u, true);
             }
         });
+        if combo && !self.hole_through {
+            ui.columns(2, |cols| {
+                rz_label(&mut cols[0], tr("底孔深(从最后一件的入口)", "Tap depth (from the last solid)"));
+                enter |= rz_field(&mut cols[0], &mut self.hole_vals[1], &u, true);
+            });
+        }
         if ty == "counterbore" {
             ui.columns(2, |cols| {
                 rz_label(&mut cols[0], tr("沉头直径", "Bore dia."));
@@ -3723,19 +3873,9 @@ impl PlaApp {
                 enter |= rz_field(&mut cols[0], &mut self.hole_vals[4], &u, true);
             });
         }
-        if self.hole_vals != before && self.hole_std.is_some_and(|i| std_hole_vals(i, self.hole_usage) != self.hole_vals) {
+        if self.hole_vals != before && self.hole_std.and_then(|i| self.hole_sizes.get(i)).is_some_and(|s| std_hole_vals(s, self.hole_usage) != self.hole_vals) {
             self.hole_std = None;
         }
-        // ---- 位置: 距面中点的偏移(两条面内轴, 标签 = 最接近的世界轴) ----
-        let (un, vn) = plane.as_ref().map_or(("u".to_string(), "v".to_string()), |v| {
-            (v["axes"]["uName"].as_str().unwrap_or("u").to_string(), v["axes"]["vName"].as_str().unwrap_or("v").to_string())
-        });
-        ui.columns(2, |cols| {
-            rz_label(&mut cols[0], &t!("偏移 {un}", "Offset {un}"));
-            enter |= rz_field(&mut cols[0], &mut self.hole_off[0], &u, true);
-            rz_label(&mut cols[1], &t!("偏移 {vn}", "Offset {vn}"));
-            enter |= rz_field(&mut cols[1], &mut self.hole_off[1], &u, true);
-        });
         // ---- 校验 + 底部 ----
         let num = |s: &str| s.trim().parse::<f64>().ok();
         let d = num(&self.hole_vals[0]).filter(|x| *x > 0.0);
@@ -3743,28 +3883,31 @@ impl PlaApp {
         let cbd = num(&self.hole_vals[2]).filter(|x| d.is_some_and(|d| *x > d));
         let cbh = num(&self.hole_vals[3]).filter(|x| *x > 0.0);
         let cskd = num(&self.hole_vals[4]).filter(|x| d.is_some_and(|d| *x > d));
-        let off = [num(&self.hole_off[0]), num(&self.hole_off[1])];
+        let tapd = num(&self.hole_vals[5]).filter(|x| *x > 0.0);
         let valid = d.is_some()
             && (self.hole_through || depth.is_some())
-            && match ty { "counterbore" => cbd.is_some() && cbh.is_some(), "countersink" => cskd.is_some(), _ => true }
-            && off.iter().all(|x| x.is_some());
+            && (!combo || tapd.is_some())
+            && match ty { "counterbore" => cbd.is_some() && cbh.is_some(), "countersink" => cskd.is_some(), _ => true };
         let can = plane.is_some() && valid && !self.dim_busy;
         let esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
         let (cancel, ok) = rz_footer(ui, can, self.dim_busy);
         if cancel || esc {
-            self.hole_off = [String::from("0"), String::from("0")];
+            if let Some(s) = self.hole_std.and_then(|i| self.hole_sizes.get(i)) {
+                self.hole_vals = std_hole_vals(s, self.hole_usage);
+            }
         }
         let go = ok || (can && (right_click_confirm(ui) || enter));
         if !(go && can && self.require_feature(Feature::DimFace)) {
             return;
         }
         let (Some(v), Some(d)) = (plane, d) else { return };
-        let mut args = serde_json::json!({
-            "face": faces[0], "type": ty, "d": d, "units": v["units"],
-            "offset": [off[0].unwrap_or(0.0), off[1].unwrap_or(0.0)],
-        });
+        let mut args = serde_json::json!({ "face": faces[0], "type": ty, "d": d, "units": v["units"], "points": points });
         if !self.hole_through {
             args["depth"] = serde_json::json!(depth);
+        }
+        if combo {
+            args["stack"] = serde_json::json!(stack);
+            args["tapD"] = serde_json::json!(tapd);
         }
         match ty {
             "counterbore" => {
@@ -3775,12 +3918,14 @@ impl PlaApp {
             _ => {}
         }
         let mut spec = args.clone();
-        spec["std"] = serde_json::json!(self.hole_std.map(|i| HOLE_STD[i].0));
+        spec.as_object_mut().map(|o| o.remove("points"));
+        spec["std"] = serde_json::json!(self.hole_std.and_then(|i| self.hole_sizes.get(i)).map(|s| s.size.clone()));
+        spec["preset"] = serde_json::json!(self.hole_preset);
         spec["usage"] = serde_json::json!(if self.hole_usage == 1 { "tap" } else { "clearance" });
         self.cdp.send(pla_bridge::cdp::CdpCmd::Call { name: pla_bridge::shim::api::HOLE_MAKE, args });
         self.hole_pending = Some(spec);
         self.dim_busy = true;
-        self.set_notice((false, tr("正在打孔…", "Making the hole…").into()));
+        self.set_notice((false, tr("正在打孔…", "Making the hole(s)…").into()));
     }
 
     /// 「记录」标签顶部: 把「操作」里当前读到的尺寸存成一条记录。没读到 / 已经是某条记录 → 灰色说明, 不可点。

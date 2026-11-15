@@ -1296,18 +1296,43 @@ const callAsync = async (name, args) => JSON.parse(await run(`window.__PLA__.cal
     assert.ok(Math.abs(c0.h - diag * 0.001) < 1e-9, '通孔深度');
     assert.ok(Math.abs(c1.r - 0.004) < 1e-12 && Math.abs(c1.h - 0.0044) < 1e-12 && c1.target !== id, '沉头圆柱减在第一步产物上');
     assert.strictEqual(h.v.through, true);
-    assert.ok(h.v.faces.entry && h.v.faces.entry.surface === 'Plane', '入口面签名');
+    assert.ok(h.v.holes[0].faces.entry && h.v.holes[0].faces.entry.surface === 'Plane', '入口面签名');
     // 偏移: 面中点 + u × 5 + v × (−3); 法向 +Z → u = X, v = Y(planeAxes, dim.face 回带同一组轴)
-    const top2 = call('geo.query', { detail: 'faces', of: [h.v.solid], normal: [0, 0, 1] }).v.faces[0].id;
+    const top2 = call('geo.query', { detail: 'faces', of: [h.v.solids[id]], normal: [0, 0, 1] }).v.faces[0].id;
     const ax = call('dim.face', { face: top2 }).v.axes;
     assert.deepStrictEqual(JSON.parse(JSON.stringify([ax.u, ax.v, ax.uName, ax.vName])), [[1, 0, 0], [0, 1, 0], 'X', 'Y']);
     const ho = await callAsync('hole.make', { face: top2, offset: [5, -3], type: 'simple', d: 3, depth: 4 });
     assert.ok(ho.ok, JSON.stringify(ho));
-    assert.deepStrictEqual(JSON.parse(JSON.stringify(ho.v.at)), [725, 12, 10]);
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(ho.v.holes[0].at)), [725, 12, 10]);
     assert.ok(Math.abs(ed.cyls[ed.cyls.length - 1].h - 0.004) < 1e-12 && ho.v.through === false, '盲孔深度');
+    // N4b 草图点定孔位: 曲线端点(Vertex.GetPoint, 米)+ 闭合曲线(包围盒中心); 投影到面上, 一点一孔
+    const rb = (await callAsync('cmd.exec', { ops: [{ op: 'box', p1: [760, 0, 0], p2: [800, 30, 0], height: 10 }] })).v.results[0].items[0].id;
+    const topB = call('geo.query', { detail: 'faces', of: [rb], normal: [0, 0, 1] }).v.faces[0].id;
+    ed.geo._topo['900v1'] = { kind: 'curveVertex' };
+    ed.geo._models['900v1'] = { GetPoint: () => v3(0.77, 0.01, 0.015) };
+    ed.geo.items.push({ view: { userData: { versionId: 901 }, vertices: { length: 0 }, segments: { bboxes: Float32Array.from([0.785, 0.015, 0.012, 0.795, 0.025, 0.012]) } }, model: {} });
+    ed.cyls = [];
+    const mp = await callAsync('hole.make', { face: topB, points: [{ kind: 'curveVertex', id: '900v1' }, { kind: 'curve', id: '901' }], type: 'simple', d: 3 });
+    assert.ok(mp.ok, JSON.stringify(mp));
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(mp.v.holes.map((x) => x.at))), [[770, 10, 10], [790, 20, 10]]);
+    assert.strictEqual(ed.cyls.length, 2);
+    assert.ok(ed.cyls[1].target !== ed.cyls[0].target, '第二个孔减在第一个孔的产物上');
+    assert.ok(/hole points must be curve points/.test((await callAsync('hole.make', { face: call('geo.query', { detail: 'faces', of: [Object.values(mp.v.solids)[0]], normal: [0, 0, 1] }).v.faces[0].id, points: [{ kind: 'face', id: 'x' }], d: 3 })).err));
+    ed.geo.items = ed.geo.items.filter((x) => !(x.view.userData && x.view.userData.versionId === 901));
+    // N4b 组合孔: 上板 A(z 0..10)+ 下板 B(z −8..0)。A = 过孔 d + 柱形沉头; B = 底孔 tapD, 深 6 从 B 的入口(孔口下 10)算 → 圆柱高 16
+    const ra = (await callAsync('cmd.exec', { ops: [{ op: 'box', p1: [820, 0, 0], p2: [860, 30, 0], height: 10 }] })).v.results[0].items[0].id;
+    const rbb = (await callAsync('cmd.exec', { ops: [{ op: 'box', p1: [820, 0, -8], p2: [860, 30, -8], height: 8 }] })).v.results[0].items[0].id;
+    const topA = call('geo.query', { detail: 'faces', of: [ra], normal: [0, 0, 1] }).v.faces[0].id;
+    ed.cyls = [];
+    const cb = await callAsync('hole.make', { face: topA, stack: [rbb], type: 'counterbore', d: 4.5, tapD: 3.3, depth: 6, cbD: 8, cbDepth: 4.4 });
+    assert.ok(cb.ok, JSON.stringify(cb));
+    assert.deepStrictEqual(ed.cyls.map((x) => [x.target === ra || x.target === cb.v.solids[ra] ? 'A' : x.target === rbb ? 'B' : '?', Math.round(x.r * 1e5) / 1e2]), [['A', 2.25], ['B', 1.65], ['?', 4]]);
+    assert.ok(Math.abs(ed.cyls[1].h - 0.016) < 1e-9, '底孔圆柱高 = B 的入口深度 10 + 6');
+    assert.strictEqual(cb.v.holes[0].t0, 10);
+    assert.ok(/tapD must be > 0/.test(call('hole.make', { face: call('geo.query', { detail: 'faces', of: [cb.v.solids[ra]], normal: [0, 0, 1] }).v.faces[0].id, stack: [cb.v.solids[rbb]], d: 4.5 }).err));
     // 锥形沉头: 假机没有孔口圆边 → 第二步挑边失败 → 第一步也撤回
     const undo0 = ed.history._undoStack.length;
-    const top3 = call('geo.query', { detail: 'faces', of: [ho.v.solid], normal: [0, 0, 1] }).v.faces[0].id;
+    const top3 = call('geo.query', { detail: 'faces', of: [Object.values(ho.v.solids)[0]], normal: [0, 0, 1] }).v.faces[0].id;
     const cs = await callAsync('hole.make', { face: top3, type: 'countersink', d: 4.5, cskD: 9, depth: 6 });
     assert.strictEqual(cs.ok, false);
     assert.ok(/step 1 \(chamfer\).*rolled back/.test(cs.err), cs.err);

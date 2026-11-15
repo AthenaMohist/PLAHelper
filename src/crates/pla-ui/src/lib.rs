@@ -4,6 +4,7 @@ pub mod diag;
 pub mod dims;
 pub mod features;
 pub mod formula;
+pub mod hole_presets;
 pub mod hotkey;
 pub mod matstate;
 pub mod notes;
