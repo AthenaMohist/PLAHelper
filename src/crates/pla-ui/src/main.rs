@@ -206,6 +206,8 @@ struct PlaApp {
     lib_search: String,
     lib_import_path: String,
     lib_import_report: Option<String>,
+    /// 按类型整理的待确认计划: (料号, 新类型, 勾选)
+    lib_reclass: Option<Vec<(String, String, bool)>>,
     lib_edit: Option<pla_ui::parts_lib::Entry>,
     lib_edit_orig: Option<String>,
     lib_edit_aliases: String,
@@ -2483,6 +2485,7 @@ impl PlaApp {
             lib_search: String::new(),
             lib_import_path: String::new(),
             lib_import_report: None,
+            lib_reclass: None,
             lib_edit: None,
             lib_edit_orig: None,
             lib_edit_aliases: String::new(),
@@ -3991,8 +3994,8 @@ impl PlaApp {
         let cols = self.bom_tpl.columns.clone();
         let get = |id: &str| cols.iter().position(|c| c.id == id).map(|i| row.cells[i].clone()).unwrap_or_default();
         let origin = get("origin");
-        // 分类: 采购 → 009; 否则按材料(塑胶 001 / 金属 002); 认不出 → 001
-        let category = if origin.contains("采购") || origin.to_lowercase().contains("purchas") { "009" } else { pla_ui::parts_lib::material_category(&get("material")).unwrap_or("001") };
+        // 分类: 按名称 / 型号关键词猜(工具 / 耗材 / 橡胶 / 外购组件 / 传动 / 紧固件 / 电气), 否则采购 → 007, 再按材料(塑胶 001 / 金属 002); 认不出 → 001
+        let category = pla_ui::parts_lib::guess_category(&get("name"), &get("model"), &get("material"), &origin).unwrap_or("001");
         let pn = if get("pn").trim().is_empty() || self.lib.find(get("pn").trim()).is_some() { self.lib.next_pn_for(&self.bom_edits.project, category) } else { get("pn").trim().to_string() };
         let mut en = pla_ui::parts_lib::Entry { pn: pn.clone(), name: get("name"), category: category.into(), ..Default::default() };
         for c in cols.iter().filter(|c| c.source.as_deref() == Some("field") && c.formula.is_none() && c.id != "pn" && c.id != "unit_price") {
@@ -4042,10 +4045,70 @@ impl PlaApp {
         for (row, why) in &rep.skipped {
             s.push_str(&t!("\n  跳过 第 {row} 行: {why}", "\n  skipped row {row}: {why}"));
         }
+        for (row, old, new) in &rep.renumbered {
+            s.push_str(&t!("\n  第 {row} 行: 料号 {old} 在表里重复, 给了新料号 {new}", "\n  row {row}: part number {old} is used twice, given new number {new}"));
+        }
         for (pn, mat, got, want) in &rep.mismatched {
             s.push_str(&t!("\n  {pn}: 材料 {mat} 应为 {want} 类, 料号是 {got}", "\n  {pn}: material {mat} suggests type {want}, number has {got}"));
         }
         self.lib_import_report = Some(s);
+    }
+
+    /// B4 按类型整理: 建议改类型的条目(可取消勾选 / 改成别的类型), 应用 = 按料号顺序逐条重新编号, 旧号进 former, 本文档链接跟着改。
+    fn lib_reclass_ui(&mut self, ui: &mut egui::Ui) {
+        let Some(mut plan) = self.lib_reclass.take() else { return };
+        let cats: Vec<(String, String)> = self.lib.pn_rule.categories.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        ui.label(egui::RichText::new(t!("{} 条建议改类型(旧料号保留, 搜索 / 旧表 / 链接仍认得)", "{} entries suggested for a new type (old numbers are kept and still resolve)", plan.len())).strong());
+        let (mut apply, mut cancel) = (false, false);
+        egui::ScrollArea::vertical().id_salt("lib-reclass").max_height(420.0).show(ui, |ui| {
+            egui::Grid::new("lib-reclass-g").striped(true).num_columns(5).spacing([8.0, 3.0]).show(ui, |ui| {
+                for h in ["", tr("料号", "Part no."), tr("名称", "Name"), tr("现类型", "Now"), tr("改为", "New type")] {
+                    ui.label(egui::RichText::new(h).color(COL_MUTED).size(11.5));
+                }
+                ui.end_row();
+                for (i, (pn, cat, on)) in plan.iter_mut().enumerate() {
+                    let Some(e) = self.lib.find(pn) else { continue };
+                    ui.checkbox(on, "");
+                    ui.label(pn.as_str());
+                    ui.label(&e.name).on_hover_text(e.fields.get("model").cloned().unwrap_or_default());
+                    ui.label(&e.category);
+                    egui::ComboBox::from_id_salt(("lib-reclass-c", i)).width(200.0).selected_text(cats.iter().find(|c| c.0 == *cat).map(|c| format!("{} {}", c.0, c.1)).unwrap_or(cat.clone())).show_ui(ui, |ui| {
+                        for (k, v) in &cats {
+                            if ui.selectable_label(cat == k, format!("{k} {v}")).clicked() {
+                                *cat = k.clone();
+                            }
+                        }
+                    });
+                    ui.end_row();
+                }
+            });
+        });
+        ui.horizontal(|ui| {
+            apply = ui.button(egui::RichText::new(tr("应用", "Apply")).strong()).clicked();
+            cancel = ui.button(tr("取消", "Cancel")).clicked();
+        });
+        if cancel {
+            return;
+        }
+        if !apply {
+            self.lib_reclass = Some(plan);
+            return;
+        }
+        let mut n = 0;
+        for (pn, cat, _) in plan.iter().filter(|p| p.2) {
+            if let Some(new_pn) = self.lib.reclassify(pn, cat) {
+                for v in self.bom_edits.links.values_mut() {
+                    if v == pn {
+                        *v = new_pn.clone();
+                    }
+                }
+                n += 1;
+            }
+        }
+        self.lib_save();
+        self.bom_edits_save();
+        self.bom_cell_buf.clear();
+        self.set_notice((false, t!("已重新编号 {n} 条", "Renumbered {n} entries")));
     }
 
     /// B4 零件库标签: 搜索 + 列表(料号 / 名称 / 型号 / 首选单价 / 供应商数 / 本文档在用); 点"编辑"或"＋ 新建"进条目表单。
@@ -4061,6 +4124,10 @@ impl PlaApp {
             self.lib_form(ui, &field_cols);
             return;
         }
+        if self.lib_reclass.is_some() {
+            self.lib_reclass_ui(ui);
+            return;
+        }
         ui.horizontal(|ui| {
             ui.add(egui::TextEdit::singleline(&mut self.lib_search).hint_text(tr("搜索料号 / 名称 / 型号…", "Search part number / name / model…")).desired_width(220.0));
             if ui.button(tr("＋ 新建", "+ New")).clicked() {
@@ -4068,6 +4135,19 @@ impl PlaApp {
                 self.lib_edit = Some(pla_ui::parts_lib::Entry { pn, category: "009".into(), ..Default::default() });
                 self.lib_edit_orig = None;
                 self.lib_edit_aliases.clear();
+            }
+            if ui.button(tr("按类型整理…", "Sort by type…")).on_hover_text(tr("按名称 / 型号猜类型, 列出与当前类型码不同的条目, 确认后重新编号(旧号保留)", "Guess each entry's type from name / model, list the ones whose type code differs, renumber after you confirm (old numbers are kept)")).clicked() {
+                let plan: Vec<(String, String, bool)> = self
+                    .lib
+                    .entries
+                    .iter()
+                    .filter_map(|e| {
+                        let f = |k: &str| e.fields.get(k).cloned().unwrap_or_default();
+                        let g = pla_ui::parts_lib::guess_category(&e.name, &f("model"), &f("material"), &f("origin"))?;
+                        (g != e.category).then(|| (e.pn.clone(), g.to_string(), true))
+                    })
+                    .collect();
+                self.lib_reclass = Some(plan);
             }
             if ui.button(tr("打开文件夹", "Open folder")).clicked() {
                 let d = pla_ui::parts_lib::dir();
@@ -4104,7 +4184,13 @@ impl PlaApp {
             .lib
             .entries
             .iter()
-            .filter(|e| q.is_empty() || e.pn.to_lowercase().contains(&q) || e.name.to_lowercase().contains(&q) || e.fields.get("model").is_some_and(|m| m.to_lowercase().contains(&q)))
+            .filter(|e| {
+                q.is_empty()
+                    || e.pn.to_lowercase().contains(&q)
+                    || e.former.iter().any(|f| f.contains(&q))
+                    || e.name.to_lowercase().contains(&q)
+                    || e.fields.get("model").is_some_and(|m| m.to_lowercase().contains(&q))
+            })
             .cloned()
             .collect();
         if entries.is_empty() {
@@ -4250,15 +4336,18 @@ impl PlaApp {
             e.aliases = self.lib_edit_aliases.split([',', '，']).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
             let renamed = orig.as_ref().is_some_and(|o| *o != e.pn);
             if let Some(o) = orig.filter(|o| *o != e.pn) {
-                // 改了料号: 库里换掉旧条目, 本文档的链接跟着改(其它文档的链接会失效, 如实提示)
+                // 改了料号: 库里换掉旧条目, 旧号记进 former(其它文档 / 旧表写着旧号也认得), 本文档的链接跟着改
                 self.lib.remove(&o);
+                if !e.former.contains(&o) {
+                    e.former.push(o.clone());
+                }
                 for v in self.bom_edits.links.values_mut() {
                     if *v == o {
                         *v = e.pn.clone();
                     }
                 }
                 self.bom_edits_save();
-                self.set_notice((false, t!("料号 {o} → {}: 本文档的链接已更新; 其它文档里链接 {o} 的行需重新链接", "Part number {o} → {}: links in this document updated; rows linked to {o} in other documents need relinking", e.pn)));
+                self.set_notice((false, t!("料号 {o} → {}: 旧号已记下, 链接旧号的行仍认得这个条目", "Part number {o} → {}: the old number is kept, rows linked to it still resolve", e.pn)));
             }
             let pn = e.pn.clone();
             self.lib.upsert(e);

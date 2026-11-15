@@ -268,8 +268,10 @@ pub fn build(scan: &Value, t: &Template, e: &Edits, lib: &crate::parts_lib::Libr
     let mut rows = Vec::new();
     let field_default = |c: &Col| e.defaults.get(&c.id).cloned().or_else(|| c.default.clone()).unwrap_or_default();
     let fill = |base: &dyn Fn(&Col) -> String, over: Option<&BTreeMap<String, String>>, key: String, manual: bool, name_hint: &str| -> Row {
-        let link = e.links.get(&key).filter(|pn| lib.find(pn).is_some()).cloned();
-        let libf = link.as_ref().and_then(|pn| lib.find(pn)).map(|en| en.bom_fields()).unwrap_or_default();
+        // 链接写的可能是改号前的旧料号 → 认到现条目, 显示现料号
+        let linked = e.links.get(&key).and_then(|pn| lib.find_any(pn));
+        let link = linked.map(|en| en.pn.clone());
+        let libf = linked.map(|en| en.bom_fields()).unwrap_or_default();
         let suggest = if link.is_none() { lib.suggest(name_hint, &key) } else { None };
         let mut vals: BTreeMap<String, String> = BTreeMap::new();
         let mut overridden = vec![false; t.columns.len()];

@@ -52,6 +52,30 @@ pub struct Entry {
     pub keys: Vec<String>,
     #[serde(default)]
     pub notes: String,
+    /// 改号前用过的料号(旧表 / 旧 BOM 还写着它们; 搜索、导入、链接都认)。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub former: Vec<String>,
+}
+
+/// 按名称 / 型号 / 材料 / 来源猜类型码(关键词表; 先认工具、耗材, 再认具体件类, 最后按材料分塑胶 / 金属)。认不出 → None。
+pub fn guess_category(name: &str, model: &str, material: &str, origin: &str) -> Option<&'static str> {
+    let s = format!("{name} {model}").to_lowercase();
+    const RULES: [(&str, &[&str]); 7] = [
+        ("009", &["电钻", "批头", "手钻", "手捻钻", "螺丝刀", "攻丝", "电子秤", "锉刀", "老虎夹", "扳手", "钳子", "卡尺", "游标", "量具", "工具"]),
+        ("008", &["砂纸", "抛光", "搅拌棒", "胶带", "标签", "包装", "胶水", "手套", "耗材"]),
+        ("003", &["橡胶", "硅胶", "密封", "胶塞", "脚垫", "o型圈", "防震垫"]),
+        ("007", &["快速夹", "夹钳", "合页", "铰链", "搭扣", "浮动接头", "气缸", "柱塞", "把手", "拉手", "磁铁", "脚轮"]),
+        ("005", &["轴承", "光轴", "钢珠", "钢球", "轴套", "导轨", "滑块", "丝杆", "同步带", "同步轮", "齿轮", "联轴器"]),
+        ("004", &["螺丝", "螺钉", "螺栓", "螺母", "垫片", "垫圈", "销", "卡簧", "挡圈", "铆钉", "钢丝圈"]),
+        ("006", &["线缆", "电线", "导线", "连接器", "端子", "传感器", "pcb", "电机", "开关", "电源"]),
+    ];
+    if let Some((c, _)) = RULES.iter().find(|(_, ks)| ks.iter().any(|k| s.contains(k))) {
+        return Some(c);
+    }
+    if origin.contains("采购") || origin.to_lowercase().contains("purchas") {
+        return Some("007");
+    }
+    material_category(material)
 }
 
 /// 料号规则(用户 2026-11-15): 前三位 = 项目编号(904 = OYM; 每个文档在 BOM 里设自己的项目编号, 这里是默认值),
@@ -106,6 +130,8 @@ pub struct ImportReport {
     pub skipped: Vec<(usize, String)>,
     /// 料号类型码与材料不一致: (料号, 材料, 料号里的类型码, 按材料应是)
     pub mismatched: Vec<(String, String, String, String)>,
+    /// 表里重复料号的后一条给了新料号: (CSV 行号, 表里料号, 新料号)
+    pub renumbered: Vec<(usize, String, String)>,
 }
 
 /// 解析 CSV(支持双引号包裹、引号转义、字段内换行)。
@@ -143,7 +169,8 @@ pub fn parse_csv(text: &str) -> Vec<Vec<String>> {
 
 /// 从现有 BOM 表(CSV, 如 OYM testbed BOM)导入零件库。表头行 = 同时含"名称"和"料号"列标题的那一行(前面的空行跳过);
 /// 列按 BOM 模板的表头对到列 id(headers: 列 id → 表头文字)。每行有料号才导入: 新料号 → 新条目; 已有 → 非空字段覆盖、单价写进首选供应商。
-/// 同一个料号在表里出现两次且型号不同 → 第二次跳过并报告; 料号类型码与材料不符 → 只报告, 料号不改。
+/// 表里的料号也认库里条目的旧料号(former), 所以改号后再导同一张表不会重复建。
+/// 同一个料号在表里出现两次且型号不同 → 后一个给新料号(旧号记进 former)并报告; 料号类型码与材料不符 → 只报告, 料号不改。
 pub fn import_csv(lib: &mut Library, text: &str, headers: &[(String, String)]) -> ImportReport {
     let mut rep = ImportReport::default();
     let rows = parse_csv(text);
@@ -170,15 +197,30 @@ pub fn import_csv(lib: &mut Library, text: &str, headers: &[(String, String)]) -
             continue;
         }
         let model = get(r, "model");
-        if let Some(prev) = seen.get(&pn) {
-            if *prev != model {
-                rep.skipped.push((ri + 1, format!("{pn} used twice ({prev} / {model}); kept the first")));
-            }
-            continue;
-        }
+        let dup = match seen.get(&pn) {
+            Some(prev) if *prev == model => continue,
+            Some(_) => true,
+            None => false,
+        };
         seen.insert(pn.clone(), model.clone());
-        let existed = lib.find(&pn).is_some();
-        let mut e = lib.find(&pn).cloned().unwrap_or_else(|| Entry { pn: pn.clone(), ..Default::default() });
+        // 认库里的条目: 现料号或旧料号 = 表里料号; 同料号多条时按型号分
+        let cands: Vec<&Entry> = lib.entries.iter().filter(|e| e.pn == pn || e.former.contains(&pn)).collect();
+        let same_model = cands.iter().find(|e| e.fields.get("model").map(String::as_str).unwrap_or("") == model);
+        let hit = same_model.or(if dup { None } else { cands.first() }).map(|e| (*e).clone());
+        let existed = hit.is_some();
+        let mut e = hit.unwrap_or_else(|| {
+            if dup {
+                // 表里同一料号给了两个不同零件 → 后一个给新料号(同项目, 按名称猜类型, 猜不出用原类型码)
+                let n = pn.len().min(lib.pn_rule.prefix.len());
+                let typ = guess_category(&name, &model, &get(r, "material"), &get(r, "origin")).map(str::to_string).unwrap_or_else(|| pn.get(n..n + 3).unwrap_or("").to_string());
+                let new_pn = lib.next_pn_for(&pn[..n], &typ);
+                rep.renumbered.push((ri + 1, pn.clone(), new_pn.clone()));
+                Entry { pn: new_pn, category: typ, former: vec![pn.clone()], ..Default::default() }
+            } else {
+                Entry { pn: pn.clone(), ..Default::default() }
+            }
+        });
+        let pn = e.pn.clone();
         if !name.is_empty() {
             e.name = name;
         }
@@ -317,6 +359,27 @@ impl Library {
     }
 
     /// 新增或更新一条(按料号)。
+    /// 现料号或旧料号命中的条目。
+    pub fn find_any(&self, pn: &str) -> Option<&Entry> {
+        self.find(pn).or_else(|| self.entries.iter().find(|e| e.former.iter().any(|f| f == pn)))
+    }
+
+    /// 改分类并按新分类重新编号(同项目编号, 该分类下一个序号); 旧料号记进 former。返回新料号; 分类没变或料号不存在 → None。
+    pub fn reclassify(&mut self, pn: &str, category: &str) -> Option<String> {
+        let e = self.find(pn)?;
+        if e.category == category {
+            return None;
+        }
+        let n = pn.len().min(self.pn_rule.prefix.len());
+        let new_pn = self.next_pn_for(&pn[..n], category);
+        let e = self.find_mut(pn)?;
+        e.former.push(pn.to_string());
+        e.pn = new_pn.clone();
+        e.category = category.to_string();
+        self.entries.sort_by(|a, b| a.pn.cmp(&b.pn));
+        Some(new_pn)
+    }
+
     pub fn upsert(&mut self, e: Entry) {
         match self.entries.iter_mut().find(|x| x.pn == e.pn) {
             Some(x) => *x = e,
@@ -388,18 +451,43 @@ mod tests {
         assert_eq!(lib.next_pn_for("905", "001"), "905001001");
     }
 
-    /// 手动: 把一份真实 BOM CSV 导入某个零件库目录。
-    /// PLA_IMPORT_CSV=<csv> PLA_LIB_DIR=<dir> cargo test -p pla-ui --release --lib import_real_csv -- --ignored --nocapture
+    /// 手动: (可选)先按类型整理, 再把一份真实 BOM CSV 导入某个零件库目录。
+    /// PLA_LIB_DIR=<dir> [PLA_RECLASS=<料号=类型,…|guess>] [PLA_IMPORT_CSV=<csv>] cargo test -p pla-ui --release --lib import_real_csv -- --ignored --nocapture
+    /// PLA_RECLASS: guess = 按 guess_category; 也可写 "guess,904009011=008" 在猜测上逐条改。
     #[test]
     #[ignore]
     fn import_real_csv() {
-        let (Ok(csv), Ok(dir)) = (std::env::var("PLA_IMPORT_CSV"), std::env::var("PLA_LIB_DIR")) else { return };
+        let Ok(dir) = std::env::var("PLA_LIB_DIR") else { return };
         let dir = std::path::PathBuf::from(dir);
         let mut lib = load_in(&dir);
+        if let Ok(spec) = std::env::var("PLA_RECLASS") {
+            let mut plan: BTreeMap<String, String> = BTreeMap::new();
+            for part in spec.split(',').map(str::trim) {
+                if part == "guess" {
+                    for e in &lib.entries {
+                        let f = |k: &str| e.fields.get(k).cloned().unwrap_or_default();
+                        if let Some(g) = guess_category(&e.name, &f("model"), &f("material"), &f("origin")) {
+                            plan.insert(e.pn.clone(), g.to_string());
+                        }
+                    }
+                } else if let Some((pn, c)) = part.split_once('=') {
+                    plan.insert(pn.to_string(), c.to_string());
+                }
+            }
+            for (pn, c) in &plan {
+                if let Some(n) = lib.reclassify(pn, c) {
+                    println!("{pn} -> {n}  {}", lib.find(&n).map(|e| e.name.as_str()).unwrap_or(""));
+                }
+            }
+        }
+        let Ok(csv) = std::env::var("PLA_IMPORT_CSV") else {
+            save_in(&dir, &lib).unwrap();
+            return;
+        };
         let headers: Vec<(String, String)> = crate::bom_table::builtin().columns.iter().map(|c| (c.id.clone(), c.header.clone())).collect();
         let rep = import_csv(&mut lib, &std::fs::read_to_string(csv).unwrap(), &headers);
         save_in(&dir, &lib).unwrap();
-        println!("added {} updated {}\nskipped {:#?}\nmismatched {:#?}", rep.added.len(), rep.updated.len(), rep.skipped, rep.mismatched);
+        println!("added {:?} updated {}\nrenumbered {:?}\nskipped {:#?}\nmismatched {:#?}", rep.added, rep.updated.len(), rep.renumbered, rep.skipped, rep.mismatched);
     }
 
     #[test]
@@ -416,18 +504,42 @@ mod tests {
         let headers: Vec<(String, String)> = crate::bom_table::builtin().columns.iter().map(|c| (c.id.clone(), c.header.clone())).collect();
         let mut lib = Library::default();
         let rep = import_csv(&mut lib, csv, &headers);
-        assert_eq!(rep.added, vec!["904001001", "904002001", "904001002", "904009022", "904009023"]);
-        assert!(rep.skipped.iter().any(|(_, w)| w.contains("904009022 used twice")), "{:?}", rep.skipped);
-        assert!(rep.skipped.iter().any(|(_, w)| w.contains("没有料号的行")));
+        // 重复料号的 M4*18 → 按名称猜成 004 紧固件, 新号 904004001, 旧号记进 former
+        assert_eq!(rep.added, vec!["904001001", "904002001", "904001002", "904009022", "904004001", "904009023"]);
+        assert_eq!(rep.renumbered.iter().map(|r| (r.1.as_str(), r.2.as_str())).collect::<Vec<_>>(), vec![("904009022", "904004001")]);
+        assert_eq!(lib.find("904004001").unwrap().fields["model"], "M4*18[50个]");
+        assert_eq!(rep.skipped.len(), 1);
+        assert!(rep.skipped[0].1.contains("没有料号的行"));
         assert_eq!(rep.mismatched, vec![("904001002".to_string(), "铝合金6061".to_string(), "001".to_string(), "002".to_string())]);
         let s = lib.find("904009023").unwrap();
         assert_eq!((s.category.as_str(), s.fields["model"].as_str(), s.fields["pcs_unit"].as_str(), s.fields["unit"].as_str()), ("009", "M4*14[50个]", "50", "包"));
         assert_eq!(s.bom_fields()["unit_price"], "6.1");
         assert!(s.notes.contains("光轴x2"), "带逗号的用途完整: {}", s.notes);
         assert_eq!(lib.find("904001001").unwrap().fields["material"], "电木");
-        // 再导一次: 全部是更新, 不重复加供应商
+        // 按类型重新编号: 旧号进 former, find_any 认旧号
+        assert_eq!(lib.reclassify("904009023", "004").as_deref(), Some("904004002"));
+        assert_eq!(lib.reclassify("904009022", "004").as_deref(), Some("904004003"));
+        assert_eq!(lib.reclassify("904004003", "004"), None);
+        assert_eq!(lib.find_any("904009023").unwrap().pn, "904004002");
+        // 再导同一张表(还写着旧号): 全部是更新, 不重复建、不重复加供应商
         let rep2 = import_csv(&mut lib, csv, &headers);
-        assert_eq!((rep2.added.len(), rep2.updated.len()), (0, 5));
-        assert_eq!(lib.find("904009023").unwrap().suppliers.len(), 1);
+        assert_eq!((rep2.added.len(), rep2.updated.len(), rep2.renumbered.len()), (0, 6, 0), "{rep2:?}");
+        assert_eq!(lib.entries.len(), 6);
+        assert_eq!(lib.find("904004002").unwrap().suppliers.len(), 1);
+    }
+
+    #[test]
+    fn guess_types() {
+        let g = |n: &str, m: &str| guess_category(n, m, "", "采购");
+        assert_eq!(g("硅胶孔塞耐高温橡胶堵孔塞子", "Φ50"), Some("003"));
+        assert_eq!(g("平头自攻螺丝", "M3*12"), Some("004"));
+        assert_eq!(g("304不锈钢销轴平头带孔圆柱销", "M3x35"), Some("004"));
+        assert_eq!(g("直线双切边法兰轴承 LMH", "LMH8UU"), Some("005"));
+        assert_eq!(g("快速夹具固定器推紧器工装夹钳推拉式靠山", "305E"), Some("007"));
+        assert_eq!(g("海绵抛光板砂纸打磨抛光块", ""), Some("008"));
+        assert_eq!(g("德力西小型手捻钻", "手钻/螺丝刀套装"), Some("009"));
+        assert_eq!(guess_category("Base down", "", "电木", "代工"), Some("001"));
+        assert_eq!(guess_category("big platform", "", "铝合金6061", "代工"), Some("002"));
+        assert_eq!(guess_category("bracket", "", "", "代工"), None);
     }
 }
