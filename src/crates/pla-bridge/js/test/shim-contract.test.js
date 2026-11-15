@@ -275,7 +275,7 @@ const canvasEl = { getBoundingClientRect: () => ({ x: 10.2, y: 20.7, width: 800.
 // A3: body 上派发 edit:undo → 当前假编辑器异步撤一步(仿 Ctrl+Z: 弹出撤销栈顶, 几何退回该步之前的快照)
 const body = {
   attrs: {}, removeAttribute(a) { delete this.attrs[a]; },
-  dispatchEvent(ev) { if (ev.type === 'edit:undo' && currentEd && currentEd._undo) setTimeout(() => currentEd._undo(), 5); return true; },
+  dispatchEvent(ev) { (this.events = this.events || []).push(ev.type); if (ev.type === 'edit:undo' && currentEd && currentEd._undo) setTimeout(() => currentEd._undo(), 5); return true; },
 };
 class CustomEvent { constructor(type, init) { this.type = type; this.bubbles = !!(init && init.bubbles); } }
 // window 级事件监听(ui.rightClick 的捕获监听)
@@ -614,20 +614,29 @@ t('R33 vp v2: 存全显示状态; 可见性走 memento(稳定 id); render mode /
   const c0 = ed.executor.cancels;
   call('vp.restore', B);
   assert.ok(ed.executor.cancels > c0, '恢复可见性前取消活动命令');
-  // 隔离: 两层(外层 idA+idB, 内层 idA)按稳定 id 存, 恢复走 memento 写回层栈
+  // 隔离(2026-11-15 改): 存档仍按稳定 id 记层栈; 恢复时**不写隔离层**(直接写会让 Plasticity 卡在隔离里, 用户实测),
+  // 而是把"隔离集合之外的物体"并入隐藏; 当前处于隔离 → 派发 Plasticity 自己的 command:unisolate(= Alt+.)
   call('vp.restore', s); // 先回到 A(无隔离)
   ed.nodes.read.isolations = [new Set([101, 102]), new Set([101])];
   const sIso = call('vp.save').v;
   assert.deepStrictEqual(sIso.vis.isolations, [['idA', 'idB'], ['idA']], '隔离层栈按稳定 id 存');
   ed.nodes.read.isolations = [];
+  // 一个隔离集合之外的物体(nodeKey 'k7') → 应被并入隐藏
+  const outside = { view: { id: 7 }, model: {} };
+  ed.geo.items = (ed.geo.items || []).concat([outside]);
   const rIso = call('vp.restore', sIso).v;
-  assert.ok(rIso.applied.includes('vis:iso2'), JSON.stringify(rIso.applied));
-  assert.ok(ed.originator.last && ed.originator.restores > 0, '隔离后原样 restore 一次让场景重算');
-  assert.strictEqual(JSON.stringify(Array.from(ed.nodes.read.isolations, (x) => [...x].sort())), '[[101,102],[101]]');
-  assert.ok(call('vp.restore', sIso).v.applied.includes('vis(same)'), '层栈相同不动');
-  const rNoIso = call('vp.restore', s).v; // A 存档里隔离为空 → 解除
-  assert.ok(rNoIso.applied.some((a) => a.startsWith('vis:')), JSON.stringify(rNoIso.applied));
-  assert.strictEqual(ed.nodes.read.isolations.length, 0);
+  assert.ok(rIso.applied.some((a) => /iso→hidden/.test(a)), JSON.stringify(rIso.applied));
+  assert.strictEqual(ed.nodes.read.isolations.length, 0, '不直接写隔离层');
+  // (假机 nodeKey 是字符串, 写进 Float64Array 后是 NaN; 真机 nodeKey 是数字 —— 这里只核对条数: 原隐藏 1 + 隔离之外 1)
+  assert.strictEqual(ed.originator.last.nodes.hidden.length, sIso.vis.hidden.length + 1, '隔离之外的物体被隐藏');
+  ed.geo.items = ed.geo.items.filter((x) => x !== outside);
+  // 当前处于隔离 → 退出用 Plasticity 自己的命令
+  ed.nodes.read.isolations = [new Set([101])];
+  body.events = [];
+  const rNoIso = call('vp.restore', s).v;
+  assert.ok(rNoIso.applied.some((a) => /unisolate1/.test(a)), JSON.stringify(rNoIso.applied));
+  assert.deepStrictEqual(body.events, ['command:unisolate'], '派发退出隔离命令(不直接改 NodeState)');
+  ed.nodes.read.isolations = [];
   // 窗口不可见(显示器关/被遮挡)时不做 memento 恢复(实测会在 Plasticity 内部抛错)
   run('document.visibilityState = "hidden"');
   const rH = call('vp.restore', B).v;

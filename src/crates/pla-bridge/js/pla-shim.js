@@ -337,6 +337,8 @@
     // ---- A3: 事务回滚 ----
     // 撤销 = 在 document.body 上派发 edit:undo(与 Ctrl+Z 同一条路径; 异步, 实测 300 ms 内完成; 内部走 memento 恢复)
     undoCommand: 'edit:undo',
+    // 退出隔离 = Plasticity 自己的命令(键位 alt-. → command:unisolate, 选择器 body); 恢复可见性时用它, 不直接写 NodeState 隔离层
+    unisolateCommand: 'command:unisolate',
     undoPollMs: 50,
     undoStepTimeoutMs: 5000,
     // 每步命令的超时(ms); 按位置挑边/面的默认容差(文档单位)
@@ -2817,23 +2819,28 @@
     };
     var want = {}, visSame = true;
     var sameSet = function (cur, keys) { return cur.size === keys.length && keys.every(function (k) { return cur.has(k); }); };
-    NAMES.nodeVisSets.forEach(function (n) {
-      want[n] = keysOf(V[n]);
-      if (!sameSet(st[n], want[n])) visSame = false;
-    });
-    // 隔离层栈: 老存档(没有/格式不对)不动隔离
+    NAMES.nodeVisSets.forEach(function (n) { want[n] = keysOf(V[n]); });
+    // 隔离(2026-11-15 用户实测: 直接写 NodeState 的隔离层后 Plasticity 卡在隔离里, Alt+. 退不出来 —— 它自己的 IsolateCommand
+    // 还有 preisolate 等步骤): 不再直接写隔离层。存档里的隔离 → 换成"隐藏隔离集合之外的物体"(普通隐藏, Plasticity 照常处理,
+    // 全部显示即可还原); 当前处于隔离 → 派发 Plasticity 自己的退出隔离命令(= 按 Alt+.)。
     var isoSaved = Array.isArray(V[NAMES.nodeIsolations]) && V[NAMES.nodeIsolations].every(Array.isArray) ? V[NAMES.nodeIsolations] : null;
-    var isoWant = isoSaved ? isoSaved.map(keysOf).filter(function (l) { return l.length > 0; }) : null;
-    var isoSame = true;
-    if (isoWant) {
-      var curIso = st[NAMES.nodeIsolations] || [];
-      if (curIso.length !== isoWant.length || !isoWant.every(function (l, i) { return sameSet(toSet(curIso[i]), l); })) isoSame = false;
+    var isoTop = isoSaved ? isoSaved.map(keysOf).filter(function (l) { return l.length > 0; }).pop() : null;
+    if (isoTop) {
+      var keep = new Set(isoTop), hid = new Set(want[NAMES.nodeVisSets[0]]);
+      Array.from(need('geo.items') || []).forEach(function (it) {
+        var v = it && it[NAMES.lookupViewKey], k;
+        try { k = invokeOn('nodes.item2key', [v]); } catch (e) { return; }
+        if (k !== null && k !== undefined && !keep.has(k)) hid.add(k);
+      });
+      want[NAMES.nodeVisSets[0]] = Array.from(hid);
     }
-    if (visSame && isoSame) return 'vis(same)';
-    mementoGuard();
-    var orig = need('ed.originator');
+    NAMES.nodeVisSets.forEach(function (n) { if (!sameSet(st[n], want[n])) visSame = false; });
+    var curIso = (st[NAMES.nodeIsolations] || []).length;
+    if (visSame && !curIso) return 'vis(same)';
     var parts = [];
     if (!visSame) {
+      mementoGuard();
+      var orig = need('ed.originator');
       // 隐藏 / 眼睛: 改 memento 的两项再 restore(场景随之重算)
       var m = invokeOn('orig.snapshot', [], orig);
       var nodes = {};
@@ -2841,16 +2848,12 @@
       NAMES.nodeVisSets.forEach(function (n) { nodes[n] = Float64Array.from(want[n]); });
       m[NAMES.mementoNodes] = nodes;
       invokeOn('orig.restore', [m], orig);
-      parts.push(want[NAMES.nodeVisSets[0]].length + '/' + want[NAMES.nodeVisSets[1]].length);
+      parts.push(want[NAMES.nodeVisSets[0]].length + '/' + want[NAMES.nodeVisSets[1]].length + (isoTop ? ' iso→hidden' : ''));
     }
-    if (!isoSame) {
-      // 隔离: memento 里的 isolations 恢复时被忽略(实测) → 用 NodeState 自己的方法: unisolate 清空全部层,
-      // isolate(Set<nodeKey>) 压一层; 之后原样 restore 一次当前快照让场景重算(不重算则显示不变)。
-      var nst = need('ed.nodes');
-      invokeOn('nodes.unisolate', [], nst);
-      isoWant.forEach(function (l) { invokeOn('nodes.isolate', [new Set(l)], nst); });
-      invokeOn('orig.restore', [invokeOn('orig.snapshot', [], orig)], orig);
-      parts.push('iso' + isoWant.length);
+    // 退出隔离放最后: 恢复前的 mementoGuard 会取消活动命令, 先派发的话会把刚排上的退出隔离命令取消掉
+    if (curIso) {
+      for (var i = 0; i < curIso; i++) W.document.body.dispatchEvent(new CustomEvent(NAMES.unisolateCommand, { bubbles: true }));
+      parts.push('unisolate' + curIso);
     }
     return 'vis:' + parts.join('/');
   }
