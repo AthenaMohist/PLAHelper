@@ -111,6 +111,8 @@ pub mod api {
     pub const DIM_RECORD: &str = "dim.record";
     /// N3e: 本体测量(两面面心之间的 Distance 测量, 名字 = 尺寸记录名; 改名同步)。
     pub const DIM_MEASURE: &str = "dim.measure";
+    /// N3: 多选面(第一个平面 → 距离; 等半径倒圆 / 圆柱 → 一起改半径)。
+    pub const DIM_FACES: &str = "dim.faces";
 
     /// 全部接口名（契约测试用）。
     pub const ALL: &[&str] = &[
@@ -118,7 +120,7 @@ pub mod api {
         CMD_PING, ERR_LAST, TREE_LIST, SEL_CANCEL_COMMAND, SEL_CLEAR, SEL_APPLY, CAM_NAVIGATE, CAM_RENDER, CAM_THUMBNAIL, CAM_VP_RECT,
         CAM_SET_ORBIT_STEP, CAM_ROLL, KEYMAP_SET_BINDINGS, VP_SAVE, VP_RESTORE, MAT_SAVE, MAT_RESTORE, CMD_EXEC, CMD_FACTORIES,
         GEO_QUERY, HIST_BEGIN, HIST_ROLLBACK, HIST_COMMIT, GEO_SNAPS, GEO_MEASURE, CAM_VIEW, DIM_FACE, VIEW_HIGHLIGHT, DIM_DISTANCE, DIM_SIGNATURE, GEO_RESOLVE,
-        DIM_RECORD, DIM_MEASURE,
+        DIM_RECORD, DIM_MEASURE, DIM_FACES,
     ];
 }
 

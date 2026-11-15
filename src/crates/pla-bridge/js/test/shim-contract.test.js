@@ -1290,6 +1290,14 @@ const callAsync = async (name, args) => JSON.parse(await run(`window.__PLA__.cal
     assert.deepStrictEqual(ed.lastMove.move.map((x) => Math.round(x * 1e9) / 1e9), [0, 0, 0.003], '3 mm → 0.003 m');
     assert.deepStrictEqual(ed.lastMove.matrix.map((x) => Math.round(x * 1e9) / 1e9), [0, 0, 0.003], '平移矩阵同时设');
     assert.deepStrictEqual([d.mixed, d.sides], [false, [1]], '只在一侧 → 不给对称选项');
+    // dim.faces: 多选入口, 第一个是平面 → 距离(同 dim.distance); 少于两个面报错
+    const df = call('dim.faces', { faces: [bot, top] }).v;
+    assert.deepStrictEqual([df.kind, df.value, df.anchorFace], ['distance', 5, top]);
+    assert.ok(/at least two faces/.test(call('dim.faces', { faces: [bot] }).err));
+    // 厚度候选带曲面类型、包围盒中心与"改对面"的做法(平面 = offsetFace)
+    const th = call('dim.face', { face: top }).v;
+    assert.deepStrictEqual([th.candidates[0].surface, th.oppositeOp], ['Plane', 'offsetFace']);
+    assert.ok(Array.isArray(th.candidates[0].boxCenter));
     // 对称: 参考面 x=10(另一实体), 动的面 x=5 / x=20 分在两侧 → mixed; 锚 = 最近的 x=5, 方向 −x
     const r2 = (await callAsync('cmd.exec', { ops: [{ op: 'box', p1: [5, 0, 0], p2: [20, 20, 0], height: 5 }] })).v;
     const id2 = r2.results[0].items[0].id;

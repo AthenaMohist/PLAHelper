@@ -282,6 +282,8 @@ struct PlaApp {
     dims_vals: std::collections::HashMap<String, String>,
     /// 上一帧有条目数值框获得焦点(此时右键归条目, 不触发上面的应用)。
     dims_row_focus: bool,
+    /// 正在编辑数值的条目(右键确认用: 右键按下时文本框已失焦, 见 dim_saved_ui)。
+    dims_edit_row: Option<String>,
     /// 缩略图缓存(名字 → PNG 字节)。
     dims_pngs: std::collections::HashMap<String, Vec<u8>>,
     /// 记录 / 更新后等视口截图回包的记录名。
@@ -2289,6 +2291,7 @@ impl PlaApp {
             dims_batch_confirm: false,
             dims_vals: Default::default(),
             dims_row_focus: false,
+            dims_edit_row: None,
             dims_pngs: Default::default(),
             dims_thumb_pending: None,
             dim_busy: false,
@@ -2424,7 +2427,7 @@ impl PlaApp {
                 }
                 // N3: 面的可改尺寸 → 面板显示, 目标值初始化为当前值
                 pla_bridge::cdp::CdpEvent::CallResult { name, result }
-                    if name == pla_bridge::shim::api::DIM_FACE || name == pla_bridge::shim::api::DIM_DISTANCE =>
+                    if name == pla_bridge::shim::api::DIM_FACE || name == pla_bridge::shim::api::DIM_DISTANCE || name == pla_bridge::shim::api::DIM_FACES =>
                 {
                     if let Ok(v) = &result {
                         if let Some(x) = v["value"].as_f64() {
@@ -3079,10 +3082,11 @@ impl PlaApp {
                     if let Some(k) = &cur {
                         match k.strip_prefix("D:") {
                             Some(list) => {
+                                // 第一个是平面 → 距离; 全是等半径倒圆 / 圆柱 → 一起改半径(垫片 dim.faces 判)
                                 let ids: Vec<&str> = list.split('|').collect();
                                 self.cdp.send(pla_bridge::cdp::CdpCmd::Call {
-                                    name: pla_bridge::shim::api::DIM_DISTANCE,
-                                    args: serde_json::json!({ "reference": ids[0], "moving": &ids[1..] }),
+                                    name: pla_bridge::shim::api::DIM_FACES,
+                                    args: serde_json::json!({ "faces": ids }),
                                 });
                             }
                             None => self.cdp.send(pla_bridge::cdp::CdpCmd::Call {
@@ -3193,6 +3197,8 @@ impl PlaApp {
                                     "radius" => (tr("孔", "Hole"), tr("轴线不动", "Axis stays").to_string()),
                                     _ => (tr("倒圆", "Fillet"), tr("保持与两侧相切", "Stays tangent to both sides").to_string()),
                                 };
+                                let nf = v["faces"].as_array().map_or(1, |a| a.len());
+                                let card_sub = if nf > 1 { t!("{card_sub} · {nf} 个面一起改", "{card_sub} · {nf} faces together") } else { card_sub };
                                 rz_info_card(ui, card_title, &card_sub);
                                 // ---- 对面候选(分段选择, 橙 = 当前) ----
                                 if kind == "thickness" && cands.len() > 1 {
@@ -3238,6 +3244,10 @@ impl PlaApp {
             let mut ids = vec![v["reference"].as_str().unwrap_or("").to_string()];
             ids.extend(v["moving"].as_array().into_iter().flatten().filter_map(|x| x.as_str().map(String::from)));
             return (ids, None);
+        }
+        // 多选等半径倒圆 / 圆柱: 全部面
+        if let Some(all) = v["faces"].as_array().filter(|a| a.len() > 1) {
+            return (all.iter().filter_map(|x| x.as_str().map(String::from)).collect(), None);
         }
         let face = v["face"].as_str().unwrap_or("").to_string();
         let opp = (v["kind"] == "thickness")
@@ -3344,10 +3354,32 @@ impl PlaApp {
             self.dim_note_apply(v, sel, value, target);
             let face = v["face"].as_str().unwrap_or("").to_string();
             let delta = target - value;
+            // 对面是圆柱(孔 / 凸台): 改它 = 沿 −n 整体平移(偏移会改半径); 两侧各半 = 先偏移选中面, 再按包围盒中心挑圆柱平移
+            if kind == "thickness" && v["oppositeOp"] == "moveFaces" && self.dim_side != 0 {
+                let n: Vec<f64> = v["normal"].as_array().map(|a| a.iter().filter_map(|x| x.as_f64()).collect()).unwrap_or_default();
+                let c = &cands[self.dim_cand.min(cands.len() - 1)];
+                if n.len() == 3 {
+                    let half = if self.dim_side == 2 { 0.5 } else { 1.0 };
+                    let mv = serde_json::json!([-n[0] * delta * half, -n[1] * delta * half, -n[2] * delta * half]);
+                    let ops = if self.dim_side == 2 {
+                        serde_json::json!([
+                            { "op": "offsetFace", "faces": [face], "distance": delta / 2.0 },
+                            { "op": "moveFaces", "faces": [{ "near": c["boxCenter"], "tol": 0.01 }], "move": mv },
+                        ])
+                    } else {
+                        serde_json::json!([{ "op": "moveFaces", "faces": [c["id"]], "move": mv }])
+                    };
+                    self.cdp.send(pla_bridge::cdp::CdpCmd::Exec(serde_json::json!({ "atomic": true, "ops": ops })));
+                    self.dim_busy = true;
+                    self.set_notice((false, t!("正在修改: {} → {} {units}…", "Changing: {} → {} {units}…", fmt3(value), fmt3(target))));
+                    return;
+                }
+            }
             let (faces_arg, dist) = match (kind, self.dim_side, &opposite) {
                 ("thickness", 1, Some(o)) => (serde_json::json!([o]), delta),
                 ("thickness", 2, Some(o)) => (serde_json::json!([face, o]), delta / 2.0),
-                _ => (serde_json::json!([face]), delta * sign),
+                // 多选等半径倒圆 / 圆柱: 一起改
+                _ => (v["faces"].as_array().filter(|a| a.len() > 1).map(|a| serde_json::json!(a)).unwrap_or_else(|| serde_json::json!([face])), delta * sign),
             };
             (value, serde_json::json!({ "atomic": true, "ops": [{ "op": op, "faces": faces_arg, "distance": dist }] }))
         };
@@ -3392,7 +3424,8 @@ impl PlaApp {
             }
             Some("thickness") => {
                 let n_sel = rec.faces.first().map(|s| vec3(&s["normal"])).unwrap_or([0.0; 3]);
-                let n_opp = rec.opposite.as_ref().map(|s| vec3(&s["normal"])).unwrap_or([0.0; 3]);
+                // 对面移动方向 = −选中面法向(平面对面的外法向本来就是它; 圆柱对面的"中点法向"不是移动方向)
+                let n_opp = scale(n_sel, -1.0);
                 match self.dim_side {
                     1 => vec![[0.0; 3], scale(n_opp, delta)],
                     2 => vec![scale(n_sel, delta / 2.0), scale(n_opp, delta / 2.0)],
@@ -3427,7 +3460,8 @@ impl PlaApp {
     /// N3e: 记录对应的本体测量(两面面心之间, 名字 = 记录名; 同名已有则不重复建)。半径 / 圆角没有配对面 → 不建。
     fn dim_measure_for(&mut self, name: &str, info: &serde_json::Value) {
         let pair = match info["kind"].as_str() {
-            Some("thickness") => (info["face"].as_str(), info["opposite"].as_str()),
+            // 对面是圆柱时面心吸附点不在"最近 / 最远处", 量出来不是厚度 → 不建
+            Some("thickness") if info["oppositeOp"] != "moveFaces" => (info["face"].as_str(), info["opposite"].as_str()),
             Some("distance") => (info["reference"].as_str(), info["anchorFace"].as_str()),
             _ => (None, None),
         };
@@ -3551,14 +3585,26 @@ impl PlaApp {
             );
             ui.painter().text(egui::pos2(fr.right() + 4.0, cy), egui::Align2::LEFT_CENTER, u, egui::FontId::proportional(11.0), COL_MUTED);
             let focused = te.has_focus();
-            focus_any |= focused;
+            // 右键确认: 按下右键那一帧 egui 就把文本框焦点收走了, 到"右键单击"(松开)那一帧已不在编辑 →
+            // 记住"正在编辑的条目"(dims_edit_row), 直到左键点别处 / Esc / 应用(用户 2026-11-15: 右键确认没生效)
+            if focused {
+                self.dims_edit_row = Some(rec.name.clone());
+            }
+            let editing = focused || self.dims_edit_row.as_deref() == Some(rec.name.as_str());
+            focus_any |= editing;
             let enter = te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if (enter || (focused && right_click_confirm(ui))) && !busy {
+            let rclick = editing && right_click_confirm(ui);
+            if (enter || rclick) && !busy {
+                self.dims_edit_row = None;
                 match buf.trim().parse::<f64>() {
                     Ok(t) if t >= 0.0 && (t - rec.value).abs() > 5e-4 => acts.push(Act::Value(rec.clone(), t)),
                     _ => *buf = fmt3(rec.value),
                 }
-            } else if !focused {
+            } else if !focused && editing && ui.input(|i| i.pointer.primary_pressed() || i.key_pressed(egui::Key::Escape)) {
+                // 左键点了别处 / Esc = 放弃这次输入
+                self.dims_edit_row = None;
+                *buf = fmt3(rec.value);
+            } else if !editing {
                 // 没在编辑: 永远显示记录里的值(不缓存旧输入 —— 否则改完后记录已更新, 框里还停在旧数, 用户 2026-11-15 图1)
                 *buf = fmt3(rec.value);
             }
@@ -4127,6 +4173,7 @@ impl PlaApp {
         self.dims_pngs.clear();
         self.dims_thumb_pending = None;
         self.dim_sym = 0;
+        self.dims_edit_row = None;
     }
 
     fn update_snap(&mut self, ctx: &egui::Context) {

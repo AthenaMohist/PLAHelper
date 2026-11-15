@@ -1835,18 +1835,44 @@
     var overlap = function (b1, b2) {
       return [ax[1], ax[2]].every(function (j) { return Math.min(b1[1][j], b2[1][j]) - Math.max(b1[0][j], b2[0][j]) > -1e-9; });
     };
-    // 全部候选: 背对的平行平面, 在选中面"后方"(d > 0); 排序 = 投影重叠的在前, 再按距离近 → 远
+    // 全部候选: 背对的平行平面, 在选中面"后方"(d > 0); 排序 = 投影重叠的在前, 再按距离近 → 远。
+    // 也收轴线与选中面平行(轴 ⟂ n)的圆柱面(用户 2026-11-15): 孔(凹) = 到孔壁最近处(轴深 − r), 凸圆柱 = 到最远处(轴深 + r)
+    // —— 都是该处外法向背对选中面的那一点; 这一点要落在面的范围内(沿 n 方向看包围盒), 半个圆柱面不在那一侧就不算。
+    var sinTol = Math.sin(((a.angleTol !== undefined ? Number(a.angleTol) : NAMES.parallelTolDeg) * Math.PI) / 180);
+    var alongN = function (bb) {
+      var lo = Infinity, hi = -Infinity;
+      for (var i = 0; i < 8; i++) {
+        var c = vdot([(i & 1 ? bb[1] : bb[0])[0], (i & 2 ? bb[1] : bb[0])[1], (i & 4 ? bb[1] : bb[0])[2]], n);
+        lo = Math.min(lo, c); hi = Math.max(hi, c);
+      }
+      return [lo, hi];
+    };
     var cands = [];
     entries.forEach(function (e) {
       if (e.id === id) return;
       var o = faceSig(e, sid, k);
-      if (o.surface !== NAMES.planeSurface || !o.normal || !o.center) return;
-      if (vdot(o.normal, n) > -cosTol) return;
-      var d = vdot([f.center[0] - o.center[0], f.center[1] - o.center[1], f.center[2] - o.center[2]], n);
+      if (!o.center) return;
+      var d;
+      if (o.surface === NAMES.planeSurface && o.normal) {
+        if (vdot(o.normal, n) > -cosTol) return;
+        d = vdot([f.center[0] - o.center[0], f.center[1] - o.center[1], f.center[2] - o.center[2]], n);
+      } else if (typeof o.radius === 'number' && o.axis && o.axisOrigin && o.normal && Math.abs(vdot(o.axis, n)) <= sinTol) {
+        var w = [o.center[0] - o.axisOrigin[0], o.center[1] - o.axisOrigin[1], o.center[2] - o.axisOrigin[2]];
+        var al = vdot(w, o.axis);
+        w = [w[0] - al * o.axis[0], w[1] - al * o.axis[1], w[2] - al * o.axis[2]];
+        var cvx = vdot(w, o.normal) > 0;
+        var depth = vdot([f.center[0] - o.axisOrigin[0], f.center[1] - o.axisOrigin[1], f.center[2] - o.axisOrigin[2]], n);
+        d = cvx ? depth + o.radius : depth - o.radius;
+        var ext = o.bbox ? alongN(o.bbox) : null, at = vdot(f.center, n) - d, eps = 1e-6 * Math.max(1, Math.abs(at));
+        if (ext && (at < ext[0] - eps || at > ext[1] + eps)) return;
+      } else return;
       if (!(d > 1e-9)) return;
-      cands.push({ id: e.id, value: sig7(d), overlap: overlap(me.bbox, e.bbox), center: o.center });
+      cands.push({ id: e.id, value: sig7(d), overlap: overlap(me.bbox, e.bbox), center: o.center, surface: o.surface,
+                   boxCenter: e.bbox ? boxCenter(e.bbox) : null });
     });
-    cands.sort(function (p, q) { return (q.overlap - p.overlap) || (p.value - q.value); });
+    // 平面在圆柱前(默认对面保持以前的平面, 圆柱是加进来的备选), 同类内重叠优先、再近 → 远
+    var isPlane = function (c) { return c.surface === NAMES.planeSurface ? 1 : 0; };
+    cands.sort(function (p, q) { return (q.overlap - p.overlap) || (isPlane(q) - isPlane(p)) || (p.value - q.value); });
     out.normal = n;
     out.candidates = cands;
     if (!cands.length) return out;
@@ -1857,7 +1883,35 @@
       if (!pick) throw new Error('not an opposite parallel face of ' + id + ': ' + a.opposite);
     }
     out.kind = 'thickness'; out.value = pick.value; out.opposite = pick.id; out.overlap = pick.overlap; out.op = 'offsetFace'; out.offsetSign = 1;
+    // 改对面时: 平面 = 沿自身外法向偏移; 圆柱(孔 / 凸台) = 整体平移(偏移会改半径, 不是位置)
+    out.oppositeOp = pick.surface === NAMES.planeSurface ? 'offsetFace' : 'moveFaces';
     return out;
+  });
+
+  // N3: 多选面(Plasticity 选择里 ≥ 2 个面)。第一个是平面 → 距离(= dim.distance, 第一个 = 参考面);
+  // 全是半径相等的倒圆面 → 一起改圆角半径; 全是半径相等、同凹凸的圆柱 → 一起改半径(用户 2026-11-15: 等半径倒圆不能多选)。
+  // args = { faces: [拓扑 id…], units?, angleTol? } → dim.face / dim.distance 同形, 多出 faces: [...]
+  def('dim.faces', 'geo.read', function (a) {
+    a = a || {};
+    var ids = (Array.isArray(a.faces) ? a.faces : []).map(String);
+    if (ids.length < 2) throw new Error('dim.faces needs at least two faces');
+    var one = function (id) { return API['dim.face'].fn({ face: id, units: a.units, angleTol: a.angleTol }); };
+    var first = one(ids[0]);
+    if (first.surface === NAMES.planeSurface) {
+      return API['dim.distance'].fn({ reference: ids[0], moving: ids.slice(1), units: a.units, angleTol: a.angleTol });
+    }
+    if (first.kind !== 'filletRadius' && first.kind !== 'radius') {
+      throw new Error('first face must be a plane (reference) or all faces fillets / cylinders of one radius (got ' + (first.surface || '?') + ')');
+    }
+    var tol = 1e-4 * Math.max(1, Math.abs(first.value));
+    ids.slice(1).forEach(function (id) {
+      var o = one(id);
+      if (o.kind !== first.kind) throw new Error('mixed faces: ' + first.kind + ' and ' + o.kind + ' (' + id + ')');
+      if (first.kind === 'radius' && o.convex !== first.convex) throw new Error('mixed holes and bosses (' + id + ')');
+      if (Math.abs(o.value - first.value) > tol) throw new Error('different radii: ' + first.value + ' and ' + o.value + ' (' + id + ')');
+    });
+    first.faces = ids;
+    return first;
   });
 
   // N3c: 参考面 → 一组动的面的距离(约定: 第一个选的面 = 参考面, 其余 = 动的面; 用户 2026-11-15 确认)。
@@ -2003,6 +2057,7 @@
       out.info = API['dim.distance'].fn({ reference: ids[0], moving: ids.slice(1), units: a.units });
       return out;
     }
+    if (n > 1) { out.info = API['dim.faces'].fn({ faces: ids, units: a.units }); return out; }   // 多个等半径倒圆 / 圆柱
     var opp = a.opposite && res[n] && res[n].id;
     if (opp) {
       try { out.info = API['dim.face'].fn({ face: ids[0], opposite: opp, units: a.units }); out.opposite = opp; }
