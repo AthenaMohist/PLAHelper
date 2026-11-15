@@ -1104,8 +1104,8 @@ fn dim_help_lines() -> Vec<InfoLine> {
         info_key(tr("右键 / Enter", "Right-click / Enter"), tr("应用(一步可撤销, 失败自动撤回)", "Apply (one undo step; rolled back on failure)")),
         info_key("Esc", tr("目标值复原", "Reset the target value")),
         info_text(tr(
-            "记录: 「操作」标签标题右侧 ＋ 记录 → 存到「记录」标签(在「记录」里选择变了不跳标签, 「操作」上出提示点)。点条目 = 载入并选中这些面(面换了 id 也能找回), 并在 Plasticity 里建一个同名测量(厚度 / 距离; 条目改名测量跟着改); 直接改条目里的数值再 Enter = 应用。★ 收藏、笔 = 改名、↻ 用当前尺寸更新、管理 = 批量删除。",
-            "Saved: + Save at the top right of the Operate tab → stored in the Records tab (selection changes do not switch tabs; a dot appears on Operate). Click an entry to load and select its faces (found even after face ids change) and create a Plasticity measurement with the same name (thickness / distance; renaming the entry renames it); edit its value and press Enter to apply. ★ favourite, pencil = rename, ↻ update from the current dimension, Manage = batch delete.",
+            "记录: 在「操作」读出尺寸 → 切到「记录」点顶部 ＋ 保存当前尺寸(在「记录」里选择变了不跳标签, 「操作」上出提示点)。点条目 = 载入并选中这些面(面换了 id 也能找回), 并在 Plasticity 里建一个同名测量(厚度 / 距离; 条目改名测量跟着改); 直接改条目里的数值再 Enter = 应用。★ 收藏、笔 = 改名、↻ 用当前尺寸更新、管理 = 批量删除。",
+            "Saved: read a dimension in Operate → in the Records tab click + Save current dimension at the top (selection changes do not switch tabs; a dot appears on Operate). Click an entry to load and select its faces (found even after face ids change) and create a Plasticity measurement with the same name (thickness / distance; renaming the entry renames it); edit its value and press Enter to apply. ★ favourite, pencil = rename, ↻ update from the current dimension, Manage = batch delete.",
         )),
     ]
 }
@@ -1113,6 +1113,47 @@ fn dim_help_lines() -> Vec<InfoLine> {
 /// 0xRRGGBB → Color32(高亮色块用)。
 fn rgb_hex(c: u32) -> egui::Color32 {
     egui::Color32::from_rgb((c >> 16) as u8, (c >> 8) as u8, c as u8)
+}
+
+/// 标签栏(与分段单选区分开, 用户 2026-11-15): 左对齐的文字标签 + 贯通的底线; 当前标签白色粗体 + 橙色下划线,
+/// 其它灰色(悬停变亮, 手形光标)。dot = 在第几个标签文字右上画提示点。返回是否切换了。
+fn rz_tabs(ui: &mut egui::Ui, labels: &[String], selected: &mut usize, dot: Option<usize>) -> bool {
+    let h = 30.0;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), h), egui::Sense::hover());
+    let font = egui::FontId::proportional(13.0);
+    let pad = 12.0;
+    let mut x = rect.left();
+    let mut changed = false;
+    for (i, label) in labels.iter().enumerate() {
+        let tw = ui.fonts(|f| f.layout_no_wrap(label.clone(), font.clone(), COL_TEXT).size().x);
+        let r = egui::Rect::from_min_size(egui::pos2(x, rect.top()), egui::vec2(tw + pad * 2.0, h));
+        let resp = ui.interact(r, ui.id().with(("rz-tab", i)), egui::Sense::click());
+        let on = i == *selected;
+        if resp.hovered() && !on {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            ui.painter().rect_filled(r.shrink2(egui::vec2(2.0, 4.0)), egui::Rounding::same(5.0), lerp_color(COL_CARD, egui::Color32::WHITE, 0.05));
+        }
+        let col = if on { egui::Color32::WHITE } else if resp.hovered() { COL_TEXT } else { COL_MUTED };
+        paint_text(ui.painter(), egui::pos2(r.left() + pad, r.center().y - 1.0), egui::Align2::LEFT_CENTER, label, 13.0, col, on);
+        if on {
+            ui.painter().rect_filled(
+                egui::Rect::from_min_max(egui::pos2(r.left() + 6.0, rect.bottom() - 2.5), egui::pos2(r.right() - 6.0, rect.bottom())),
+                egui::Rounding::same(1.0),
+                COL_ACCENT,
+            );
+        }
+        if dot == Some(i) {
+            ui.painter().circle_filled(egui::pos2(r.left() + pad + tw + 4.0, r.top() + 8.0), 3.5, COL_ACCENT);
+        }
+        if resp.clicked() && !on {
+            *selected = i;
+            changed = true;
+        }
+        x = r.right();
+    }
+    // 贯通底线(当前标签的下划线压在上面)
+    ui.painter().line_segment([egui::pos2(rect.left(), rect.bottom() - 0.5), egui::pos2(rect.right(), rect.bottom() - 0.5)], egui::Stroke::new(1.0_f32, lerp_color(COL_CARD, egui::Color32::WHITE, 0.15)));
+    changed
 }
 
 /// 对面候选: ◀ [色块 + 距离 | …] ▶。色块 = Plasticity 里的高亮色(当前 = 橙, 其它 = 蓝);
@@ -3213,13 +3254,8 @@ impl PlaApp {
                     let n = self.dims_list.len();
                     let labels = vec![tr("操作", "Operate").to_string(), if n > 0 { t!("记录 {n}", "Records {n}") } else { tr("记录", "Records").to_string() }];
                     let mut s = self.dim_tab as usize;
-                    let (top, left, w) = (ui.cursor().top(), ui.cursor().left(), ui.available_width());
-                    let r = rz_segmented(ui, "dim-tab", &labels, &mut s);
-                    if self.dim_tab_dot && self.dim_tab != 0 {
-                        // 提示点: "操作"标签的右上角
-                        ui.painter().circle_filled(egui::pos2(left + w * 0.5 - 10.0, top + 8.0), 3.5, COL_ACCENT);
-                    }
-                    if r {
+                    let dot = (self.dim_tab_dot && self.dim_tab != 0).then_some(0);
+                    if rz_tabs(ui, &labels, &mut s, dot) {
                         self.dim_tab = s as u8;
                         if self.dim_tab == 0 {
                             self.dim_tab_dot = false;
@@ -3234,7 +3270,8 @@ impl PlaApp {
                     self.dims_edit_row = None;
                 }
                 if self.dim_tab != 0 {
-                    // 记录标签: 只有列表(更新 ↻ 仍用"操作"里当前读到的尺寸)
+                    // 记录标签: 顶部"保存当前尺寸" + 列表(保存 / 更新 ↻ 都用「操作」里当前读到的尺寸)
+                    self.dim_save_row(ui, info.as_ref(), &faces);
                     self.dim_saved_ui(ui, info.clone());
                     return;
                 }
@@ -3266,9 +3303,8 @@ impl PlaApp {
                     ui.painter().text(c, egui::Align2::CENTER_CENTER, "?", egui::FontId::proportional(8.5), col);
                     hover_info(ui, trow, hot, tr("参数化 · 说明", "Parametric · help"), dim_help_lines());
                 }
-                if let Some(v) = &info {
-                    let v = v.clone();
-                    self.dim_record_control(ui, trow, &v, &faces);
+                if info.is_some() {
+                    self.dim_record_control(ui, trow, &faces);
                 }
                 match (self.dim_face.clone(), self.dim_info.clone()) {
                     (None, _) => rz_info_card(
@@ -3379,25 +3415,41 @@ impl PlaApp {
         (vec![face], opp)
     }
 
-    /// N3d: 标题行右侧 —— 当前选择正是某条记录 → 显示记录名; 否则 "＋ 记录"(可点)。
-    fn dim_record_control(&mut self, ui: &mut egui::Ui, row: egui::Rect, v: &serde_json::Value, sel: &[String]) {
+    /// N3d: 「操作」标题行右侧 —— 当前选择正是某条记录 → 显示记录名(保存按钮在「记录」标签, 用户 2026-11-15)。
+    fn dim_record_control(&mut self, ui: &mut egui::Ui, row: egui::Rect, sel: &[String]) {
         if self.dim_active.is_some() && sel == self.dim_active_ids.as_slice() {
             let name = self.dim_active.clone().unwrap_or_default();
             paint_text(ui.painter(), egui::pos2(row.right(), row.center().y), egui::Align2::RIGHT_CENTER, &name, 12.0, COL_ACCENT, true);
-            return;
         }
-        if !matches!(v["kind"].as_str(), Some("thickness" | "radius" | "filletRadius" | "distance")) || self.dim_pending.is_some() {
-            return;
+    }
+
+    /// 「记录」标签顶部: 把「操作」里当前读到的尺寸存成一条记录。没读到 / 已经是某条记录 → 灰色说明, 不可点。
+    fn dim_save_row(&mut self, ui: &mut egui::Ui, cur: Option<&serde_json::Value>, sel: &[String]) {
+        let (r, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 30.0), egui::Sense::click());
+        let savable = cur.filter(|v| matches!(v["kind"].as_str(), Some("thickness" | "radius" | "filletRadius" | "distance")));
+        let already = self.dim_active.clone().filter(|_| sel == self.dim_active_ids.as_slice());
+        let can = savable.is_some() && already.is_none() && self.dim_pending.is_none();
+        let hot = can && resp.hovered();
+        let fill = if hot { lerp_color(COL_STEPPER, egui::Color32::WHITE, 0.12) } else if can { COL_STEPPER } else { COL_CARD };
+        ui.painter().rect_filled(r, egui::Rounding::same(6.0), fill);
+        let text = match (&already, savable) {
+            (Some(n), _) => t!("当前选择已记录为 {n}", "Current selection is saved as {n}"),
+            (None, Some(v)) => {
+                let kind = match v["kind"].as_str().unwrap_or("") { "thickness" => tr("厚度", "thickness"), "radius" => tr("半径", "radius"), "filletRadius" => tr("圆角", "fillet"), _ => tr("距离", "distance") };
+                let u = match v["units"].as_str().unwrap_or("") { "millimeter" => "mm", "centimeter" => "cm", "meter" => "m", "inch" => "in", "foot" => "ft", x => x };
+                let val = self.dim_value_of(v).map(fmt3).unwrap_or_default();
+                t!("＋ 保存当前尺寸({kind} {val} {u})", "+ Save current dimension ({kind} {val} {u})")
+            }
+            (None, None) => tr("在「操作」标签选面读出尺寸后可保存", "Select faces in the Operate tab to read a dimension, then save it here").to_string(),
+        };
+        let col = if can { if hot { egui::Color32::WHITE } else { COL_ACCENT } } else { COL_MUTED };
+        paint_text(ui.painter(), r.center(), egui::Align2::CENTER_CENTER, &text, 12.0, col, can);
+        if can && resp.on_hover_text(tr("存下来以后点条目就能再改(面换了 id 也能找回)", "Click the entry later to edit again (found even after face ids change)")).clicked() {
+            if let Some(v) = savable.cloned() {
+                self.dim_request_save(&v, None);
+            }
         }
-        let label = tr("＋ 记录", "+ Save");
-        let font = egui::FontId::proportional(12.0);
-        let w = ui.fonts(|f| f.layout_no_wrap(label.into(), font.clone(), COL_ACCENT).size().x);
-        let r = egui::Rect::from_min_max(egui::pos2(row.right() - w - 4.0, row.top()), row.max);
-        let resp = ui.interact(r, ui.id().with("dim-save"), egui::Sense::click());
-        ui.painter().text(egui::pos2(row.right(), row.center().y), egui::Align2::RIGHT_CENTER, label, font, if resp.hovered() { egui::Color32::WHITE } else { COL_ACCENT });
-        if resp.on_hover_text(tr("把这个尺寸记下来, 以后在「记录」标签里点它就能再改(面换了 id 也能找回)", "Save this dimension; click it in the Records tab later to edit again (found even after face ids change)")).clicked() {
-            self.dim_request_save(v, None);
-        }
+        ui.add_space(4.0);
     }
 
     /// N3d: 取当前尺寸各面的签名 → 新增记录(update = None)或覆盖已有记录(update = Some(名字))。
@@ -3639,7 +3691,7 @@ impl PlaApp {
             }
         }
         if self.dims_list.is_empty() {
-            ui.label(egui::RichText::new(tr("还没有记录。在「操作」标签读出尺寸后点标题右侧的 ＋ 记录。", "Nothing saved yet. Read a dimension in the Operate tab, then click + Save at the top right.")).size(11.5).color(COL_MUTED));
+            ui.label(egui::RichText::new(tr("还没有记录。在「操作」标签读出尺寸后, 点上方的 ＋ 保存当前尺寸。", "Nothing saved yet. Read a dimension in the Operate tab, then click + Save current dimension above.")).size(11.5).color(COL_MUTED));
             self.dims_row_focus = false;
             return;
         }
