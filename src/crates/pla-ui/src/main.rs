@@ -197,6 +197,18 @@ struct PlaApp {
     bom_edits: pla_ui::bom_table::Edits,
     bom_edits_doc: String,
     bom_cell_buf: std::collections::HashMap<String, String>,
+    /// B4 零件库: BOM 窗口标签(0 清单 / 1 零件库); 库内容 + 修改时间 / 上次检查(外部改了热生效);
+    /// 库里搜索词; 正在编辑的条目(副本)及其原料号(None = 新建); 行"库"菜单里的搜索词。
+    bom_tab: u8,
+    lib: pla_ui::parts_lib::Library,
+    lib_mtime: Option<std::time::SystemTime>,
+    lib_checked: Option<Instant>,
+    lib_search: String,
+    lib_edit: Option<pla_ui::parts_lib::Entry>,
+    lib_edit_orig: Option<String>,
+    lib_edit_aliases: String,
+    lib_link_search: String,
+    lib_del_confirm: Option<String>,
     show_settings: bool,
     /// F2: CDP 能力面板(点工具栏状态点开关)。
     show_caps: bool,
@@ -2462,6 +2474,16 @@ impl PlaApp {
             bom_edits: Default::default(),
             bom_edits_doc: String::new(),
             bom_cell_buf: Default::default(),
+            bom_tab: 0,
+            lib: Default::default(),
+            lib_mtime: None,
+            lib_checked: None,
+            lib_search: String::new(),
+            lib_edit: None,
+            lib_edit_orig: None,
+            lib_edit_aliases: String::new(),
+            lib_link_search: String::new(),
+            lib_del_confirm: None,
             show_settings: false,
             show_caps: false,
             show_notes: false,
@@ -3931,10 +3953,300 @@ impl PlaApp {
         let _ = pla_ui::bom_table::save_edits(&self.doc_key, &self.bom_edits);
     }
 
-    /// 按当前模板 + 本文档编辑导出一份 CSV(含手动行与合计)。
+    /// B4: 零件库每秒查一次修改时间(外部编辑 library.json 也能热生效)。
+    fn lib_tick(&mut self) {
+        if self.lib_checked.is_some_and(|t| t.elapsed() < Duration::from_secs(1)) {
+            return;
+        }
+        self.lib_checked = Some(Instant::now());
+        let dir = pla_ui::parts_lib::dir();
+        let m = pla_ui::parts_lib::mtime_in(&dir);
+        if m != self.lib_mtime || (m.is_none() && self.lib.entries.is_empty()) {
+            self.lib_mtime = m;
+            self.lib = pla_ui::parts_lib::load_in(&dir);
+        }
+    }
+
+    fn lib_save(&mut self) {
+        let dir = pla_ui::parts_lib::dir();
+        match pla_ui::parts_lib::save_in(&dir, &self.lib) {
+            Ok(()) => self.lib_mtime = pla_ui::parts_lib::mtime_in(&dir),
+            Err(e) => self.set_notice((true, t!("零件库保存失败: {e}", "Saving the parts library failed: {e}"))),
+        }
+    }
+
+    fn bom_edits_save(&mut self) {
+        self.bom_edits.template = self.bom_tpl_name.clone();
+        if let Err(e) = pla_ui::bom_table::save_edits(&self.doc_key, &self.bom_edits) {
+            self.set_notice((true, t!("BOM 编辑保存失败: {e}", "Saving BOM edits failed: {e}")));
+        }
+    }
+
+    /// B4: 把 BOM 里的一行存成零件库新条目(料号按规则自动给, 字段 / 单价取这一行的当前值, 记下零件 key 与模型名作匹配), 并链接。
+    fn lib_add_from_row(&mut self, row: &pla_ui::bom_table::Row, model_name: &str) {
+        let cols = self.bom_tpl.columns.clone();
+        let get = |id: &str| cols.iter().position(|c| c.id == id).map(|i| row.cells[i].clone()).unwrap_or_default();
+        let origin = get("origin");
+        let category = if origin.contains("采购") || origin.to_lowercase().contains("purchas") { "009" } else { "001" };
+        let pn = if get("pn").trim().is_empty() || self.lib.find(get("pn").trim()).is_some() { self.lib.next_pn(category) } else { get("pn").trim().to_string() };
+        let mut en = pla_ui::parts_lib::Entry { pn: pn.clone(), name: get("name"), category: category.into(), ..Default::default() };
+        for c in cols.iter().filter(|c| c.source.as_deref() == Some("field") && c.formula.is_none() && c.id != "pn" && c.id != "unit_price") {
+            let v = get(&c.id);
+            if !v.trim().is_empty() {
+                en.fields.insert(c.id.clone(), v);
+            }
+        }
+        let price = get("unit_price");
+        if price.trim().parse::<f64>().is_ok_and(|p| p != 0.0) {
+            en.suppliers.push(pla_ui::parts_lib::Supplier { price, date: pla_ui::parts_lib::today(), ..Default::default() });
+        }
+        if !model_name.is_empty() && model_name != en.name {
+            en.aliases.push(model_name.to_string());
+        }
+        if !row.manual {
+            en.keys.push(row.key.clone());
+        }
+        self.lib.upsert(en);
+        self.lib_save();
+        self.bom_edits.links.insert(row.key.clone(), pn.clone());
+        // 已存进库的字段不再作为本文档覆盖重复保存
+        if let Some(m) = self.bom_edits.parts.get_mut(&row.key) {
+            m.retain(|k, _| k == "usage" || k == "sets");
+        }
+        self.bom_edits_save();
+        self.bom_cell_buf.clear();
+        self.set_notice((false, t!("已存入零件库: {pn}", "Saved to the parts library: {pn}")));
+    }
+
+    /// B4 零件库标签: 搜索 + 列表(料号 / 名称 / 型号 / 首选单价 / 供应商数 / 本文档在用); 点"编辑"或"＋ 新建"进条目表单。
+    fn lib_ui(&mut self, ui: &mut egui::Ui) {
+        let field_cols: Vec<pla_ui::bom_table::Col> = self
+            .bom_tpl
+            .columns
+            .iter()
+            .filter(|c| c.source.as_deref() == Some("field") && c.formula.is_none() && !matches!(c.id.as_str(), "pn" | "unit_price" | "sets" | "redundancy" | "usage"))
+            .cloned()
+            .collect();
+        if self.lib_edit.is_some() {
+            self.lib_form(ui, &field_cols);
+            return;
+        }
+        ui.horizontal(|ui| {
+            ui.add(egui::TextEdit::singleline(&mut self.lib_search).hint_text(tr("搜索料号 / 名称 / 型号…", "Search part number / name / model…")).desired_width(220.0));
+            if ui.button(tr("＋ 新建", "+ New")).clicked() {
+                let pn = self.lib.next_pn("009");
+                self.lib_edit = Some(pla_ui::parts_lib::Entry { pn, category: "009".into(), ..Default::default() });
+                self.lib_edit_orig = None;
+                self.lib_edit_aliases.clear();
+            }
+            if ui.button(tr("打开文件夹", "Open folder")).clicked() {
+                let d = pla_ui::parts_lib::dir();
+                let _ = std::fs::create_dir_all(&d);
+                let _ = std::process::Command::new("explorer").arg(&d).spawn();
+            }
+        });
+        ui.label(egui::RichText::new(tr("零件库跨文档共用: BOM 行的「库」菜单可存入 / 链接; 链接后名称、料号、型号、单价等从这里带出(蓝色)。", "The library is shared across documents: use the row's 库 menu in the list to save / link; linked rows take name, part number, model, price from here (blue).")).size(11.0).color(COL_MUTED));
+        let used: std::collections::HashSet<String> = self.bom_edits.links.values().cloned().collect();
+        let q = self.lib_search.trim().to_lowercase();
+        let entries: Vec<pla_ui::parts_lib::Entry> = self
+            .lib
+            .entries
+            .iter()
+            .filter(|e| q.is_empty() || e.pn.to_lowercase().contains(&q) || e.name.to_lowercase().contains(&q) || e.fields.get("model").is_some_and(|m| m.to_lowercase().contains(&q)))
+            .cloned()
+            .collect();
+        if entries.is_empty() {
+            ui.label(egui::RichText::new(tr("(空)", "(empty)")).color(COL_MUTED));
+            return;
+        }
+        let mut edit: Option<pla_ui::parts_lib::Entry> = None;
+        egui::ScrollArea::horizontal().id_salt("lib-h").show(ui, |ui| {
+            egui::Grid::new("lib-grid").striped(true).num_columns(7).spacing([10.0, 3.0]).show(ui, |ui| {
+                for h in [tr("料号", "Part no."), tr("名称", "Name"), tr("型号", "Model"), tr("单价", "Price"), tr("供应商", "Suppliers"), tr("本文档", "This doc"), ""] {
+                    ui.label(egui::RichText::new(h).color(COL_MUTED).size(11.5));
+                }
+                ui.end_row();
+                for e in &entries {
+                    ui.label(&e.pn);
+                    ui.label(&e.name);
+                    ui.label(e.fields.get("model").cloned().unwrap_or_default());
+                    let s = e.suppliers.get(e.preferred).or_else(|| e.suppliers.first());
+                    ui.label(s.map(|s| format!("{} {}", s.price, s.currency)).unwrap_or_default()).on_hover_text(s.map(|s| t!("{} · 记录于 {}", "{} · recorded {}", s.name, s.date)).unwrap_or_default());
+                    ui.label(format!("{}", e.suppliers.len()));
+                    ui.label(if used.contains(&e.pn) { "●" } else { "" });
+                    if ui.small_button(tr("编辑", "Edit")).clicked() {
+                        edit = Some(e.clone());
+                    }
+                    ui.end_row();
+                }
+            });
+        });
+        if let Some(e) = edit {
+            self.lib_edit_aliases = e.aliases.join(", ");
+            self.lib_edit_orig = Some(e.pn.clone());
+            self.lib_edit = Some(e);
+        }
+    }
+
+    /// B4 零件库条目表单: 料号(可按分类自动给)/ 名称 / 分类 / 模板字段 / 别名 / 备注 / 供应商(首选、链接可打开、改价自动记日期)。
+    fn lib_form(&mut self, ui: &mut egui::Ui, field_cols: &[pla_ui::bom_table::Col]) {
+        let Some(mut e) = self.lib_edit.take() else { return };
+        let cats: Vec<(String, String)> = self.lib.pn_rule.categories.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        let mut save = false;
+        let mut cancel = false;
+        let mut delete = false;
+        egui::Grid::new("lib-form").num_columns(2).spacing([10.0, 4.0]).show(ui, |ui| {
+            ui.label(egui::RichText::new(tr("料号", "Part no.")).color(COL_MUTED));
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut e.pn).desired_width(130.0));
+                if ui.small_button(tr("按分类自动", "Auto by category")).clicked() {
+                    e.pn = self.lib.next_pn(&e.category);
+                }
+            });
+            ui.end_row();
+            ui.label(egui::RichText::new(tr("分类", "Category")).color(COL_MUTED));
+            egui::ComboBox::from_id_salt("lib-cat").width(160.0).selected_text(cats.iter().find(|c| c.0 == e.category).map(|c| format!("{} {}", c.0, c.1)).unwrap_or(e.category.clone())).show_ui(ui, |ui| {
+                for (k, v) in &cats {
+                    if ui.selectable_label(e.category == *k, format!("{k} {v}")).clicked() {
+                        e.category = k.clone();
+                    }
+                }
+            });
+            ui.end_row();
+            ui.label(egui::RichText::new(tr("名称(采购名)", "Name (purchasing)")).color(COL_MUTED));
+            ui.add(egui::TextEdit::singleline(&mut e.name).desired_width(300.0));
+            ui.end_row();
+            for c in field_cols {
+                ui.label(egui::RichText::new(&c.header).color(COL_MUTED));
+                let mut v = e.fields.get(&c.id).cloned().unwrap_or_default();
+                if ui.add(egui::TextEdit::singleline(&mut v).desired_width(300.0)).changed() {
+                    if v.trim().is_empty() { e.fields.remove(&c.id); } else { e.fields.insert(c.id.clone(), v); }
+                }
+                ui.end_row();
+            }
+            ui.label(egui::RichText::new(tr("别名(逗号分隔)", "Aliases (comma-separated)")).color(COL_MUTED)).on_hover_text(tr("模型里的名字等, 用来自动建议链接", "Names used in models etc., for link suggestions"));
+            ui.add(egui::TextEdit::singleline(&mut self.lib_edit_aliases).desired_width(300.0));
+            ui.end_row();
+            ui.label(egui::RichText::new(tr("备注", "Notes")).color(COL_MUTED));
+            ui.add(egui::TextEdit::singleline(&mut e.notes).desired_width(300.0));
+            ui.end_row();
+        });
+        // ---- 供应商 ----
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new(tr("供应商(选中的 = 首选, BOM 单价取它)", "Suppliers (the selected one is preferred; BOM price uses it)")).strong());
+        let mut remove: Option<usize> = None;
+        egui::ScrollArea::horizontal().id_salt("lib-sup-h").show(ui, |ui| {
+            egui::Grid::new("lib-sup").num_columns(9).spacing([6.0, 3.0]).show(ui, |ui| {
+                for h in ["", tr("名称", "Name"), tr("链接", "Link"), "", tr("单价", "Price"), tr("币种", "Currency"), tr("起订量", "MOQ"), tr("交期", "Lead time"), tr("记录日期", "Recorded")] {
+                    ui.label(egui::RichText::new(h).color(COL_MUTED).size(11.0));
+                }
+                ui.label("");
+                ui.end_row();
+                for (i, s) in e.suppliers.iter_mut().enumerate() {
+                    ui.radio_value(&mut e.preferred, i, "");
+                    ui.add(egui::TextEdit::singleline(&mut s.name).desired_width(90.0));
+                    ui.add(egui::TextEdit::singleline(&mut s.url).desired_width(140.0));
+                    if ui.add_enabled(s.url.starts_with("http"), egui::Button::new("↗").small()).on_hover_text(tr("在浏览器里打开", "Open in the browser")).clicked() {
+                        let _ = std::process::Command::new("cmd").args(["/C", "start", "", &s.url]).spawn();
+                    }
+                    if ui.add(egui::TextEdit::singleline(&mut s.price).desired_width(60.0)).changed() {
+                        s.date = pla_ui::parts_lib::today();
+                    }
+                    ui.add(egui::TextEdit::singleline(&mut s.currency).desired_width(40.0).hint_text("CNY"));
+                    ui.add(egui::TextEdit::singleline(&mut s.moq).desired_width(50.0));
+                    ui.add(egui::TextEdit::singleline(&mut s.lead).desired_width(60.0));
+                    ui.label(egui::RichText::new(&s.date).size(11.0).color(COL_MUTED));
+                    if ui.small_button("×").clicked() {
+                        remove = Some(i);
+                    }
+                    ui.end_row();
+                }
+            });
+        });
+        if let Some(i) = remove {
+            e.suppliers.remove(i);
+            if e.preferred >= e.suppliers.len() {
+                e.preferred = 0;
+            }
+        }
+        if ui.small_button(tr("＋ 供应商", "+ Supplier")).clicked() {
+            e.suppliers.push(pla_ui::parts_lib::Supplier { currency: "CNY".into(), date: pla_ui::parts_lib::today(), ..Default::default() });
+        }
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            if ui.button(egui::RichText::new(tr("保存", "Save")).strong()).clicked() {
+                save = true;
+            }
+            if ui.button(tr("取消", "Cancel")).clicked() {
+                cancel = true;
+            }
+            if self.lib_edit_orig.is_some() && ui.button(egui::RichText::new(tr("删除条目", "Delete entry")).color(COL_RED)).clicked() {
+                delete = true;
+            }
+        });
+        if save {
+            e.pn = e.pn.trim().to_string();
+            if e.pn.is_empty() {
+                e.pn = self.lib.next_pn(&e.category);
+            }
+            let orig = self.lib_edit_orig.clone();
+            if self.lib.find(&e.pn).is_some() && orig.as_deref() != Some(e.pn.as_str()) {
+                self.set_notice((true, t!("料号 {} 已存在", "Part number {} already exists", e.pn)));
+                self.lib_edit = Some(e);
+                return;
+            }
+            e.aliases = self.lib_edit_aliases.split([',', '，']).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+            let renamed = orig.as_ref().is_some_and(|o| *o != e.pn);
+            if let Some(o) = orig.filter(|o| *o != e.pn) {
+                // 改了料号: 库里换掉旧条目, 本文档的链接跟着改(其它文档的链接会失效, 如实提示)
+                self.lib.remove(&o);
+                for v in self.bom_edits.links.values_mut() {
+                    if *v == o {
+                        *v = e.pn.clone();
+                    }
+                }
+                self.bom_edits_save();
+                self.set_notice((false, t!("料号 {o} → {}: 本文档的链接已更新; 其它文档里链接 {o} 的行需重新链接", "Part number {o} → {}: links in this document updated; rows linked to {o} in other documents need relinking", e.pn)));
+            }
+            let pn = e.pn.clone();
+            self.lib.upsert(e);
+            self.lib_save();
+            self.lib_edit_orig = None;
+            self.bom_cell_buf.clear();
+            if !renamed {
+                self.set_notice((false, t!("零件库已保存: {pn}", "Library saved: {pn}")));
+            }
+            return;
+        }
+        if cancel {
+            self.lib_edit_orig = None;
+            return;
+        }
+        if delete {
+            self.lib_del_confirm = self.lib_edit_orig.clone();
+        }
+        self.lib_edit = Some(e);
+        if let Some(pn) = self.lib_del_confirm.clone() {
+            match confirm_popup(ui.ctx(), "lib-del", &t!("从零件库删除 {pn}?(链接它的 BOM 行回到原值)", "Delete {pn} from the library? (BOM rows linked to it fall back to their own values)")) {
+                Some(true) => {
+                    self.lib_del_confirm = None;
+                    self.lib.remove(&pn);
+                    self.lib_save();
+                    self.lib_edit = None;
+                    self.lib_edit_orig = None;
+                    self.bom_cell_buf.clear();
+                }
+                Some(false) => self.lib_del_confirm = None,
+                None => {}
+            }
+        }
+    }
+
+    /// 按当前模板 + 本文档编辑 + 零件库导出一份 CSV(含手动行与合计)。
     fn bom_export(&mut self, scope_label: &str, scan: &serde_json::Value) -> Result<std::path::PathBuf, String> {
         self.bom_template_tick();
-        let (rows, totals) = pla_ui::bom_table::build(scan, &self.bom_tpl, &self.bom_edits);
+        self.lib_tick();
+        let (rows, totals) = pla_ui::bom_table::build(scan, &self.bom_tpl, &self.bom_edits, &self.lib);
         pla_ui::bom::export_text(&self.doc_key, scope_label, &pla_ui::bom_table::to_csv(&self.bom_tpl, &rows, &totals))
     }
 
@@ -3968,6 +4280,20 @@ impl PlaApp {
             |ui| {
                 if let Some(why) = self.feature_block(Feature::Bom) {
                     ui.label(egui::RichText::new(why).small().color(COL_RED));
+                }
+                // ---- 标签: 清单 / 零件库(B4) ----
+                self.lib_tick();
+                {
+                    let labels = vec![tr("清单", "List").to_string(), t!("零件库 {}", "Parts library {}", self.lib.entries.len())];
+                    let mut s = self.bom_tab as usize;
+                    if rz_tabs(ui, &labels, &mut s, None) {
+                        self.bom_tab = s as u8;
+                    }
+                    ui.add_space(4.0);
+                }
+                if self.bom_tab == 1 {
+                    self.lib_ui(ui);
+                    return;
                 }
                 // ---- 范围 + 操作 ----
                 let mut rescan: Option<Option<String>> = None;
@@ -4082,7 +4408,12 @@ impl PlaApp {
                     }
                     Some(Ok(v)) => {
                         let v = v.clone();
-                        let (rows, totals) = pla_ui::bom_table::build(&v, &self.bom_tpl, &self.bom_edits);
+                        let (rows, totals) = pla_ui::bom_table::build(&v, &self.bom_tpl, &self.bom_edits, &self.lib);
+                        let lib_list: Vec<(String, String)> = self.lib.entries.iter().map(|e| (e.pn.clone(), e.name.clone())).collect();
+                        let model_names: std::collections::HashMap<String, String> = v["lines"].as_array().into_iter().flatten().map(|l| (l["key"].as_str().unwrap_or("").to_string(), l["name"].as_str().unwrap_or("").to_string())).collect();
+                        enum LibAct { Link(String, String), Unlink(String), Add(usize), Edit(String) }
+                        let mut lib_acts: Vec<LibAct> = Vec::new();
+                        let link_search = &mut self.lib_link_search;
                         let (kinds, total) = pla_ui::bom::totals(&v);
                         ui.horizontal(|ui| {
                             ui.label(egui::RichText::new(t!("{}: 模型里 {kinds} 种 / 共 {total} 件", "{}: {kinds} distinct in the model / {total} in total", Self::bom_scope_label(&self.bom_result_scope))).strong());
@@ -4130,7 +4461,8 @@ impl PlaApp {
                                         let w = if c.source.as_deref() == Some("name") || c.id == "model" || c.id == "usage" { 140.0 } else { 64.0 };
                                         let key = format!("{}|{}", r.key, c.id);
                                         let buf = buf_map.entry(key).or_insert_with(|| val.clone());
-                                        let col = if r.overridden[j] { COL_ACCENT } else { egui::Color32::WHITE };
+                                        // 橙 = 本文档手工覆盖; 蓝 = 来自零件库
+                                        let col = if r.overridden[j] { COL_ACCENT } else if r.from_lib[j] { rgb_hex(pla_bridge::shim::HIGHLIGHT_CANDIDATE) } else { egui::Color32::WHITE };
                                         let te = ui.add(egui::TextEdit::singleline(buf).desired_width(w).text_color(col));
                                         if c.source.as_deref() == Some("name") {
                                             if let Some(m) = members_of.get(&r.key) {
@@ -4145,10 +4477,66 @@ impl PlaApp {
                                             *buf = val.clone();
                                         }
                                     }
-                                    let tip = if r.manual { tr("删除这一手动行", "Delete this manual row") } else { tr("从 BOM 里排除(不影响模型; 可恢复)", "Exclude from the BOM (model unaffected; restorable)") };
-                                    if ui.small_button("×").on_hover_text(tip).clicked() {
-                                        remove_row = Some(r.key.clone());
-                                    }
+                                    ui.horizontal(|ui| {
+                                        // B4 "库"菜单: 链接 / 建议 / 存入零件库 / 取消链接 / 编辑条目
+                                        let label = match (&r.link, &r.suggest) {
+                                            (Some(_), _) => egui::RichText::new("库").color(rgb_hex(pla_bridge::shim::HIGHLIGHT_CANDIDATE)),
+                                            (None, Some(_)) => egui::RichText::new("库?").color(COL_ACCENT),
+                                            _ => egui::RichText::new("库").color(COL_MUTED),
+                                        };
+                                        let tip = match (&r.link, &r.suggest) {
+                                            (Some(pn), _) => t!("已链接零件库 {pn}", "Linked to library {pn}"),
+                                            (None, Some(pn)) => t!("零件库里可能是 {pn}", "Library suggests {pn}"),
+                                            _ => tr("零件库: 存入 / 链接", "Parts library: save / link").to_string(),
+                                        };
+                                        let b = ui.small_button(label).on_hover_text(tip);
+                                        let pid = ui.id().with(("bom-lib-menu", &r.key));
+                                        if b.clicked() {
+                                            ui.memory_mut(|m| m.toggle_popup(pid));
+                                        }
+                                        egui::popup::popup_below_widget(ui, pid, &b, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
+                                            ui.set_min_width(240.0);
+                                            match &r.link {
+                                                Some(pn) => {
+                                                    ui.label(egui::RichText::new(t!("已链接 {pn}", "Linked {pn}")).strong());
+                                                    if ui.button(tr("在零件库里编辑", "Edit in the library")).clicked() {
+                                                        lib_acts.push(LibAct::Edit(pn.clone()));
+                                                        ui.memory_mut(|m| m.close_popup());
+                                                    }
+                                                    if ui.button(tr("取消链接", "Unlink")).clicked() {
+                                                        lib_acts.push(LibAct::Unlink(r.key.clone()));
+                                                        ui.memory_mut(|m| m.close_popup());
+                                                    }
+                                                }
+                                                None => {
+                                                    if let Some(pn) = &r.suggest {
+                                                        let nm = lib_list.iter().find(|x| &x.0 == pn).map(|x| x.1.clone()).unwrap_or_default();
+                                                        if ui.button(t!("链接到建议: {pn} {nm}", "Link to suggestion: {pn} {nm}")).clicked() {
+                                                            lib_acts.push(LibAct::Link(r.key.clone(), pn.clone()));
+                                                            ui.memory_mut(|m| m.close_popup());
+                                                        }
+                                                    }
+                                                    if ui.button(tr("＋ 存入零件库(新料号)", "+ Save to the library (new part number)")).clicked() {
+                                                        lib_acts.push(LibAct::Add(i));
+                                                        ui.memory_mut(|m| m.close_popup());
+                                                    }
+                                                    ui.separator();
+                                                    ui.add(egui::TextEdit::singleline(link_search).hint_text(tr("搜索零件库链接…", "Search the library to link…")).desired_width(220.0));
+                                                    let q = link_search.trim().to_lowercase();
+                                                    for (pn, nm) in lib_list.iter().filter(|(pn, nm)| q.is_empty() || pn.to_lowercase().contains(&q) || nm.to_lowercase().contains(&q)).take(8) {
+                                                        if ui.selectable_label(false, format!("{pn}  {nm}")).clicked() {
+                                                            lib_acts.push(LibAct::Link(r.key.clone(), pn.clone()));
+                                                            ui.memory_mut(|m| m.close_popup());
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        });
+                                        let tip = if r.manual { tr("删除这一手动行", "Delete this manual row") } else { tr("从 BOM 里排除(不影响模型; 可恢复)", "Exclude from the BOM (model unaffected; restorable)") };
+                                        if ui.small_button("×").on_hover_text(tip).clicked() {
+                                            remove_row = Some(r.key.clone());
+                                        }
+                                    });
                                     ui.end_row();
                                 }
                                 // 合计行
@@ -4168,6 +4556,34 @@ impl PlaApp {
                                 }
                             });
                         });
+                        for a in lib_acts {
+                            match a {
+                                LibAct::Link(rk, pn) => {
+                                    self.bom_edits.links.insert(rk, pn);
+                                    self.bom_cell_buf.clear();
+                                    edits_changed = true;
+                                }
+                                LibAct::Unlink(rk) => {
+                                    self.bom_edits.links.remove(&rk);
+                                    self.bom_cell_buf.clear();
+                                    edits_changed = true;
+                                }
+                                LibAct::Add(i) => {
+                                    if let Some(r) = rows.get(i).cloned() {
+                                        let mn = model_names.get(&r.key).cloned().unwrap_or_default();
+                                        self.lib_add_from_row(&r, &mn);
+                                    }
+                                }
+                                LibAct::Edit(pn) => {
+                                    if let Some(e) = self.lib.find(&pn).cloned() {
+                                        self.lib_edit_aliases = e.aliases.join(", ");
+                                        self.lib_edit_orig = Some(pn);
+                                        self.lib_edit = Some(e);
+                                        self.bom_tab = 1;
+                                    }
+                                }
+                            }
+                        }
                         if ui.button(tr("＋ 手动行(模型里没有的采购件 / 工具)", "+ Manual row (purchased parts / tools not in the model)")).clicked() {
                             self.bom_edits.add_manual();
                             edits_changed = true;

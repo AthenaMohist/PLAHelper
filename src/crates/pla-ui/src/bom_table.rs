@@ -142,6 +142,9 @@ pub struct Edits {
     pub template: String,
     #[serde(default)]
     pub next_manual: u64,
+    /// B4: 行(零件 key / "manual:<id>")→ 零件库料号。
+    #[serde(default)]
+    pub links: BTreeMap<String, String>,
 }
 
 fn edits_path(doc_key: &str) -> PathBuf {
@@ -199,7 +202,12 @@ pub struct Row {
     pub cells: Vec<String>,
     /// 每格是否是人工覆盖(界面高亮)。
     pub overridden: Vec<bool>,
+    /// B4: 每格是否来自零件库。
+    pub from_lib: Vec<bool>,
     pub manual: bool,
+    /// B4: 已链接的料号 / 没链接时零件库给的建议料号。
+    pub link: Option<String>,
+    pub suggest: Option<String>,
 }
 
 /// 格式化数字: 去掉多余的 0(12.0 → 12, 42.70 → 42.7)。
@@ -251,31 +259,40 @@ fn model_value(src: &str, line: &Value, remark: &str) -> String {
     }
 }
 
-/// `bom.scan` 结果 + 模板 + 编辑 → 表行(零件行在前, 手动行在后) + 合计行(sum 列求和, 其余空)。
-pub fn build(scan: &Value, t: &Template, e: &Edits) -> (Vec<Row>, Vec<String>) {
+/// `bom.scan` 结果 + 模板 + 编辑 + 零件库 → 表行(零件行在前, 手动行在后) + 合计行(sum 列求和, 其余空)。
+/// 每格取值优先级: 文档里的手工覆盖 > 零件库(该行链接了料号)> 本文档默认值 / 模型数据 > 模板默认值。
+pub fn build(scan: &Value, t: &Template, e: &Edits, lib: &crate::parts_lib::Library) -> (Vec<Row>, Vec<String>) {
     let mut rows = Vec::new();
     let field_default = |c: &Col| e.defaults.get(&c.id).cloned().or_else(|| c.default.clone()).unwrap_or_default();
-    let fill = |base: &dyn Fn(&Col) -> String, over: Option<&BTreeMap<String, String>>, key: String, manual: bool| -> Row {
+    let fill = |base: &dyn Fn(&Col) -> String, over: Option<&BTreeMap<String, String>>, key: String, manual: bool, name_hint: &str| -> Row {
+        let link = e.links.get(&key).filter(|pn| lib.find(pn).is_some()).cloned();
+        let libf = link.as_ref().and_then(|pn| lib.find(pn)).map(|en| en.bom_fields()).unwrap_or_default();
+        let suggest = if link.is_none() { lib.suggest(name_hint, &key) } else { None };
         let mut vals: BTreeMap<String, String> = BTreeMap::new();
         let mut overridden = vec![false; t.columns.len()];
+        let mut from_lib = vec![false; t.columns.len()];
         // 两遍: 公式可以引用后面的列
         for _ in 0..2 {
             for (i, c) in t.columns.iter().enumerate() {
                 let v = if let Some(f) = &c.formula {
                     eval_formula(f, &vals)
                 } else {
-                    match over.and_then(|m| m.get(&c.id)) {
-                        Some(o) => {
+                    match (over.and_then(|m| m.get(&c.id)), libf.get(&c.id)) {
+                        (Some(o), _) => {
                             overridden[i] = !manual;
                             o.clone()
                         }
-                        None => base(c),
+                        (None, Some(l)) => {
+                            from_lib[i] = true;
+                            l.clone()
+                        }
+                        (None, None) => base(c),
                     }
                 };
                 vals.insert(c.id.clone(), v);
             }
         }
-        Row { key, cells: t.columns.iter().map(|c| vals.get(&c.id).cloned().unwrap_or_default()).collect(), overridden, manual }
+        Row { key, cells: t.columns.iter().map(|c| vals.get(&c.id).cloned().unwrap_or_default()).collect(), overridden, from_lib, manual, link, suggest }
     };
     for line in scan["lines"].as_array().into_iter().flatten() {
         let key = line["key"].as_str().unwrap_or("").to_string();
@@ -287,7 +304,7 @@ pub fn build(scan: &Value, t: &Template, e: &Edits) -> (Vec<Row>, Vec<String>) {
             Some("field") | None => field_default(c),
             Some(src) => model_value(src, line, &remark),
         };
-        rows.push(fill(&base, e.parts.get(&key), key.clone(), false));
+        rows.push(fill(&base, e.parts.get(&key), key.clone(), false, line["name"].as_str().unwrap_or("")));
     }
     for m in &e.manual {
         let base = |c: &Col| match c.source.as_deref() {
@@ -295,7 +312,8 @@ pub fn build(scan: &Value, t: &Template, e: &Edits) -> (Vec<Row>, Vec<String>) {
             Some("field") | None => field_default(c),
             _ => String::new(),
         };
-        rows.push(fill(&base, Some(&m.fields), format!("manual:{}", m.id), true));
+        let hint = m.fields.get("name").cloned().unwrap_or_default();
+        rows.push(fill(&base, Some(&m.fields), format!("manual:{}", m.id), true, &hint));
     }
     let totals = t
         .columns
@@ -363,7 +381,7 @@ mod tests {
         e.set_cell(&format!("manual:{mid}"), "sets", "1", "");
         e.set_cell(&format!("manual:{mid}"), "redundancy", "1", "");
         e.set_cell(&format!("manual:{mid}"), "unit_price", "1205", "");
-        let (rows, totals) = build(&scan, &t, &e);
+        let (rows, totals) = build(&scan, &t, &e, &crate::parts_lib::Library::default());
         let col = |id: &str| t.columns.iter().position(|c| c.id == id).unwrap();
         assert_eq!(rows.len(), 3, "k3 排除, 手动行在后");
         let r1 = &rows[0];
@@ -385,6 +403,47 @@ mod tests {
         assert_eq!(lines.len(), 5);
         assert!(lines[0].trim_start_matches('\u{feff}').starts_with("名称,料号,Column 16,型号,用途,材料,来源,一套用量,套数,总数量"));
         assert!(lines[4].ends_with("total,4007.7"));
+    }
+
+    #[test]
+    fn library_layer_and_suggestions() {
+        use crate::parts_lib::{Entry, Library, Supplier};
+        let t = builtin();
+        let scan = json!({ "lines": [
+            { "key": "ks", "name": "杯内六M4x14", "names": ["杯内六M4x14"], "qty": 53, "material": "", "path": "" },
+            { "key": "kb", "name": "Base side", "names": ["Base side"], "qty": 2, "material": "电木", "path": "" },
+        ]});
+        let mut lib = Library::default();
+        let mut en = Entry { pn: "904009023".into(), name: "304不锈钢杯头内六角螺丝".into(), ..Default::default() };
+        en.fields.insert("origin".into(), "采购".into());
+        en.fields.insert("pcs_unit".into(), "50".into());
+        en.fields.insert("unit".into(), "包".into());
+        en.suppliers.push(Supplier { price: "6.1".into(), ..Default::default() });
+        en.aliases.push("杯内六M4x14".into());
+        lib.upsert(en);
+        let mut e = Edits::default();
+        e.defaults.insert("sets".into(), "5".into());
+        let col = |id: &str| t.columns.iter().position(|c| c.id == id).unwrap();
+        // 没链接: 只给建议
+        let (rows, _) = build(&scan, &t, &e, &lib);
+        assert_eq!((rows[0].link.as_deref(), rows[0].suggest.as_deref()), (None, Some("904009023")));
+        assert_eq!(rows[1].suggest, None);
+        // 链接后: 名称 / 料号 / 字段 / 单价从库里来, 公式跟着算; 手工覆盖仍然优先
+        e.links.insert("ks".into(), "904009023".into());
+        e.set_cell("ks", "unit", "盒", "\u{0}");
+        let (rows, _) = build(&scan, &t, &e, &lib);
+        let r = &rows[0];
+        assert_eq!(r.link.as_deref(), Some("904009023"));
+        assert_eq!((r.cells[col("name")].as_str(), r.cells[col("pn")].as_str()), ("304不锈钢杯头内六角螺丝", "904009023"));
+        assert!(r.from_lib[col("pn")] && r.from_lib[col("unit_price")]);
+        assert_eq!(r.cells[col("unit")], "盒");
+        assert!(r.overridden[col("unit")] && !r.from_lib[col("unit")], "覆盖优先于库");
+        assert_eq!((r.cells[col("unit_qty")].as_str(), r.cells[col("total_cost")].as_str()), ("7", "42.7"));
+        // 库里删了这个料号 → 链接失效, 回到原值
+        lib.remove("904009023");
+        let (rows, _) = build(&scan, &t, &e, &lib);
+        assert_eq!(rows[0].link, None);
+        assert_eq!(rows[0].cells[col("name")], "杯内六M4x14");
     }
 
     #[test]

@@ -13,6 +13,7 @@ pub mod matstate;
 pub mod notes;
 pub mod notes_table;
 pub mod notes_ui;
+pub mod parts_lib;
 pub mod plasticity_config;
 pub mod prefs;
 pub mod round_corners;
