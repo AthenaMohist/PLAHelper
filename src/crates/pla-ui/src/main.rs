@@ -204,6 +204,8 @@ struct PlaApp {
     lib_mtime: Option<std::time::SystemTime>,
     lib_checked: Option<Instant>,
     lib_search: String,
+    lib_import_path: String,
+    lib_import_report: Option<String>,
     lib_edit: Option<pla_ui::parts_lib::Entry>,
     lib_edit_orig: Option<String>,
     lib_edit_aliases: String,
@@ -2479,6 +2481,8 @@ impl PlaApp {
             lib_mtime: None,
             lib_checked: None,
             lib_search: String::new(),
+            lib_import_path: String::new(),
+            lib_import_report: None,
             lib_edit: None,
             lib_edit_orig: None,
             lib_edit_aliases: String::new(),
@@ -3987,8 +3991,9 @@ impl PlaApp {
         let cols = self.bom_tpl.columns.clone();
         let get = |id: &str| cols.iter().position(|c| c.id == id).map(|i| row.cells[i].clone()).unwrap_or_default();
         let origin = get("origin");
-        let category = if origin.contains("采购") || origin.to_lowercase().contains("purchas") { "009" } else { "001" };
-        let pn = if get("pn").trim().is_empty() || self.lib.find(get("pn").trim()).is_some() { self.lib.next_pn(category) } else { get("pn").trim().to_string() };
+        // 分类: 采购 → 009; 否则按材料(塑胶 001 / 金属 002); 认不出 → 001
+        let category = if origin.contains("采购") || origin.to_lowercase().contains("purchas") { "009" } else { pla_ui::parts_lib::material_category(&get("material")).unwrap_or("001") };
+        let pn = if get("pn").trim().is_empty() || self.lib.find(get("pn").trim()).is_some() { self.lib.next_pn_for(&self.bom_edits.project, category) } else { get("pn").trim().to_string() };
         let mut en = pla_ui::parts_lib::Entry { pn: pn.clone(), name: get("name"), category: category.into(), ..Default::default() };
         for c in cols.iter().filter(|c| c.source.as_deref() == Some("field") && c.formula.is_none() && c.id != "pn" && c.id != "unit_price") {
             let v = get(&c.id);
@@ -4018,6 +4023,31 @@ impl PlaApp {
         self.set_notice((false, t!("已存入零件库: {pn}", "Saved to the parts library: {pn}")));
     }
 
+    /// B4: 从 CSV 导入零件库, 报告写进 lib_import_report。
+    fn lib_import(&mut self) {
+        let path = self.lib_import_path.trim().trim_matches('"').to_string();
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) => {
+                self.set_notice((true, t!("读取失败: {e}", "Read failed: {e}")));
+                return;
+            }
+        };
+        let headers: Vec<(String, String)> = self.bom_tpl.columns.iter().map(|c| (c.id.clone(), c.header.clone())).collect();
+        let rep = pla_ui::parts_lib::import_csv(&mut self.lib, &text, &headers);
+        if !rep.added.is_empty() || !rep.updated.is_empty() {
+            self.lib_save();
+        }
+        let mut s = t!("新增 {} · 更新 {} · 跳过 {} · 类型码与材料不符 {}", "Added {} · updated {} · skipped {} · type code vs material mismatch {}", rep.added.len(), rep.updated.len(), rep.skipped.len(), rep.mismatched.len());
+        for (row, why) in &rep.skipped {
+            s.push_str(&t!("\n  跳过 第 {row} 行: {why}", "\n  skipped row {row}: {why}"));
+        }
+        for (pn, mat, got, want) in &rep.mismatched {
+            s.push_str(&t!("\n  {pn}: 材料 {mat} 应为 {want} 类, 料号是 {got}", "\n  {pn}: material {mat} suggests type {want}, number has {got}"));
+        }
+        self.lib_import_report = Some(s);
+    }
+
     /// B4 零件库标签: 搜索 + 列表(料号 / 名称 / 型号 / 首选单价 / 供应商数 / 本文档在用); 点"编辑"或"＋ 新建"进条目表单。
     fn lib_ui(&mut self, ui: &mut egui::Ui) {
         let field_cols: Vec<pla_ui::bom_table::Col> = self
@@ -4034,7 +4064,7 @@ impl PlaApp {
         ui.horizontal(|ui| {
             ui.add(egui::TextEdit::singleline(&mut self.lib_search).hint_text(tr("搜索料号 / 名称 / 型号…", "Search part number / name / model…")).desired_width(220.0));
             if ui.button(tr("＋ 新建", "+ New")).clicked() {
-                let pn = self.lib.next_pn("009");
+                let pn = self.lib.next_pn_for(&self.bom_edits.project, "009");
                 self.lib_edit = Some(pla_ui::parts_lib::Entry { pn, category: "009".into(), ..Default::default() });
                 self.lib_edit_orig = None;
                 self.lib_edit_aliases.clear();
@@ -4045,6 +4075,28 @@ impl PlaApp {
                 let _ = std::process::Command::new("explorer").arg(&d).spawn();
             }
         });
+        // 本文档项目编号(料号前三位) + 分类表说明
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(tr("本文档项目编号", "Project code (this doc)")).color(COL_MUTED));
+            let mut p = self.bom_edits.project.clone();
+            let hint = self.lib.pn_rule.prefix.clone();
+            if ui.add(egui::TextEdit::singleline(&mut p).hint_text(hint).desired_width(50.0)).on_hover_text(tr("料号前三位, 如 904 = OYM; 空 = 默认前缀", "First three digits of part numbers, e.g. 904 = OYM; empty = default prefix")).changed() {
+                self.bom_edits.project = p.trim().to_string();
+                self.bom_edits_save();
+            }
+            let cats: String = self.lib.pn_rule.categories.iter().map(|(k, v)| format!("{k} {v}")).collect::<Vec<_>>().join("\n");
+            ui.label(egui::RichText::new(tr("料号 = 项目 + 类型 + 序号 ⓘ", "Part no. = project + type + serial ⓘ")).size(11.0).color(COL_MUTED)).on_hover_text(cats);
+        });
+        // 从现有 BOM 表(CSV)导入
+        ui.horizontal(|ui| {
+            ui.add(egui::TextEdit::singleline(&mut self.lib_import_path).hint_text(tr("BOM CSV 路径", "BOM CSV path")).desired_width(300.0));
+            if ui.button(tr("从 CSV 导入", "Import CSV")).on_hover_text(tr("按当前 BOM 模板的表头对列; 有料号的行进库, 已有料号则更新", "Columns are matched by the current BOM template's headers; rows with a part number go in, existing ones are updated")).clicked() {
+                self.lib_import();
+            }
+        });
+        if let Some(r) = &self.lib_import_report {
+            ui.label(egui::RichText::new(r).size(11.0).color(COL_MUTED));
+        }
         ui.label(egui::RichText::new(tr("零件库跨文档共用: BOM 行的「库」菜单可存入 / 链接; 链接后名称、料号、型号、单价等从这里带出(蓝色)。", "The library is shared across documents: use the row's 库 menu in the list to save / link; linked rows take name, part number, model, price from here (blue).")).size(11.0).color(COL_MUTED));
         let used: std::collections::HashSet<String> = self.bom_edits.links.values().cloned().collect();
         let q = self.lib_search.trim().to_lowercase();
@@ -4100,7 +4152,7 @@ impl PlaApp {
             ui.horizontal(|ui| {
                 ui.add(egui::TextEdit::singleline(&mut e.pn).desired_width(130.0));
                 if ui.small_button(tr("按分类自动", "Auto by category")).clicked() {
-                    e.pn = self.lib.next_pn(&e.category);
+                    e.pn = self.lib.next_pn_for(&self.bom_edits.project, &e.category);
                 }
             });
             ui.end_row();
@@ -4187,7 +4239,7 @@ impl PlaApp {
         if save {
             e.pn = e.pn.trim().to_string();
             if e.pn.is_empty() {
-                e.pn = self.lib.next_pn(&e.category);
+                e.pn = self.lib.next_pn_for(&self.bom_edits.project, &e.category);
             }
             let orig = self.lib_edit_orig.clone();
             if self.lib.find(&e.pn).is_some() && orig.as_deref() != Some(e.pn.as_str()) {

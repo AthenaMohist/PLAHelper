@@ -145,6 +145,9 @@ pub struct Edits {
     /// B4: 行(零件 key / "manual:<id>")→ 零件库料号。
     #[serde(default)]
     pub links: BTreeMap<String, String>,
+    /// 本文档的项目编号(料号前三位, 如 904 = OYM); 空 = 零件库规则里的默认前缀。
+    #[serde(default)]
+    pub project: String,
 }
 
 fn edits_path(doc_key: &str) -> PathBuf {
