@@ -220,14 +220,25 @@ area_b = 297 - std["title_block"]["rows_top"]  # 标题栏上沿(Y 向上; 标�
 AREA = (inner_l + 6, area_b + 6, inner_r - 6, inner_t - 6)  # l, b, r, t
 
 # ---------------------------------------------------------------- 视图方向
-front = V(*spec.get("front", [0, -1, 0]))
-# 主视 / 俯视 / 左视在页面上的尺寸(模型单位): 由主视方向决定的三根轴
-if abs(front.z) > 0.9:
-    ax_w, ax_h, ax_d = V(1, 0, 0), V(0, 1, 0), V(0, 0, 1)
-elif abs(front.x) > 0.9:
-    ax_w, ax_h, ax_d = V(0, 1, 0), V(0, 0, 1), V(1, 0, 0)
+front_spec = spec.get("front", "auto")
+if front_spec == "auto":
+    # 主视 = 最能反映形状的面: 沿最薄方向看(板件看板面, 与用户 OYM 图一致); 视线从正侧来
+    exts = [(bb.XLength, V(1, 0, 0)), (bb.YLength, V(0, 1, 0)), (bb.ZLength, V(0, 0, 1))]
+    front = min(exts, key=lambda e: e[0])[1]
+    rep["front"] = "auto"
 else:
-    ax_w, ax_h, ax_d = V(1, 0, 0), V(0, 0, 1), V(0, 1, 0)
+    front = V(*front_spec)
+front = front.normalize()
+# 三根轴: ax_d = 视线(主视方向), ax_h = 页面"上", ax_w = 页面"右" = 上 × 视线
+ax_d = V(abs(front.x), abs(front.y), abs(front.z))
+if front_spec == "auto":
+    # 剩下两根轴里长的横放(用户 OYM 图: 长边水平)
+    others = sorted([e for e in exts if abs(e[1].dot(ax_d)) < 0.5], key=lambda e: -e[0])
+    ax_h = others[1][1]
+else:
+    ax_h = V(0, 0, 1) if abs(front.z) < 0.9 else V(0, 1, 0)
+ax_w = ax_h.cross(front)
+rep["axes"] = {"front": [front.x, front.y, front.z], "right": [ax_w.x, ax_w.y, ax_w.z], "up": [ax_h.x, ax_h.y, ax_h.z]}
 
 
 def ext(a):
@@ -243,17 +254,25 @@ GAPV = 22.0  # 视图之间
 aw, ah = AREA[2] - AREA[0], AREA[3] - AREA[1]
 
 
-def fits(s):
-    # 左边三视图(主 + 左, 主 + 俯)占 ~70% 宽, 右边留给轴测 / 剖视
-    w = (Wm + Dm) * s + GAPV + 2 * MARGIN
-    h = (Hm + Dm) * s + GAPV + 2 * MARGIN
-    return w <= aw * 0.72 and h <= ah
+def fits(s, sec_at):
+    """sec_at = 剖视放哪: right = 俯视右边(横向要两个主视宽), below = 俯视下面(纵向多一个厚度)。右边留 ~15% 给轴测。"""
+    if sec_at == "right":
+        w = max((Wm + Dm) * s + GAPV + 2 * MARGIN, 2 * Wm * s + GAPV + 3 * MARGIN)
+        h = (Hm + Dm) * s + GAPV + 2 * MARGIN
+    else:
+        w = (Wm + Dm) * s + GAPV + 2 * MARGIN
+        h = (Hm + 2 * Dm) * s + 2 * GAPV + 3 * MARGIN
+    return w <= aw * 0.85 and h <= ah
 
 
 scale = spec.get("scale", "auto")
+SEC_AT = "right"
 if scale == "auto":
-    scale = next((s for s in SCALES if fits(s)), SCALES[-1])
+    s_r = next((s for s in SCALES if fits(s, "right")), SCALES[-1])
+    s_b = next((s for s in SCALES if fits(s, "below")), SCALES[-1])
+    scale, SEC_AT = (s_r, "right") if s_r >= s_b else (s_b, "below")
 rep["scale"] = scale
+rep["section_at"] = SEC_AT
 
 
 def scale_text(s):
@@ -267,17 +286,20 @@ grp.Source = [part]
 grp.ProjectionType = std.get("projection", "First angle")
 grp.ScaleType = "Custom"
 grp.Scale = scale
+# 先建主视并定方向, 再加俯视 / 左视: 子视图方向在 addProjection 时按锚点当时的方向算(后改锚点不跟着变)
 for name in ("Front", "Top", "Left"):
     it = grp.addProjection(name)
     try:
         it.HardHidden = True  # 虚线(不可见轮廓); 建好就设, 别等后台消隐算完再改
     except Exception:
         pass
-try:
-    grp.Anchor.Direction = front
-    grp.Anchor.XDirection = ax_w
-except Exception as e:
-    rep["warnings"].append("anchor: %s" % e)
+    if name == "Front":
+        try:
+            grp.Anchor.Direction = front
+            grp.Anchor.XDirection = ax_w
+            doc.recompute()
+        except Exception as e:
+            rep["warnings"].append("anchor: %s" % e)
 try:
     grp.AutoDistribute = True  # False = 子视图全叠在锚点上
     grp.spacingX = GAPV + 0.0
@@ -324,10 +346,9 @@ def vcenter(v):
     return q(v.X), q(v.Y)
 
 
-R = {}
-R["Front"] = vrect(views["Front"], Wm * scale, Hm * scale)
-R["Top"] = vrect(views["Top"], Wm * scale, Dm * scale)
-R["Left"] = vrect(views["Left"], Dm * scale, Hm * scale)
+# 每个视图: (页面横向对应的模型轴, 页面竖向对应的模型轴, 视线方向轴)。第一角: 俯视在主视下, 左视在主视右。
+VAX = {"Front": (ax_w, ax_h, ax_d), "Top": (ax_w, ax_d, ax_h), "Left": (ax_d, ax_h, ax_w)}
+R = {n: vrect(views[n], ext(VAX[n][0]) * scale, ext(VAX[n][1]) * scale) for n in VAX}
 
 # ---------------------------------------------------------------- 孔
 holes = spec.get("holes", "auto")
@@ -335,27 +356,44 @@ if holes == "auto":
     holes = find_holes(shape)
 rep["holes"] = holes
 
-# ---------------------------------------------------------------- 剖视(过孔最多的那排, 平行主视)
+def hole_view(h):
+    """孔在哪个视图里是圆: 孔轴 ∥ 该视图视线。"""
+    a = V(*h["axis"])
+    for n, (_, _, d) in VAX.items():
+        if abs(abs(a.dot(d)) - 1) < 1e-3:
+            return n
+    return None
+
+
+# ---------------------------------------------------------------- 剖视: 在"孔最多的视图"上横着剖, 剖切面过孔最多的那排孔轴
 sec = None
 sec_spec = spec.get("section", "auto")
+sec_base = None
 if sec_spec == "auto" and holes:
-    # 孔轴线在"深度"方向上的坐标, 取孔最多的那个
     from collections import Counter
 
-    cnt = Counter(round(V(*h["at"]).dot(ax_d), 2) for h in holes)
-    dval = cnt.most_common(1)[0][0]
-    o = V(bb.Center.x, bb.Center.y, bb.Center.z)
-    o = o + ax_d * (dval - o.dot(ax_d))
-    sec_spec = {"origin": [o.x, o.y, o.z], "normal": [front.x, front.y, front.z], "symbol": "A"}
+    per_view = Counter(hole_view(h) for h in holes if hole_view(h))
+    if per_view:
+        sec_base = per_view.most_common(1)[0][0]
+        bw, bh, bd = VAX[sec_base]
+        cnt = Counter(round(V(*h["at"]).dot(bh), 2) for h in holes if hole_view(h) == sec_base)
+        hval = cnt.most_common(1)[0][0]
+        o = V(bb.Center.x, bb.Center.y, bb.Center.z)
+        o = o + bh * (hval - o.dot(bh))
+        sec_spec = {"base": sec_base, "origin": [o.x, o.y, o.z], "normal": [bh.x, bh.y, bh.z], "symbol": "A"}
+    else:
+        sec_spec = None
 if isinstance(sec_spec, dict):
+    sec_base = sec_spec.get("base", "Front")
+    bw, bh, bd = VAX[sec_base]
     sec = doc.addObject("TechDraw::DrawViewSection", "SectionA")
     page.addView(sec)
-    sec.BaseView = views["Top"]
+    sec.BaseView = views[sec_base]
     sec.Source = [part]
     sec.SectionNormal = V(*sec_spec["normal"])
     sec.SectionOrigin = V(*sec_spec["origin"])
     sec.Direction = V(*sec_spec["normal"])
-    sec.XDirection = ax_w
+    sec.XDirection = bw
     sec.SectionSymbol = sec_spec.get("symbol", "A")
     sec.Label = "%s-%s" % (sec.SectionSymbol, sec.SectionSymbol)  # 国标剖视名 "A-A", 界面里 ShowLabel 时显示
     sec.Scale = scale
@@ -364,10 +402,15 @@ if isinstance(sec_spec, dict):
         sec.CutSurfaceDisplay = "PatHatch"
     except Exception:
         pass
-    # 放在俯视右边(左视下面那块空地), 与俯视同高
-    sec.X = R["Top"][2] + GAPV + MARGIN + Wm * scale / 2
-    sec.Y = (R["Top"][1] + R["Top"][3]) / 2
-    R["Section"] = vrect(sec, Wm * scale, Hm * scale)
+    # 剖视大小 = 基视图宽 × 视线方向厚度; 放在俯视右边(左视下面那块空地), 与俯视同高; 出界就往下挪
+    sw, sh_ = ext(bw) * scale, ext(bd) * scale
+    if SEC_AT == "right":
+        sec.X = R["Top"][2] + GAPV + MARGIN + sw / 2
+        sec.Y = (R["Top"][1] + R["Top"][3]) / 2
+    else:
+        sec.X = (R["Top"][0] + R["Top"][2]) / 2
+        sec.Y = R["Top"][1] - GAPV - MARGIN - sh_ / 2
+    R["Section"] = vrect(sec, sw, sh_)
     # 剖视名 "A-A" 写在剖视上方(界面侧的视图标签导出时不一定显示, 用注释文字最稳)
     lab = doc.addObject("TechDraw::DrawViewAnnotation", "SectionLabel")
     page.addView(lab)
@@ -382,12 +425,13 @@ if isinstance(sec_spec, dict):
 iso = doc.addObject("TechDraw::DrawViewPart", "Iso")
 page.addView(iso)
 iso.Source = [part]
-iso.Direction = V(1, -1, 1) if front.y < 0 else V(1, 1, 1)
-iso.XDirection = V(1, 1, 0) if front.y < 0 else V(1, -1, 0)
+# 轴测方向 = 主视方向 + 右 + 上(正等测), X 方向 = 右 − 主视方向(与视线垂直)
+iso.Direction = (front + ax_w + ax_h).normalize()
+iso.XDirection = (ax_w - front).normalize()
 used_r = max(r[2] for r in R.values())
 free_w = AREA[2] - used_r - 10
 diag = math.sqrt(bb.XLength ** 2 + bb.YLength ** 2 + bb.ZLength ** 2)
-iso_s = next((s for s in SCALES if diag * s <= max(free_w, 60) and s <= scale), SCALES[-1])
+iso_s = next((s for s in SCALES if diag * s <= max(free_w, 60) and s <= scale * 0.75), SCALES[-1])  # 轴测只作参考, 不比主视大
 iso.Scale = iso_s
 iso.ScaleType = "Custom"
 iso.X = AREA[2] - diag * iso_s / 2 - 4
@@ -468,83 +512,94 @@ def longest(view, axis):
 
 
 G, STEP = DIMS["gap"], DIMS["step"]
-# 外形: 俯视 长(下)、宽(右); 主视 高(左)
-top, frontv, leftv = views["Top"], views["Front"], views["Left"]
-rT, rF = R["Top"], R["Front"]
-e = longest(top, "x")
-if e:
-    p = ((rT[0] + rT[2]) / 2, rT[1] - G)
-    add_dim(top, "DistanceX", [e], "LenW", p, fmt_spec="%." + str(DIMS["decimals"]) + "w")
-    placer.take(text_rect(p[0], p[1], fmt(Wm)))
-e = longest(top, "y")
-if e:
-    p = (rT[2] + G, (rT[1] + rT[3]) / 2)
-    add_dim(top, "DistanceY", [e], "LenD", p, fmt_spec="%." + str(DIMS["decimals"]) + "w")
-    placer.take(text_rect(p[0], p[1], fmt(Dm)))
-e = longest(frontv, "y")
-if e:
-    p = (rF[0] - G, (rF[1] + rF[3]) / 2)
-    add_dim(frontv, "DistanceY", [e], "LenH", p, fmt_spec="%." + str(DIMS["decimals"]) + "w")
-    placer.take(text_rect(p[0], p[1], fmt(Hm)))
-
-# 孔: 同规格合并成一条标注, 引线指向其中一个(俯视里, 轴线朝深度方向 = 俯视看得到的孔)
-groups = {}
-for h in holes:
-    if abs(abs(V(*h["axis"]).dot(ax_h)) - 1) > 1e-3:
-        continue  # 只标俯视方向看得到的孔(其它方向的留给后续: 在对应视图里标)
-    k = (h["d"], h.get("through"), h.get("depth"), tuple(h["cb"]) if h.get("cb") else None, h.get("tap"), h.get("tol"))
-    groups.setdefault(k, []).append(h)
-circles = [(n, ed) for n, ed in edges_of(top) if isinstance(ed.Curve, Part.Circle)]
-rep["top_circles"] = [[n, round(ed.Curve.Radius, 3), round(ed.Curve.Center.x, 2), round(ed.Curve.Center.y, 2)] for n, ed in circles]
-cxT, cyT = (rT[0] + rT[2]) / 2, (rT[1] + rT[3]) / 2
+FSPEC = "%." + str(DIMS["decimals"]) + "w"
 
 
-def circle_for(h):
-    """俯视里与孔对应的圆边: 半径 = d/2, 圆心最接近孔轴投影。视图边坐标 = 模型单位(未乘比例)、以零件包围盒中心为原点。
-    返回 (边名, 圆心在页面上相对视图中心的偏移 = 边坐标 × 比例)。"""
+def place_linear(vname, axis, side, name, value):
+    """外形尺寸: vname 视图里沿 axis("x" 横 / "y" 竖)最长的边, 放在 side(top / bottom / left / right)外侧。"""
+    v, r = views[vname], R[vname]
+    e = longest(v, axis)
+    if not e:
+        return
+    cx, cy = (r[0] + r[2]) / 2, (r[1] + r[3]) / 2
+    # 左右两侧多让 6 mm: 剖切符号的箭头伸在视图左右外面
+    p = {"top": (cx, r[3] + G), "bottom": (cx, r[1] - G), "left": (r[0] - G - 6, cy), "right": (r[2] + G + 6, cy)}[side]
+    add_dim(v, "DistanceX" if axis == "x" else "DistanceY", [e], name, p, fmt_spec=FSPEC)
+    placer.take(text_rect(p[0], p[1], fmt(value)))
+
+
+# 外形: 主视 宽(上)、高(左); 厚度标在左视(上)。第一角里主视下面是俯视, 所以宽标在上面
+place_linear("Front", "x", "top", "LenW", Wm)
+place_linear("Front", "y", "left", "LenH", Hm)
+place_linear("Left", "x", "top", "LenD", Dm)
+
+
+def circle_for(vname, circles, h):
+    """视图里与孔对应的圆边: 半径 = d/2, 圆心最接近孔轴投影。视图边坐标 = 模型单位(未乘比例)、以零件包围盒中心为原点,
+    横 / 竖方向的正负不确定(四种都试)。返回 (边名, 圆心在页面上相对视图中心的偏移 = 边坐标 × 比例)。"""
+    bw_, bh_, _ = VAX[vname]
     at = V(*h["at"])
-    px = (at - bb.Center).dot(ax_w)
-    py = (at - bb.Center).dot(ax_d)
-    best, bd = None, 1e9
+    px, py = (at - bb.Center).dot(bw_), (at - bb.Center).dot(bh_)
+    best, bdist = None, 1e9
     for n, ed in circles:
         if abs(ed.Curve.Radius - h["d"] / 2) > 1e-3:
             continue
         c = ed.Curve.Center
-        for sy in (1, -1):
-            dd = math.hypot(c.x - px, c.y - sy * py)
-            if dd < bd:
-                best, bd = (n, V(c.x * scale, c.y * scale, 0)), dd
+        for sx in (1, -1):
+            for sy in (1, -1):
+                dd = math.hypot(c.x - sx * px, c.y - sy * py)
+                if dd < bdist:
+                    best, bdist = (n, V(c.x * scale, c.y * scale, 0)), dd
     return best
 
 
+# 孔: 按"在哪个视图里是圆"分视图, 同规格合并成一条标注("6 x ⌀4.3 贯穿"), 引线指向其中一个
 k_i = 0
-for k, hs in sorted(groups.items(), key=lambda kv: -len(kv[1])):
-    h0 = dict(hs[0])
-    txt = callout(h0, len(hs))
-    hit = circle_for(h0)
-    if not hit:
-        rep["warnings"].append("no circle for hole %s" % h0)
+for vname in VAX:
+    groups = {}
+    for h in holes:
+        if hole_view(h) != vname:
+            continue
+        k = (h["d"], h.get("through"), h.get("depth"), tuple(h["cb"]) if h.get("cb") else None, h.get("tap"), h.get("tol"))
+        groups.setdefault(k, []).append(h)
+    if not groups:
         continue
-    n, c = hit
-    # 候选: 视图外上 / 下 / 左 / 右, 由近到远
-    cands = []
-    for ring in range(6):
-        off = G * 1.6 + ring * STEP
-        cands += [(cxT + c.x + off * 0.6, rT[3] + off), (cxT + c.x - off * 0.6, rT[3] + off),
-                  (cxT + c.x + off * 0.6, rT[1] - off - G), (cxT + c.x - off * 0.6, rT[1] - off - G),
-                  (rT[2] + off + 10, cyT + c.y + off * 0.4), (rT[0] - off - 10, cyT + c.y + off * 0.4)]
-    spot = None
-    for p in cands:
-        r = text_rect(p[0], p[1], txt)
-        if placer.free(r):
-            spot = p
-            placer.take(r)
-            break
-    if spot is None:
-        spot = cands[0]
-        rep["warnings"].append("callout overlaps: " + txt)
-    add_dim(top, "Diameter", [n], "Hole%d" % k_i, spot, text=txt)
-    k_i += 1
+    v, r = views[vname], R[vname]
+    circles = [(n, ed) for n, ed in edges_of(v) if isinstance(ed.Curve, Part.Circle)]
+    cxV, cyV = (r[0] + r[2]) / 2, (r[1] + r[3]) / 2
+    for k, hs in sorted(groups.items(), key=lambda kv: -len(kv[1])):
+        h0 = dict(hs[0])
+        txt = callout(h0, len(hs))
+        # 引线指向这组里最靠视图外缘的那个孔(引线短、少穿过图形)
+        hits = [(hh, circle_for(vname, circles, hh)) for hh in hs]
+        hits = [(hh, ht) for hh, ht in hits if ht]
+        if not hits:
+            rep["warnings"].append("no circle for hole %s in %s" % (h0, vname))
+            continue
+        # 候选位置: 视图四周外侧一圈圈往外; 对组里每个孔 × 每个空位算引线长, 取最短(引线短、少横穿图形)
+        best = None
+        for hh, (n, c) in hits:
+            px_, py_ = cxV + c.x, cyV + c.y
+            for ring in range(8):
+                off = G * 1.6 + ring * STEP
+                for p in ((px_ + off * 0.5, r[3] + off), (px_ - off * 0.5, r[3] + off),
+                          (px_ + off * 0.5, r[1] - off), (px_ - off * 0.5, r[1] - off),
+                          (r[2] + off + 12, py_ + off * 0.3), (r[0] - off - 12, py_ + off * 0.3)):
+                    rr = text_rect(p[0], p[1], txt)
+                    if not placer.free(rr):
+                        continue
+                    dist = math.hypot(p[0] - px_, p[1] - py_)
+                    if best is None or dist < best[0]:
+                        best = (dist, n, p, rr)
+        if best is None:
+            hh, (n, c) = hits[0]
+            spot = (r[2] + G * 2, cyV + c.y)
+            rep["warnings"].append("callout overlaps: " + txt)
+        else:
+            _, n, spot, rr = best
+            placer.take(rr)
+        add_dim(v, "Diameter", [n], "Hole%d" % k_i, spot, text=txt)
+        k_i += 1
 doc.recompute()
 lap("dims")
 
