@@ -115,6 +115,8 @@ pub mod api {
     pub const DIM_FACES: &str = "dim.faces";
     /// 右键确认扩展到 Plasticity 窗口: arm 时页面右键被吃掉并计数(计数随 sel.snapshot 轮询带回)。
     pub const UI_RCLICK: &str = "ui.rightClick";
+    /// N4: 打孔(简单 / 柱形沉头 / 锥形沉头; 一次原子执行, 回孔的各面签名)。
+    pub const HOLE_MAKE: &str = "hole.make";
 
     /// 全部接口名（契约测试用）。
     pub const ALL: &[&str] = &[
@@ -122,7 +124,7 @@ pub mod api {
         CMD_PING, ERR_LAST, TREE_LIST, SEL_CANCEL_COMMAND, SEL_CLEAR, SEL_APPLY, CAM_NAVIGATE, CAM_RENDER, CAM_THUMBNAIL, CAM_VP_RECT,
         CAM_SET_ORBIT_STEP, CAM_ROLL, KEYMAP_SET_BINDINGS, VP_SAVE, VP_RESTORE, MAT_SAVE, MAT_RESTORE, CMD_EXEC, CMD_FACTORIES,
         GEO_QUERY, HIST_BEGIN, HIST_ROLLBACK, HIST_COMMIT, GEO_SNAPS, GEO_MEASURE, CAM_VIEW, DIM_FACE, VIEW_HIGHLIGHT, DIM_DISTANCE, DIM_SIGNATURE, GEO_RESOLVE,
-        DIM_RECORD, DIM_MEASURE, DIM_FACES, UI_RCLICK,
+        DIM_RECORD, DIM_MEASURE, DIM_FACES, UI_RCLICK, HOLE_MAKE,
     ];
 }
 

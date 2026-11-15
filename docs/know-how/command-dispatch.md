@@ -118,6 +118,18 @@
   配方 `moveFaces {faces, move: [dx,dy,dz]}`(参数类型 translation)。方槽 5 个面一次平移, 孔形不变。
 - 布尔相减 `operationType = 15902`(subtract)实测可用(盒子挖方槽)。
 
+## N4 打孔(2026-11-15 副本实测)
+
+- `CylinderFactory`(→ BooleanBodyFactory, 同 CornerBox 的布尔): 实例字段 `center` / `point`(Vector3, 原地 set)、`orientation`(四元数:
+  把 (0,0,1) 转到圆柱轴)、setter `radius` / `height`(沿轴)。按手工建圆柱的顺序设: 圆心 → 朝向 → 半径点(圆心 + 垂直轴方向 × r)→ radius → height,
+  再 `targets` + `operationType = 15902` = 一次挖出孔。孔的轴 = 入口面法向的反向; 通孔深度给实体包围盒对角线 + 1。
+  "Operation has no effect" = 圆柱没碰到材料(例: Box.006 台阶面下面是空的), 不是字段问题。
+- 倒角: `MultiFilletShellFactory` 距离取负 = 45° 倒角(出 Cone 面); `chamferMode` 设 true / 1 仍是圆角(Torus), `shape` 22202 = BSurf(二次曲线)。
+  锥形沉头(90°) = 孔口圆边倒角 (D − d) / 2。柱形沉头 = 再减一个大而浅的圆柱(目标 = 上一步产物 `$hole`)。
+- `BooleanFactory`(targets / tools / operationType 默认 15902)也可单独做布尔, 打孔用不上。
+- 配方: `cylinder {center, axis, radius, height, bool, targets}`(参数类型 vecset / axisQuat, 配方标记 radiusPoint)、`chamfer {edges, distance}`(negLength)。
+  垫片 `hole.make` 组合这几步, 一次原子执行。
+
 ## 加一个新操作
 
 1. 副本上读工厂原型链的 setter 名(本文 4.), 用 lab 脚本试出参数取值与 commit 返回值;

@@ -1005,7 +1005,30 @@ const callAsync = async (name, args) => JSON.parse(await run(`window.__PLA__.cal
         return [];
       }
     }
-    return { CornerBoxFactory, MultiFilletShellFactory, OffsetFaceFactory, RefilletFaceFactory, MultiMoveFaceFactory };
+    // N4 圆柱(仿实测字段): center / point(Vector3 原地 set)、orientation(四元数 setFromUnitVectors)、radius / height setter;
+    // 带 targets + subtract → 目标实体换新(包围盒不变, 假机不真挖), 每次记进 ed.cyls
+    const vec0 = () => ({ x: 0, y: 0, z: 0, set(x, y, z) { this.x = x; this.y = y; this.z = z; return this; } });
+    class CylinderFactory extends AbstractFactory {
+      constructor(editor) {
+        super(editor);
+        this.center = vec0(); this.point = vec0();
+        this.orientation = { to: null, setFromUnitVectors(a, b) { this.from = [a.x, a.y, a.z]; this.to = [b.x, b.y, b.z]; return this; } };
+      }
+      set radius(v) { this._r = v; } get radius() { return this._r; }
+      set height(v) { this._h = v; } set targets(v) { this._targets = v; } set operationType(v) { this._op = v; }
+      async commit() {
+        this.guard();
+        const c = this.center, p = this.point;
+        (ed.cyls = ed.cyls || []).push({ center: [c.x, c.y, c.z], axis: this.orientation.to, from: this.orientation.from, r: this._r, h: this._h,
+          op: this._op, target: this._targets && this._targets[0].userData.versionId, pointDist: Math.hypot(p.x - c.x, p.y - c.y, p.z - c.z) });
+        const snap = ed.geo.items.slice();
+        const t = this._targets[0];
+        remove(t);
+        ed.history._undoStack.push({ name: 'PlaFactory', snapshot: snap });
+        return [add(new Solid(t.mn, t.mx))];
+      }
+    }
+    return { CornerBoxFactory, MultiFilletShellFactory, OffsetFaceFactory, RefilletFaceFactory, MultiMoveFaceFactory, CylinderFactory };
   }
 
   const L_BRACKET = { ops: [
@@ -1020,8 +1043,8 @@ const callAsync = async (name, args) => JSON.parse(await run(`window.__PLA__.cal
     assert.strictEqual(r.err, 'exc:need-factories');
     const f = call('cmd.factories').v;
     assert.strictEqual(f.loaded, false);
-    assert.deepStrictEqual(f.missing.sort(), ['fac.cornerBox', 'fac.moveFaces', 'fac.multiFillet', 'fac.offsetFace', 'fac.refillet']);
-    assert.deepStrictEqual(f.ops, ['box', 'fillet', 'offsetFace', 'refillet', 'moveFaces']);
+    assert.deepStrictEqual(f.missing.sort(), ['fac.cornerBox', 'fac.cylinder', 'fac.moveFaces', 'fac.multiFillet', 'fac.offsetFace', 'fac.refillet']);
+    assert.deepStrictEqual(f.ops, ['box', 'fillet', 'offsetFace', 'refillet', 'moveFaces', 'cylinder', 'chamfer']);
   });
 
   await ta('N2 cmd.exec M-A: L 形支架 = 底板 + 立板(合并) + 内角倒圆; 文档单位 mm → 内部米; 每步一个命令一个撤销步', async () => {
@@ -1072,7 +1095,7 @@ const callAsync = async (name, args) => JSON.parse(await run(`window.__PLA__.cal
     // 参数错误在执行任何一步之前就报
     const q1 = ed.enqueued;
     const bad = [
-      [{ ops: [{ op: 'sphere' }] }, /unknown op \(known: box, fillet, offsetFace, refillet, moveFaces\)/],
+      [{ ops: [{ op: 'sphere' }] }, /unknown op \(known: box, fillet, offsetFace, refillet, moveFaces, cylinder, chamfer\)/],
       [{ ops: [{ op: 'box', p1: [0, 0, 0], p2: [1, 1, 0] }] }, /missing height/],
       [{ ops: [{ op: 'box', p1: [0, 0, 0], p2: [1, 1, 0], height: 1, colour: 'red' }] }, /unknown param colour/],
       [{ ops: [{ op: 'fillet', edges: ['1e1'], distance: 1, bool: 'union' }] }, /bool not supported/],
@@ -1255,6 +1278,44 @@ const callAsync = async (name, args) => JSON.parse(await run(`window.__PLA__.cal
     assert.deepStrictEqual(d.candidates.map((c) => [c.id, c.value, c.overlap]), [[bot, 5, true]]);
     assert.strictEqual(call('dim.face', { face: top, opposite: bot }).v.value, 5);
     assert.ok(/not an opposite parallel face/.test(call('dim.face', { face: top, opposite: top }).err));
+  });
+
+  await ta('N4 hole.make: 圆柱 subtract(轴 = −法向, 通孔深 = 包围盒对角线 + 1); 柱形沉头 = 第二个圆柱减在上一步产物上; 锥形沉头挑不到孔口边 → 整体撤回; 参数错如实报', async () => {
+    const ed = ed3;
+    const r = (await callAsync('cmd.exec', { ops: [{ op: 'box', p1: [700, 0, 0], p2: [740, 30, 0], height: 10 }] })).v;
+    const id = r.results[0].items[0].id;
+    const top = call('geo.query', { detail: 'faces', of: [id], normal: [0, 0, 1] }).v.faces[0].id;
+    ed.cyls = [];
+    const h = await callAsync('hole.make', { face: top, at: [710, 15, 99], type: 'counterbore', d: 4.5, cbD: 8, cbDepth: 4.4 });
+    assert.ok(h.ok, JSON.stringify(h));
+    const diag = Math.hypot(40, 30, 10) + 1;
+    const c0 = ed.cyls[0], c1 = ed.cyls[1];
+    assert.deepStrictEqual(c0.center.map((x) => Math.round(x * 1e6) / 1e6), [0.71, 0.015, 0.01], 'at 投影到面上(z = 10), 毫米 → 米');
+    assert.deepStrictEqual([c0.axis, c0.from, c0.op, c0.target], [[0, 0, -1], [0, 0, 1], 15902, id]);
+    assert.ok(Math.abs(c0.r - 0.00225) < 1e-12 && Math.abs(c0.pointDist - 0.00225) < 1e-12, '半径 + 半径点');
+    assert.ok(Math.abs(c0.h - diag * 0.001) < 1e-9, '通孔深度');
+    assert.ok(Math.abs(c1.r - 0.004) < 1e-12 && Math.abs(c1.h - 0.0044) < 1e-12 && c1.target !== id, '沉头圆柱减在第一步产物上');
+    assert.strictEqual(h.v.through, true);
+    assert.ok(h.v.faces.entry && h.v.faces.entry.surface === 'Plane', '入口面签名');
+    // 偏移: 面中点 + u × 5 + v × (−3); 法向 +Z → u = X, v = Y(planeAxes, dim.face 回带同一组轴)
+    const top2 = call('geo.query', { detail: 'faces', of: [h.v.solid], normal: [0, 0, 1] }).v.faces[0].id;
+    const ax = call('dim.face', { face: top2 }).v.axes;
+    assert.deepStrictEqual(JSON.parse(JSON.stringify([ax.u, ax.v, ax.uName, ax.vName])), [[1, 0, 0], [0, 1, 0], 'X', 'Y']);
+    const ho = await callAsync('hole.make', { face: top2, offset: [5, -3], type: 'simple', d: 3, depth: 4 });
+    assert.ok(ho.ok, JSON.stringify(ho));
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(ho.v.at)), [725, 12, 10]);
+    assert.ok(Math.abs(ed.cyls[ed.cyls.length - 1].h - 0.004) < 1e-12 && ho.v.through === false, '盲孔深度');
+    // 锥形沉头: 假机没有孔口圆边 → 第二步挑边失败 → 第一步也撤回
+    const undo0 = ed.history._undoStack.length;
+    const top3 = call('geo.query', { detail: 'faces', of: [ho.v.solid], normal: [0, 0, 1] }).v.faces[0].id;
+    const cs = await callAsync('hole.make', { face: top3, type: 'countersink', d: 4.5, cskD: 9, depth: 6 });
+    assert.strictEqual(cs.ok, false);
+    assert.ok(/step 1 \(chamfer\).*rolled back/.test(cs.err), cs.err);
+    assert.strictEqual(ed.history._undoStack.length, undo0, '撤回到起点');
+    // 参数错
+    assert.ok(/d must be > 0/.test(call('hole.make', { face: top3 }).err));
+    assert.ok(/type must be/.test(call('hole.make', { face: top3, d: 3, type: 'x' }).err));
+    assert.ok(/counterbore diameter must be larger/.test(call('hole.make', { face: top3, d: 5, type: 'counterbore', cbD: 4, cbDepth: 1 }).err));
   });
 
   await ta('N3d dim.signature / geo.resolve: 签名 → 改几何(面 id 全变)→ 按预测签名重新定位到新面; 偏差 / 次优差距如实报', async () => {

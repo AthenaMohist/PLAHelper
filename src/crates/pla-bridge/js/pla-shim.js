@@ -137,6 +137,7 @@
     'fac.offsetFace':          ['fac', 'OffsetFaceFactory'],
     'fac.refillet':            ['fac', 'RefilletFaceFactory'],
     'fac.moveFaces':           ['fac', 'MultiMoveFaceFactory'],
+    'fac.cylinder':            ['fac', 'CylinderFactory'],
     // ---- N3e: 本体测量(Measure Distance 的同一工厂; 名字在 nodes 表里, 不在测量记录上 —— 实测 2026-11-15) ----
     'ed.measurements':         ['ed', 'measurements'],
     'meas.snapshot':           ['meas', 'snapshot'],
@@ -334,6 +335,9 @@
     undoStepTimeoutMs: 5000,
     // 每步命令的超时(ms); 按位置挑边/面的默认容差(文档单位)
     cmdTimeoutMs: 15000,
+    // 命令入队后多久还没开始执行就重新入队、最多几次(runCommand 看门狗)
+    cmdStartWatchMs: 1500,
+    cmdStartRetries: 2,
     pickTolerance: 0.5,
     // 配方表(唯一来源): 对外操作名 → 工厂表键 + 参数(对外名 → [工厂 setter, 类型]) + 必填 + 是否支持布尔。
     // 类型决定换算: point(文档单位 → 米, 构造 Vector3) / length / angle(度 → 弧度) / number / bool /
@@ -353,8 +357,17 @@
       // N3c: 一组面整体平移(孔位 / 凸台位置 / 两面间距); move = [dx, dy, dz](文档单位)。
       // 实测要同时设 move(Vector3)与 matrix(平移矩阵): 只设 move 无效果, 只设 matrix 也无效果。
       moveFaces: { fac: 'fac.moveFaces', required: ['faces', 'move'],
-                   params: { faces: ['faces', 'faces'], move: [null, 'translation'] } }
+                   params: { faces: ['faces', 'faces'], move: [null, 'translation'] } },
+      // N4: 圆柱(+ 布尔; 打孔 = subtract)。center = 底面圆心, axis = 长出去的方向, height 沿 axis(实测 2026-11-15:
+      // 设 center / orientation / 半径点 / radius / height; 孔 = axis 取入口面法向的反向)
+      cylinder: { fac: 'fac.cylinder', bool: true, radiusPoint: true, required: ['center', 'axis', 'radius', 'height'],
+                  params: { center: ['center', 'vecset'], axis: ['orientation', 'axisQuat'], radius: ['radius', 'length'], height: ['height', 'length'] } },
+      // N4: 倒角(= 圆角工厂距离取负; 孔口倒角 = 锥形沉头)
+      chamfer: { fac: 'fac.multiFillet', required: ['edges', 'distance'],
+                 params: { edges: ['edges', 'edges'], distance: ['distance', 'negLength'] } }
     },
+    // N4 圆柱工厂的实例字段: 圆心 / 半径点(Vector3)、半径 setter; 朝向四元数把 baseAxis 转到圆柱轴
+    cylinderFields: { center: 'center', point: 'point', radius: 'radius', baseAxis: [0, 0, 1] },
     // translation 类型参数写到工厂的哪两个字段(Vector3.set + Matrix4.makeTranslation)
     translationFields: { vector: 'move', matrix: 'matrix' },
     // ---- 右键确认扩展到 Plasticity 窗口(ui.rightClick): 捕获这些事件, 右键松开计一次; contextmenu 只吃不计 ----
@@ -1021,17 +1034,30 @@
 
   // 入队一个命令并等它结束。editor.enqueue 的 Promise 要等整条命令链结束(后续命令等输入就永不兑现) →
   // 改为监听 commandEnded 认本命令; 入队前先取消活动命令(否则新命令排队不执行)。
+  // 启动看门狗(N4 实测): 紧跟在上一条命令之后入队, 偶尔整条命令不开始执行(commandEnded 永不来) →
+  // 带 plaStarted 标记的命令(自建工厂命令)若 NAMES.cmdStartWatchMs 内没开始, 取消活动命令后重新入队(最多 NAMES.cmdStartRetries 次)。
   function runCommand(cmd, timeoutMs) {
     var sig = need('sig.commandEnded');
     try { invokeOn('exec.cancel'); } catch (e) {}
     return new Promise(function (resolve) {
       var done = false;
-      var timer = null;
-      var finish = function (how) { if (done) return; done = true; sig.remove(f); if (timer) clearTimeout(timer); resolve(how); };
+      var timer = null, watch = null, retries = 0;
+      var finish = function (how) { if (done) return; done = true; sig.remove(f); if (timer) clearTimeout(timer); if (watch) clearTimeout(watch); resolve(how); };
       var f = function (c) { if (c === cmd) finish('ended'); };
       sig.add(f);
       timer = setTimeout(function () { finish('timeout'); }, timeoutMs || 10000);
+      var arm = function () {
+        if (cmd.plaStarted !== false) return;
+        watch = setTimeout(function () {
+          if (done || cmd.plaStarted !== false || retries >= NAMES.cmdStartRetries) return;
+          retries++;
+          try { invokeOn('exec.cancel'); } catch (e) {}
+          invokeOn('ed.enqueue', [cmd]);
+          arm();
+        }, NAMES.cmdStartWatchMs);
+      };
       invokeOn('ed.enqueue', [cmd]);
+      arm();
     });
   }
 
@@ -1080,8 +1106,11 @@
     if (typeof Base !== 'function') throw new CapError('cmd.factoryBaseHolder', ['cmd.factoryBaseHolder']);
     if (state.facCmd && state.facCmd.base === Base) return state.facCmd.cls;
     class PlaFactoryCommand extends Base {
-      constructor(editor, build) { super(editor); this.plaBuild = build; this.plaResult = null; this.plaErr = null; }
+      constructor(editor, build) { super(editor); this.plaBuild = build; this.plaResult = null; this.plaErr = null; this.plaStarted = false; }
       async execute() {
+        // 看门狗重新入队过的命令可能被执行第二次: 只执行一次
+        if (this.plaStarted) return;
+        this.plaStarted = true;
         // 失败要再抛出去: 让 Plasticity 按命令失败收尾(工厂随 resource 释放、不进撤销栈)
         try { this.plaResult = await this.plaBuild(this); } catch (e) { this.plaErr = errMsg(e); throw e; }
       }
@@ -1201,6 +1230,19 @@
       case 'translation':
         if (!Array.isArray(val) || val.length !== 3) throw new Error('move must be [dx,dy,dz]');
         return [num(val[0]) * ctx.k, num(val[1]) * ctx.k, num(val[2]) * ctx.k];
+      // N4: 工厂实例上已有的 Vector3, 原地 set(米)
+      case 'vecset':
+        if (!Array.isArray(val) || val.length !== 3) throw new Error('point must be [x,y,z]');
+        return [num(val[0]) * ctx.k, num(val[1]) * ctx.k, num(val[2]) * ctx.k];
+      // N4: 方向 → 把工厂的基准轴(NAMES.cylinderFields.baseAxis)转到该方向的四元数(原地 setFromUnitVectors)
+      case 'axisQuat': {
+        if (!Array.isArray(val) || val.length !== 3) throw new Error('axis must be [x,y,z]');
+        var l = Math.hypot(num(val[0]), num(val[1]), num(val[2]));
+        if (!(l > 0)) throw new Error('axis must be non-zero');
+        return [val[0] / l, val[1] / l, val[2] / l];
+      }
+      // N4: 倒角 = 圆角距离取负(Plasticity 约定; 实测出 45° 圆锥面)
+      case 'negLength': return -Math.abs(num(val)) * ctx.k;
     }
     throw new Error('recipe: unknown param type ' + type);
   }
@@ -1213,14 +1255,35 @@
     Object.keys(rc.params).forEach(function (p) {
       if (o[p] === undefined) return;
       var type = rc.params[p][1], val = convertParam(type, o[p], ctx);
+      var setter = rc.params[p][0];
       if (type === 'translation') {
         // 平移: 向量与平移矩阵都要设(见 recipes.moveFaces)
         var TF = NAMES.translationFields;
         sets.push(function (f) { f[TF.vector].set(val[0], val[1], val[2]); f[TF.matrix].makeTranslation(val[0], val[1], val[2]); });
+      } else if (type === 'vecset') {
+        sets.push(function (f) { f[setter].set(val[0], val[1], val[2]); });
+      } else if (type === 'axisQuat') {
+        sets.push(function (f) {
+          var V = ctx.V3, b = NAMES.cylinderFields.baseAxis;
+          f[setter].setFromUnitVectors(new V(b[0], b[1], b[2]), new V(val[0], val[1], val[2]));
+        });
       } else {
-        sets.push([rc.params[p][0], val]);
+        sets.push([setter, val]);
       }
     });
+    if (rc.radiusPoint) {
+      // N4 圆柱: 半径点 = 圆心 + 垂直于轴的方向 × 半径(手工建圆柱时的第二次点击); 设完再设一次半径
+      var CF = NAMES.cylinderFields;
+      var cen = convertParam('vecset', o.center, ctx), ax = convertParam('axisQuat', o.axis, ctx), rr = convertParam('length', o.radius, ctx);
+      var pp = Math.abs(ax[0]) < 0.9 ? [1, 0, 0] : [0, 1, 0];
+      var dp = pp[0] * ax[0] + pp[1] * ax[1] + pp[2] * ax[2];
+      pp = [pp[0] - dp * ax[0], pp[1] - dp * ax[1], pp[2] - dp * ax[2]];
+      var pl = Math.hypot(pp[0], pp[1], pp[2]);
+      sets.push(function (f) {
+        f[CF.point].set(cen[0] + pp[0] / pl * rr, cen[1] + pp[1] / pl * rr, cen[2] + pp[2] / pl * rr);
+        f[CF.radius] = rr;
+      });
+    }
     if (o.bool !== undefined) {
       var targets = o.targets !== undefined ? convertParam('solids', o.targets, ctx) : [];
       if (!targets.length) throw new Error('bool needs targets');
@@ -1852,6 +1915,8 @@
       return out;
     }
     if (f.surface !== NAMES.planeSurface || !f.normal || !f.center) return out;
+    out.center = f.center;
+    out.axes = planeAxes(f.normal);   // N4 打孔的偏移轴(界面标签与 hole.make 共用这一条规则)
     var n = f.normal, cosTol = Math.cos(((a.angleTol !== undefined ? Number(a.angleTol) : NAMES.parallelTolDeg) * Math.PI) / 180);
     // 屏幕外两条世界轴上的投影重叠(法向的主轴之外)
     var ax = [0, 1, 2].sort(function (p, q) { return Math.abs(n[q]) - Math.abs(n[p]); });
@@ -2174,6 +2239,79 @@
         return m;
       });
     }).then(function () { return { created: true, name: name }; });
+  }, { async: true });
+
+  // N4 打孔。在平面上 at 处(默认面中点; 会投影到面所在平面)打孔, 一次原子执行(失败整体撤回):
+  // 孔 = 圆柱 subtract(轴 = 入口面法向的反向; 通孔深度 = 实体包围盒对角线 + 1); 柱形沉头 = 再减一个大而浅的圆柱;
+  // 锥形沉头(90°) = 孔口边倒角 (cskD − d) / 2(第二步按位置挑边: 孔口圆的包围盒中心就是 at)。
+  // args = { face, at?: [x,y,z], offset?: [u, v](相对 at / 面中点, 沿 planeAxes), type: 'simple'|'counterbore'|'countersink',
+  //          d, depth?(省略 = 通孔), cbD?, cbDepth?, cskD?, units? }
+  // → { solid, at, normal, through, faces: { entry, wall, bottom?, cbWall?, cbFloor?, csk? }(签名, 文档单位), units }
+  // 平面内的两条偏移轴: u = 与法向最不平行的世界轴(法向近 Z → X; 近 X → Y; 否则 X)投影到平面, v = n × u。
+  // 返回 { u, v, uName, vName }(名字 = 与之最接近的世界轴, 带符号, 界面标签用)
+  function planeAxes(n) {
+    var base = Math.abs(n[2]) > 0.9 ? [1, 0, 0] : Math.abs(n[0]) > 0.9 ? [0, 1, 0] : [1, 0, 0];
+    var d = vdot(base, n);
+    var u = vnorm([base[0] - d * n[0], base[1] - d * n[1], base[2] - d * n[2]]);
+    var v = vcross(n, u);
+    var nameOf = function (w) { var i = [0, 1, 2].sort(function (p, q) { return Math.abs(w[q]) - Math.abs(w[p]); })[0]; return (w[i] < 0 ? '-' : '') + 'XYZ'.charAt(i); };
+    return { u: u.map(sig7), v: v.map(sig7), uName: nameOf(u), vName: nameOf(v) };
+  }
+
+  def('hole.make', 'cmd.exec', function (a) {
+    a = a || {};
+    var U = unitOf(a), k = U.k;
+    var num = function (x, what) { var n = Number(x); if (!(n > 0)) throw new Error(what + ' must be > 0'); return n; };
+    var type = a.type || 'simple';
+    if (['simple', 'counterbore', 'countersink'].indexOf(type) < 0) throw new Error('type must be simple / counterbore / countersink');
+    var d = num(a.d, 'd');
+    var f = faceSigFull(String(a.face || ''), k);
+    if (f.surface !== NAMES.planeSurface || !f.normal || !f.center) throw new Error('holes go on a plane face (got ' + (f.surface || '?') + ')');
+    var n = f.normal, c = f.center;
+    var at = Array.isArray(a.at) && a.at.length === 3 ? a.at.map(Number) : c.slice();
+    // offset = [沿 u, 沿 v](planeAxes; 界面"距面中心"的两个偏移)
+    if (Array.isArray(a.offset) && a.offset.length === 2) {
+      var ax2 = planeAxes(n), ou = Number(a.offset[0]) || 0, ov = Number(a.offset[1]) || 0;
+      at = [at[0] + ax2.u[0] * ou + ax2.v[0] * ov, at[1] + ax2.u[1] * ou + ax2.v[1] * ov, at[2] + ax2.u[2] * ou + ax2.v[2] * ov];
+    }
+    var off = vdot([at[0] - c[0], at[1] - c[1], at[2] - c[2]], n);
+    at = [at[0] - n[0] * off, at[1] - n[1] * off, at[2] - n[2] * off];
+    var sv = viewOf('solid', /^(\d+)/.exec(String(a.face))[1]);
+    var bb = bboxOf(sv, k);
+    var through = a.depth === undefined || a.depth === null;
+    var depth = through ? Math.hypot(bb[1][0] - bb[0][0], bb[1][1] - bb[0][1], bb[1][2] - bb[0][2]) + 1 : num(a.depth, 'depth');
+    var axis = n.map(function (x) { return x === 0 ? 0 : -x; });   // 不出 −0
+    var ops = [{ op: 'cylinder', id: 'hole', center: at, axis: axis, radius: d / 2, height: depth, bool: 'subtract', targets: [itemIdOf(sv)] }];
+    if (type === 'counterbore') {
+      var cbD = num(a.cbD, 'cbD'), cbDepth = num(a.cbDepth, 'cbDepth');
+      if (cbD <= d) throw new Error('counterbore diameter must be larger than the hole');
+      ops.push({ op: 'cylinder', id: 'cb', center: at, axis: axis, radius: cbD / 2, height: cbDepth, bool: 'subtract', targets: ['$hole'] });
+    } else if (type === 'countersink') {
+      var cskD = num(a.cskD, 'cskD');
+      if (cskD <= d) throw new Error('countersink diameter must be larger than the hole');
+      ops.push({ op: 'chamfer', edges: [{ near: at, tol: d / 4 }], distance: (cskD - d) / 2 });
+    }
+    return API['cmd.exec'].fn({ atomic: true, ops: ops, units: U.unit }).then(function (r) {
+      if (r.failed) throw new Error('step ' + r.failed.index + ' (' + r.failed.op + '): ' + r.failed.err + (r.rolledBack !== undefined ? ' — rolled back' : ''));
+      var last = r.results[r.results.length - 1];
+      var sid = last && last.items[0] && last.items[0].id;
+      var nv = sid !== undefined && viewOf('solid', sid);
+      if (!nv) throw new Error('hole made but the result solid was not found');
+      var sigs = groupEntries(nv, 'face', k).map(function (e) { var s = faceSig(e, sid, k); s.solidName = nameOf(nv); return s; });
+      var tol = Math.max(1e-3, d * 1e-3);
+      var distToAxis = function (s) {
+        var w = [at[0] - s.axisOrigin[0], at[1] - s.axisOrigin[1], at[2] - s.axisOrigin[2]], al = vdot(w, s.axis);
+        return Math.hypot(w[0] - al * s.axis[0], w[1] - al * s.axis[1], w[2] - al * s.axis[2]);
+      };
+      var cylOf = function (r) { return sigs.filter(function (s) { return typeof s.radius === 'number' && s.axis && s.axisOrigin && s.surface !== 'Cone' && Math.abs(s.radius - r) < tol && Math.abs(Math.abs(vdot(s.axis, n)) - 1) < 1e-4 && distToAxis(s) < tol; })[0]; };
+      // 朝外(= +n)的平面, 中心在 at 下方 h 处(孔底 / 沉头台阶)
+      var floorAt = function (h) { return sigs.filter(function (s) { return s.surface === NAMES.planeSurface && s.normal && vdot(s.normal, n) > 0.9999 && Math.abs(vdot([at[0] - s.center[0], at[1] - s.center[1], at[2] - s.center[2]], n) - h) < tol; }).sort(function (p, q) { return Math.hypot(p.center[0] - at[0], p.center[1] - at[1], p.center[2] - at[2]) - Math.hypot(q.center[0] - at[0], q.center[1] - at[1], q.center[2] - at[2]); })[0]; };
+      var faces = { entry: floorAt(0), wall: cylOf(d / 2) };
+      if (!through) faces.bottom = floorAt(depth);
+      if (type === 'counterbore') { faces.cbWall = cylOf(a.cbD / 2); faces.cbFloor = floorAt(a.cbDepth); }
+      if (type === 'countersink') faces.csk = sigs.filter(function (s) { return s.surface === 'Cone' && s.axis && s.axisOrigin && distToAxis(s) < tol; })[0];
+      return { solid: sid, at: at.map(sig7), normal: n, through: through, depth: sig7(depth), faces: faces, units: U.unit };
+    });
   }, { async: true });
 
   // N3: 面高亮。args = { faces: [{id, role?: primary|candidate|source}] } —— 每次调用替换上一次; faces 为空 = 清除。

@@ -76,6 +76,16 @@ pub struct Group {
     pub collapsed: bool,
     #[serde(default)]
     pub created: u64,
+    /// P3: "group" = 用户建的文件夹; "hole" = 打孔工具生成的特征(删它时自动子项一起删)。
+    #[serde(default = "kind_group")]
+    pub kind: String,
+    /// P3: 特征参数(孔: type / d / depth / cbD / cbDepth / cskD / std / usage …), 悬停详情与以后"按规格重做"用。
+    #[serde(default)]
+    pub spec: Option<Value>,
+}
+
+fn kind_group() -> String {
+    "group".into()
 }
 
 /// P2: 文件格式 v2 = { version, dims, groups, next_id }。v1 = 只有尺寸的数组(载入时迁移)。
@@ -170,9 +180,46 @@ pub fn add_group(doc_key: &str) -> Result<String, String> {
     let mut f = load_file(doc_key);
     let max = f.groups.iter().filter_map(|g| g.name.strip_prefix(GROUP_PREFIX).and_then(|n| n.parse::<u32>().ok())).max().unwrap_or(0);
     let id = f.new_id('g');
-    f.groups.push(Group { id: id.clone(), name: format!("{GROUP_PREFIX}{:03}", max + 1), parent: None, fav: false, collapsed: false, created: now_secs() });
+    f.groups.push(Group { id: id.clone(), name: format!("{GROUP_PREFIX}{:03}", max + 1), parent: None, fav: false, collapsed: false, created: now_secs(), kind: kind_group(), spec: None });
     save_file(doc_key, &f)?;
     Ok(id)
+}
+
+/// 特征名前缀(孔 = H)。
+pub fn feature_prefix(kind: &str) -> &'static str {
+    match kind {
+        "hole" => "H",
+        _ => GROUP_PREFIX,
+    }
+}
+
+/// P3: 新建一个特征(工具生成, 如孔 H001)及其自动子尺寸(origin = auto, 名字 = "<特征名>.<后缀>"), 返回 (id, 名字)。
+/// children: (后缀, 尺寸记录模板); 子尺寸重名时加序号。
+pub fn add_feature(doc_key: &str, kind: &str, spec: Value, children: Vec<(String, DimRecord)>) -> Result<(String, String), String> {
+    let mut f = load_file(doc_key);
+    let pre = feature_prefix(kind);
+    let max = f.groups.iter().filter(|g| g.kind == kind).filter_map(|g| g.name.strip_prefix(pre).and_then(|n| n.parse::<u32>().ok())).max().unwrap_or(0);
+    let name = format!("{pre}{:03}", max + 1);
+    let id = f.new_id('g');
+    f.groups.push(Group { id: id.clone(), name: name.clone(), parent: None, fav: false, collapsed: false, created: now_secs(), kind: kind.into(), spec: Some(spec) });
+    for (suffix, mut rec) in children {
+        let mut nm = format!("{name}.{suffix}");
+        let mut k = 2;
+        while f.dims.iter().any(|d| d.name == nm) {
+            nm = format!("{name}.{suffix}{k}");
+            k += 1;
+        }
+        rec.name = nm;
+        rec.id = f.new_id('d');
+        rec.parent = Some(id.clone());
+        rec.origin = "auto".into();
+        if rec.created == 0 {
+            rec.created = now_secs();
+        }
+        f.dims.push(rec);
+    }
+    save_file(doc_key, &f)?;
+    Ok((id, name))
 }
 
 /// 组改名(组之间不重名)。
@@ -202,18 +249,32 @@ pub fn set_group_flags(doc_key: &str, id: &str, fav: Option<bool>, collapsed: Op
     save_file(doc_key, &f)
 }
 
-/// 删组: 组内的尺寸(手动挂入的)回到组的父级(顶层); 自动生成的子项(P3 特征)也只解除挂靠 —— 组不是特征。
+/// 删组 / 特征: 手动挂入的尺寸回到父级(顶层); 特征(kind ≠ group)自动生成的子尺寸一起删(连同缩略图)。
+/// 只删记录, 不动模型。
 pub fn delete_group(doc_key: &str, id: &str) -> Result<(), String> {
     let mut f = load_file(doc_key);
     let Some(pos) = f.groups.iter().position(|g| g.id == id) else { return Err(format!("no group {id}")) };
     let up = f.groups[pos].parent.clone();
+    let feature = f.groups[pos].kind != "group";
     f.groups.remove(pos);
+    let mut gone = Vec::new();
+    f.dims.retain(|d| {
+        let drop = feature && d.parent.as_deref() == Some(id) && d.origin == "auto";
+        if drop {
+            gone.push(d.name.clone());
+        }
+        !drop
+    });
     for d in &mut f.dims {
         if d.parent.as_deref() == Some(id) {
             d.parent = up.clone();
         }
     }
-    save_file(doc_key, &f)
+    save_file(doc_key, &f)?;
+    for nm in gone {
+        let _ = std::fs::remove_file(png_path(doc_key, &nm));
+    }
+    Ok(())
 }
 
 /// 把若干尺寸(按名字)挂到组下(None = 移到顶层)。
@@ -405,6 +466,20 @@ mod tests {
         assert!(load(&doc).iter().all(|d| d.parent.is_none()), "删组: 子项回顶层");
         let ids: Vec<String> = load(&doc).iter().map(|d| d.id.clone()).collect();
         assert!(ids[0] != ids[1] && !ids[1].is_empty(), "id 唯一");
+        // P3 特征: 自动子尺寸(名字 = 特征名.后缀, origin auto); 手动挂入的在删特征时只解除挂靠
+        let (hid, hname) = add_feature(&doc, "hole", json!({ "type": "simple", "d": 4.5 }), vec![("R".into(), rec("radius")), ("R".into(), rec("radius"))]).unwrap();
+        assert_eq!(hname, "H001");
+        let l = load(&doc);
+        let kids: Vec<&DimRecord> = l.iter().filter(|d| d.parent.as_deref() == Some(hid.as_str())).collect();
+        assert_eq!(kids.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), vec!["H001.R", "H001.R2"], "重名加序号");
+        assert!(kids.iter().all(|d| d.origin == "auto"));
+        set_parent(&doc, &["D001".into()], Some(&hid)).unwrap();
+        assert_eq!(add_feature(&doc, "hole", json!({}), vec![]).unwrap().1, "H002");
+        delete_group(&doc, &hid).unwrap();
+        let l = load(&doc);
+        assert!(!l.iter().any(|d| d.name.starts_with("H001.")), "自动子尺寸随特征删除");
+        assert!(l.iter().any(|d| d.name == "D001" && d.parent.is_none()), "手动挂入的回到顶层");
+        assert_eq!(load_groups(&doc).iter().map(|g| (g.name.as_str(), g.kind.as_str())).collect::<Vec<_>>(), vec![("H002", "hole")]);
         let _ = std::fs::remove_dir_all(STORE.dir(&doc));
     }
 
