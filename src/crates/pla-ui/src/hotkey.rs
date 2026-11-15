@@ -51,7 +51,7 @@ impl Action {
             Action::EntitiesRefresh => tr("刷新实体", "Refresh entities"),
             Action::ToggleSnapshots => tr("快照墙面板", "Snapshot wall panel"),
             Action::ToggleEntities => tr("实体树面板", "Entity tree panel"),
-            Action::ToggleDim => tr("尺寸驱动面板", "Dimension panel"),
+            Action::ToggleDim => tr("参数化面板", "Parametric panel"),
             Action::ToggleSettings => tr("设置面板", "Settings panel"),
             Action::ToggleVpState => tr("视口状态面板", "Viewport state panel"),
             Action::ToggleMatState => tr("材质状态面板", "Material state panel"),

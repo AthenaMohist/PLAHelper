@@ -119,7 +119,7 @@ const PANEL_ENTITIES: [f32; 2] = [520.0, 560.0];
 /// R23: 选择集面板右侧 ENTITIES 列宽。
 const SEL_ENTITIES_COL_W: f32 = 220.0;
 /// N3 尺寸浮窗的默认外框(之后用户拖 / 拉的大小会记住)。
-const PANEL_DIM: [f32; 2] = [320.0, 340.0];
+const PANEL_DIM: [f32; 2] = [360.0, 340.0];
 const PANEL_SETTINGS: [f32; 2] = [300.0, 560.0];
 /// F2: CDP 能力面板(点工具栏状态点打开)。
 const PANEL_CAPS: [f32; 2] = [320.0, 600.0];
@@ -257,6 +257,10 @@ struct PlaApp {
     dim_sym: u8,
     /// 对面是圆柱时的测量点: None = 自动 / 0 最近 / 1 轴心 / 2 最远(CYL_POINTS)。
     dim_cyl: Option<u8>,
+    /// 参数化面板标签: 0 操作 / 1 记录; 记住标签所属的文档; 在"记录"时选择变了 → "操作"上的提示点。
+    dim_tab: u8,
+    dim_tab_doc: String,
+    dim_tab_dot: bool,
     /// 上次发出的高亮(面 + 对面 + 候选数), 没变就不重发。
     dim_hl_key: String,
     /// N3d: 本文档的尺寸记录(懒加载, 换文档重读)。
@@ -1100,8 +1104,8 @@ fn dim_help_lines() -> Vec<InfoLine> {
         info_key(tr("右键 / Enter", "Right-click / Enter"), tr("应用(一步可撤销, 失败自动撤回)", "Apply (one undo step; rolled back on failure)")),
         info_key("Esc", tr("目标值复原", "Reset the target value")),
         info_text(tr(
-            "记录: 标题右侧 ＋ 记录 → 下方列表。点条目 = 载入并选中这些面(面换了 id 也能找回), 并在 Plasticity 里建一个同名测量(厚度 / 距离; 条目改名测量跟着改); 直接改条目里的数值再 Enter = 应用。★ 收藏、笔 = 改名、↻ 用当前尺寸更新、管理 = 批量删除。",
-            "Saved: + Save at the top right → list below. Click an entry to load and select its faces (found even after face ids change) and create a Plasticity measurement with the same name (thickness / distance; renaming the entry renames it); edit its value and press Enter to apply. ★ favourite, pencil = rename, ↻ update from the current dimension, Manage = batch delete.",
+            "记录: 「操作」标签标题右侧 ＋ 记录 → 存到「记录」标签(在「记录」里选择变了不跳标签, 「操作」上出提示点)。点条目 = 载入并选中这些面(面换了 id 也能找回), 并在 Plasticity 里建一个同名测量(厚度 / 距离; 条目改名测量跟着改); 直接改条目里的数值再 Enter = 应用。★ 收藏、笔 = 改名、↻ 用当前尺寸更新、管理 = 批量删除。",
+            "Saved: + Save at the top right of the Operate tab → stored in the Records tab (selection changes do not switch tabs; a dot appears on Operate). Click an entry to load and select its faces (found even after face ids change) and create a Plasticity measurement with the same name (thickness / distance; renaming the entry renames it); edit its value and press Enter to apply. ★ favourite, pencil = rename, ↻ update from the current dimension, Manage = batch delete.",
         )),
     ]
 }
@@ -1376,6 +1380,19 @@ fn drag_row<T: egui::emath::Numeric>(
         hover_info(ui, rect, hovered, title, lines);
     }
     changed
+}
+
+/// 参数化面板: 文档上次停留的标签(0 操作 / 1 记录), prefs "dim_tabs" = {doc_key: n}。
+fn prefs_dim_tab(doc: &str) -> u8 {
+    pla_ui::prefs::load_value("dim_tabs").and_then(|v| v[doc].as_u64()).map_or(0, |x| x.min(1) as u8)
+}
+
+fn prefs_save_dim_tab(doc: &str, tab: u8) {
+    let mut v = pla_ui::prefs::load_value("dim_tabs").filter(|v| v.is_object()).unwrap_or_else(|| serde_json::json!({}));
+    v[doc] = serde_json::json!(tab);
+    if let Err(e) = pla_ui::prefs::save_value("dim_tabs", v) {
+        pla_ui::diag::log(&format!("save dim_tabs failed: {e}"));
+    }
 }
 
 /// 圆柱对面的测量点(与垫片 dim.face 候选的 values 键同名; 下标 = 界面分段 / 记录 cyl)。
@@ -2308,6 +2325,9 @@ impl PlaApp {
             dim_side: 0,
             dim_sym: 0,
             dim_cyl: None,
+            dim_tab: 0,
+            dim_tab_doc: String::new(),
+            dim_tab_dot: false,
             dim_hl_key: String::new(),
             dims_list: Vec::new(),
             dims_loaded: false,
@@ -3103,7 +3123,7 @@ impl PlaApp {
             FloatSpec {
                 id: "panel-dim",
                 prefs_key: DIM_RECT_KEY,
-                title: tr("改尺寸", "Resize"),
+                title: tr("参数化", "Parametric"),
                 subtitle: String::new(),
                 close_tip: tr("关闭", "Close"),
                 default_rect: default,
@@ -3129,6 +3149,10 @@ impl PlaApp {
                     _ => None,
                 };
                 if cur != self.dim_face && !self.dim_busy {
+                    // 在"记录"标签时选择变了: 不跳标签, 只在"操作"标签上点个提示点(用户 2026-11-15)
+                    if self.dim_tab != 0 && cur.is_some() {
+                        self.dim_tab_dot = true;
+                    }
                     self.dim_face = cur.clone();
                     self.dim_info = None;
                     if let Some(k) = &cur {
@@ -3174,6 +3198,46 @@ impl PlaApp {
                     _ => (String::new(), Vec::new()),
                 };
                 self.dim_set_highlight(hl_key, hl_faces);
+                // ---- 标签: 操作(随选择变) / 记录(存下来的东西; 以后孔等类型也在这里按类型筛选) ----
+                {
+                    // 每个文档记住上次停在哪个标签(prefs "dim_tabs": {doc_key: 0|1})
+                    if self.dim_tab_doc != self.doc_key {
+                        self.dim_tab_doc = self.doc_key.clone();
+                        self.dim_tab = crate::prefs_dim_tab(&self.doc_key);
+                        self.dim_tab_dot = false;
+                    }
+                    if !self.dims_loaded {
+                        self.dims_list = pla_ui::dims::load(&self.doc_key);
+                        self.dims_loaded = true;
+                    }
+                    let n = self.dims_list.len();
+                    let labels = vec![tr("操作", "Operate").to_string(), if n > 0 { t!("记录 {n}", "Records {n}") } else { tr("记录", "Records").to_string() }];
+                    let mut s = self.dim_tab as usize;
+                    let (top, left, w) = (ui.cursor().top(), ui.cursor().left(), ui.available_width());
+                    let r = rz_segmented(ui, "dim-tab", &labels, &mut s);
+                    if self.dim_tab_dot && self.dim_tab != 0 {
+                        // 提示点: "操作"标签的右上角
+                        ui.painter().circle_filled(egui::pos2(left + w * 0.5 - 10.0, top + 8.0), 3.5, COL_ACCENT);
+                    }
+                    if r {
+                        self.dim_tab = s as u8;
+                        if self.dim_tab == 0 {
+                            self.dim_tab_dot = false;
+                        }
+                        crate::prefs_save_dim_tab(&self.doc_key, self.dim_tab);
+                    }
+                    ui.add_space(4.0);
+                }
+                if self.dim_tab == 0 {
+                    // 列表不在本标签: 条目编辑态不能残留(否则会挡住这里的右键应用)
+                    self.dims_row_focus = false;
+                    self.dims_edit_row = None;
+                }
+                if self.dim_tab != 0 {
+                    // 记录标签: 只有列表(更新 ↻ 仍用"操作"里当前读到的尺寸)
+                    self.dim_saved_ui(ui, info.clone());
+                    return;
+                }
                 let units = |v: &serde_json::Value| -> String {
                     match v["units"].as_str().unwrap_or("") {
                         "millimeter" => "mm", "centimeter" => "cm", "meter" => "m", "inch" => "in", "foot" => "ft", u => u,
@@ -3200,7 +3264,7 @@ impl PlaApp {
                     let col = if hot { egui::Color32::WHITE } else { COL_MUTED };
                     ui.painter().circle_stroke(c, 5.5, egui::Stroke::new(1.0_f32, col));
                     ui.painter().text(c, egui::Align2::CENTER_CENTER, "?", egui::FontId::proportional(8.5), col);
-                    hover_info(ui, trow, hot, tr("改尺寸 · 说明", "Resize · help"), dim_help_lines());
+                    hover_info(ui, trow, hot, tr("参数化 · 说明", "Parametric · help"), dim_help_lines());
                 }
                 if let Some(v) = &info {
                     let v = v.clone();
@@ -3286,8 +3350,7 @@ impl PlaApp {
                         }
                     }
                 }
-                // ---- N3d 已记录尺寸 ----
-                self.dim_saved_ui(ui, info.clone());
+                // 操作标签底部不再放列表(在"记录"标签); 当前选择正是某条记录时标题右侧显示记录名
             },
         );
         self.dim_win = win;
@@ -3332,7 +3395,7 @@ impl PlaApp {
         let r = egui::Rect::from_min_max(egui::pos2(row.right() - w - 4.0, row.top()), row.max);
         let resp = ui.interact(r, ui.id().with("dim-save"), egui::Sense::click());
         ui.painter().text(egui::pos2(row.right(), row.center().y), egui::Align2::RIGHT_CENTER, label, font, if resp.hovered() { egui::Color32::WHITE } else { COL_ACCENT });
-        if resp.on_hover_text(tr("把这个尺寸记下来, 以后在下方列表里点它就能再改(面换了 id 也能找回)", "Save this dimension; click it in the list below later to edit again (found even after face ids change)")).clicked() {
+        if resp.on_hover_text(tr("把这个尺寸记下来, 以后在「记录」标签里点它就能再改(面换了 id 也能找回)", "Save this dimension; click it in the Records tab later to edit again (found even after face ids change)")).clicked() {
             self.dim_request_save(v, None);
         }
     }
@@ -3576,7 +3639,7 @@ impl PlaApp {
             }
         }
         if self.dims_list.is_empty() {
-            ui.label(egui::RichText::new(tr("还没有记录。读出尺寸后点标题右侧的 ＋ 记录。", "Nothing saved yet. Read a dimension, then click + Save at the top right.")).size(11.5).color(COL_MUTED));
+            ui.label(egui::RichText::new(tr("还没有记录。在「操作」标签读出尺寸后点标题右侧的 ＋ 记录。", "Nothing saved yet. Read a dimension in the Operate tab, then click + Save at the top right.")).size(11.5).color(COL_MUTED));
             self.dims_row_focus = false;
             return;
         }

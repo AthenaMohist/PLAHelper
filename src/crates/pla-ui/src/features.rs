@@ -121,7 +121,7 @@ impl Feature {
             Feature::AutoSnapSteps => tr("自动快照(定步数)", "Auto snapshot (every N steps)"),
             Feature::ErrorDisplay => tr("Plasticity 报错显示", "Plasticity error display"),
             Feature::EntityTree => tr("实体树", "Entity tree"),
-            Feature::DimFace => tr("改尺寸(厚度 / 半径)", "Resize (thickness / radius)"),
+            Feature::DimFace => tr("参数化(改尺寸 / 记录)", "Parametric (resize / records)"),
         }
     }
 
