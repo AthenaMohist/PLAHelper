@@ -37,6 +37,7 @@ pub enum Action {
     ToggleSettings,   // 工具栏: 开/关设置面板
     ToggleVpState,    // R8-1: 开/关视口状态面板
     ToggleMatState,   // R34: 开/关材质状态面板
+    ToggleConfig,     // C0: 开/关配置面板(可见性 + 材质 = 一个方案)
     ToggleNotes,      // R30: 开/关笔记面板(记录 + 计算器, 不与其他面板互斥)
 }
 
@@ -55,6 +56,7 @@ impl Action {
             Action::ToggleSettings => tr("设置面板", "Settings panel"),
             Action::ToggleVpState => tr("视口状态面板", "Viewport state panel"),
             Action::ToggleMatState => tr("材质状态面板", "Material state panel"),
+            Action::ToggleConfig => tr("配置面板(方案)", "Configurations panel"),
             Action::ToggleNotes => tr("笔记(记录 + 计算)", "Notes (notes + calculator)"),
         }
     }
@@ -73,14 +75,15 @@ impl Action {
             Action::ToggleSettings => "⚙",
             Action::ToggleVpState => "🎥",
             Action::ToggleMatState => "🎨",
+            Action::ToggleConfig => "📦",
             Action::ToggleNotes => "📝",
         }
     }
-    pub const ALL: [Action; 13] = [
+    pub const ALL: [Action; 14] = [
         Action::SnapshotManual, Action::SnapshotRestore, Action::SelSave,
         Action::SelApply, Action::DimApply, Action::EntitiesRefresh,
         Action::ToggleSnapshots, Action::ToggleEntities, Action::ToggleDim,
-        Action::ToggleSettings, Action::ToggleVpState, Action::ToggleMatState, Action::ToggleNotes,
+        Action::ToggleSettings, Action::ToggleVpState, Action::ToggleMatState, Action::ToggleConfig, Action::ToggleNotes,
     ];
 }
 

@@ -1,5 +1,6 @@
 pub mod bridge_thread;
 pub mod cdp_mode;
+pub mod configs;
 pub mod diag;
 pub mod dims;
 pub mod features;

@@ -406,8 +406,11 @@
 - [ ] **N7 轻量装配**：实例 + PLAhelper 记录装配关系 + 干涉检查 + 隐藏线/SVG 导出。完整配合约束和工程图不在范围内。
 - [ ] **N8 交付出口**：STEP 导出 → SolidWorks / COMSOL；网页 3D（glTF + three.js 单文件）。
 - [ ] **N9 BOM → 零件库 → 装配图 → 零件图**（用户 2026-11-15；设计 `docs/PRD/PRD-bom-drawings.md`）。顺序：B1–B3 先做（单独就有用），D0 可并行。
-      - [ ] C0 「配置」面板（用户 2026-11-15）：一条配置 = 可见性（稳定 id）+ 材质指派，只提取这两类要素（不含相机 / 着色）；
-            复用快照墙交互与垫片 vp / mat 已有的可见性段、材质段；存 `.pla/configs/<doc_key>/`。
+      - [~] C0 「配置」面板（2026-11-15 已做，契约 + 单测，待用户实测）：工具栏 📦；一条配置 = 可见性（稳定 id）+ 材质指派 + 抓取时
+            可见的实体清单（members，BOM 用），不含相机 / 着色。垫片 `cfg.save` / `cfg.restore`（能力 `cfg.state`）复用 `visibilityNow` /
+            `applyVisibility` / `materialsNow` / `restoreMaterials`；恢复可只选一项（parts）。界面 = 快照墙同一套（StatePanel::Cfg：卡片 + 缩略图、
+            收藏、改名、↻ 更新、批量删除、点卡片应用），存 `.pla/configs/<doc_key>/CF001.json + .png`（`pla_ui::configs`）。
+            恢复走 memento（不进撤销栈），窗口隐藏时拒绝（同视口 / 材质状态）。
       - [ ] B1 BOM 范围 = 配置（纯数据，不用切换显示；无配置 = 当前可见）；排除 / 包含覆盖项；多配置各出一份并对比。
             出图时才切换：应用配置 → 编译，多配置排队自动切换、各自出图，最后恢复。
       - [ ] B2 零件身份：稳定 id（nodes.node2id）+ 几何指纹（体积 / 面积 / 面类型计数 / 边长直方图 / 包围盒三边 / 主惯量）+ 实例 + 镜像判别；

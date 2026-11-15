@@ -413,6 +413,8 @@
     'err.hook':  { needs: ['ed.errorSignal'] },
     'tree':      { needs: [], dom: true },
     'mat.state': { needs: ['ed.originator', 'nodes.state'], optional: ['mat.textures', 'tex.get'] },
+    // C0 配置: 可见性 + 材质指派(与 vp.state 的可见性段、mat.state 同一批内部结构)
+    'cfg.state': { needs: ['ed.originator', 'nodes.state', 'ed.nodes', 'nodes.item2key', 'nodes.getName', 'geo.items'], optional: ['mat.textures', 'tex.get', 'nodes.isolate', 'nodes.unisolate'] },
     'mat.set':     { todo: 'N1' },
     'geo.read':  { needs: ['geo.items', 'geo.lookupTopo', 'geo.lookupItem', 'ed.docUnit'] },
     'hist.write': { needs: ['ed.undoStack', 'exec.cancel'] },
@@ -3152,6 +3154,54 @@
     call0(viewport(), 'vp.render');
     return { applied: ['materials:' + defs.length, 'assign:' + keys.length], missing: missing, failed: failed };
   }
+
+  // ---- C0 配置(用户 2026-11-15): 固化一个方案 = 可见性(稳定 id)+ 材质指派; 不含相机 / 着色等纯视觉要素。
+  //      抓取 / 恢复复用视口状态的 visibilityNow / applyVisibility 与材质状态的 materialsNow / restoreMaterials。
+  //      members = 此刻可见的实体(稳定 id + 名字), BOM 按配置计算时直接用, 不必切换显示。 ----
+  function visibleSolids() {
+    var st = need('nodes.state');
+    var iso = st[NAMES.nodeIsolations] || [];
+    var top = iso.length ? toSet(iso[iso.length - 1]) : null;
+    var hid = st[NAMES.nodeVisSets[0]], inv = st[NAMES.nodeVisSets[1]];
+    var out = [];
+    solidViews().forEach(function (v) {
+      var k = invokeOn('nodes.item2key', [v]);
+      if (hid.has(k) || inv.has(k) || (top && !top.has(k))) return;
+      var sid = st[NAMES.node2id].get(k);
+      if (sid) out.push({ id: sid, name: nameOf(v) });
+    });
+    out.sort(function (a, b) { return a.name < b.name ? -1 : a.name > b.name ? 1 : 0; });
+    return out;
+  }
+
+  // → { v, vis, mat, members: [{id, name}] }
+  def('cfg.save', 'cfg.state', function () {
+    return { v: 1, vis: visibilityNow(), mat: materialsNow(), members: visibleSolids() };
+  });
+
+  // args = 配置(cfg.save 的回包), parts?: { vis: bool, mat: bool }(默认两项都恢复) → { applied, missing, failed }
+  def('cfg.restore', 'cfg.state', function (S) {
+    S = S || {};
+    var parts = S.parts || {};
+    var applied = [], missing = [], failed = [];
+    if (S.vis && parts.vis !== false) {
+      try { applied.push(applyVisibility(S.vis, missing)); } catch (e) { failed.push('vis:' + errMsg(e)); }
+    }
+    if (!(S.mat && parts.mat !== false) || !Array.isArray(S.mat.materials) || !Array.isArray(S.mat.assign)) {
+      return Promise.resolve({ applied: applied, missing: missing, failed: failed });
+    }
+    var cur = materialsNow();
+    if (sameJson(cur.materials, S.mat.materials) && sameJson(cur.assign, S.mat.assign)) {
+      applied.push('materials(same)');
+      return Promise.resolve({ applied: applied, missing: missing, failed: failed });
+    }
+    try { mementoGuard(); } catch (e) { failed.push('mat:' + errMsg(e)); return Promise.resolve({ applied: applied, missing: missing, failed: failed }); }
+    var tf = [];
+    return reviveTextures(S.mat.materials, tf).then(function (defs) {
+      var r = restoreMaterials(S.mat, defs, tf);
+      return { applied: applied.concat(r.applied), missing: missing.concat(r.missing), failed: failed.concat(r.failed) };
+    }, function (e) { failed.push('mat:' + errMsg(e)); return { applied: applied, missing: missing, failed: failed }; });
+  }, { async: true });
 
   def('err.last', 'err.hook', function () { return state.lastError; });
 

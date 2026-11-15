@@ -94,11 +94,12 @@ const ROUNDING: f32 = 10.0;
 /// 工具栏按钮列(横向排列, 顺序即产品顺序)。
 /// R7-5: 手动快照移入快照墙头部(图标钮); R7-11: 刷新实体移入选择集窗口头部 —
 /// 一级工具栏只留面板开关类按钮。R8-1: 加视口状态。
-const TOOLBAR_ACTIONS: [Action; 7] = [
+const TOOLBAR_ACTIONS: [Action; 8] = [
     Action::ToggleSnapshots,
     Action::ToggleEntities,
     Action::ToggleVpState,
     Action::ToggleMatState,
+    Action::ToggleConfig,
     Action::ToggleDim,
     Action::ToggleNotes,
     Action::ToggleSettings,
@@ -108,6 +109,8 @@ const TOOLBAR_ACTIONS: [Action; 7] = [
 const PANEL_VPSTATE: [f32; 2] = [PANEL_SNAPSHOTS[0], PANEL_SNAPSHOTS[1]];
 /// R34: 材质状态面板尺寸(同视口状态)。
 const PANEL_MATSTATE: [f32; 2] = PANEL_VPSTATE;
+/// C0: 配置面板尺寸(同视口状态)。
+const PANEL_CONFIG: [f32; 2] = PANEL_VPSTATE;
 
 /// 面板逻辑尺寸 (宽, 高) — 子视口 OS 窗口大小。
 /// R7-6: 快照墙改窄加高(232x480) — 一行一个快照, 缩略图撑满内容宽。
@@ -367,6 +370,12 @@ struct PlaApp {
     ms_pending_state: Option<String>,
     ms_shot_path: Option<String>,
     ms_update_target: Option<String>,
+    /// C0 配置面板: 同材质状态(采集回包 → 截图 → 落盘)。
+    show_config: bool,
+    cfg_wall: state_wall::StateWall,
+    cfg_pending_state: Option<String>,
+    cfg_shot_path: Option<String>,
+    cfg_update_target: Option<String>,
     /// R8-1: 选择集截图缓存 + 管理模式 + pending 保存流程。
     sel_pngs: std::collections::HashMap<String, std::sync::Arc<[u8]>>,
     sel_manage: bool,
@@ -1794,6 +1803,8 @@ impl Default for PanelDragState {
 enum StatePanel {
     Vp,
     Mat,
+    /// C0 配置: 可见性 + 材质指派。
+    Cfg,
 }
 
 /// R8b: 二级面板标识(互斥用)。
@@ -1803,6 +1814,7 @@ enum PanelId {
     Entities,
     VpState,
     MatState,
+    Config,
     Settings,
     Caps,
 }
@@ -2543,6 +2555,11 @@ impl PlaApp {
             ms_pending_state: None,
             ms_shot_path: None,
             ms_update_target: None,
+            show_config: false,
+            cfg_wall: state_wall::StateWall::default(),
+            cfg_pending_state: None,
+            cfg_shot_path: None,
+            cfg_update_target: None,
             sel_pngs: std::collections::HashMap::new(),
             sel_manage: false,
             sel_selected: std::collections::HashSet::new(),
@@ -2822,6 +2839,34 @@ impl PlaApp {
                         }
                     }
                 }
+                // C0 配置采集回包 → 截图 → 落盘(同材质状态的串行流程)
+                pla_bridge::cdp::CdpEvent::CallResult { name, result } if name == pla_bridge::shim::api::CFG_SAVE => match result {
+                    Ok(v) => {
+                        self.cfg_pending_state = Some(v.to_string());
+                        let path = self.cfg_shot_path.clone().unwrap_or_else(|| pla_ui::configs::STORE.dir(&self.doc_key).join("__shot_tmp.png").display().to_string());
+                        self.cdp.send(pla_bridge::cdp::CdpCmd::CaptureViewport(path));
+                    }
+                    Err(e) => {
+                        self.cfg_update_target = None;
+                        self.set_notice((true, t!("配置采集失败: {e}", "Capturing the configuration failed: {e}")));
+                    }
+                },
+                // C0 配置恢复回包: 如实报缺失 / 失败
+                pla_bridge::cdp::CdpEvent::CallResult { name, result } if name == pla_bridge::shim::api::CFG_RESTORE => match result {
+                    Ok(v) => {
+                        let n = |k: &str| v[k].as_array().map_or(0, |a| a.len());
+                        let (missing, failed) = (n("missing"), n("failed"));
+                        if failed > 0 {
+                            let first = v["failed"][0].as_str().unwrap_or("").to_string();
+                            self.set_notice((true, t!("配置部分恢复失败({failed} 项): {first}", "Configuration partly failed ({failed}): {first}")));
+                        } else if missing > 0 {
+                            self.set_notice((true, t!("配置已应用, {missing} 项在当前模型里找不到(已删除的物体 / 材质)", "Configuration applied; {missing} item(s) not found in the current model (deleted objects / materials)")));
+                        } else {
+                            self.set_notice((false, tr("配置已应用", "Configuration applied").into()));
+                        }
+                    }
+                    Err(e) => self.set_notice((true, t!("应用配置失败: {e}", "Applying the configuration failed: {e}"))),
+                },
                 // P3 打孔回包 → 「记录」里生成孔特征 H00n + 自动子尺寸(半径 / 深度 / 沉头半径 / 沉头深度)
                 pla_bridge::cdp::CdpEvent::CallResult { name, result } if name == pla_bridge::shim::api::HOLE_MAKE => {
                     self.dim_busy = false;
@@ -3075,6 +3120,25 @@ impl PlaApp {
                             Err(e) => self.set_notice((true, e)),
                         }
                     }
+                    // C0: 配置存档 / 更新(截图失败照样落盘)
+                    if let Some(state) = self.cfg_pending_state.take() {
+                        let png = if png_len > 0 { self.cfg_shot_path.clone().and_then(|p| std::fs::read(p).ok()) } else { None };
+                        let store = pla_ui::configs::STORE;
+                        let res = match self.cfg_update_target.take() {
+                            Some(target) => store.update(&self.doc_key, &target, &state, png.as_deref()).map(|_| t!("配置已更新: {target}", "Configuration updated: {target}")),
+                            None => store.save(&self.doc_key, &state, png.as_deref()).map(|stem| t!("配置已保存: {stem}", "Configuration saved: {stem}")),
+                        };
+                        match res {
+                            Ok(mut msg) => {
+                                self.cfg_wall.invalidate();
+                                if png.is_none() {
+                                    msg.push_str(tr("(截图失败, 无缩略图)", " (capture failed, no thumbnail)"));
+                                }
+                                self.set_notice((false, msg));
+                            }
+                            Err(e) => self.set_notice((true, e)),
+                        }
+                    }
                     // 选择集存档(pending = (SG名, members, camera))
                     if let Some((name, members, cam)) = self.sel_save_pending.take() {
                         let png2 = if png_len > 0 {
@@ -3254,6 +3318,13 @@ impl PlaApp {
                 if self.show_matstate {
                     self.close_secondary_panels_except(PanelId::MatState);
                     self.ms_wall.loaded = false;
+                }
+            }
+            Action::ToggleConfig => {
+                self.show_config = !self.show_config;
+                if self.show_config {
+                    self.close_secondary_panels_except(PanelId::Config);
+                    self.cfg_wall.loaded = false;
                 }
             }
             Action::ToggleDim => {
@@ -5029,6 +5100,24 @@ impl PlaApp {
                 Feature::MatSave,
                 Feature::MatApply,
             ),
+            StatePanel::Cfg => (
+                pla_ui::configs::STORE,
+                state_wall::WallText {
+                    id: "cfg",
+                    kind: tr("配置", "configuration"),
+                    empty: tr(
+                        "(空 — 先在 Plasticity 里显示 / 隐藏出一套方案、指好材质, 再点右上软盘图标保存为一个配置)",
+                        "(Empty — show / hide one design variant in Plasticity and assign materials, then click the disk icon to save it as a configuration)",
+                    ),
+                    batch_delete_tip: tr("删除勾选的配置(含截图), 不可恢复; 不影响模型", "Delete checked configurations (with images), cannot be undone; the model is not affected"),
+                    update_confirm: |n| t!("用当前的显示 / 隐藏与材质覆盖配置「{n}」? 原内容不可恢复", "Overwrite configuration \"{n}\" with the current visibility and materials? The old content cannot be recovered"),
+                },
+                PANEL_CONFIG,
+                "panel-config",
+                tr("配置", "Configurations"),
+                Feature::CfgSave,
+                Feature::CfgApply,
+            ),
         };
         let mut flag = true;
         let do_save = std::rc::Rc::new(std::cell::Cell::new(false));
@@ -5044,6 +5133,10 @@ impl PlaApp {
             StatePanel::Mat => (
                 tr("打开材质状态文件夹", "Open material state folder"),
                 tr("保存当前材质与指派(MS 自动命名 + 截图)", "Save current materials and assignments (auto MS name + image)"),
+            ),
+            StatePanel::Cfg => (
+                tr("打开配置文件夹", "Open configuration folder"),
+                tr("把当前的显示 / 隐藏 + 材质存成一个配置(CF 自动命名 + 截图)", "Save the current visibility + materials as a configuration (auto CF name + image)"),
             ),
         };
         let icons: Box<dyn FnOnce(&mut egui::Ui)> = Box::new(move |ui| {
@@ -5065,12 +5158,14 @@ impl PlaApp {
         let mut wall = std::mem::take(match kind {
             StatePanel::Vp => &mut self.vp_wall,
             StatePanel::Mat => &mut self.ms_wall,
+            StatePanel::Cfg => &mut self.cfg_wall,
         });
         let brief = |name: &str| -> String {
             match store.load(&doc_key, name) {
                 Some(s) => match kind {
                     StatePanel::Vp => pla_ui::vpstate::brief(&s),
                     StatePanel::Mat => pla_ui::matstate::brief(&s),
+                    StatePanel::Cfg => pla_ui::configs::brief(&s),
                 },
                 None => tr("状态数据缺失", "State data missing").into(),
             }
@@ -5085,6 +5180,7 @@ impl PlaApp {
         match kind {
             StatePanel::Vp => self.vp_wall = wall,
             StatePanel::Mat => self.ms_wall = wall,
+            StatePanel::Cfg => self.cfg_wall = wall,
         }
         for n in outcome.notices {
             self.set_notice(n);
@@ -5104,6 +5200,13 @@ impl PlaApp {
                         StatePanel::Mat => (
                             pla_bridge::cdp::CdpCmd::MatStateApply(state),
                             t!("正在恢复材质状态「{name}」…", "Restoring material state \"{name}\"…"),
+                        ),
+                        StatePanel::Cfg => (
+                            pla_bridge::cdp::CdpCmd::Call {
+                                name: pla_bridge::shim::api::CFG_RESTORE,
+                                args: serde_json::from_str(&state).unwrap_or_default(),
+                            },
+                            t!("正在应用配置「{name}」…", "Applying configuration \"{name}\"…"),
                         ),
                     };
                     self.cdp.send(cmd);
@@ -5138,6 +5241,12 @@ impl PlaApp {
                     self.ms_update_target = target;
                     self.cdp.send(pla_bridge::cdp::CdpCmd::MatStateSave);
                 }
+                StatePanel::Cfg => {
+                    self.cfg_shot_path = Some(tmp);
+                    self.cfg_pending_state = None;
+                    self.cfg_update_target = target;
+                    self.cdp.send(pla_bridge::cdp::CdpCmd::Call { name: pla_bridge::shim::api::CFG_SAVE, args: serde_json::Value::Null });
+                }
             }
             self.set_notice((false, msg));
         }
@@ -5150,6 +5259,7 @@ impl PlaApp {
             let w = match kind {
                 StatePanel::Vp => &mut self.vp_wall,
                 StatePanel::Mat => &mut self.ms_wall,
+                StatePanel::Cfg => &mut self.cfg_wall,
             };
             w.manage = !w.manage;
             w.selected.clear();
@@ -5171,6 +5281,9 @@ impl PlaApp {
         }
         if keep != PanelId::MatState {
             self.show_matstate = false;
+        }
+        if keep != PanelId::Config {
+            self.show_config = false;
         }
         if keep != PanelId::Settings {
             self.show_settings = false;
@@ -5293,6 +5406,9 @@ impl PlaApp {
         self.ms_wall.reset();
         self.ms_pending_state = None;
         self.ms_update_target = None;
+        self.cfg_wall.reset();
+        self.cfg_pending_state = None;
+        self.cfg_update_target = None;
         // N3 改尺寸 / N3d 尺寸记录
         self.dim_face = None;
         self.dim_info = None;
@@ -5514,6 +5630,7 @@ impl PlaApp {
             (self.show_entities, PANEL_ENTITIES),
             (self.show_vpstate, PANEL_VPSTATE),
             (self.show_matstate, PANEL_MATSTATE),
+            (self.show_config, PANEL_CONFIG),
             (self.show_settings, PANEL_SETTINGS),
             (self.show_caps, PANEL_CAPS),
         ] {
@@ -6330,6 +6447,7 @@ impl eframe::App for PlaApp {
                             Action::ToggleEntities => self.show_entities,
                             Action::ToggleVpState => self.show_vpstate,
                             Action::ToggleMatState => self.show_matstate,
+                            Action::ToggleConfig => self.show_config,
                             Action::ToggleDim => self.show_dim,
                             Action::ToggleSettings => self.show_settings,
                             Action::ToggleNotes => self.show_notes,
@@ -6480,6 +6598,9 @@ impl eframe::App for PlaApp {
             }
             if self.show_matstate {
                 open.insert("panel-matstate");
+            }
+            if self.show_config {
+                open.insert("panel-config");
             }
             if self.show_settings {
                 open.insert("panel-settings");
@@ -7436,6 +7557,11 @@ impl eframe::App for PlaApp {
         if self.show_matstate {
             if let Some(desired) = next_pos(&mut stack_y, PANEL_MATSTATE[1]) {
                 self.show_matstate = self.state_panel(ctx, desired, StatePanel::Mat);
+            }
+        }
+        if self.show_config {
+            if let Some(desired) = next_pos(&mut stack_y, PANEL_CONFIG[1]) {
+                self.show_config = self.state_panel(ctx, desired, StatePanel::Cfg);
             }
         }
 

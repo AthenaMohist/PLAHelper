@@ -49,6 +49,7 @@ pub fn cap_label(c: &str) -> &'static str {
         cap::SEL_APPLY => tr("按 id 恢复选择(经选择命令)", "Restore selection by id (via select command)"),
         cap::VP_STATE => tr("视口显示状态(视角/着色/隐藏/网格…)", "Viewport display state (view/shading/hidden/grid…)"),
         cap::MAT_STATE => tr("材质与颜色状态(定义 + 指派)", "Material & colour state (definitions + assignments)"),
+        cap::CFG_STATE => tr("配置(可见性 + 材质指派)", "Configurations (visibility + material assignments)"),
         cap::KEYMAP => tr("改按键绑定(运行时)", "Change keybindings (runtime)"),
         cap::CMD_DISPATCH => tr("注册 / 派发命令", "Register / dispatch commands"),
         cap::ERR_HOOK => tr("捕获命令报错", "Capture command errors"),
@@ -86,6 +87,8 @@ pub enum Feature {
     ErrorDisplay,
     EntityTree,
     DimFace,
+    CfgSave,
+    CfgApply,
 }
 
 impl Feature {
@@ -104,6 +107,8 @@ impl Feature {
         Feature::ErrorDisplay,
         Feature::EntityTree,
         Feature::DimFace,
+        Feature::CfgSave,
+        Feature::CfgApply,
     ];
 
     pub fn label(self) -> &'static str {
@@ -122,6 +127,8 @@ impl Feature {
             Feature::ErrorDisplay => tr("Plasticity 报错显示", "Plasticity error display"),
             Feature::EntityTree => tr("实体树", "Entity tree"),
             Feature::DimFace => tr("参数化(改尺寸 / 记录)", "Parametric (resize / records)"),
+            Feature::CfgSave => tr("保存配置", "Save configuration"),
+            Feature::CfgApply => tr("应用配置", "Apply configuration"),
         }
     }
 
@@ -130,7 +137,7 @@ impl Feature {
             Feature::SelMirror | Feature::SelSave | Feature::SelApply => Group::Selection,
             Feature::VpSave | Feature::VpApply | Feature::MatSave | Feature::MatApply | Feature::OrbitStepLive | Feature::Roll => Group::View,
             Feature::ArrowKeysLive => Group::Input,
-            Feature::AutoSnapSteps | Feature::ErrorDisplay | Feature::EntityTree | Feature::DimFace => Group::Document,
+            Feature::AutoSnapSteps | Feature::ErrorDisplay | Feature::EntityTree | Feature::DimFace | Feature::CfgSave | Feature::CfgApply => Group::Document,
         }
     }
 
@@ -152,6 +159,8 @@ impl Feature {
             Feature::EntityTree => &[cap::TREE],
             // N3: 读面尺寸(geo.read) + 面偏移 / 重新倒圆(cmd.exec, atomic 回滚要 hist.write)
             Feature::DimFace => &[cap::GEO_READ, cap::CMD_EXEC, cap::HIST_WRITE],
+            // C0: 配置 = 可见性 + 材质指派
+            Feature::CfgSave | Feature::CfgApply => &[cap::CFG_STATE],
         }
     }
 }

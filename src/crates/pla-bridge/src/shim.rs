@@ -117,6 +117,9 @@ pub mod api {
     pub const UI_RCLICK: &str = "ui.rightClick";
     /// N4: 打孔(简单 / 柱形沉头 / 锥形沉头; 一次原子执行, 回孔的各面签名)。
     pub const HOLE_MAKE: &str = "hole.make";
+    /// C0: 配置 = 可见性 + 材质指派(抓取 / 恢复; 抓取时附可见实体清单供 BOM)。
+    pub const CFG_SAVE: &str = "cfg.save";
+    pub const CFG_RESTORE: &str = "cfg.restore";
 
     /// 全部接口名（契约测试用）。
     pub const ALL: &[&str] = &[
@@ -124,7 +127,7 @@ pub mod api {
         CMD_PING, ERR_LAST, TREE_LIST, SEL_CANCEL_COMMAND, SEL_CLEAR, SEL_APPLY, CAM_NAVIGATE, CAM_RENDER, CAM_THUMBNAIL, CAM_VP_RECT,
         CAM_SET_ORBIT_STEP, CAM_ROLL, KEYMAP_SET_BINDINGS, VP_SAVE, VP_RESTORE, MAT_SAVE, MAT_RESTORE, CMD_EXEC, CMD_FACTORIES,
         GEO_QUERY, HIST_BEGIN, HIST_ROLLBACK, HIST_COMMIT, GEO_SNAPS, GEO_MEASURE, CAM_VIEW, DIM_FACE, VIEW_HIGHLIGHT, DIM_DISTANCE, DIM_SIGNATURE, GEO_RESOLVE,
-        DIM_RECORD, DIM_MEASURE, DIM_FACES, UI_RCLICK, HOLE_MAKE,
+        DIM_RECORD, DIM_MEASURE, DIM_FACES, UI_RCLICK, HOLE_MAKE, CFG_SAVE, CFG_RESTORE,
     ];
 }
 
@@ -159,13 +162,15 @@ pub mod cap {
     pub const VIEW_HIGHLIGHT: &str = "view.highlight";
     /// N3e: 本体测量(建测量 + 写大纲名字)。
     pub const MEASURE_WRITE: &str = "measure.write";
+    /// C0: 配置(可见性 + 材质指派)。
+    pub const CFG_STATE: &str = "cfg.state";
     pub const BOOL_RUN: &str = "bool.run";
     pub const ASSET_PLACE: &str = "asset.place";
 
     /// 全部能力名（契约测试用）。
     pub const ALL: &[&str] = &[
         EDITOR, SEL_READ, SEL_WRITE, HIST_READ, CAM_READ, CAM_WRITE, CAM_NAV, CAM_STEP, CAM_ROLL, SEL_APPLY,
-        VP_STATE, KEYMAP, CMD_DISPATCH, ERR_HOOK, TREE, MAT_STATE, MAT_SET, CMD_EXEC, GEO_READ, HIST_WRITE, SNAP_READ, VIEW_HIGHLIGHT, MEASURE_WRITE, BOOL_RUN, ASSET_PLACE,
+        VP_STATE, KEYMAP, CMD_DISPATCH, ERR_HOOK, TREE, MAT_STATE, MAT_SET, CMD_EXEC, GEO_READ, HIST_WRITE, SNAP_READ, VIEW_HIGHLIGHT, MEASURE_WRITE, CFG_STATE, BOOL_RUN, ASSET_PLACE,
     ];
 }
 

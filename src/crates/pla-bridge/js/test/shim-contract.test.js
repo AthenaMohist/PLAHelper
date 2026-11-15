@@ -783,6 +783,29 @@ const callAsync = async (name, args) => JSON.parse(await run(`window.__PLA__.cal
     assert.strictEqual(call('mat.restore', {}).ok, false);
   });
 
+  await ta('C0 配置: cfg.save = 可见性 + 材质指派 + 可见实体清单; 原样恢复两项都不动; 只恢复一项; 材质改了走 memento', async () => {
+    const ed = ed3;
+    const c = call('cfg.save').v;
+    assert.strictEqual(c.v, 1);
+    assert.deepStrictEqual(c.mat, call('mat.save').v, '材质段与材质状态同格式');
+    assert.ok(c.vis && Array.isArray(c.vis.hidden) && Array.isArray(c.members), JSON.stringify(Object.keys(c)));
+    const r0 = ed.originator.restores;
+    const same = (await callAsync('cfg.restore', c)).v;
+    assert.ok(same.applied.includes('vis(same)') && same.applied.includes('materials(same)'), JSON.stringify(same));
+    assert.strictEqual(ed.originator.restores, r0, '没变化不碰 memento');
+    // 只恢复可见性: 材质改了也不动
+    const B = JSON.parse(JSON.stringify(c));
+    B.mat.materials[0].baseColorFactor = [0.2, 0.3, 0.4, 1];
+    const onlyVis = (await callAsync('cfg.restore', Object.assign({}, B, { parts: { vis: true, mat: false } }))).v;
+    assert.deepStrictEqual(onlyVis.applied, ['vis(same)']);
+    // 两项: 材质改动走 memento
+    const both = (await callAsync('cfg.restore', B)).v;
+    assert.ok(both.applied.some((x) => /^materials:/.test(x)), JSON.stringify(both));
+    assert.deepStrictEqual(ed.matDb.materials[0].baseColorFactor, [0.2, 0.3, 0.4, 1]);
+    await callAsync('cfg.restore', c);
+    assert.deepStrictEqual(call('cfg.save').v.mat, c.mat, '回到原样');
+  });
+
   await ta('R34d 带贴图的材质: 存档里的纯 JSON 贴图按文件名重新加载成真 Texture; 当前已有的沿用; 无文件名如实报', async () => {
     const ed = ed3;
     const s = call('mat.save').v;
