@@ -105,6 +105,9 @@
     'orig.restore':            ['orig', 'restore'],
     // R34d: 材质库的纹理加载器(按文件名缓存 Promise<Texture>); 恢复带贴图的材质时用它重建真 Texture
     'mat.textures':            ['ed', 'materials.textures'],
+    // 材质库本体(根 mats): snapshot() = { version, counter, materials }, 与 memento 的 materials 段同形; 有命令进行中也能读
+    'ed.materialsDb':          ['ed', 'materials'],
+    'mats.snapshot':           ['mats', 'snapshot'],
     'tex.get':                 ['tex', 'get'],
     'ds.snapshot':             ['ds', 'snapshot'],
     'ds.init':                 ['ds', 'init'],
@@ -412,9 +415,9 @@
     'cmd.dispatch': { needs: ['reg.add', 'reg.listeners'] },
     'err.hook':  { needs: ['ed.errorSignal'] },
     'tree':      { needs: [], dom: true },
-    'mat.state': { needs: ['ed.originator', 'nodes.state'], optional: ['mat.textures', 'tex.get'] },
+    'mat.state': { needs: ['ed.originator', 'nodes.state'], optional: ['mat.textures', 'tex.get', 'mats.snapshot'] },
     // C0 配置: 可见性 + 材质指派(与 vp.state 的可见性段、mat.state 同一批内部结构)
-    'cfg.state': { needs: ['ed.originator', 'nodes.state', 'ed.nodes', 'nodes.item2key', 'nodes.getName', 'geo.items'], optional: ['mat.textures', 'tex.get', 'nodes.isolate', 'nodes.unisolate'] },
+    'cfg.state': { needs: ['ed.originator', 'nodes.state', 'ed.nodes', 'nodes.item2key', 'nodes.getName', 'geo.items'], optional: ['mat.textures', 'tex.get', 'nodes.isolate', 'nodes.unisolate', 'mats.snapshot'] },
     'mat.set':     { todo: 'N1' },
     'geo.read':  { needs: ['geo.items', 'geo.lookupTopo', 'geo.lookupItem', 'ed.docUnit'] },
     'hist.write': { needs: ['ed.undoStack', 'exec.cancel'] },
@@ -478,6 +481,7 @@
       case 'ss': return get('ed.snapScene');
       case 'helpers': return get('ed.helpers');
       case 'meas': return get('ed.measurements');
+      case 'mats': return get('ed.materialsDb');
     }
     return undefined;
   }
@@ -3041,8 +3045,15 @@
   // ---- R34: 材质与颜色状态 —— 材质定义(glTF 风格: baseColorFactor / metallic / roughness …, uuid 稳定)
   //      + 物体 → 材质的指派(物体按稳定 id, 材质按 uuid)。恢复走 memento(同可见性), 不进撤销栈。 ----
   function materialsNow() {
-    var m = invokeOn('orig.snapshot', [], need('ed.originator'));
-    var defs = plain(m[NAMES.mementoMaterials][NAMES.materialsList] || []);
+    // 材质定义优先读材质库自己的 snapshot(与 memento 的 materials 段同形): 整份 memento 在有命令进行中时
+    // (如用户开着材质编辑 edit-material, 测量库处于 scratch)会抛 "snapshot(): scratch active"(用户 2026-11-15 实测)。
+    var defs = null;
+    try { if (get('mats.snapshot')) defs = invokeOn('mats.snapshot', [])[NAMES.materialsList]; } catch (e) { defs = null; }
+    if (!Array.isArray(defs)) {
+      var m = invokeOn('orig.snapshot', [], need('ed.originator'));
+      defs = m[NAMES.mementoMaterials][NAMES.materialsList] || [];
+    }
+    defs = plain(defs);
     var id2uuid = {};
     defs.forEach(function (d) { id2uuid[d[NAMES.materialId]] = d[NAMES.materialUuid]; });
     var st = need('nodes.state');
