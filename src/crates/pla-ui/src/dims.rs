@@ -38,6 +38,60 @@ pub struct DimRecord {
     pub units: String,
     #[serde(default)]
     pub created: u64,
+    /// 收藏(列表里置顶)。
+    #[serde(default)]
+    pub fav: bool,
+}
+
+/// 记录的缩略图(记录 / 更新时截的视口, 悬停详情里显示): `<目录>/<名字>.png`。
+pub fn png_path(doc_key: &str, name: &str) -> PathBuf {
+    STORE.dir(doc_key).join(format!("{name}.png"))
+}
+
+/// 列表显示顺序: 收藏在前, 再按名字。
+pub fn sorted(mut list: Vec<DimRecord>) -> Vec<DimRecord> {
+    list.sort_by(|a, b| b.fav.cmp(&a.fav).then_with(|| a.name.cmp(&b.name)));
+    list
+}
+
+/// 改名(连同缩略图); 新名不能为空或与其它记录重名。
+pub fn rename(doc_key: &str, old: &str, new: &str) -> Result<(), String> {
+    let new = new.trim();
+    if new.is_empty() {
+        return Err("empty name".into());
+    }
+    let mut list = load(doc_key);
+    if new != old && list.iter().any(|r| r.name == new) {
+        return Err(format!("name {new} already exists"));
+    }
+    match list.iter_mut().find(|r| r.name == old) {
+        Some(r) => r.name = new.to_string(),
+        None => return Err(format!("no dimension named {old}")),
+    }
+    save(doc_key, &list)?;
+    let _ = std::fs::rename(png_path(doc_key, old), png_path(doc_key, new));
+    Ok(())
+}
+
+pub fn set_fav(doc_key: &str, name: &str, fav: bool) -> Result<(), String> {
+    let mut list = load(doc_key);
+    match list.iter_mut().find(|r| r.name == name) {
+        Some(r) => r.fav = fav,
+        None => return Err(format!("no dimension named {name}")),
+    }
+    save(doc_key, &list)
+}
+
+/// 批量删除(连同缩略图), 返回删了几条。
+pub fn delete_many(doc_key: &str, names: &[String]) -> Result<usize, String> {
+    let mut list = load(doc_key);
+    let n = list.len();
+    list.retain(|r| !names.contains(&r.name));
+    save(doc_key, &list)?;
+    for nm in names {
+        let _ = std::fs::remove_file(png_path(doc_key, nm));
+    }
+    Ok(n - list.len())
 }
 
 fn path(doc_key: &str) -> PathBuf {
@@ -97,13 +151,10 @@ pub fn update(doc_key: &str, rec: &DimRecord) -> Result<(), String> {
 }
 
 pub fn delete(doc_key: &str, name: &str) -> Result<(), String> {
-    let mut list = load(doc_key);
-    let n = list.len();
-    list.retain(|r| r.name != name);
-    if list.len() == n {
-        return Err(format!("no dimension named {name}"));
+    match delete_many(doc_key, &[name.to_string()])? {
+        0 => Err(format!("no dimension named {name}")),
+        _ => Ok(()),
     }
-    save(doc_key, &list)
 }
 
 #[cfg(test)]
@@ -122,6 +173,7 @@ mod tests {
             value: 5.0,
             units: "millimeter".into(),
             created: 0,
+            fav: false,
         }
     }
 
@@ -142,6 +194,16 @@ mod tests {
         assert_eq!(load(&doc).iter().map(|r| r.name.as_str()).collect::<Vec<_>>(), vec!["D002"]);
         assert_eq!(add(&doc, rec("thickness")).unwrap(), "D003", "取最大号 + 1, 不复用删掉的号");
         assert!(delete(&doc, "nope").is_err());
+        // 改名(连同缩略图)/ 重名拒绝 / 收藏置顶 / 批量删
+        std::fs::write(png_path(&doc, "D002"), b"png").unwrap();
+        rename(&doc, "D002", "壁厚").unwrap();
+        assert!(png_path(&doc, "壁厚").exists() && !png_path(&doc, "D002").exists());
+        assert!(rename(&doc, "壁厚", "D003").is_err(), "重名");
+        assert!(rename(&doc, "壁厚", "  ").is_err(), "空名");
+        set_fav(&doc, "D003", true).unwrap();
+        assert_eq!(sorted(load(&doc))[0].name, "D003", "收藏置顶");
+        assert_eq!(delete_many(&doc, &["壁厚".into(), "D003".into()]).unwrap(), 2);
+        assert!(load(&doc).is_empty() && !png_path(&doc, "壁厚").exists());
         let _ = std::fs::remove_dir_all(STORE.dir(&doc));
     }
 }

@@ -35,6 +35,11 @@ pub const PROXY_EXPOSE_CLOSURES: &str = "PLA.exposeClosures";
 /// N2: 工厂还没挂上时 `cmd.exec` 抛的错误文字(Rust 据此让代理挂一次再重试)。
 pub const NEED_FACTORIES_ERR: &str = "need-factories";
 
+/// N3: 面高亮颜色(0xRRGGBB)。垫片高亮与 pla-ui 面板上的色块共用这一份(经配置注入垫片)。
+pub const HIGHLIGHT_PRIMARY: u32 = 0xff8c1a; // 当前对面 / 锚面(橙)
+pub const HIGHLIGHT_CANDIDATE: u32 = 0x3aa0ff; // 其它候选(蓝)
+pub const HIGHLIGHT_SOURCE: u32 = 0x5ad16a; // 参考面(绿)
+
 /// `PLA.exposeClosures` 的参数。`force` = 页面上已有也重拍(默认有就直接用)。
 pub fn expose_closures_params(force: bool) -> Value {
     json!({ "pattern": FACTORY_CLASS_PATTERN, "global": FACTORIES_GLOBAL, "force": force })
@@ -287,6 +292,7 @@ pub fn config_json() -> Value {
         "rollCommands": { "left": ROLL_LEFT_COMMAND, "right": ROLL_RIGHT_COMMAND },
         "factoriesGlobal": FACTORIES_GLOBAL,
         "needFactoriesErr": NEED_FACTORIES_ERR,
+        "highlightColors": { "primary": HIGHLIGHT_PRIMARY, "candidate": HIGHLIGHT_CANDIDATE, "source": HIGHLIGHT_SOURCE },
     })
 }
 

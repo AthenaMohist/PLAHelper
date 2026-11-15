@@ -269,6 +269,23 @@ struct PlaApp {
     dim_last_apply: Option<DimApplied>,
     /// 删除确认中的记录名。
     dim_del_confirm: Option<String>,
+    /// 已记录列表的交互(同快照墙): 管理模式 + 勾选、改名、更新确认、批量删除确认。
+    dims_manage: bool,
+    dims_selected: std::collections::HashSet<String>,
+    dims_rename: Option<String>,
+    dims_rename_buf: String,
+    dims_update_confirm: Option<String>,
+    dims_batch_confirm: bool,
+    /// 各条目数值框的文本(直接改 + Enter = 载入并应用)。
+    dims_vals: std::collections::HashMap<String, String>,
+    /// 上一帧有条目数值框获得焦点(此时右键归条目, 不触发上面的应用)。
+    dims_row_focus: bool,
+    /// 缩略图缓存(名字 → PNG 字节)。
+    dims_pngs: std::collections::HashMap<String, Vec<u8>>,
+    /// 记录 / 更新后等视口截图回包的记录名。
+    dims_thumb_pending: Option<String>,
+    /// 条目里直接改数值: 载入完成后要应用的目标值。
+    dim_pending_target: Option<f64>,
     dim_busy: bool,
     hotkeys: HotkeyMap,
     /// 正在录制快捷键的动作名 (None = 未在录制)。
@@ -849,6 +866,8 @@ enum InfoLine {
     Text(String),
     /// 快捷键: 键帽 + 说明。
     Key(String, String),
+    /// 图片(纹理 URI + PNG 字节; 如尺寸记录的缩略图)。
+    Image(String, Vec<u8>),
 }
 
 fn info_text(s: impl Into<String>) -> InfoLine {
@@ -1057,6 +1076,79 @@ fn rz_segmented(ui: &mut egui::Ui, id: &str, options: &[String], selected: &mut 
     changed
 }
 
+/// 尺寸窗口 "?" 的说明(三级面板)。
+fn dim_help_lines() -> Vec<InfoLine> {
+    vec![
+        info_text(tr(
+            "选一个面: 平面 = 厚度(到背对的平行面; 有多个时在\"对面候选\"里切换, 橙 = 当前, 蓝 = 其它), 圆柱 = 半径(孔 / 凸台, 轴线不动), 倒圆 = 圆角半径(保持相切)。",
+            "One face: plane = thickness (to the opposite parallel face; switch among candidates, orange = current, blue = others), cylinder = radius (hole / boss, axis stays), fillet = fillet radius (stays tangent).",
+        )),
+        info_text(tr(
+            "约定: 选多个面时,【第一个选的面 = 参考面】(绿, 固定不动), 之后 Shift 加选的都是要动的面(可多个: 孔的圆柱 + 倒角、凸台侧面…)→ 距离 / 孔位, 改值时整组平移。",
+            "Convention: with several faces, the FIRST selected face is the REFERENCE (green, fixed); faces Shift-added after it move (several: hole + chamfer, boss sides…) → distance / hole position; the group is translated.",
+        )),
+        info_text(tr("移动: 选中面 / 对面 / 两侧各半(厚度)。", "Move: selected / opposite / both halves (thickness).")),
+        info_key(tr("右键 / Enter", "Right-click / Enter"), tr("应用(一步可撤销, 失败自动撤回)", "Apply (one undo step; rolled back on failure)")),
+        info_key("Esc", tr("目标值复原", "Reset the target value")),
+        info_text(tr(
+            "记录: 标题右侧 ＋ 记录 → 下方列表。点条目 = 载入并选中这些面(面换了 id 也能找回); 直接改条目里的数值再 Enter = 应用。★ 收藏、✎ 改名、↻ 用当前尺寸更新、管理 = 批量删除。",
+            "Saved: + Save at the top right → list below. Click an entry to load and select its faces (found even after face ids change); edit its value and press Enter to apply. ★ favourite, ✎ rename, ↻ update from the current dimension, Manage = batch delete.",
+        )),
+    ]
+}
+
+/// 0xRRGGBB → Color32(高亮色块用)。
+fn rgb_hex(c: u32) -> egui::Color32 {
+    egui::Color32::from_rgb((c >> 16) as u8, (c >> 8) as u8, c as u8)
+}
+
+/// 对面候选: ◀ [色块 + 距离 | …] ▶。色块 = Plasticity 里的高亮色(当前 = 橙, 其它 = 蓝)。返回是否换了。
+fn rz_candidates(ui: &mut egui::Ui, values: &[String], selected: &mut usize) -> bool {
+    let n = values.len().max(1);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 28.0), egui::Sense::hover());
+    let aw = 24.0;
+    let mut changed = false;
+    // 两侧箭头
+    for (r, step, glyph) in [
+        (egui::Rect::from_min_size(rect.min, egui::vec2(aw, rect.height())), n - 1, "◀"),
+        (egui::Rect::from_min_size(egui::pos2(rect.right() - aw, rect.top()), egui::vec2(aw, rect.height())), 1, "▶"),
+    ] {
+        let resp = ui.interact(r, ui.id().with(("dim-cand-arrow", glyph)), egui::Sense::click());
+        let fill = if resp.hovered() { lerp_color(COL_STEPPER, egui::Color32::WHITE, 0.15) } else { COL_STEPPER };
+        ui.painter().rect_filled(r, egui::Rounding::same(6.0), fill);
+        ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, glyph, egui::FontId::proportional(11.0), egui::Color32::WHITE);
+        if resp.clicked() && values.len() > 1 {
+            *selected = (*selected + step) % n;
+            changed = true;
+        }
+    }
+    // 中间分段
+    let mid = egui::Rect::from_min_max(egui::pos2(rect.left() + aw + 4.0, rect.top()), egui::pos2(rect.right() - aw - 4.0, rect.bottom()));
+    ui.painter().rect_filled(mid, egui::Rounding::same(6.0), COL_FIELD);
+    let w = mid.width() / n as f32;
+    for (i, label) in values.iter().enumerate() {
+        let r = egui::Rect::from_min_size(egui::pos2(mid.left() + w * i as f32, mid.top()), egui::vec2(w, mid.height()));
+        let resp = ui.interact(r, ui.id().with(("dim-cand", i)), egui::Sense::click());
+        let on = i == *selected;
+        if on || resp.hovered() {
+            let fill = if on { COL_STEPPER } else { lerp_color(COL_FIELD, egui::Color32::WHITE, 0.06) };
+            ui.painter().rect_filled(r.shrink(2.0), egui::Rounding::same(5.0), fill);
+        }
+        let swatch = rgb_hex(if on { pla_bridge::shim::HIGHLIGHT_PRIMARY } else { pla_bridge::shim::HIGHLIGHT_CANDIDATE });
+        let font = egui::FontId::proportional(12.5);
+        let tw = ui.fonts(|f| f.layout_no_wrap(label.clone(), font.clone(), COL_TEXT).size().x);
+        let total = 10.0 + 5.0 + tw;
+        let x0 = r.center().x - total / 2.0;
+        ui.painter().rect_filled(egui::Rect::from_min_size(egui::pos2(x0, r.center().y - 5.0), egui::vec2(10.0, 10.0)), egui::Rounding::same(2.0), swatch);
+        ui.painter().text(egui::pos2(x0 + 15.0, r.center().y), egui::Align2::LEFT_CENTER, label, font, if on { egui::Color32::WHITE } else { COL_MUTED });
+        if resp.clicked() && !on {
+            *selected = i;
+            changed = true;
+        }
+    }
+    changed
+}
+
 /// 圆角深色数值框(白字居中 + 单位); editable 时是输入框。返回 (Response 或 None, 回车提交)。
 fn rz_field(ui: &mut egui::Ui, buf: &mut String, units: &str, editable: bool) -> bool {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 28.0), egui::Sense::hover());
@@ -1105,7 +1197,8 @@ fn rz_footer(ui: &mut egui::Ui, ok_enabled: bool, busy: bool) -> (bool, bool) {
     let cancel_r = kc.union(ct).expand(3.0);
     let cancel = ui.interact(cancel_r, ui.id().with("rz-cancel"), egui::Sense::click()).clicked();
     // 右: OK ↵
-    let kr = rz_keycap(&p, egui::pos2(rect.right() - 2.0, rect.center().y), egui::Align2::RIGHT_CENTER, "↵");
+    // 内置字体没有 ↵ 字形(实测显示成方框)→ 键帽写 Enter
+    let kr = rz_keycap(&p, egui::pos2(rect.right() - 2.0, rect.center().y), egui::Align2::RIGHT_CENTER, "Enter");
     let ok_col = if ok_enabled { egui::Color32::WHITE } else { COL_GRAY_DOT };
     let ok_txt = if busy { tr("修改中…", "Applying…") } else { "OK" };
     let ot = paint_text(&p, egui::pos2(kr.left() - 8.0, rect.center().y), egui::Align2::RIGHT_CENTER, ok_txt, 12.5, ok_col, ok_enabled);
@@ -1320,6 +1413,9 @@ fn show_info_popup(ctx: &egui::Context, h: InfoHint) {
                                 // 连带后面的说明文字都越过右边框(R15 实测)。
                                 ui.add(egui::Label::new(egui::RichText::new(d).size(12.0).color(COL_TEXT)).wrap());
                             });
+                        }
+                        InfoLine::Image(uri, bytes) => {
+                            ui.add(egui::Image::from_bytes(uri.clone(), bytes.clone()).max_width(W - 24.0).rounding(4.0));
                         }
                     }
                 }
@@ -2168,6 +2264,17 @@ impl PlaApp {
             dim_pending_opp: None,
             dim_last_apply: None,
             dim_del_confirm: None,
+            dims_manage: false,
+            dims_selected: Default::default(),
+            dims_rename: None,
+            dims_rename_buf: String::new(),
+            dims_update_confirm: None,
+            dims_batch_confirm: false,
+            dims_vals: Default::default(),
+            dims_row_focus: false,
+            dims_pngs: Default::default(),
+            dims_thumb_pending: None,
+            dim_pending_target: None,
             dim_busy: false,
             hotkeys: pla_ui::hotkey::load_binds().unwrap_or_default(),
             recording: None,
@@ -2322,7 +2429,7 @@ impl PlaApp {
                 // N3d: 面签名回包(记录 / 改后刷新之外的签名请求不会发)
                 pla_bridge::cdp::CdpEvent::CallResult { name, result } if name == pla_bridge::shim::api::DIM_SIGNATURE => {
                     match (self.dim_pending.take(), result) {
-                        (Some(DimPending::Save(mut rec, n)), Ok(v)) => {
+                        (Some(DimPending::Save(mut rec, n, update)), Ok(v)) => {
                             let sigs = v["faces"].as_array().cloned().unwrap_or_default();
                             if let Some(e) = sigs.iter().find_map(|s| s["err"].as_str().map(String::from)) {
                                 self.set_notice((true, t!("记录失败: {e}", "Save failed: {e}")));
@@ -2332,10 +2439,27 @@ impl PlaApp {
                                 rec.faces = sigs[..n].to_vec();
                                 rec.opposite = sigs.get(n).cloned();
                                 let ids: Vec<String> = rec.faces.iter().filter_map(|s| s["id"].as_str().map(String::from)).collect();
-                                match pla_ui::dims::add(&self.doc_key, rec) {
+                                let saved = if update {
+                                    // 更新: 保留名字 / 收藏 / 创建时间, 其余换成当前尺寸
+                                    if let Some(old) = self.dims_list.iter().find(|r| r.name == rec.name) {
+                                        rec.fav = old.fav;
+                                        rec.created = old.created;
+                                    }
+                                    pla_ui::dims::update(&self.doc_key, &rec).map(|_| rec.name.clone())
+                                } else {
+                                    pla_ui::dims::add(&self.doc_key, rec)
+                                };
+                                match saved {
                                     Ok(name) => {
                                         self.dims_list = pla_ui::dims::load(&self.doc_key);
-                                        self.set_notice((false, t!("已记录尺寸 {name}", "Dimension saved as {name}")));
+                                        self.dims_vals.remove(&name);
+                                        self.set_notice((false, if update { t!("已更新尺寸 {name}", "Dimension {name} updated") } else { t!("已记录尺寸 {name}", "Dimension saved as {name}") }));
+                                        // 缩略图: 当前视口(带高亮)截一张, 悬停详情里显示
+                                        self.cdp.send(pla_bridge::cdp::CdpCmd::Call {
+                                            name: pla_bridge::shim::api::CAM_THUMBNAIL,
+                                            args: serde_json::json!({ "maxWidth": 480 }),
+                                        });
+                                        self.dims_thumb_pending = Some(name.clone());
                                         self.dim_active = Some(name);
                                         self.dim_active_ids = ids;
                                     }
@@ -2345,6 +2469,19 @@ impl PlaApp {
                         }
                         (Some(_), Err(e)) => self.set_notice((true, t!("记录失败: {e}", "Save failed: {e}"))),
                         (other, _) => self.dim_pending = other,
+                    }
+                }
+                // N3d: 记录 / 更新后截的视口缩略图 → `<models>/<名字>.png`
+                pla_bridge::cdp::CdpEvent::CallResult { name, result }
+                    if name == pla_bridge::shim::api::CAM_THUMBNAIL && self.dims_thumb_pending.is_some() =>
+                {
+                    let nm = self.dims_thumb_pending.take().unwrap_or_default();
+                    if let Ok(v) = result {
+                        if let Some(bytes) = v["data"].as_str().and_then(|b| pla_bridge::cdp::base64_decode(b).ok()) {
+                            if std::fs::write(pla_ui::dims::png_path(&self.doc_key, &nm), &bytes).is_ok() {
+                                self.dims_pngs.insert(nm, bytes);
+                            }
+                        }
                     }
                 }
                 // N3d: 按签名定位回包 → 载入(在 Plasticity 里选中)/ 改后刷新(写回当前签名)
@@ -2361,6 +2498,7 @@ impl PlaApp {
                             let n = rec.faces.len();
                             if ids.len() < n || ids.iter().take(n).any(|x| x.is_none()) {
                                 let why = res.iter().find_map(|r| r["err"].as_str().map(String::from)).unwrap_or_default();
+                                self.dim_pending_target = None;
                                 self.set_notice((true, t!("尺寸 {} 在当前模型里找不到对应的面: {why}", "Dimension {} not found in the current model: {why}", rec.name)));
                             } else {
                                 let main: Vec<String> = ids.iter().take(n).flatten().cloned().collect();
@@ -2790,6 +2928,7 @@ impl PlaApp {
                 default_rect: default,
                 min_size: egui::vec2(NotesDrag::MIN_W, NotesDrag::MIN_H),
                 resizable: true,
+                fit_height: false,
             },
             &mut self.notes_win,
             |ui| {
@@ -2853,6 +2992,8 @@ impl PlaApp {
                 default_rect: default,
                 min_size: egui::vec2(NotesDrag::MIN_W, NotesDrag::MIN_H),
                 resizable: true,
+                // 用户 2026-11-15: 默认贴合内容高度; 手动调过大小后保持, 内容超出出滚动条
+                fit_height: true,
             },
             &mut win,
             |ui| {
@@ -2915,6 +3056,14 @@ impl PlaApp {
                     _ => (String::new(), Vec::new()),
                 };
                 self.dim_set_highlight(hl_key, hl_faces);
+                // N3d: 条目里直接改了数值 → 载入完成(选择 = 记录的面、尺寸已读到)后自动应用
+                if let (Some(t), Some(v)) = (self.dim_pending_target, &info) {
+                    if self.dim_active.is_some() && faces == self.dim_active_ids && !self.dim_busy && self.dim_pending_opp.is_none() {
+                        self.dim_pending_target = None;
+                        let v = v.clone();
+                        self.dim_apply(&v, &faces, t);
+                    }
+                }
                 let units = |v: &serde_json::Value| -> String {
                     match v["units"].as_str().unwrap_or("") {
                         "millimeter" => "mm", "centimeter" => "cm", "meter" => "m", "inch" => "in", "foot" => "ft", u => u,
@@ -2933,7 +3082,16 @@ impl PlaApp {
                     None => tr("尺寸", "DIMENSION"),
                 };
                 let (trow, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 20.0), egui::Sense::hover());
-                paint_text(ui.painter(), egui::pos2(trow.left(), trow.center().y), egui::Align2::LEFT_CENTER, title, 12.0, COL_SECTION, true);
+                let tr_ = paint_text(ui.painter(), egui::pos2(trow.left(), trow.center().y), egui::Align2::LEFT_CENTER, title, 12.0, COL_SECTION, true);
+                // "?" 说明(悬停弹三级面板; 含"第一个选的面 = 参考面"约定)
+                {
+                    let c = egui::pos2(tr_.right() + 10.0, trow.center().y);
+                    let hot = ui.rect_contains_pointer(egui::Rect::from_center_size(c, egui::vec2(16.0, 16.0)));
+                    let col = if hot { egui::Color32::WHITE } else { COL_MUTED };
+                    ui.painter().circle_stroke(c, 5.5, egui::Stroke::new(1.0_f32, col));
+                    ui.painter().text(c, egui::Align2::CENTER_CENTER, "?", egui::FontId::proportional(8.5), col);
+                    hover_info(ui, trow, hot, tr("改尺寸 · 说明", "Resize · help"), dim_help_lines());
+                }
                 if let Some(v) = &info {
                     let v = v.clone();
                     self.dim_record_control(ui, trow, &v, &faces);
@@ -2956,16 +3114,14 @@ impl PlaApp {
                         self.dim_distance_ui(ui, &v, &u, &faces);
                     }
                     (Some(_), Some(Ok(v))) => {
-                        let face = v["face"].as_str().unwrap_or("").to_string();
                         let kind = v["kind"].as_str().unwrap_or("none");
                         let u = units(&v);
                         let cands = v["candidates"].as_array().cloned().unwrap_or_default();
-                        // 厚度: 值与对面随当前候选; 其它: 回包里的值
-                        let (value, opposite) = if kind == "thickness" && !cands.is_empty() {
-                            let c = &cands[self.dim_cand.min(cands.len() - 1)];
-                            (c["value"].as_f64(), c["id"].as_str().map(String::from))
+                        // 厚度: 值随当前候选; 其它: 回包里的值(应用时 dim_apply 自己再取对面)
+                        let value = if kind == "thickness" && !cands.is_empty() {
+                            cands[self.dim_cand.min(cands.len() - 1)]["value"].as_f64()
                         } else {
-                            (v["value"].as_f64(), None)
+                            v["value"].as_f64()
                         };
                         match (kind, value, v["op"].as_str(), v["offsetSign"].as_f64()) {
                             ("none", ..) | (_, None, ..) | (_, _, None, _) | (.., None) => {
@@ -2976,7 +3132,7 @@ impl PlaApp {
                                     &t!("曲面 {surf}; 平面需要同一实体里有背对的平行面", "Surface {surf}; a plane needs an opposite parallel face in the same solid"),
                                 );
                             }
-                            (_, Some(value), Some(op), Some(sign)) => {
+                            (_, Some(value), Some(_), Some(_)) => {
                                 let (card_title, card_sub) = match kind {
                                     "thickness" => (tr("到背对的平行面", "To the opposite parallel face"), t!("对面 {}/{}(橙)", "Opposite {}/{} (orange)", self.dim_cand.min(cands.len().saturating_sub(1)) + 1, cands.len())),
                                     "radius" if v["convex"] == true => (tr("凸台", "Boss"), tr("轴线不动", "Axis stays").to_string()),
@@ -2986,10 +3142,10 @@ impl PlaApp {
                                 rz_info_card(ui, card_title, &card_sub);
                                 // ---- 对面候选(分段选择, 橙 = 当前) ----
                                 if kind == "thickness" && cands.len() > 1 {
-                                    rz_label(ui, tr("对面", "Opposite face"));
+                                    rz_label(ui, tr("对面候选(量得的距离)", "Opposite face candidates (measured distance)"));
                                     let labels: Vec<String> = cands.iter().map(|c| fmt3(c["value"].as_f64().unwrap_or(0.0))).collect();
                                     let mut i = self.dim_cand.min(cands.len() - 1);
-                                    if rz_segmented(ui, "dim-opp", &labels, &mut i) {
+                                    if rz_candidates(ui, &labels, &mut i) {
                                         self.dim_cand = i;
                                         self.dim_text = fmt3(cands[i]["value"].as_f64().unwrap_or(0.0));
                                     }
@@ -3004,27 +3160,14 @@ impl PlaApp {
                                     }
                                 }
                                 if let Some(t) = self.dim_value_block(ui, value, &u, false) {
-                                    self.dim_note_apply(&v, &faces, value, t);
-                                    let delta = t - value;
-                                    let (faces_arg, dist) = match (kind, self.dim_side, &opposite) {
-                                        ("thickness", 1, Some(o)) => (serde_json::json!([o]), delta),
-                                        ("thickness", 2, Some(o)) => (serde_json::json!([face, o]), delta / 2.0),
-                                        _ => (serde_json::json!([face]), delta * sign),
-                                    };
-                                    let script = serde_json::json!({
-                                        "atomic": true,
-                                        "ops": [{ "op": op, "faces": faces_arg, "distance": dist }],
-                                    });
-                                    self.cdp.send(pla_bridge::cdp::CdpCmd::Exec(script));
-                                    self.dim_busy = true;
-                                    self.set_notice((false, t!("正在修改: {} → {} {u}…", "Changing: {} → {} {u}…", fmt3(value), fmt3(t))));
+                                    self.dim_apply(&v, &faces, t);
                                 }
                             }
                         }
                     }
                 }
                 // ---- N3d 已记录尺寸 ----
-                self.dim_saved_ui(ui);
+                self.dim_saved_ui(ui, info.clone());
             },
         );
         self.dim_win = win;
@@ -3066,32 +3209,80 @@ impl PlaApp {
         let resp = ui.interact(r, ui.id().with("dim-save"), egui::Sense::click());
         ui.painter().text(egui::pos2(row.right(), row.center().y), egui::Align2::RIGHT_CENTER, label, font, if resp.hovered() { egui::Color32::WHITE } else { COL_ACCENT });
         if resp.on_hover_text(tr("把这个尺寸记下来, 以后在下方列表里点它就能再改(面换了 id 也能找回)", "Save this dimension; click it in the list below later to edit again (found even after face ids change)")).clicked() {
-            let (ids, opp) = Self::dim_current_faces(v, self.dim_cand);
-            let n = ids.len();
-            let value = if v["kind"] == "thickness" {
-                v["candidates"].as_array().and_then(|a| a.get(self.dim_cand.min(a.len().saturating_sub(1)))).and_then(|c| c["value"].as_f64())
-            } else {
-                v["value"].as_f64()
-            };
-            let rec = pla_ui::dims::DimRecord {
-                name: String::new(),
-                mode: if v["kind"] == "distance" { "distance".into() } else { "face".into() },
-                kind: v["kind"].as_str().unwrap_or("").into(),
-                faces: Vec::new(),
-                opposite: None,
-                side: self.dim_side,
-                value: value.unwrap_or(0.0),
-                units: v["units"].as_str().unwrap_or("").into(),
-                created: 0,
-            };
-            let mut all = ids;
-            all.extend(opp);
-            self.cdp.send(pla_bridge::cdp::CdpCmd::Call {
-                name: pla_bridge::shim::api::DIM_SIGNATURE,
-                args: serde_json::json!({ "faces": all, "units": rec.units }),
-            });
-            self.dim_pending = Some(DimPending::Save(rec, n));
+            self.dim_request_save(v, None);
         }
+    }
+
+    /// N3d: 取当前尺寸各面的签名 → 新增记录(update = None)或覆盖已有记录(update = Some(名字))。
+    fn dim_request_save(&mut self, v: &serde_json::Value, update: Option<String>) {
+        let (ids, opp) = Self::dim_current_faces(v, self.dim_cand);
+        let n = ids.len();
+        let value = if v["kind"] == "thickness" {
+            v["candidates"].as_array().and_then(|a| a.get(self.dim_cand.min(a.len().saturating_sub(1)))).and_then(|c| c["value"].as_f64())
+        } else {
+            v["value"].as_f64()
+        };
+        let rec = pla_ui::dims::DimRecord {
+            name: update.clone().unwrap_or_default(),
+            mode: if v["kind"] == "distance" { "distance".into() } else { "face".into() },
+            kind: v["kind"].as_str().unwrap_or("").into(),
+            faces: Vec::new(),
+            opposite: None,
+            side: self.dim_side,
+            value: value.unwrap_or(0.0),
+            units: v["units"].as_str().unwrap_or("").into(),
+            created: 0,
+            fav: false,
+        };
+        let mut all = ids;
+        all.extend(opp);
+        self.cdp.send(pla_bridge::cdp::CdpCmd::Call {
+            name: pla_bridge::shim::api::DIM_SIGNATURE,
+            args: serde_json::json!({ "faces": all, "units": rec.units }),
+        });
+        self.dim_pending = Some(DimPending::Save(rec, n, update.is_some()));
+    }
+
+    /// 把当前尺寸改成 target(编辑区的应用 / 条目里直接改数值共用)。单面: offsetFace / refillet(按移动侧);
+    /// 距离: moveFaces 整组平移。成功后若对应某条记录, 由 ExecResult 刷新记录。
+    fn dim_apply(&mut self, v: &serde_json::Value, sel: &[String], target: f64) {
+        let kind = v["kind"].as_str().unwrap_or("");
+        let units = match v["units"].as_str().unwrap_or("") {
+            "millimeter" => "mm", "centimeter" => "cm", "meter" => "m", "inch" => "in", "foot" => "ft", u => u,
+        }
+        .to_string();
+        let script = if kind == "distance" {
+            let Some(value) = v["value"].as_f64() else { return };
+            let dir: Vec<f64> = v["direction"].as_array().map(|a| a.iter().filter_map(|x| x.as_f64()).collect()).unwrap_or_default();
+            if dir.len() != 3 {
+                return;
+            }
+            self.dim_note_apply(v, sel, value, target);
+            let d = target - value;
+            (value, serde_json::json!({ "atomic": true, "ops": [{ "op": "moveFaces", "faces": v["moving"], "move": [dir[0] * d, dir[1] * d, dir[2] * d] }] }))
+        } else {
+            let cands = v["candidates"].as_array().cloned().unwrap_or_default();
+            let (value, opposite) = if kind == "thickness" && !cands.is_empty() {
+                let c = &cands[self.dim_cand.min(cands.len() - 1)];
+                (c["value"].as_f64(), c["id"].as_str().map(String::from))
+            } else {
+                (v["value"].as_f64(), None)
+            };
+            let (Some(value), Some(op), Some(sign)) = (value, v["op"].as_str(), v["offsetSign"].as_f64()) else { return };
+            self.dim_note_apply(v, sel, value, target);
+            let face = v["face"].as_str().unwrap_or("").to_string();
+            let delta = target - value;
+            let (faces_arg, dist) = match (kind, self.dim_side, &opposite) {
+                ("thickness", 1, Some(o)) => (serde_json::json!([o]), delta),
+                ("thickness", 2, Some(o)) => (serde_json::json!([face, o]), delta / 2.0),
+                _ => (serde_json::json!([face]), delta * sign),
+            };
+            (value, serde_json::json!({ "atomic": true, "ops": [{ "op": op, "faces": faces_arg, "distance": dist }] }))
+        };
+        let (value, script) = script;
+        self.cdp.send(pla_bridge::cdp::CdpCmd::Exec(script));
+        self.dim_busy = true;
+        self.set_notice((false, t!("正在修改: {} → {} {units}…", "Changing: {} → {} {units}…", fmt3(value), fmt3(target))));
     }
 
     /// N3d: 应用前登记 —— 当前选择正是某条记录时, 记下各面(faces 之后 opposite)的平移量, 成功后据此刷新记录。
@@ -3146,8 +3337,10 @@ impl PlaApp {
         self.dim_pending = Some(DimPending::Load(rec.clone()));
     }
 
-    /// N3d: 已记录尺寸列表(点 = 载入并选中; × = 删除, 需确认)。
-    fn dim_saved_ui(&mut self, ui: &mut egui::Ui) {
+    /// N3d: 已记录尺寸列表。交互同快照墙: ★ 收藏(置顶)、✎ / 双击名字改名、↻ 用当前尺寸更新(确认)、管理 = 勾选批量删除;
+    /// 点条目空白处 = 载入并在 Plasticity 里选中; 条目里的数值框直接改 + Enter / 右键 = 载入并应用;
+    /// 悬停 = 三级面板显示详细信息与缩略图(条目本身不放截图)。cur = 当前编辑区读到的尺寸(更新用)。
+    fn dim_saved_ui(&mut self, ui: &mut egui::Ui, cur: Option<serde_json::Value>) {
         if !self.dims_loaded {
             self.dims_list = pla_ui::dims::load(&self.doc_key);
             self.dims_loaded = true;
@@ -3155,43 +3348,260 @@ impl PlaApp {
         ui.add_space(8.0);
         let (row, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 20.0), egui::Sense::hover());
         paint_text(ui.painter(), egui::pos2(row.left(), row.center().y), egui::Align2::LEFT_CENTER, tr("已记录", "SAVED"), 12.0, COL_SECTION, true);
+        if !self.dims_list.is_empty() {
+            let label = if self.dims_manage { tr("完成", "Done") } else { tr("管理", "Manage") };
+            let font = egui::FontId::proportional(12.0);
+            let w = ui.fonts(|f| f.layout_no_wrap(label.into(), font.clone(), COL_ACCENT).size().x);
+            let r = egui::Rect::from_min_max(egui::pos2(row.right() - w - 4.0, row.top()), row.max);
+            let resp = ui.interact(r, ui.id().with("dims-manage"), egui::Sense::click());
+            ui.painter().text(egui::pos2(row.right(), row.center().y), egui::Align2::RIGHT_CENTER, label, font, if resp.hovered() { egui::Color32::WHITE } else { COL_ACCENT });
+            if resp.clicked() {
+                self.dims_manage = !self.dims_manage;
+                self.dims_selected.clear();
+            }
+        }
         if self.dims_list.is_empty() {
-            ui.label(egui::RichText::new(tr("还没有记录。改尺寸前点标题右侧的 ＋ 记录。", "Nothing saved yet. Click + Save at the top right before resizing.")).size(11.5).color(COL_MUTED));
+            ui.label(egui::RichText::new(tr("还没有记录。读出尺寸后点标题右侧的 ＋ 记录。", "Nothing saved yet. Read a dimension, then click + Save at the top right.")).size(11.5).color(COL_MUTED));
+            self.dims_row_focus = false;
             return;
         }
-        let mut load: Option<pla_ui::dims::DimRecord> = None;
-        let list = self.dims_list.clone();
-        egui::ScrollArea::vertical().id_salt("dims-list").max_height(160.0).show(ui, |ui| {
-            for rec in &list {
-                let (r, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 26.0), egui::Sense::click());
-                let active = self.dim_active.as_deref() == Some(rec.name.as_str());
-                let fill = if active { COL_STEPPER } else if resp.hovered() { lerp_color(COL_CARD, egui::Color32::WHITE, 0.06) } else { COL_CARD };
-                ui.painter().rect_filled(r, egui::Rounding::same(6.0), fill);
-                let kind = match rec.kind.as_str() {
-                    "thickness" => tr("厚度", "Thickness"),
-                    "radius" => tr("半径", "Radius"),
-                    "filletRadius" => tr("圆角", "Fillet"),
-                    "distance" => tr("距离", "Distance"),
-                    _ => "",
-                };
-                let u = match rec.units.as_str() { "millimeter" => "mm", "centimeter" => "cm", "meter" => "m", "inch" => "in", "foot" => "ft", x => x };
-                paint_text(ui.painter(), egui::pos2(r.left() + 10.0, r.center().y), egui::Align2::LEFT_CENTER, &rec.name, 12.0, if active { COL_ACCENT } else { egui::Color32::WHITE }, true);
-                ui.painter().text(egui::pos2(r.left() + 56.0, r.center().y), egui::Align2::LEFT_CENTER, kind, egui::FontId::proportional(12.0), COL_MUTED);
-                // 右: 值 + ×
-                let x = egui::Rect::from_center_size(egui::pos2(r.right() - 12.0, r.center().y), egui::vec2(18.0, 18.0));
-                let xr = ui.interact(x, ui.id().with(("dim-del", &rec.name)), egui::Sense::click());
-                ui.painter().text(x.center(), egui::Align2::CENTER_CENTER, "×", egui::FontId::proportional(14.0), if xr.hovered() { egui::Color32::WHITE } else { COL_MUTED });
-                ui.painter().text(egui::pos2(x.left() - 6.0, r.center().y), egui::Align2::RIGHT_CENTER, format!("{} {u}", fmt3(rec.value)), egui::FontId::proportional(12.0), COL_TEXT);
-                if xr.clicked() {
-                    self.dim_del_confirm = Some(rec.name.clone());
-                } else if resp.clicked() && self.dim_pending.is_none() && !self.dim_busy {
-                    load = Some(rec.clone());
-                }
-                ui.add_space(2.0);
+        let list = pla_ui::dims::sorted(self.dims_list.clone());
+        if self.dims_manage {
+            let names: Vec<String> = list.iter().map(|r| r.name.clone()).collect();
+            let (del, done) = manage_bar(ui, &names, &mut self.dims_selected, tr("删除勾选的尺寸记录(不影响模型)", "Delete the checked records (the model is not affected)"));
+            if del {
+                self.dims_batch_confirm = true;
             }
-        });
-        if let Some(rec) = load {
-            self.dim_load(&rec);
+            if done {
+                self.dims_manage = false;
+                self.dims_selected.clear();
+            }
+        }
+        enum Act {
+            Load(pla_ui::dims::DimRecord),
+            Value(pla_ui::dims::DimRecord, f64),
+            Fav(String, bool),
+            RenameStart(String),
+            RenameCommit(String),
+            RenameCancel,
+            Update(String),
+            Delete(String),
+        }
+        let mut acts: Vec<Act> = Vec::new();
+        let mut focus_any = false;
+        let busy = self.dim_pending.is_some() || self.dim_busy;
+        for rec in &list {
+            let (r, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 28.0), egui::Sense::click());
+            let active = self.dim_active.as_deref() == Some(rec.name.as_str());
+            let hot = ui.rect_contains_pointer(r);
+            let fill = if active { COL_STEPPER } else if hot { lerp_color(COL_CARD, egui::Color32::WHITE, 0.06) } else { COL_CARD };
+            ui.painter().rect_filled(r, egui::Rounding::same(6.0), fill);
+            let cy = r.center().y;
+            let mut x = r.left() + 6.0;
+            // 管理勾选
+            if self.dims_manage {
+                let mut on = self.dims_selected.contains(&rec.name);
+                let cb = egui::Rect::from_min_size(egui::pos2(x, cy - 9.0), egui::vec2(18.0, 18.0));
+                if ui.put(cb, egui::Checkbox::without_text(&mut on)).changed() {
+                    if on { self.dims_selected.insert(rec.name.clone()); } else { self.dims_selected.remove(&rec.name); }
+                }
+                x += 20.0;
+            }
+            // ★ 收藏
+            let sr = egui::Rect::from_min_size(egui::pos2(x, cy - 9.0), egui::vec2(18.0, 18.0));
+            let s = ui.interact(sr, ui.id().with(("dims-fav", &rec.name)), egui::Sense::click());
+            ui.painter().text(sr.center(), egui::Align2::CENTER_CENTER, if rec.fav { "★" } else { "☆" }, egui::FontId::proportional(13.0), if rec.fav { egui::Color32::from_rgb(255, 200, 60) } else { COL_MUTED });
+            if s.on_hover_text(tr("收藏(置顶)", "Favourite (pinned)")).clicked() {
+                acts.push(Act::Fav(rec.name.clone(), !rec.fav));
+            }
+            x += 20.0;
+            // 右侧从右往左: × ↻ ✎ 数值框
+            let btn = |ui: &mut egui::Ui, cx: f32, glyph: &str, tip: &str, key: &str| -> bool {
+                let br = egui::Rect::from_center_size(egui::pos2(cx, cy), egui::vec2(18.0, 18.0));
+                let b = ui.interact(br, ui.id().with((key, glyph)), egui::Sense::click());
+                ui.painter().text(br.center(), egui::Align2::CENTER_CENTER, glyph, egui::FontId::proportional(13.0), if b.hovered() { egui::Color32::WHITE } else { COL_MUTED });
+                b.on_hover_text(tip).clicked()
+            };
+            let key = rec.name.as_str();
+            if btn(ui, r.right() - 12.0, "×", tr("删除(需确认)", "Delete (confirm)"), key) {
+                acts.push(Act::Delete(rec.name.clone()));
+            }
+            if btn(ui, r.right() - 32.0, "↻", tr("用当前读到的尺寸更新这条(保留名字与收藏; 需确认)", "Update from the current dimension (keeps name and favourite; confirm)"), key) {
+                acts.push(Act::Update(rec.name.clone()));
+            }
+            if btn(ui, r.right() - 52.0, "✎", tr("改名(也可双击名字)", "Rename (or double-click the name)"), key) {
+                acts.push(Act::RenameStart(rec.name.clone()));
+            }
+            let u = match rec.units.as_str() { "millimeter" => "mm", "centimeter" => "cm", "meter" => "m", "inch" => "in", "foot" => "ft", x => x };
+            let unit_w = 22.0;
+            let fr = egui::Rect::from_min_max(egui::pos2(r.right() - 64.0 - 66.0 - unit_w, cy - 11.0), egui::pos2(r.right() - 64.0 - unit_w, cy + 11.0));
+            ui.painter().rect_filled(fr, egui::Rounding::same(5.0), COL_FIELD);
+            let buf = self.dims_vals.entry(rec.name.clone()).or_insert_with(|| fmt3(rec.value));
+            let te = ui.put(
+                fr.shrink2(egui::vec2(4.0, 2.0)),
+                egui::TextEdit::singleline(buf).frame(false).horizontal_align(egui::Align::Center).font(egui::FontId::proportional(12.5)).text_color(egui::Color32::WHITE),
+            );
+            ui.painter().text(egui::pos2(fr.right() + 4.0, cy), egui::Align2::LEFT_CENTER, u, egui::FontId::proportional(11.0), COL_MUTED);
+            let focused = te.has_focus();
+            focus_any |= focused;
+            let enter = te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if (enter || (focused && right_click_confirm(ui))) && !busy {
+                match buf.trim().parse::<f64>() {
+                    Ok(t) if t >= 0.0 && (t - rec.value).abs() > 5e-4 => acts.push(Act::Value(rec.clone(), t)),
+                    _ => *buf = fmt3(rec.value),
+                }
+            } else if !focused && te.lost_focus() {
+                *buf = fmt3(rec.value);
+            }
+            // 名字 / 改名
+            let name_r = egui::Rect::from_min_max(egui::pos2(x, cy - 11.0), egui::pos2(fr.left() - 50.0, cy + 11.0));
+            if self.dims_rename.as_deref() == Some(rec.name.as_str()) {
+                ui.painter().rect_filled(name_r, egui::Rounding::same(5.0), COL_FIELD);
+                let e = ui.put(name_r.shrink2(egui::vec2(4.0, 2.0)), egui::TextEdit::singleline(&mut self.dims_rename_buf).frame(false).font(egui::FontId::proportional(12.5)));
+                e.request_focus();
+                focus_any = true;
+                let (en, esc) = ui.input(|i| (i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Escape)));
+                if en || right_click_confirm(ui) {
+                    acts.push(Act::RenameCommit(rec.name.clone()));
+                } else if esc {
+                    acts.push(Act::RenameCancel);
+                }
+            } else {
+                let (shown, size, _) = fit_text(ui, &rec.name, name_r.width().max(20.0), 12.5, 10.5);
+                paint_text(ui.painter(), egui::pos2(name_r.left(), cy), egui::Align2::LEFT_CENTER, &shown, size, if active { COL_ACCENT } else { egui::Color32::WHITE }, true);
+                let nr = ui.interact(name_r, ui.id().with(("dims-name", &rec.name)), egui::Sense::click());
+                if nr.double_clicked() {
+                    acts.push(Act::RenameStart(rec.name.clone()));
+                } else if nr.clicked() {
+                    if self.dims_manage {
+                        if !self.dims_selected.remove(&rec.name) { self.dims_selected.insert(rec.name.clone()); }
+                    } else if !busy {
+                        acts.push(Act::Load(rec.clone()));
+                    }
+                }
+            }
+            let kind = match rec.kind.as_str() { "thickness" => tr("厚度", "Thick."), "radius" => tr("半径", "Radius"), "filletRadius" => tr("圆角", "Fillet"), "distance" => tr("距离", "Dist."), _ => "" };
+            ui.painter().text(egui::pos2(fr.left() - 8.0, cy), egui::Align2::RIGHT_CENTER, kind, egui::FontId::proportional(11.5), COL_MUTED);
+            // 条目空白处单击 = 载入(管理模式 = 勾选)
+            if resp.clicked() {
+                if self.dims_manage {
+                    if !self.dims_selected.remove(&rec.name) { self.dims_selected.insert(rec.name.clone()); }
+                } else if !busy {
+                    acts.push(Act::Load(rec.clone()));
+                }
+            }
+            // 悬停详情(三级面板, 含缩略图)
+            if hot {
+                let mut lines = vec![info_text(format!("{} · {} {} {u}", rec.name, kind, fmt3(rec.value)))];
+                let face0 = rec.faces.first();
+                let solid = face0.and_then(|f| f["solidName"].as_str()).unwrap_or("?");
+                let surf = face0.and_then(|f| f["surface"].as_str()).unwrap_or("?");
+                lines.push(info_text(if rec.mode == "distance" {
+                    t!("参考面: {solid} 的 {surf} 面 → 动 {} 个面", "Reference: {surf} face of {solid} → {} faces move", rec.faces.len().saturating_sub(1))
+                } else {
+                    let side = match rec.side { 1 => tr("移动对面", "move opposite"), 2 => tr("两侧各半", "both halves"), _ => tr("移动选中面", "move selected") };
+                    t!("{solid} 的 {surf} 面 · {side}", "{surf} face of {solid} · {side}")
+                }));
+                if !self.dims_pngs.contains_key(&rec.name) {
+                    if let Ok(b) = std::fs::read(pla_ui::dims::png_path(&self.doc_key, &rec.name)) {
+                        self.dims_pngs.insert(rec.name.clone(), b);
+                    }
+                }
+                if let Some(b) = self.dims_pngs.get(&rec.name) {
+                    lines.push(InfoLine::Image(png_uri("dims", &rec.name, b), b.clone()));
+                } else {
+                    lines.push(info_text(tr("(没有截图: 记录 / 更新时会截一张)", "(no thumbnail: taken on save / update)")));
+                }
+                lines.push(info_text(tr("单击 = 载入并选中 · 改数值 + Enter / 右键 = 应用 · 双击名字 = 改名", "Click = load & select · edit value + Enter / right-click = apply · double-click name = rename")));
+                hover_info(ui, r, true, tr("尺寸记录", "Saved dimension"), lines);
+            }
+            ui.add_space(2.0);
+        }
+        self.dims_row_focus = focus_any;
+        for a in acts {
+            match a {
+                Act::Load(rec) => self.dim_load(&rec),
+                Act::Value(rec, t) => {
+                    self.dims_vals.remove(&rec.name);
+                    self.dim_pending_target = Some(t);
+                    self.dim_load(&rec);
+                }
+                Act::Fav(name, fav) => {
+                    if let Err(e) = pla_ui::dims::set_fav(&self.doc_key, &name, fav) {
+                        self.set_notice((true, t!("收藏失败: {e}", "Favourite failed: {e}")));
+                    }
+                    self.dims_list = pla_ui::dims::load(&self.doc_key);
+                }
+                Act::RenameStart(name) => {
+                    self.dims_rename_buf = name.clone();
+                    self.dims_rename = Some(name);
+                }
+                Act::RenameCancel => self.dims_rename = None,
+                Act::RenameCommit(old) => {
+                    let new = self.dims_rename_buf.trim().to_string();
+                    self.dims_rename = None;
+                    if new != old {
+                        match pla_ui::dims::rename(&self.doc_key, &old, &new) {
+                            Ok(()) => {
+                                if let Some(b) = self.dims_pngs.remove(&old) {
+                                    self.dims_pngs.insert(new.clone(), b);
+                                }
+                                self.dims_vals.remove(&old);
+                                if self.dim_active.as_deref() == Some(old.as_str()) {
+                                    self.dim_active = Some(new.clone());
+                                }
+                                self.dims_list = pla_ui::dims::load(&self.doc_key);
+                            }
+                            Err(e) => self.set_notice((true, t!("改名失败: {e}", "Rename failed: {e}"))),
+                        }
+                    }
+                }
+                Act::Update(name) => self.dims_update_confirm = Some(name),
+                Act::Delete(name) => self.dim_del_confirm = Some(name),
+            }
+        }
+        // ---- 确认弹层(右键 = 确认, Esc = 取消) ----
+        if let Some(name) = self.dims_update_confirm.clone() {
+            let ok_cur = cur.as_ref().filter(|v| matches!(v["kind"].as_str(), Some("thickness" | "radius" | "filletRadius" | "distance")));
+            if ok_cur.is_none() {
+                self.dims_update_confirm = None;
+                self.set_notice((true, tr("先在 Plasticity 里选面读出一个尺寸, 再用它更新记录", "Select faces in Plasticity to read a dimension first, then update the record with it").into()));
+            } else {
+                match confirm_popup_with(ui.ctx(), "dims-update", &t!("用当前读到的尺寸覆盖 {name}?(名字与收藏保留)", "Overwrite {name} with the current dimension? (name and favourite kept)"), tr("更新", "Update"), COL_ACCENT) {
+                    Some(true) => {
+                        self.dims_update_confirm = None;
+                        let v = ok_cur.cloned().unwrap_or_default();
+                        self.dim_request_save(&v, Some(name));
+                    }
+                    Some(false) => self.dims_update_confirm = None,
+                    None => {}
+                }
+            }
+        }
+        if self.dims_batch_confirm {
+            let names: Vec<String> = self.dims_selected.iter().cloned().collect();
+            match confirm_popup(ui.ctx(), "dims-batch", &t!("删除勾选的 {} 条尺寸记录?(不影响模型)", "Delete {} checked records? (the model is not affected)", names.len())) {
+                Some(true) => {
+                    self.dims_batch_confirm = false;
+                    match pla_ui::dims::delete_many(&self.doc_key, &names) {
+                        Ok(_) => {
+                            if self.dim_active.as_ref().is_some_and(|a| names.contains(a)) {
+                                self.dim_active = None;
+                            }
+                            for n in &names {
+                                self.dims_pngs.remove(n);
+                                self.dims_vals.remove(n);
+                            }
+                            self.dims_selected.clear();
+                            self.dims_manage = false;
+                            self.dims_list = pla_ui::dims::load(&self.doc_key);
+                        }
+                        Err(e) => self.set_notice((true, t!("删除失败: {e}", "Delete failed: {e}"))),
+                    }
+                }
+                Some(false) => self.dims_batch_confirm = false,
+                None => {}
+            }
         }
         if let Some(name) = self.dim_del_confirm.clone() {
             match confirm_popup(ui.ctx(), "dim-del", &t!("删除尺寸记录 {name}?(不影响模型)", "Delete dimension {name}? (the model is not affected)")) {
@@ -3202,6 +3612,8 @@ impl PlaApp {
                             if self.dim_active.as_deref() == Some(name.as_str()) {
                                 self.dim_active = None;
                             }
+                            self.dims_pngs.remove(&name);
+                            self.dims_vals.remove(&name);
                             self.dims_list = pla_ui::dims::load(&self.doc_key);
                         }
                         Err(e) => self.set_notice((true, t!("删除失败: {e}", "Delete failed: {e}"))),
@@ -3234,7 +3646,8 @@ impl PlaApp {
         if cancel || esc {
             self.dim_text = fmt3(value);
         }
-        let go = ok || (can && (right_click_confirm(ui) || enter));
+        // 条目数值框有焦点时右键归条目(见 dim_saved_ui), 不在这里应用
+        let go = ok || (can && ((right_click_confirm(ui) && !self.dims_row_focus) || enter));
         if go && self.require_feature(Feature::DimFace) { target } else { None }
     }
 
@@ -3258,15 +3671,7 @@ impl PlaApp {
             return;
         }
         if let Some(t) = self.dim_value_block(ui, value, units, true) {
-            self.dim_note_apply(v, sel, value, t);
-            let delta = t - value;
-            let script = serde_json::json!({
-                "atomic": true,
-                "ops": [{ "op": "moveFaces", "faces": moving, "move": [dir[0] * delta, dir[1] * delta, dir[2] * delta] }],
-            });
-            self.cdp.send(pla_bridge::cdp::CdpCmd::Exec(script));
-            self.dim_busy = true;
-            self.set_notice((false, t!("正在移动 {n} 个面: {} → {} {units}…", "Moving {n} faces: {} → {} {units}…", fmt3(value), fmt3(t))));
+            self.dim_apply(v, sel, t);
         }
     }
 
@@ -3591,6 +3996,15 @@ impl PlaApp {
         self.dim_pending_opp = None;
         self.dim_last_apply = None;
         self.dim_del_confirm = None;
+        self.dims_manage = false;
+        self.dims_selected.clear();
+        self.dims_rename = None;
+        self.dims_update_confirm = None;
+        self.dims_batch_confirm = false;
+        self.dims_vals.clear();
+        self.dims_pngs.clear();
+        self.dims_thumb_pending = None;
+        self.dim_pending_target = None;
     }
 
     fn update_snap(&mut self, ctx: &egui::Context) {
@@ -4111,8 +4525,8 @@ fn header_extra_and_show(
 
 /// N3d: 等垫片回包的尺寸记录操作。
 enum DimPending {
-    /// 记录: 模板 + 主面个数(签名列表里前 n 个是 faces, 之后一个是 opposite)。
-    Save(pla_ui::dims::DimRecord, usize),
+    /// 记录: 模板 + 主面个数(签名列表里前 n 个是 faces, 之后一个是 opposite)+ 是否"更新"已有记录(保留名字 / 收藏 / 创建时间)。
+    Save(pla_ui::dims::DimRecord, usize, bool),
     /// 载入: 按签名定位后在 Plasticity 里选中。
     Load(pla_ui::dims::DimRecord),
     /// 改后刷新: 按预测签名定位, 用定位到的当前签名与新值写回。
@@ -4139,6 +4553,8 @@ struct FloatWin {
     saved_rect: Option<[f32; 4]>,
     /// R30b: 自管拖动/调大小会话(SetCapture + 屏幕坐标 delta; 不用 OS StartDrag/BeginResize, pitfalls #49)。
     drag: Option<NotesDrag>,
+    /// 用户本次打开后手动调过大小 → 不再自动贴合内容高度(内容超出时用滚动条)。
+    user_resized: bool,
 }
 
 impl FloatWin {
@@ -4149,6 +4565,7 @@ impl FloatWin {
     fn closed(&mut self) {
         self.open_rect = None;
         self.drag = None;
+        self.user_resized = false;
     }
 }
 
@@ -4162,6 +4579,8 @@ struct FloatSpec<'a> {
     default_rect: [f32; 4],
     min_size: egui::Vec2,
     resizable: bool,
+    /// 高度自动贴合内容(用户手动调过大小后停止); 内容一律包在纵向滚动区里, 超出时出滚动条。
+    fit_height: bool,
 }
 
 /// R30 / N3: 独立浮窗(笔记、尺寸)。与二级面板不同: 不跟随工具栏、不互斥、不被其他面板关掉;
@@ -4188,6 +4607,8 @@ fn floating_window(ctx: &egui::Context, spec: FloatSpec, st: &mut FloatWin, body
     let mut live_rect: Option<[f32; 4]> = None;
     let mut pointer_down = false;
     let mut start: Option<NotesDragMode> = None;
+    let mut want_h: Option<f32> = None;
+    let st_user_resized = st.user_resized;
     let drag_state = &mut st.drag;
     let mut body = Some(body);
     ctx.show_viewport_immediate(egui::ViewportId::from_hash_of(id), builder, |ctx, _class| {
@@ -4224,7 +4645,18 @@ fn floating_window(ctx: &egui::Context, spec: FloatSpec, st: &mut FloatWin, body
                 open = false;
             }
             if let Some(b) = body.take() {
-                b(ui);
+                if spec.fit_height {
+                    // 内容包在纵向滚动区: 窗口比内容矮时出滚动条; 记下内容高度供自动贴合
+                    let scroll_top = ui.cursor().min.y;
+                    let out = egui::ScrollArea::vertical()
+                        .id_salt((id, "scroll"))
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| b(ui));
+                    // 窗口内高 = 滚动区顶部(含标题行与外边距)+ 内容高 + 底部外边距
+                    want_h = Some(scroll_top + out.content_size.y + 14.0);
+                } else {
+                    b(ui);
+                }
             }
         });
         paint_panel_border(ctx);
@@ -4271,6 +4703,13 @@ fn floating_window(ctx: &egui::Context, spec: FloatSpec, st: &mut FloatWin, body
         let vp = ctx.input(|i| (i.viewport().outer_rect, i.viewport().inner_rect));
         if let (Some(o), Some(inner)) = vp {
             live_rect = Some([o.left(), o.top(), inner.width(), inner.height()]);
+            // 自动贴合内容高度(没手动调过大小、没在拖动时; 封顶 900, 不低于最小高)
+            if let (Some(h), false, true) = (want_h, st_user_resized, drag_state.is_none()) {
+                let h = h.clamp(spec.min_size.y, 900.0);
+                if (h - inner.height()).abs() > 1.5 {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(inner.width(), h)));
+                }
+            }
         }
         // ---- R30b: 自管拖动/调大小 —— 开始与结束都以鼠标左键**物理**状态为准 ----
         // (旧版用 OS StartDrag/BeginResize: 模态循环吞掉松手事件 → egui 以为一直按着,
@@ -4304,6 +4743,9 @@ fn floating_window(ctx: &egui::Context, spec: FloatSpec, st: &mut FloatWin, body
         }
         pointer_down = phys_down || drag_state.is_some();
     });
+    if matches!(start, Some(NotesDragMode::Resize(_))) {
+        st.user_resized = true;
+    }
     // 位置/大小变了且已松手 → 写偏好(拖动/调整中不写, 免得每帧写盘)
     if let Some(r) = live_rect {
         let moved = st.saved_rect.map_or(true, |s| s.iter().zip(r.iter()).any(|(a, b)| (a - b).abs() > 1.0));

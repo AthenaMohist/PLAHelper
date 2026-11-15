@@ -313,10 +313,11 @@
     parallelTolDeg: 0.1,
     planeSurface: 'Plane',
     // ---- N3: 面高亮的样式(角色 → 颜色 / 不透明度); 透过实体可见(depthTest 关), 画在最上层 ----
+    // 颜色来自配置(Rust shim::HIGHLIGHT_*; 面板色块用同一份), 这里只定不透明度
     highlightStyles: {
-      primary:   { color: 0xff8c1a, opacity: 0.55 },   // 当前选中的对面
-      candidate: { color: 0x3aa0ff, opacity: 0.25 },   // 其它候选
-      source:    { color: 0x5ad16a, opacity: 0.35 }    // 选中面(可选; Plasticity 自己已有选中色)
+      primary:   { color: (CFG.highlightColors || {}).primary, opacity: 0.55 },     // 当前对面 / 锚面
+      candidate: { color: (CFG.highlightColors || {}).candidate, opacity: 0.25 },   // 其它候选
+      source:    { color: (CFG.highlightColors || {}).source, opacity: 0.35 }       // 参考面
     },
     highlightRenderOrder: 999,
     // geo.query 每类最多返回的项数(超出如实报 truncated)
