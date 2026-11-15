@@ -1,4 +1,5 @@
 pub mod bom;
+pub mod bom_table;
 pub mod bridge_thread;
 pub mod cdp_mode;
 pub mod configs;

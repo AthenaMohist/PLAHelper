@@ -3360,7 +3360,10 @@
     var out = lines.map(function (l) {
       var names = l.members.map(function (p) { return p.name; });
       var paths = l.members.map(function (p) { return p.path.join(' / '); });
-      return { name: common(names), names: names.filter(function (x, i) { return names.indexOf(x) === i; }), qty: l.members.length,
+      // key: 零件身份(指纹的文本形式; 跨配置相同的零件 key 相同 → BOM 里的人工编辑跟着零件走)
+      var fk = Object.keys(l.fp.faces).sort().map(function (t) { return t + l.fp.faces[t]; }).join('.');
+      return { key: [l.fp.volume, l.fp.area, l.fp.moments.join('/'), fk, l.fp.chiral].join('|'),
+               name: common(names), names: names.filter(function (x, i) { return names.indexOf(x) === i; }), qty: l.members.length,
                members: l.members.map(function (p) { return { id: p.id, name: p.name, path: p.path }; }),
                path: common(paths) || '', material: common(l.members.map(function (p) { return p.material || ''; })) || null,
                volume: l.fp.volume, area: l.fp.area, faces: l.fp.faces, chiral: l.fp.chiral, mirrorOf: l.mirrorOf };

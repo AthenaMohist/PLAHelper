@@ -55,13 +55,18 @@ pub fn to_csv(scan: &Value) -> String {
     s
 }
 
-/// 写 CSV 到 `<bom 目录>/<范围名>.csv`, 返回路径。
+/// 写 CSV 到 `<bom 目录>/<范围名>.csv`(简表: 序号 / 名称 / 数量 / 材料 / 组 / 体积 / 备注), 返回路径。
 pub fn export(doc_key: &str, scope: &str, scan: &Value) -> Result<std::path::PathBuf, String> {
+    export_text(doc_key, scope, &to_csv(scan))
+}
+
+/// 写一份已生成的 CSV 文本到 `<bom 目录>/<范围名>.csv`(模板表用它), 返回路径。
+pub fn export_text(doc_key: &str, scope: &str, csv: &str) -> Result<std::path::PathBuf, String> {
     let dir = STORE.dir(doc_key);
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let safe: String = scope.chars().map(|c| if "/\\:*?\"<>|".contains(c) { '_' } else { c }).collect();
     let p = dir.join(format!("{safe}.csv"));
-    std::fs::write(&p, to_csv(scan)).map_err(|e| e.to_string())?;
+    std::fs::write(&p, csv).map_err(|e| e.to_string())?;
     Ok(p)
 }
 

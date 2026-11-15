@@ -186,6 +186,17 @@ struct PlaApp {
     bom_busy: bool,
     bom_pending_scope: Option<Option<String>>,
     bom_batch: Option<(std::collections::VecDeque<String>, Vec<String>)>,
+    /// B3 模板(bom_table): 模板名列表 / 当前名 / 内容 / 修改时间 + 上次检查(热生效)/ 读错;
+    /// 本文档的编辑(覆盖 / 排除 / 手动行 / 默认值)及其所属文档; 单元格输入缓冲("行key|列id")。
+    bom_tpl_list: Vec<String>,
+    bom_tpl_name: String,
+    bom_tpl: pla_ui::bom_table::Template,
+    bom_tpl_mtime: Option<std::time::SystemTime>,
+    bom_tpl_checked: Option<Instant>,
+    bom_tpl_err: Option<String>,
+    bom_edits: pla_ui::bom_table::Edits,
+    bom_edits_doc: String,
+    bom_cell_buf: std::collections::HashMap<String, String>,
     show_settings: bool,
     /// F2: CDP 能力面板(点工具栏状态点开关)。
     show_caps: bool,
@@ -2442,6 +2453,15 @@ impl PlaApp {
             bom_busy: false,
             bom_pending_scope: None,
             bom_batch: None,
+            bom_tpl_list: Vec::new(),
+            bom_tpl_name: String::new(),
+            bom_tpl: pla_ui::bom_table::builtin(),
+            bom_tpl_mtime: None,
+            bom_tpl_checked: None,
+            bom_tpl_err: None,
+            bom_edits: Default::default(),
+            bom_edits_doc: String::new(),
+            bom_cell_buf: Default::default(),
             show_settings: false,
             show_caps: false,
             show_notes: false,
@@ -2865,7 +2885,7 @@ impl PlaApp {
                     if let Some((mut queue, mut done)) = self.bom_batch.take() {
                         let label = Self::bom_scope_label(&scope);
                         match &result {
-                            Ok(v) => match pla_ui::bom::export(&self.doc_key, &label, v) {
+                            Ok(v) => match self.bom_export(&label, &v.clone()) {
                                 Ok(_) => done.push(label),
                                 Err(e) => self.set_notice((true, t!("{label} 导出失败: {e}", "{label} export failed: {e}"))),
                             },
@@ -3867,6 +3887,57 @@ impl PlaApp {
         self.bom_pending_scope = Some(scope);
     }
 
+    /// B3: 本文档的编辑按需载入; 模板列表 / 当前模板每秒查一次修改时间, 改了重读(读错保留上一次能用的)。
+    fn bom_template_tick(&mut self) {
+        if self.bom_edits_doc != self.doc_key {
+            self.bom_edits_doc = self.doc_key.clone();
+            self.bom_edits = pla_ui::bom_table::load_edits(&self.doc_key);
+            self.bom_cell_buf.clear();
+            if !self.bom_edits.template.is_empty() {
+                self.bom_tpl_name = self.bom_edits.template.clone();
+                self.bom_tpl_mtime = None;
+            }
+        }
+        if self.bom_tpl_checked.is_some_and(|t| t.elapsed() < Duration::from_secs(1)) {
+            return;
+        }
+        self.bom_tpl_checked = Some(Instant::now());
+        let dir = pla_ui::bom_table::dir();
+        self.bom_tpl_list = pla_ui::bom_table::list_in(&dir);
+        if !self.bom_tpl_list.contains(&self.bom_tpl_name) {
+            self.bom_tpl_name = self.bom_tpl_list.first().cloned().unwrap_or_default();
+            self.bom_tpl_mtime = None;
+        }
+        let m = pla_ui::bom_table::mtime_in(&dir, &self.bom_tpl_name);
+        if m.is_some() && m == self.bom_tpl_mtime {
+            return;
+        }
+        self.bom_tpl_mtime = m;
+        match pla_ui::bom_table::load_in(&dir, &self.bom_tpl_name) {
+            Ok(t) => {
+                self.bom_tpl = t;
+                self.bom_tpl_err = None;
+                self.bom_cell_buf.clear();
+            }
+            Err(e) => self.bom_tpl_err = Some(e),
+        }
+    }
+
+    fn bom_tpl_select(&mut self, name: String) {
+        self.bom_tpl_name = name;
+        self.bom_tpl_mtime = None;
+        self.bom_tpl_checked = None;
+        self.bom_edits.template = self.bom_tpl_name.clone();
+        let _ = pla_ui::bom_table::save_edits(&self.doc_key, &self.bom_edits);
+    }
+
+    /// 按当前模板 + 本文档编辑导出一份 CSV(含手动行与合计)。
+    fn bom_export(&mut self, scope_label: &str, scan: &serde_json::Value) -> Result<std::path::PathBuf, String> {
+        self.bom_template_tick();
+        let (rows, totals) = pla_ui::bom_table::build(scan, &self.bom_tpl, &self.bom_edits);
+        pla_ui::bom::export_text(&self.doc_key, scope_label, &pla_ui::bom_table::to_csv(&self.bom_tpl, &rows, &totals))
+    }
+
     fn bom_scope_label(scope: &Option<String>) -> String {
         match scope {
             None => tr("当前可见", "Currently visible").to_string(),
@@ -3876,7 +3947,8 @@ impl PlaApp {
 
     /// B1/B2 BOM 浮窗: 范围(当前可见 / 某个配置)→ 相同零件合并计数的清单; 导出 CSV; 每个配置各出一份。
     fn show_bom_window(&mut self, ctx: &egui::Context) {
-        let default = Self::default_float_rect(ctx, 460.0, 420.0);
+        // 模板表列多(OYM 16 列): 默认宽一些, 表格在窗口内横向滚动
+        let default = Self::default_float_rect(ctx, 760.0, 460.0);
         let mut win = std::mem::take(&mut self.bom_win);
         let configs: Vec<String> = pla_ui::configs::STORE.list(&self.doc_key).into_iter().map(|m| m.name).collect();
         let open = floating_window(
@@ -3916,12 +3988,37 @@ impl PlaApp {
                         rescan = Some(self.bom_scope.clone());
                     }
                 });
+                // ---- 模板(JSON 文件: 切换 / 编辑, 保存即生效)+ 导出 ----
+                self.bom_template_tick();
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(tr("模板", "Template")).color(COL_MUTED));
+                    let mut pick: Option<String> = None;
+                    egui::ComboBox::from_id_salt("bom-tpl").width(120.0).selected_text(self.bom_tpl_name.clone()).show_ui(ui, |ui| {
+                        for n in &self.bom_tpl_list {
+                            if ui.selectable_label(*n == self.bom_tpl_name, n).clicked() {
+                                pick = Some(n.clone());
+                            }
+                        }
+                    });
+                    if let Some(n) = pick {
+                        self.bom_tpl_select(n);
+                    }
+                    if ui.small_button(tr("编辑模板", "Edit template")).on_hover_text(tr("用系统默认程序打开模板 JSON(列 / 默认值 / 公式); 保存后自动生效", "Open the template JSON (columns / defaults / formulas) in the default app; applies on save")).clicked() {
+                        let p = pla_ui::bom_table::path_in(&pla_ui::bom_table::dir(), &self.bom_tpl_name);
+                        if let Err(e) = std::process::Command::new("cmd").args(["/C", "start", "", &p.display().to_string()]).spawn() {
+                            self.set_notice((true, t!("打不开 {}: {e}", "Cannot open {}: {e}", p.display())));
+                        }
+                    }
+                });
+                if let Some(e) = &self.bom_tpl_err {
+                    ui.label(egui::RichText::new(t!("模板读取出错(仍用上一次的): {e}", "Template read error (still using the last good one): {e}")).size(11.0).color(COL_RED));
+                }
                 ui.horizontal(|ui| {
                     let have = matches!(self.bom_result, Some(Ok(_)));
                     if ui.add_enabled(have && !self.bom_busy, egui::Button::new(tr("导出 CSV", "Export CSV"))).clicked() {
-                        if let Some(Ok(v)) = &self.bom_result {
+                        if let Some(Ok(v)) = self.bom_result.clone() {
                             let label = Self::bom_scope_label(&self.bom_result_scope);
-                            match pla_ui::bom::export(&self.doc_key, &label, v) {
+                            match self.bom_export(&label, &v) {
                                 Ok(p) => self.set_notice((false, t!("已导出 {}", "Exported {}", p.display()))),
                                 Err(e) => self.set_notice((true, t!("导出失败: {e}", "Export failed: {e}"))),
                             }
@@ -3945,8 +4042,34 @@ impl PlaApp {
                     self.bom_scope = s.clone();
                     self.bom_scan(s);
                 }
+                // ---- 本文档的字段默认值(如本项目套数) ----
+                let cols = self.bom_tpl.columns.clone();
+                let mut edits_changed = false;
+                egui::CollapsingHeader::new(tr("本文档默认值(如套数)", "Document defaults (e.g. sets)")).id_salt("bom-defaults").show(ui, |ui| {
+                    egui::Grid::new("bom-defaults-grid").num_columns(2).spacing([8.0, 3.0]).show(ui, |ui| {
+                        for c in cols.iter().filter(|c| c.source.as_deref() == Some("field") && c.formula.is_none()) {
+                            ui.label(egui::RichText::new(&c.header).color(COL_MUTED));
+                            let cur = self.bom_edits.defaults.get(&c.id).cloned().or_else(|| c.default.clone()).unwrap_or_default();
+                            let key = format!("def|{}", c.id);
+                            let buf = self.bom_cell_buf.entry(key).or_insert_with(|| cur.clone());
+                            let te = ui.add(egui::TextEdit::singleline(buf).desired_width(90.0));
+                            if te.lost_focus() {
+                                let v = buf.trim().to_string();
+                                if v == c.default.clone().unwrap_or_default() || v.is_empty() {
+                                    self.bom_edits.defaults.remove(&c.id);
+                                } else {
+                                    self.bom_edits.defaults.insert(c.id.clone(), v);
+                                }
+                                edits_changed = true;
+                            } else if !te.has_focus() {
+                                *buf = cur;
+                            }
+                            ui.end_row();
+                        }
+                    });
+                });
                 ui.add_space(4.0);
-                // ---- 结果 ----
+                // ---- 结果(按模板; 可编辑格: 改了即覆盖并保存, 清空 = 恢复原值; 公式列只读) ----
                 match &self.bom_result {
                     _ if self.bom_busy => {
                         ui.label(egui::RichText::new(tr("扫描中…(大文档需要几秒)", "Scanning… (a few seconds for large documents)")).color(COL_MUTED));
@@ -3959,33 +4082,117 @@ impl PlaApp {
                     }
                     Some(Ok(v)) => {
                         let v = v.clone();
+                        let (rows, totals) = pla_ui::bom_table::build(&v, &self.bom_tpl, &self.bom_edits);
                         let (kinds, total) = pla_ui::bom::totals(&v);
-                        ui.label(egui::RichText::new(t!("{}: {kinds} 种零件 / 共 {total} 件", "{}: {kinds} distinct parts / {total} in total", Self::bom_scope_label(&self.bom_result_scope))).strong());
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(t!("{}: 模型里 {kinds} 种 / 共 {total} 件", "{}: {kinds} distinct in the model / {total} in total", Self::bom_scope_label(&self.bom_result_scope))).strong());
+                            let n_ex = self.bom_edits.excluded.len();
+                            if n_ex > 0 && ui.small_button(t!("恢复已排除({n_ex})", "Restore excluded ({n_ex})")).clicked() {
+                                self.bom_edits.excluded.clear();
+                                edits_changed = true;
+                            }
+                        });
                         if let Some(sk) = v["skipped"].as_array().filter(|a| !a.is_empty()) {
                             let names: Vec<&str> = sk.iter().filter_map(|x| x["name"].as_str()).collect();
                             ui.label(egui::RichText::new(t!("{} 个实体没算进来(读不到网格): {}", "{} solid(s) skipped (no mesh): {}", sk.len(), names.join(", "))).size(11.0).color(COL_RED));
                         }
-                        egui::Grid::new("bom-grid").striped(true).num_columns(5).spacing([10.0, 4.0]).show(ui, |ui| {
-                            for h in [tr("序号", "No."), tr("名称", "Name"), tr("数量", "Qty"), tr("材料", "Material"), tr("组 / 备注", "Group / remarks")] {
-                                ui.label(egui::RichText::new(h).color(COL_MUTED).size(11.5));
-                            }
-                            ui.end_row();
-                            for (i, l) in v["lines"].as_array().into_iter().flatten().enumerate() {
-                                ui.label(format!("{}", i + 1));
-                                let members: Vec<String> = l["members"].as_array().into_iter().flatten().map(|m| {
-                                    let path = m["path"].as_array().map(|p| p.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(" / ")).unwrap_or_default();
-                                    if path.is_empty() { m["name"].as_str().unwrap_or("").to_string() } else { format!("{} · {path}", m["name"].as_str().unwrap_or("")) }
-                                }).collect();
-                                ui.label(l["name"].as_str().unwrap_or("")).on_hover_text(members.join("\n"));
-                                ui.label(egui::RichText::new(format!("{}", l["qty"].as_u64().unwrap_or(0))).strong());
-                                ui.label(l["material"].as_str().unwrap_or("—"));
-                                let rm = pla_ui::bom::remark(l);
-                                let g = l["path"].as_str().unwrap_or("");
-                                let text = match (g.is_empty(), rm.is_empty()) { (true, true) => String::new(), (false, true) => g.to_string(), (true, false) => rm, (false, false) => format!("{g} · {rm}") };
-                                ui.label(egui::RichText::new(text).size(11.0).color(COL_MUTED));
+                        // 名称格悬停 = 各实例与所在组
+                        let mut members_of: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+                        for l in v["lines"].as_array().into_iter().flatten() {
+                            let ms: Vec<String> = l["members"].as_array().into_iter().flatten().map(|m| {
+                                let path = m["path"].as_array().map(|p| p.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(" / ")).unwrap_or_default();
+                                if path.is_empty() { m["name"].as_str().unwrap_or("").to_string() } else { format!("{} · {path}", m["name"].as_str().unwrap_or("")) }
+                            }).collect();
+                            let rm = pla_ui::bom::remark(l);
+                            members_of.insert(l["key"].as_str().unwrap_or("").to_string(), if rm.is_empty() { ms.join("\n") } else { format!("{}\n{rm}", ms.join("\n")) });
+                        }
+                        let mut cell_edits: Vec<(String, String, String)> = Vec::new();
+                        let mut remove_row: Option<String> = None;
+                        let buf_map = &mut self.bom_cell_buf;
+                        egui::ScrollArea::horizontal().id_salt("bom-h").show(ui, |ui| {
+                            egui::Grid::new("bom-grid").striped(true).num_columns(cols.len() + 2).spacing([8.0, 3.0]).show(ui, |ui| {
+                                ui.label(egui::RichText::new("#").color(COL_MUTED).size(11.5));
+                                for c in &cols {
+                                    let h = egui::RichText::new(&c.header).size(11.5);
+                                    ui.label(if c.formula.is_some() { h.color(COL_ACCENT) } else { h.color(COL_MUTED) }).on_hover_text(c.formula.clone().unwrap_or_default());
+                                }
+                                ui.label("");
                                 ui.end_row();
-                            }
+                                for (i, r) in rows.iter().enumerate() {
+                                    ui.label(if r.manual { egui::RichText::new(format!("{}*", i + 1)).color(COL_MUTED) } else { egui::RichText::new(format!("{}", i + 1)) })
+                                        .on_hover_text(if r.manual { tr("手动行(模型里没有)", "Manual row (not in the model)") } else { "" });
+                                    for (j, c) in cols.iter().enumerate() {
+                                        let val = &r.cells[j];
+                                        if c.formula.is_some() {
+                                            ui.label(egui::RichText::new(val).color(egui::Color32::WHITE));
+                                            continue;
+                                        }
+                                        let w = if c.source.as_deref() == Some("name") || c.id == "model" || c.id == "usage" { 140.0 } else { 64.0 };
+                                        let key = format!("{}|{}", r.key, c.id);
+                                        let buf = buf_map.entry(key).or_insert_with(|| val.clone());
+                                        let col = if r.overridden[j] { COL_ACCENT } else { egui::Color32::WHITE };
+                                        let te = ui.add(egui::TextEdit::singleline(buf).desired_width(w).text_color(col));
+                                        if c.source.as_deref() == Some("name") {
+                                            if let Some(m) = members_of.get(&r.key) {
+                                                te.clone().on_hover_text(m.as_str());
+                                            }
+                                        }
+                                        if te.lost_focus() {
+                                            if *buf != *val {
+                                                cell_edits.push((r.key.clone(), c.id.clone(), buf.trim().to_string()));
+                                            }
+                                        } else if !te.has_focus() {
+                                            *buf = val.clone();
+                                        }
+                                    }
+                                    let tip = if r.manual { tr("删除这一手动行", "Delete this manual row") } else { tr("从 BOM 里排除(不影响模型; 可恢复)", "Exclude from the BOM (model unaffected; restorable)") };
+                                    if ui.small_button("×").on_hover_text(tip).clicked() {
+                                        remove_row = Some(r.key.clone());
+                                    }
+                                    ui.end_row();
+                                }
+                                // 合计行
+                                if cols.iter().any(|c| c.sum) {
+                                    ui.label("");
+                                    for (j, c) in cols.iter().enumerate() {
+                                        if c.sum {
+                                            ui.label(egui::RichText::new(&totals[j]).strong().color(COL_ACCENT));
+                                        } else if cols.get(j + 1).is_some_and(|n| n.sum) {
+                                            ui.label(egui::RichText::new(tr("合计", "total")).color(COL_MUTED));
+                                        } else {
+                                            ui.label("");
+                                        }
+                                    }
+                                    ui.label("");
+                                    ui.end_row();
+                                }
+                            });
                         });
+                        if ui.button(tr("＋ 手动行(模型里没有的采购件 / 工具)", "+ Manual row (purchased parts / tools not in the model)")).clicked() {
+                            self.bom_edits.add_manual();
+                            edits_changed = true;
+                        }
+                        for (rk, cid, val) in cell_edits {
+                            // 清空 = 去掉覆盖(恢复模型值 / 默认值); 手动行直接存
+                            let base = if rk.starts_with("manual:") { "\u{0}".to_string() } else if val.is_empty() { String::new() } else { "\u{0}".to_string() };
+                            self.bom_edits.set_cell(&rk, &cid, &val, &base);
+                            self.bom_cell_buf.remove(&format!("{rk}|{cid}"));
+                            edits_changed = true;
+                        }
+                        if let Some(rk) = remove_row {
+                            if let Some(mid) = rk.strip_prefix("manual:") {
+                                self.bom_edits.manual.retain(|m| m.id != mid);
+                            } else if !self.bom_edits.excluded.contains(&rk) {
+                                self.bom_edits.excluded.push(rk);
+                            }
+                            edits_changed = true;
+                        }
+                    }
+                }
+                if edits_changed {
+                    self.bom_edits.template = self.bom_tpl_name.clone();
+                    if let Err(e) = pla_ui::bom_table::save_edits(&self.doc_key, &self.bom_edits) {
+                        self.set_notice((true, t!("BOM 编辑保存失败: {e}", "Saving BOM edits failed: {e}")));
                     }
                 }
             },
