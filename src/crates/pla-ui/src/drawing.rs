@@ -67,6 +67,13 @@ pub struct Sheet {
     /// 装配图: 记下的配合(零件图出图时据此标本件公差)。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fits: Vec<Fit>,
+    /// 单个尺寸的修正(按尺寸对象名: LenW / LenH / LenD / DiaOuter / 孔组 H1 …): 不标 / 关键尺寸 * / 改文字。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dims_hide: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dims_key: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub dims_text: BTreeMap<String, String>,
 }
 
 impl Sheet {
@@ -88,6 +95,9 @@ impl Sheet {
             exported: String::new(),
             compiled: String::new(),
             fits: Vec::new(),
+            dims_hide: Vec::new(),
+            dims_key: Vec::new(),
+            dims_text: BTreeMap::new(),
         }
     }
 }
@@ -185,7 +195,45 @@ pub fn spec(s: &Sheet, dir: &Path, dims_file: Option<&Path>) -> Value {
     if let Some(p) = dims_file.filter(|p| p.exists()) {
         v["dims_file"] = json!(p.display().to_string());
     }
+    let text: BTreeMap<&String, &String> = s.dims_text.iter().filter(|(_, t)| !t.trim().is_empty()).collect();
+    if !s.dims_hide.is_empty() || !s.dims_key.is_empty() || !text.is_empty() {
+        v["dims"] = json!({ "hide": s.dims_hide, "key": s.dims_key, "text": text });
+    }
     v
+}
+
+/// 编译报告里放了的一个尺寸(页面毫米, 原点左下)。
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+pub struct Placed {
+    pub name: String,
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub shown: Option<String>,
+    #[serde(default)]
+    pub value: Option<f64>,
+    #[serde(default)]
+    pub at: [f64; 2],
+    #[serde(default)]
+    pub hidden: bool,
+}
+
+impl Placed {
+    /// 列表里显示的文字: 实际标出的 → 原文字 → 数值。
+    pub fn label(&self) -> String {
+        self.shown.clone().or_else(|| self.text.clone()).or_else(|| self.value.map(fmt_d)).unwrap_or_default()
+    }
+}
+
+/// 预览上点的位置(0..1, 原点左上)→ 最近的尺寸(页面上 25 mm 以内)。
+pub fn nearest_dim<'a>(placed: &'a [Placed], paper: [f64; 2], fx: f64, fy: f64) -> Option<&'a Placed> {
+    let (x, y) = (fx * paper[0], (1.0 - fy) * paper[1]);
+    placed
+        .iter()
+        .map(|p| (((p.at[0] - x).powi(2) + (p.at[1] - y).powi(2)).sqrt(), p))
+        .filter(|(d, _)| *d < 25.0)
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|(_, p)| p)
 }
 
 /// D3 装配图在图列表里的 key(不是 BOM 零件指纹)。
@@ -379,6 +427,11 @@ pub struct Report {
     /// 装配图: 配合候选(不同零件之间同轴同径的孔 / 轴)。
     #[serde(default)]
     pub fit_candidates: Vec<FitCand>,
+    /// 放了的尺寸(含被隐藏的)+ 纸张大小 mm: 预览上点选尺寸用。
+    #[serde(default)]
+    pub placed: Vec<Placed>,
+    #[serde(default)]
+    pub paper_mm: Option<[f64; 2]>,
     #[serde(default)]
     pub axes: Option<Axes>,
     #[serde(default)]
@@ -473,6 +526,28 @@ pub fn book_file(dir: &Path, doc_key: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dim_edits_and_pick() {
+        let mut s = Sheet::new("k", "p", "id", "E");
+        s.dims_hide.push("LenD".into());
+        s.dims_text.insert("H2".into(), "M6 通孔".into());
+        s.dims_text.insert("H3".into(), " ".into());
+        let v = spec(&s, Path::new("x"), None);
+        assert_eq!(v["dims"]["hide"], json!(["LenD"]));
+        assert_eq!(v["dims"]["text"], json!({"H2": "M6 通孔"}), "blank overrides are dropped");
+        assert!(spec(&Sheet::new("k", "p", "id", "E"), Path::new("x"), None).get("dims").is_none());
+        let r: Report = serde_json::from_str(
+            r#"{"placed":[{"name":"LenW","type":"DistanceX","view":"V","text":null,"at":[100,250],"value":80.0},
+                          {"name":"H1","text":"2 x ⌀6.6","at":[60,190],"shown":"*2 x ⌀6.6"}],"paper_mm":[420,297]}"#,
+        )
+        .unwrap();
+        assert_eq!(r.placed[0].label(), "80");
+        assert_eq!(r.placed[1].label(), "*2 x ⌀6.6");
+        // 预览左上为原点: (60/420, 1 − 190/297)
+        assert_eq!(nearest_dim(&r.placed, [420.0, 297.0], 60.0 / 420.0, 1.0 - 192.0 / 297.0).map(|p| p.name.as_str()), Some("H1"));
+        assert!(nearest_dim(&r.placed, [420.0, 297.0], 0.9, 0.9).is_none());
+    }
 
     #[test]
     fn fits_to_parts() {

@@ -5111,6 +5111,57 @@ impl PlaApp {
                 ui.end_row();
             });
         });
+        // ---- 尺寸: 列表 / 点预览选中 → 不标 / 关键尺寸 * / 改文字(重出后生效) ----
+        let placed: Vec<pla_ui::drawing::Placed> = self.draw_report.as_ref().filter(|(k, _)| *k == key).map(|(_, r)| r.placed.clone()).unwrap_or_default();
+        let sel_dim = self.draw_buf.get("dimsel").cloned().unwrap_or_default();
+        if !placed.is_empty() {
+            egui::CollapsingHeader::new(t!("尺寸 {}(点预览上的尺寸也能选中)", "Dimensions {} (or click one on the preview)", placed.len()))
+                .id_salt("draw-dims")
+                .default_open(!sel_dim.is_empty())
+                .show(ui, |ui| {
+                    egui::Grid::new("draw-dims-grid").num_columns(4).spacing([8.0, 2.0]).show(ui, |ui| {
+                        for p in &placed {
+                            let picked = sel_dim == p.name;
+                            if ui.selectable_label(picked, egui::RichText::new(format!("{}  {}", p.name, p.label())).size(12.0)).clicked() {
+                                self.draw_buf.insert("dimsel".into(), if picked { String::new() } else { p.name.clone() });
+                            }
+                            let mut hide = s.dims_hide.contains(&p.name);
+                            if ui.checkbox(&mut hide, tr("不标", "Hide")).changed() {
+                                s.dims_hide.retain(|n| n != &p.name);
+                                if hide {
+                                    s.dims_hide.push(p.name.clone());
+                                }
+                            }
+                            let mut keyd = s.dims_key.contains(&p.name);
+                            if ui.checkbox(&mut keyd, tr("关键 *", "Key *")).on_hover_text(tr("关键尺寸: 数字前加 *(技术要求第 2 条)", "Key dimension: * in front of the value")).changed() {
+                                s.dims_key.retain(|n| n != &p.name);
+                                if keyd {
+                                    s.dims_key.push(p.name.clone());
+                                }
+                            }
+                            if picked {
+                                let cur = s.dims_text.get(&p.name).cloned().unwrap_or_default();
+                                let buf = self.draw_buf.entry(format!("dimtext|{}", p.name)).or_insert_with(|| cur.clone());
+                                let te = ui.add(egui::TextEdit::singleline(buf).hint_text(tr("改文字(空 = 自动)", "Text (empty = automatic)")).desired_width(160.0));
+                                if te.lost_focus() {
+                                    let v = buf.trim().to_string();
+                                    if v.is_empty() {
+                                        s.dims_text.remove(&p.name);
+                                    } else {
+                                        s.dims_text.insert(p.name.clone(), v);
+                                    }
+                                } else if !te.has_focus() {
+                                    *buf = cur;
+                                }
+                            } else {
+                                ui.label("");
+                            }
+                            ui.end_row();
+                        }
+                    });
+                    ui.label(egui::RichText::new(tr("改完点「出图」生效; 孔位坐标值由上面的孔组勾选控制", "Click Draw to apply; hole position values are controlled by the hole groups above")).size(11.0).color(COL_MUTED));
+                });
+        }
         if s != orig {
             self.draw_sheets.upsert(s.clone());
             self.draw_save();
@@ -5123,10 +5174,28 @@ impl PlaApp {
         // ---- 预览(点击打开 PDF) ----
         if let Some((uri, bytes)) = self.draw_png.clone() {
             let w = ui.available_width();
-            let r = ui.add(egui::Image::from_bytes(uri, bytes).max_width(w).rounding(2.0).sense(egui::Sense::click())).on_hover_text(tr("点击打开 PDF", "Click to open the PDF"));
-            if r.clicked() {
+            let r = ui
+                .add(egui::Image::from_bytes(uri, bytes).max_width(w).rounding(2.0).sense(egui::Sense::click()))
+                .on_hover_text(tr("单击 = 选中最近的尺寸; 双击 = 打开 PDF", "Click = select the nearest dimension; double-click = open the PDF"));
+            let paper = self.draw_report.as_ref().filter(|(k, _)| *k == key).and_then(|(_, r)| r.paper_mm).unwrap_or([420.0, 297.0]);
+            if r.double_clicked() {
                 let p = pla_ui::drawing::file(&pla_ui::drawing::dir(&self.doc_key), &s, "pdf");
                 self.open_path(&p);
+            } else if r.clicked() {
+                if let Some(pos) = r.interact_pointer_pos() {
+                    let fx = ((pos.x - r.rect.left()) / r.rect.width()) as f64;
+                    let fy = ((pos.y - r.rect.top()) / r.rect.height()) as f64;
+                    let hit = pla_ui::drawing::nearest_dim(&placed, paper, fx, fy).map(|p| p.name.clone()).unwrap_or_default();
+                    self.draw_buf.insert("dimsel".into(), hit);
+                }
+            }
+            // 选中的尺寸: 在预览上圈出来
+            if let Some(p) = placed.iter().find(|p| !sel_dim.is_empty() && p.name == sel_dim) {
+                let c = egui::pos2(
+                    r.rect.left() + (p.at[0] / paper[0]) as f32 * r.rect.width(),
+                    r.rect.top() + (1.0 - p.at[1] / paper[1]) as f32 * r.rect.height(),
+                );
+                ui.painter().circle_stroke(c, 14.0, egui::Stroke::new(2.0_f32, COL_ACCENT));
             }
         } else if job.is_none() {
             ui.label(egui::RichText::new(tr("还没出过图", "Not drawn yet")).color(COL_MUTED));

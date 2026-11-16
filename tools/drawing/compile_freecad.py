@@ -605,7 +605,31 @@ placer = Placer(list(R.values()))
 dims_out = []
 
 
-def add_dim(view, typ, refs, name, page_xy, text=None, fmt_spec=None):
+# 方案 dims: 面板里对单个尺寸的修正(按尺寸对象名: LenW / LenH / LenD / DiaOuter / DiaFit1 / 孔组 H1 …)
+#   {"hide": ["LenD"], "text": {"H2": "4 x ⌀6.6 贯穿"}, "key": ["LenW"]}   key = 关键尺寸(前面加 *)
+DIM_EDIT = spec.get("dims") or {}
+DIM_HIDE = set(DIM_EDIT.get("hide") or [])
+DIM_TEXT = dict(DIM_EDIT.get("text") or {})
+DIM_KEY = set(DIM_EDIT.get("key") or [])
+
+
+def add_dim(view, typ, refs, name, page_xy, text=None, fmt_spec=None, value=None):
+    info = {"name": name, "type": typ, "view": view.Name, "text": text, "at": [round(page_xy[0], 1), round(page_xy[1], 1)]}
+    if value is not None:
+        info["value"] = round(value, 4)
+    if name in DIM_HIDE:
+        info["hidden"] = True
+        rep["placed"].append(info)
+        return None
+    if name in DIM_TEXT and str(DIM_TEXT[name]).strip():
+        text = str(DIM_TEXT[name]).strip()
+        info["custom"] = True
+    if name in DIM_KEY:
+        info["key"] = True
+        if text is not None:
+            text = DIMS["key_mark"] + text if not text.startswith(DIMS["key_mark"]) else text
+        else:
+            fmt_spec = DIMS["key_mark"] + (fmt_spec or FSPEC)
     d = doc.addObject("TechDraw::DrawViewDimension", name)
     d.Type = typ
     d.References2D = [(view, r) for r in refs]
@@ -618,7 +642,8 @@ def add_dim(view, typ, refs, name, page_xy, text=None, fmt_spec=None):
         d.Arbitrary = True
         d.FormatSpec = text
     dims_out.append(d)
-    rep["placed"].append({"name": name, "type": typ, "view": view.Name, "text": text, "at": [round(page_xy[0], 1), round(page_xy[1], 1)]})
+    info["shown"] = text
+    rep["placed"].append(info)
     return d
 
 
@@ -657,7 +682,7 @@ def place_linear(vname, axis, side, name, value):
     cx, cy = (r[0] + r[2]) / 2, (r[1] + r[3]) / 2
     # 左右两侧多让 6 mm: 剖切符号的箭头伸在视图左右外面
     p = {"top": (cx, r[3] + G), "bottom": (cx, r[1] - G), "left": (r[0] - G - 6, cy), "right": (r[2] + G + 6, cy)}[side]
-    add_dim(v, "DistanceX" if axis == "x" else "DistanceY", [e], name, p, fmt_spec=FSPEC)
+    add_dim(v, "DistanceX" if axis == "x" else "DistanceY", [e], name, p, fmt_spec=FSPEC, value=value)
     placer.take(text_rect(p[0], p[1], fmt(value)))
 
 
@@ -865,9 +890,9 @@ def place_diameter(vname, radius, name):
             if placer.free(rr):
                 placer.take(rr)
                 if tol:
-                    add_dim(v, "Diameter", [circ[0][0]], name, p, text=txt)
+                    add_dim(v, "Diameter", [circ[0][0]], name, p, text=txt, value=2 * radius)
                 else:
-                    add_dim(v, "Diameter", [circ[0][0]], name, p, fmt_spec=DIMS["diameter"] + FSPEC)
+                    add_dim(v, "Diameter", [circ[0][0]], name, p, fmt_spec=DIMS["diameter"] + FSPEC, value=2 * radius)
                 return True
     return False
 
