@@ -112,7 +112,7 @@ def find_holes(shape, axis_hint=None):
             continue  # 外圆柱(凸台)
         # 轴向范围
         ts = [(vx.Point - c).dot(ax) for vx in f.Vertexes] or [0]
-        cyl.append({"ax": ax, "c": c, "r": s.Radius, "t0": min(ts), "t1": max(ts)})
+        cyl.append({"ax": ax, "c": c, "r": s.Radius, "t0": min(ts), "t1": max(ts), "span": abs(u1 - u0)})
     groups = []
     for cy in cyl:
         for g in groups:
@@ -127,19 +127,101 @@ def find_holes(shape, axis_hint=None):
         else:
             groups.append([cy])
     holes = []
+    partial = []  # 不满一圈的同轴组(长圆孔两端的半圆 / 凹圆角)
     for g in groups:
         a = g[0]
         ax, c = a["ax"], a["c"]
-        # 实体沿轴向的范围(用包围盒八角投影)
-        corners = [V(x, y, z) for x in (bb.XMin, bb.XMax) for y in (bb.YMin, bb.YMax) for z in (bb.ZMin, bb.ZMax)]
-        ts = [(p - c).dot(ax) for p in corners]
-        lo, hi = min(ts), max(ts)
-        # 合并同半径段
+        # 真孔一圈是满的: 最小半径那段的各个面角度加起来 > 200°(圆柱面常被切成两个半圆面; 横孔穿过会缺一块, 所以不要求满 360°)。
+        # 凹圆角、长圆孔两端的半圆只有一部分 → 不算圆孔(实测 encoder calibrator 的板上长圆孔被当成"6 x ⌀6.18", 坐标挤成一团)
+        rmin_ = min(round(cy["r"], 4) for cy in g)
+        cover = sum(cy["span"] for cy in g if abs(round(cy["r"], 4) - rmin_) < 1e-6)
         segs = {}
         for cy in g:
             r = round(cy["r"], 4)
             s0, s1 = segs.get(r, (1e9, -1e9))
             segs[r] = (min(s0, cy["t0"]), max(s1, cy["t1"]))
+        if cover < math.radians(200):
+            partial.append({"ax": ax, "c": c, "segs": segs, "cover": cover})
+            continue
+        h = make_hole(bb, c, ax, segs)
+        if h:
+            holes.append(h)
+    holes += find_slots(bb, partial)
+    return holes
+
+
+def find_slots(bb, partial):
+    """长圆孔: 两个约 180° 的半圆柱面(同半径、轴平行、同一轴向范围)= 一段槽; 同一槽心的几段(不同半径)= 槽 + 沉槽。
+    槽心当孔位, d = 槽宽, slot = [两半圆心距(按半径), 方向]。凑不成对的(凹圆角等)记进报告。"""
+    used = set()
+    pieces = []  # (槽心, 轴, 半径, 心距, 方向, (t0, t1))
+    half = [i for i, p in enumerate(partial) if len(p["segs"]) == 1 and abs(p["cover"] - math.pi) < math.radians(15)]
+    for ii, i in enumerate(half):
+        if i in used:
+            continue
+        pi_ = partial[i]
+        (r, (t0, t1)), = pi_["segs"].items()
+        for j in half[ii + 1:]:
+            if j in used:
+                continue
+            pj = partial[j]
+            (r2, (u0, u1)), = pj["segs"].items()
+            if abs(r - r2) > 1e-4 or abs(abs(pi_["ax"].dot(pj["ax"])) - 1) > 1e-6:
+                continue
+            w = pj["c"] - pi_["c"]
+            w = w - pi_["ax"] * w.dot(pi_["ax"])
+            L = w.Length
+            # 两个半圆的轴向范围(换到 i 的轴向坐标)要一样
+            sgn = 1 if pi_["ax"].dot(pj["ax"]) > 0 else -1
+            base = (pj["c"] - pi_["c"]).dot(pi_["ax"])
+            uu = sorted([base + sgn * u0, base + sgn * u1])
+            if not (1e-3 < L <= 20 * r) or abs(uu[0] - t0) > 1e-3 or abs(uu[1] - t1) > 1e-3:
+                continue
+            used.update((i, j))
+            ctr = pi_["c"] + w * 0.5
+            pieces.append((ctr, pi_["ax"], r, L, V(w).normalize(), (t0, t1)))
+            break
+    for i, p in enumerate(partial):
+        if i not in used:
+            rmin_ = min(p["segs"])
+            rep.setdefault("partial_cylinders", []).append({"d": round(2 * rmin_, 3), "cover_deg": round(math.degrees(p["cover"])),
+                                                           "at": [round(p["c"].x, 2), round(p["c"].y, 2), round(p["c"].z, 2)]})
+    # 同槽心、同轴的几段合成一个(小的 = 槽, 大的 = 沉槽)
+    out, taken = [], set()
+    for k, (ctr, ax, r, L, wdir, tr) in enumerate(pieces):
+        if k in taken:
+            continue
+        segs, lens = {round(r, 4): tr}, {round(r, 4): L}
+        for m in range(k + 1, len(pieces)):
+            c2, ax2, r2, L2, w2, tr2 = pieces[m]
+            dv = c2 - ctr
+            if m in taken or abs(abs(ax.dot(ax2)) - 1) > 1e-6 or (dv - ax * dv.dot(ax)).Length > 1e-3:
+                continue
+            base = dv.dot(ax)
+            sgn = 1 if ax.dot(ax2) > 0 else -1
+            segs[round(r2, 4)] = tuple(sorted([base + sgn * tr2[0], base + sgn * tr2[1]]))
+            lens[round(r2, 4)] = L2
+            taken.add(m)
+        h = make_hole(bb, ctr, ax, segs)
+        if h:
+            rs = sorted(segs)
+            h["slot"] = round(lens[rs[0]], 4)
+            h["slot_dir"] = [round(wdir.x, 6), round(wdir.y, 6), round(wdir.z, 6)]
+            if h.get("cb"):
+                h["cb_slot"] = round(lens[rs[-1]], 4)
+            out.append(h)
+    rep["slots"] = len(out)
+    return out
+
+
+def make_hole(bb, c, ax, segs):
+    """同轴各半径段 segs {半径: (t0, t1)}(沿 ax、以 c 为原点)→ 孔 {at 入口点, axis 朝外, d, through, depth, cb, len}。"""
+    a_ax = ax
+    if True:
+        # 实体沿轴向的范围(用包围盒八角投影)
+        corners = [V(x, y, z) for x in (bb.XMin, bb.XMax) for y in (bb.YMin, bb.YMax) for z in (bb.ZMin, bb.ZMax)]
+        ts = [(p - c).dot(ax) for p in corners]
+        lo, hi = min(ts), max(ts)
         rs = sorted(segs)
         rmin = rs[0]
         s0, s1 = segs[rmin]
@@ -157,10 +239,9 @@ def find_holes(shape, axis_hint=None):
         if not entry_hi:
             ax = -ax
         depth = None if through else round(s1 - s0 if cb is None else (s1 - s0) - 0, 4)
-        top = c + a["ax"] * (span_hi if entry_hi else span_lo)
-        holes.append({"at": [round(top.x, 4), round(top.y, 4), round(top.z, 4)], "axis": [round(ax.x, 6), round(ax.y, 6), round(ax.z, 6)],
-                      "d": round(2 * rmin, 4), "through": through, "depth": depth, "cb": cb, "len": round(span_hi - span_lo, 4)})
-    return holes
+        top = c + a_ax * (span_hi if entry_hi else span_lo)
+        return {"at": [round(top.x, 4), round(top.y, 4), round(top.z, 4)], "axis": [round(ax.x, 6), round(ax.y, 6), round(ax.z, 6)],
+                "d": round(2 * rmin, 4), "through": through, "depth": depth, "cb": cb, "len": round(span_hi - span_lo, 4)}
 
 
 def callout(h, n):
@@ -169,14 +250,19 @@ def callout(h, n):
     s = D["count_format"].format(n=n) if n > 1 else ""
     if h.get("key"):
         s = D["key_mark"] + s
-    if h.get("tap"):
+    if h.get("slot"):
+        # 长圆孔: 宽 × 总长(= 宽 + 两半圆心距)
+        s += D.get("slot", "长圆孔") + " " + fmt(h["d"]) + "×" + fmt(h["d"] + h["slot"])
+    elif h.get("tap"):
         s += h["tap"]
     else:
         s += D["diameter"] + fmt(h["d"])
     if h.get("tol"):
         s += " " + h["tol"]
     s += " " + D["through"] if h.get("through") else (" " + D["depth"] + fmt(h["depth"]) if h.get("depth") else "")
-    if h.get("cb"):
+    if h.get("cb") and h.get("slot"):
+        s += "  " + D["counterbore"] + fmt(h["cb"][0]) + "×" + fmt(h["cb"][0] + h.get("cb_slot", h["slot"])) + D["depth"] + fmt(h["cb"][1])
+    elif h.get("cb"):
         s += "  " + D["counterbore"] + D["diameter"] + fmt(h["cb"][0]) + D["depth"] + fmt(h["cb"][1])
     if h.get("csk"):
         s += "  " + D["countersink"] + D["diameter"] + fmt(h["csk"])
@@ -427,6 +513,9 @@ R = {n: vrect(views[n], ext(VAX[n][0]) * scale, ext(VAX[n][1]) * scale) for n in
 holes = spec.get("holes", "auto")
 if holes == "auto":
     holes = find_holes(shape)
+    if rep.get("partial_cylinders"):
+        rep["warnings"].append("%d concave partial cylinder(s) not treated as holes (fillets / slot ends / cut holes, < 200 deg)"
+                               % len(rep["partial_cylinders"]))
 
 
 def apply_threads(holes):
