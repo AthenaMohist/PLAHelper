@@ -452,7 +452,12 @@
             待做：装配图（气泡 / 明细表）；build123d 路线（要装 Python，待用户同意）。
       - [x] D0b Plasticity → STEP 导出（2026-11-16，实测，见 `docs/know-how/export-step.md`）：走 Plasticity 自己的导出 —— 主进程"另存为"一次性自动应答
             （9334 inspector，只应答绑定窗口、一次 / 20 s 失效）+ 垫片 `file.exportStep`（按稳定 id 选零件、站内 STEP 对话框选格式点 OK）+ 等文件 +
-            `file.exportRestore` 还原选择。入口：BOM 每行 **STEP** 按钮（→ `<文档 .pla>/bom/<doc>/step/<料号>.step`）、CLI `pla-app cdp-export-step`。
+            `file.exportRestore` 还原选择。入口（只给自动化流程用，用户说手动导出就用 Plasticity 自带的，不留按钮）：`CdpCmd::ExportStep`、CLI `pla-app cdp-export-step`。
+      - [x] D1b 螺纹孔标注（2026-11-16）：① 打孔工具的孔记录（spec.std = M4、usage = tap）按入口点到孔轴距离 < 0.05 对上 → "M5 ↧6"；出图方案给
+            `hole_records` 或 `dims_file`（文档 dims.json，按 part.name 过滤 solidName）；多实例时优先挑孔记录落在其表面上的那个实体。
+            ② 没记录的按"孔径 → 螺纹"规则（规范 `thread_by_diameter` 默认空 + 方案 `threads` 覆盖；⌀3.2 也可能是 M3 过孔，所以不内置，属项目 / 偏好）。
+            `thread_class` 公差带后缀（默认空）。孔按标注文字分组（深度 11.9999 / 12.0002 合成一组）。
+            实测 big platform（threads 3.2→M4、2.2→M3）："4 x M4 贯穿"、"6 x M3 ↧12"，与用户原图一致。没做：螺纹的画法（大径细实线 3/4 圈）。
             零件在组里时 Plasticity 会写出全部可见实体 → 出图方案给 `part.volume`，编译器按体积 / 面积挑实体（实测 Extruded.001 挑对，0.24% 差）。
             实测出图：model1 的 Extruded.001 → STEP → 国标图 OK。发现：圆形件外径没标（只标了直线边）→ 归"该标哪些"那一项。
       - [ ] D0（原计划）出图编译器验证：FreeCAD TechDraw（本机已装）vs build123d + ezdxf，同一零件出三视图 + 剖视剖面线 + 孔标注，比效果 / 速度 / 开发量。

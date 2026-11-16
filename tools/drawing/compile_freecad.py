@@ -185,9 +185,27 @@ def callout(h, n):
 
 # ---------------------------------------------------------------- 文档 + 零件
 doc = App.newDocument("draw")
+def hole_records():
+    """打孔工具的孔记录(孔特征的 spec: at 入口点 / normal / d / depth / type / std 如 M4 / usage tap = 螺纹底孔 / solidName)。
+    来源: spec.hole_records(列表)或 spec.dims_file(文档的 dims.json, 取 kind = hole 的组; 给了 spec.part.name 就只取这个实体的)。"""
+    recs = list(spec.get("hole_records") or [])
+    p = spec.get("dims_file")
+    if p and os.path.exists(p):
+        want = (spec.get("part") or {}).get("name")
+        for g in load_json(p).get("groups", []):
+            s = g.get("spec") or {}
+            if g.get("kind") == "hole" and s.get("at") and (not want or s.get("solidName") in (None, want)):
+                recs.append(s)
+    return recs
+
+
+HOLE_RECS = hole_records()
+
+
 def load_step(path, volume=None, area=None):
     """读 STEP。只有一个实体就用它。多个实体时(零件在组里, Plasticity 会把全部可见实体都写进去; FreeCAD 读进来不保留
-    实体名)按体积(+ 面积)挑最接近的 —— 相同件挑哪个都一样; 差 > 0.5% 告警。没给体积就合成一个画全部(并告警)。"""
+    实体名)按体积(+ 面积)挑最接近的 —— 相同件挑哪个都一样; 差 > 0.5% 告警。没给体积就合成一个画全部(并告警)。
+    有孔记录时, 在体积相符的几个里优先挑孔记录的入口点落在它表面上的那一个(孔记录属于具体那个实例)。"""
     s = Part.Shape()
     s.read(path)
     sols = s.Solids
@@ -199,7 +217,22 @@ def load_step(path, volume=None, area=None):
             if area:
                 e += abs(so.Area - area) / max(area, 1e-9)
             return e
+
+        def on_it(so):
+            n = 0
+            for r in HOLE_RECS:
+                try:
+                    if so.distToShape(Part.Vertex(V(*r["at"])))[0] < 1e-3:
+                        n += 1
+                except Exception:
+                    pass
+            return n
         best = min(sols, key=err)
+        if HOLE_RECS:
+            close = [so for so in sols if err(so) <= max(err(best), 0.005)]
+            hit = max(close, key=on_it)
+            if on_it(hit) > 0:
+                best = hit
         rep["part_pick"] = {"solids": len(sols), "volume": round(best.Volume, 3), "want_volume": volume, "rel_err": round(err(best), 6)}
         if err(best) > 0.005:
             rep["warnings"].append("closest solid differs by %.2f%% from the wanted volume/area" % (err(best) * 100))
@@ -386,6 +419,43 @@ R = {n: vrect(views[n], ext(VAX[n][0]) * scale, ext(VAX[n][1]) * scale) for n in
 holes = spec.get("holes", "auto")
 if holes == "auto":
     holes = find_holes(shape)
+
+
+def apply_threads(holes):
+    """螺纹: ① 孔记录(打孔工具里选了 M4 且用途 = 螺纹底孔)按位置对上 → tap = M4; ② 没记录的按"孔径 → 螺纹"规则
+    (规范 thread_by_diameter, 方案 threads 覆盖; 是项目 / 个人建模习惯 —— ⌀3.2 也可能是 M3 的过孔, 所以不内置)。
+    孔记录还带 key(关键尺寸 *)/ tol(公差带)时一并带上。"""
+    rules = dict(std.get("thread_by_diameter") or {})
+    rules.update(spec.get("threads") or {})
+    rule_d = [(float(k), v) for k, v in rules.items()]
+    used = 0
+    for h in holes:
+        at, ax = V(*h["at"]), V(*h["axis"])
+        for r in HOLE_RECS:
+            p = V(*r["at"])
+            off = (p - at) - ax * (p - at).dot(ax)  # 记录入口点到孔轴线的距离
+            if off.Length < 0.05 and abs(float(r.get("d", h["d"])) - h["d"]) < 0.05:
+                if r.get("usage") == "tap" and r.get("std"):
+                    h["tap"] = r["std"]
+                for k in ("key", "tol"):
+                    if r.get(k):
+                        h[k] = r[k]
+                h["from"] = "record"
+                used += 1
+                break
+        if not h.get("tap"):
+            for d, t in rule_d:
+                if abs(h["d"] - d) < 0.01:
+                    h["tap"] = t
+                    h["from"] = "rule"
+                    break
+        if h.get("tap") and std.get("thread_class"):
+            h["tap"] = h["tap"] + std["thread_class"]
+    rep["threads"] = {"records": len(HOLE_RECS), "matched": used, "rules": rules}
+    return holes
+
+
+holes = apply_threads(holes)
 rep["holes"] = holes
 
 def hole_view(h):
@@ -712,7 +782,8 @@ for vname in VAX:
     for h in holes:
         if hole_view(h) != vname:
             continue
-        k = (h["d"], h.get("through"), h.get("depth"), tuple(h["cb"]) if h.get("cb") else None, h.get("tap"), h.get("tol"))
+        # 按标注文字分组(而不是原始浮点数): 深度 11.9999 与 12 标出来一样, 就是同一组
+        k = callout(h, 1)
         groups.setdefault(k, []).append(h)
     if not groups:
         continue

@@ -11,6 +11,9 @@
   "key_mark": "*", "count_format": "{n} x "
  },
  "general_tolerance": "±0.05",
+ "comment_threads": "螺纹孔: 优先用打孔工具的孔记录(选了 M4、用途 = 螺纹底孔)。thread_by_diameter = 没记录时按孔径认螺纹的规则(孔径 → 螺纹, 如 {\"3.3\": \"M4\"}); 是建模习惯, 默认空, 由项目 / 偏好填(⌀3.2 也可能是 M3 过孔)。thread_class = 螺纹公差带后缀(如 \"-6H\"), 空 = 不写。",
+ "thread_by_diameter": {},
+ "thread_class": "",
  "roughness_default": "6.3",
  "paper": {
   "A3": [420, 297], "A2": [594, 420], "A1": [841, 594], "A0": [1189, 841]

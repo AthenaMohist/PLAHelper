@@ -2934,15 +2934,6 @@ impl PlaApp {
                         self.bom_result_scope = scope;
                     }
                 }
-                // D: 导出 STEP 回包
-                pla_bridge::cdp::CdpEvent::CallResult { name, result } if name == pla_bridge::shim::api::FILE_EXPORT_STEP => match result {
-                    Ok(v) => {
-                        let kb = v["bytes"].as_u64().unwrap_or(0) / 1024;
-                        let p = v["path"].as_str().unwrap_or("").to_string();
-                        self.set_notice((false, t!("已导出 STEP ({kb} KB): {p}", "STEP exported ({kb} KB): {p}")));
-                    }
-                    Err(e) => self.set_notice((true, t!("导出 STEP 失败: {e}", "STEP export failed: {e}"))),
-                },
                 // C0 配置采集回包 → 截图 → 落盘(同材质状态的串行流程)
                 pla_bridge::cdp::CdpEvent::CallResult { name, result } if name == pla_bridge::shim::api::CFG_SAVE => match result {
                     Ok(v) => {
@@ -3998,16 +3989,6 @@ impl PlaApp {
         }
     }
 
-    /// D: 导出一种零件的 STEP 到 `<文档 .pla 目录>/bom/<doc_key>/step/<料号或名称>.step`(CDP 线程里走完整流程, 结果经 CallResult 回来)。
-    fn bom_export_step(&mut self, id: &str, stem: &str) {
-        let safe: String = stem.chars().map(|c| if r#"\/:*?"<>|"#.contains(c) { '_' } else { c }).collect();
-        let dir = pla_ui::bom::STORE.dir(&self.doc_key).join("step");
-        let path = dir.join(format!("{safe}.step"));
-        let Some(p) = path.to_str().map(String::from) else { return };
-        self.cdp.send(pla_bridge::cdp::CdpCmd::ExportStep { path: p.clone(), ids: vec![id.to_string()], format: None });
-        self.set_notice((false, t!("正在导出 STEP: {}", "Exporting STEP: {}", path.display())));
-    }
-
     /// B4: 把 BOM 里的一行存成零件库新条目(料号按规则自动给, 字段 / 单价取这一行的当前值, 记下零件 key 与模型名作匹配), 并链接。
     fn lib_add_from_row(&mut self, row: &pla_ui::bom_table::Row, model_name: &str) {
         let cols = self.bom_tpl.columns.clone();
@@ -4597,11 +4578,6 @@ impl PlaApp {
                             let rm = pla_ui::bom::remark(l);
                             members_of.insert(l["key"].as_str().unwrap_or("").to_string(), if rm.is_empty() { ms.join("\n") } else { format!("{}\n{rm}", ms.join("\n")) });
                         }
-                        // D: 行 → 导出 STEP 用的第一个实例(稳定 id)
-                        let first_member: std::collections::HashMap<String, String> = v["lines"].as_array().into_iter().flatten()
-                            .filter_map(|l| Some((l["key"].as_str()?.to_string(), l["members"].get(0)?["id"].as_str()?.to_string())))
-                            .collect();
-                        let mut step_act: Option<(String, String)> = None;
                         let mut cell_edits: Vec<(String, String, String)> = Vec::new();
                         let mut remove_row: Option<String> = None;
                         let buf_map = &mut self.bom_cell_buf;
@@ -4697,16 +4673,6 @@ impl PlaApp {
                                                 }
                                             }
                                         });
-                                        // D: 导出这一种零件(一个实例)的 STEP, 出图用
-                                        if let Some(id) = first_member.get(&r.key) {
-                                            if ui.small_button("STEP").on_hover_text(tr("导出这种零件(一个实例)的 STEP, 出图用。走 Plasticity 自己的导出, 不改模型; 选择导完还原", "Export this part (one instance) as STEP for drawings. Uses Plasticity's own export, model untouched; selection restored afterwards")).clicked() {
-                                                let pn_col = cols.iter().position(|c| c.id == "pn");
-                                                let nm_col = cols.iter().position(|c| c.source.as_deref() == Some("name"));
-                                                let stem = pn_col.map(|k| r.cells[k].trim().to_string()).filter(|s| !s.is_empty())
-                                                    .or_else(|| nm_col.map(|k| r.cells[k].trim().to_string())).unwrap_or_else(|| "part".into());
-                                                step_act = Some((id.clone(), stem));
-                                            }
-                                        }
                                         let tip = if r.manual { tr("删除这一手动行", "Delete this manual row") } else { tr("从 BOM 里排除(不影响模型; 可恢复)", "Exclude from the BOM (model unaffected; restorable)") };
                                         if ui.small_button("×").on_hover_text(tip).clicked() {
                                             remove_row = Some(r.key.clone());
@@ -4731,9 +4697,6 @@ impl PlaApp {
                                 }
                             });
                         });
-                        if let Some((id, stem)) = step_act {
-                            self.bom_export_step(&id, &stem);
-                        }
                         for a in lib_acts {
                             match a {
                                 LibAct::Link(rk, pn) => {
