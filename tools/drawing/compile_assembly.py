@@ -735,7 +735,9 @@ for f in spec.get("fits") or []:
     spot = None
     for ring in range(10):
         o = 5 + ring * 5.5
-        for cx_, cy_ in ((px - w / 2, rr[1] - o), (rr[2] + o, py + 4), (px - w / 2, rr[3] + o), (px + 4, rr[1] - o), (px - w - 4, rr[1] - o)):
+        # 先下方(正下 / 往右错开 / 往左错开), 再上方, 最后右侧(右侧引线常横穿别的零件)
+        for cx_, cy_ in ((px - w / 2, rr[1] - o), (px + 4, rr[1] - o), (px - w - 4, rr[1] - o),
+                         (px - w / 2, rr[3] + o), (px + 4, rr[3] + o), (rr[2] + o, py + 4)):
             box_ = (cx_ - 1, cy_ - 1.5, cx_ + w + 1, cy_ + fs_ + 0.5)
             inside = AREA[0] <= box_[0] and box_[2] <= AREA[2] and AREA[1] <= box_[1] and box_[3] <= AREA[3]
             if inside and not any(hit(box_, u) for u in OCC) and not hit(box_, PLR):
