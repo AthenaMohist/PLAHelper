@@ -185,12 +185,34 @@ def callout(h, n):
 
 # ---------------------------------------------------------------- 文档 + 零件
 doc = App.newDocument("draw")
+def load_step(path, volume=None, area=None):
+    """读 STEP。只有一个实体就用它。多个实体时(零件在组里, Plasticity 会把全部可见实体都写进去; FreeCAD 读进来不保留
+    实体名)按体积(+ 面积)挑最接近的 —— 相同件挑哪个都一样; 差 > 0.5% 告警。没给体积就合成一个画全部(并告警)。"""
+    s = Part.Shape()
+    s.read(path)
+    sols = s.Solids
+    if len(sols) == 1:
+        return sols[0]
+    if len(sols) > 1 and volume:
+        def err(so):
+            e = abs(so.Volume - volume) / max(volume, 1e-9)
+            if area:
+                e += abs(so.Area - area) / max(area, 1e-9)
+            return e
+        best = min(sols, key=err)
+        rep["part_pick"] = {"solids": len(sols), "volume": round(best.Volume, 3), "want_volume": volume, "rel_err": round(err(best), 6)}
+        if err(best) > 0.005:
+            rep["warnings"].append("closest solid differs by %.2f%% from the wanted volume/area" % (err(best) * 100))
+        return best
+    if len(sols) > 1:
+        rep["warnings"].append("STEP has %d solids and no part.volume: drawing all of them" % len(sols))
+        return Part.makeCompound(sols)
+    return s
+
+
 pspec = spec.get("part", {})
 if pspec.get("step"):
-    shape = Part.Shape()
-    shape.read(pspec["step"])
-    if shape.Solids:
-        shape = shape.Solids[0] if len(shape.Solids) == 1 else Part.makeCompound(shape.Solids)
+    shape = load_step(pspec["step"], pspec.get("volume"), pspec.get("area"))
 else:
     shape = test_plate()
 part = doc.addObject("Part::Feature", "Part")

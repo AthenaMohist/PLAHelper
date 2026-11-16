@@ -449,7 +449,12 @@
       - [ ] B4（原计划）零件库（全局）：零件号 / 规格 / 供应商（链接、单价、币种、起订量、交期、日期）；BOM 链接建议、成本汇总；与 N5 常用件库同一个库。
       - [~] D0 FreeCAD 路线已验证（2026-11-16，`tools/drawing/d0_*.py`，结论见 `docs/know-how/drawing-d0-freecad.md`）：无界面出第一角三视图 + 轴测 + A-A 剖视
             剖面线 + 虚线 + 尺寸（值正确），离屏界面导出整页 PDF / SVG（ISO A3 图框 + 标题栏）；约 4 s。要我们写：尺寸放置避让、孔标注文字、国标模板、视图选择。
-            待做：Plasticity 零件 → STEP 导出（垫片还没有）；装配图（气泡 / 明细表）；仿宋字体嵌入；build123d 路线（要装 Python，待用户同意）。
+            待做：装配图（气泡 / 明细表）；build123d 路线（要装 Python，待用户同意）。
+      - [x] D0b Plasticity → STEP 导出（2026-11-16，实测，见 `docs/know-how/export-step.md`）：走 Plasticity 自己的导出 —— 主进程"另存为"一次性自动应答
+            （9334 inspector，只应答绑定窗口、一次 / 20 s 失效）+ 垫片 `file.exportStep`（按稳定 id 选零件、站内 STEP 对话框选格式点 OK）+ 等文件 +
+            `file.exportRestore` 还原选择。入口：BOM 每行 **STEP** 按钮（→ `<文档 .pla>/bom/<doc>/step/<料号>.step`）、CLI `pla-app cdp-export-step`。
+            零件在组里时 Plasticity 会写出全部可见实体 → 出图方案给 `part.volume`，编译器按体积 / 面积挑实体（实测 Extruded.001 挑对，0.24% 差）。
+            实测出图：model1 的 Extruded.001 → STEP → 国标图 OK。发现：圆形件外径没标（只标了直线边）→ 归"该标哪些"那一项。
       - [ ] D0（原计划）出图编译器验证：FreeCAD TechDraw（本机已装）vs build123d + ezdxf，同一零件出三视图 + 剖视剖面线 + 孔标注，比效果 / 速度 / 开发量。
             起点（MIT，保留许可声明）：FreeCAD 路线参考 tessalabs-space/freecad-mcp 的 TechDraw 驱动；build123d 路线参考 text-to-cad 的
             engineering-drawing 出图 API（尺寸放置、孔标注、圆心标记、标题栏）；国标约定取 cad-spec-gen（层 / 线宽 / 仿宋 / 剖面）。见 PRD §12。

@@ -47,6 +47,9 @@ pub enum CdpCmd {
     /// F1b: 调一个垫片接口(名字来自 `shim::api`), 结果经 `CdpEvent::CallResult` 回报。
     /// 取代 R7-16 的通用 Eval(界面不再拼 JS)。
     Call { name: &'static str, args: Value },
+    /// D: 导出 STEP(走 Plasticity 自己的导出, 见 `export.rs`)。ids = 稳定 id(空 = 全部可见); format = AP203/214/242(None = 规范默认)。
+    /// 结果经 `CdpEvent::CallResult { name: FILE_EXPORT_STEP }` 回报: `{path, bytes, selected, format, restored}`。
+    ExportStep { path: String, ids: Vec<String>, format: Option<String> },
     Shutdown,
 }
 
@@ -382,6 +385,10 @@ async fn session_loop(
                 }
                 let result = result.map_err(|e| e.to_string());
                 let _ = ev_tx.send(CdpEvent::CallResult { name, result });
+            }
+            Ok(CdpCmd::ExportStep { path, ids, format }) => {
+                let result = export_step(ws, &mut mid, connected_to, &path, &ids, format.as_deref()).await;
+                let _ = ev_tx.send(CdpEvent::CallResult { name: shim::api::FILE_EXPORT_STEP, result });
             }
             Ok(CdpCmd::ProbeCaps) => {
                 last_caps = None; // 强制上报
@@ -1127,6 +1134,71 @@ pub(crate) async fn http_get(port: u16, path: &str) -> anyhow::Result<String> {
         buf.extend_from_slice(&tmp[..got]);
     };
     Ok(String::from_utf8_lossy(&body).to_string())
+}
+
+/// D: 导出 STEP 的全流程(见 `export.rs` 顶部说明): 武装主进程"另存为" → 垫片导出 → 等文件 → 还原选择。
+pub(crate) async fn export_step(
+    ws: &mut WsStream,
+    mid: &mut u64,
+    hwnd: isize,
+    path: &str,
+    ids: &[String],
+    format: Option<&str>,
+) -> Result<Value, String> {
+    use crate::export as ex;
+    ex::check_path(path)?;
+    if let Some(dir) = std::path::Path::new(path).parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+    }
+    // 旧文件先删: 以"文件出现"判断写完
+    let _ = std::fs::remove_file(path);
+    let armed = ex::main_eval_once(ex::INSPECT_PORT, &ex::arm_save_dialog_js(hwnd, path, ex::ARM_TIMEOUT_MS))
+        .await
+        .map_err(|e| format!("arm save dialog: {e}"))?;
+    if armed.as_str() != Some("armed") {
+        return Err(format!("arm save dialog: unexpected {armed}"));
+    }
+    let mut args = serde_json::json!({ "ids": ids });
+    if let Some(f) = format {
+        args["format"] = Value::from(f);
+    }
+    // 站内对话框出现 + 关闭各最多 10 / 20 s(垫片 NAMES.exportStep), 默认 15 s 往返不够
+    let started = match eval_roundtrip_timeout(ws, mid, &shim::call_expr(shim::api::FILE_EXPORT_STEP, &args), Duration::from_secs(40)).await {
+        Ok(raw) => shim::parse_reply(&raw).map_err(anyhow::Error::from),
+        Err(e) => Err(e),
+    };
+    let started = match started {
+        Ok(v) => v,
+        Err(e) => {
+            // 没导成: 撤销武装 + 还原选择, 免得之后用户自己的"另存为"被吞掉
+            let _ = ex::main_eval_once(ex::INSPECT_PORT, ex::DISARM_JS).await;
+            let _ = shim_call(ws, mid, shim::api::FILE_EXPORT_RESTORE, Value::Null).await;
+            return Err(format!("export: {e}"));
+        }
+    };
+    // 等文件出现且大小稳定(写完)
+    let t0 = tokio::time::Instant::now();
+    let mut last = 0u64;
+    let bytes = loop {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let n = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        if n > 0 && n == last {
+            break n;
+        }
+        last = n;
+        if t0.elapsed() > ex::WRITE_WAIT {
+            break 0;
+        }
+    };
+    let restored = shim_call(ws, mid, shim::api::FILE_EXPORT_RESTORE, Value::Null).await.ok();
+    if bytes == 0 {
+        return Err(format!("export: no file written within {}s: {path}", ex::WRITE_WAIT.as_secs()));
+    }
+    Ok(serde_json::json!({
+        "path": path, "bytes": bytes,
+        "selected": started["selected"], "format": started["format"], "names": started["names"], "parts": started["parts"],
+        "restored": restored.map(|r| r["restored"].clone()).unwrap_or(Value::Null),
+    }))
 }
 
 /// 一次性 CDP evaluate(R7-17, CLI 调试用): 连 page → Runtime.evaluate → 回包。

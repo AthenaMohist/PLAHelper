@@ -67,6 +67,10 @@
     'ed.bridge.enabled':       ['ed', 'settings.Server.enabled'],
     'sel.selected':            ['ed', 'selection.selected'],
     'sel.size':                ['sel', 'size'],
+    // D 导出: 往选择里直接加 / 清空(导出范围 = 当前选择), 导出入口(无参, 弹"另存为")
+    'sel.add':                 ['sel', 'add'],
+    'sel.removeAll':           ['sel', 'removeAll'],
+    'ed.export':               ['ed', 'export'],
     'vp.camera':               ['vp', 'camera'],
     'vp.orbit':                ['vp', 'orbitControls'],
     'vp.container':            ['vp', 'container'],
@@ -384,6 +388,11 @@
     // ---- B1/B2 BOM: 指纹比较的相对容差(网格近似, 旋转后的复制件有 Float32 噪声); 手性阈值(相对 面积 × 尺度³);
     //      组: 根组 id 与组对象的 id 字段(ed.groups.getParent(nodeKey) → Groups_Group{id…}, 根 = 0) ----
     bom: { relTol: 2e-3, chiralEps: 1e-3, groupId: 'id', rootGroupId: 0 },
+    // D 导出 STEP(实测 26.2.3, 2026-11-16): 站内对话框元素名、格式按钮文字、解析面转 NURBS 复选框名; OK / Cancel 在
+    // 对话框外层容器里(往上找同时含两者的祖先, 最多 boxClimb 层); 选择里要记 / 还原的集合。
+    exportStep: { dialogTag: 'export-step-58-dialog', formats: ['AP203', 'AP214', 'AP242'], defaultFormat: 'AP214',
+                  nurbsInput: 'saveAnalyticsToNurbs', okText: 'OK', cancelText: 'Cancel', boxClimb: 6,
+                  dialogWaitMs: 10000, closeWaitMs: 20000, selSets: ['solids', 'sheets', 'curves', 'faces', 'edges'] },
     // ---- 右键确认扩展到 Plasticity 窗口(ui.rightClick): 捕获这些事件, 右键松开计一次; contextmenu 只吃不计 ----
     rightClick: { events: ['pointerdown', 'pointerup', 'mousedown', 'mouseup', 'contextmenu'], button: 2,
                   countOn: 'pointerup', menuEvent: 'contextmenu' },
@@ -426,6 +435,8 @@
     'mat.state': { needs: ['ed.originator', 'nodes.state'], optional: ['mat.textures', 'tex.get', 'mats.snapshot'] },
     // B1/B2 BOM: 实体 + 显示网格 + 稳定 id; 组路径 / 材质缺了只降级
     'bom.read': { needs: ['geo.items', 'geo.lookupTopo', 'nodes.state', 'nodes.item2key', 'nodes.getName', 'ed.docUnit'], optional: ['ed.groupsDb', 'groups.getParent', 'mats.snapshot', 'ed.originator'] },
+    // D 导出 STEP: 选择增删 + 导出入口; 站内对话框是普通 DOM 元素, 运行时查(不用 dom 标记 —— 那个指 Preact 树可读, 且会跳过 needs)
+    'file.export': { needs: ['ed.export', 'sel.selected', 'sel.add', 'sel.removeAll', 'geo.items', 'nodes.state', 'nodes.item2key'] },
     // C0 配置: 可见性 + 材质指派(与 vp.state 的可见性段、mat.state 同一批内部结构)
     'cfg.state': { needs: ['ed.originator', 'nodes.state', 'ed.nodes', 'nodes.item2key', 'nodes.getName', 'geo.items'], optional: ['mat.textures', 'tex.get', 'nodes.isolate', 'nodes.unisolate', 'mats.snapshot'] },
     'mat.set':     { todo: 'N1' },
@@ -3372,6 +3383,85 @@
     out.forEach(function (l) { if (l.mirrorOf !== undefined) l.mirrorOf = out[l.mirrorOf].name; });
     out.sort(function (x, y) { return x.path < y.path ? -1 : x.path > y.path ? 1 : (x.name < y.name ? -1 : x.name > y.name ? 1 : 0); });
     return { units: U.unit, lines: out, skipped: skipped };
+  });
+
+  // ---------------------------------------------------------------------
+  // D: 导出 STEP(出图用)。走 Plasticity 自己的导出: Editor.export() → 主进程"另存为"对话框(由 Rust 侧事先在主进程
+  // 武装成一次性自动应答, 见 pla-bridge export.rs) → 站内 EXPORT STEP 对话框(格式 / 解析面转 NURBS / OK)→ 自带写出器。
+  // 导出范围 = 当前选择; 没选 = 全部可见。所以这里先记下用户选择, 按稳定 id 选上要导的零件, 导完由 file.exportRestore 还原。
+  // 注意: 写文件期间不能动选择(会取消导出命令), 还原要等 Rust 侧看到文件落盘之后。
+  // args = { ids?: [稳定 id](省略 / 空 = 全部可见), format?: 'AP203' | 'AP214' | 'AP242', nurbs?: bool }
+  // → { selected, format, prev(原选择条数), names(选上的零件名) }
+  function exportStepBox(dlg) {
+    var X = NAMES.exportStep, box = dlg;
+    for (var i = 0; i < X.boxClimb && box; i++) {
+      var t = box.innerText || '';
+      if (t.indexOf(X.okText) >= 0 && t.indexOf(X.cancelText) >= 0) return box;
+      box = box.parentElement;
+    }
+    return null;
+  }
+  function buttonByText(root, text) {
+    return Array.prototype.slice.call(root.querySelectorAll('button')).filter(function (b) { return (b.innerText || '').trim() === text; })[0] || null;
+  }
+  function waitFor(test, ms) {
+    return new Promise(function (resolve) {
+      var t0 = Date.now();
+      (function tick() { var v = test(); if (v || Date.now() - t0 > ms) return resolve(v || null); setTimeout(tick, 100); })();
+    });
+  }
+
+  def('file.exportStep', 'file.export', function (a) {
+    a = a || {};
+    var X = NAMES.exportStep;
+    if (document.querySelector(X.dialogTag)) throw new Error('an export dialog is already open in Plasticity');
+    var s = need('sel.selected');
+    // 记下用户当前选择(视图 / 拓扑对象本身), 导完还原
+    var prev = [];
+    X.selSets.forEach(function (k) { var set = s[k]; if (set && typeof set.forEach === 'function') set.forEach(function (v) { prev.push(v); }); });
+    state.exportPrev = prev;
+    // 选上要导的零件(稳定 id → 视图)
+    var st = need('nodes.state'), map = st[NAMES.node2id];
+    var want = new Set((Array.isArray(a.ids) ? a.ids : []).map(String));
+    var pick = want.size ? solidViews().filter(function (v) { return want.has(map.get(invokeOn('nodes.item2key', [v]))); }) : [];
+    if (want.size && pick.length !== want.size) throw new Error('export: ' + (want.size - pick.length) + ' of ' + want.size + ' ids not found');
+    invokeOn('sel.removeAll', [], s);
+    pick.forEach(function (v) { invokeOn('sel.add', [v], s); });
+    invokeOn('ed.export');
+    return waitFor(function () { return document.querySelector(X.dialogTag); }, X.dialogWaitMs).then(function (dlg) {
+      if (!dlg) throw new Error('export: STEP dialog did not appear (save dialog not answered, or not a .step path)');
+      var fmt = a.format || X.defaultFormat;
+      if (X.formats.indexOf(fmt) < 0) throw new Error('export: unknown format ' + fmt);
+      var fb = buttonByText(dlg, fmt);
+      if (fb) fb.click();
+      var cb = dlg.querySelector('input[name="' + X.nurbsInput + '"]');
+      if (cb && a.nurbs !== undefined && !!cb.checked !== !!a.nurbs) cb.click();
+      var box = exportStepBox(dlg), ok = box && buttonByText(box, X.okText);
+      if (!ok) throw new Error('export: OK button not found');
+      ok.click();
+      return waitFor(function () { return !document.querySelector(X.dialogTag); }, X.closeWaitMs).then(function (closed) {
+        if (!closed) throw new Error('export: STEP dialog did not close');
+        // parts: 选上的零件名 + 体积 / 面积(文档单位, 与 bom.scan 同一指纹)。零件在组里时 Plasticity 会把全部可见实体都写进
+        // STEP(实测 26.2.3), 而 FreeCAD 读进来不保留实体名 → 出图端按体积 + 面积挑实体(相同件挑哪个都一样)。
+        var k = unitOf({}).k;
+        var parts = pick.map(function (v) {
+          var p = { name: nameOf(v) };
+          try { var fp = partPrint(v, k); p.volume = fp.volume; p.area = fp.area; } catch (e) { p.err = errMsg(e); }
+          return p;
+        });
+        return { selected: pick.length, format: fmt, prev: prev.length, names: parts.map(function (p) { return p.name; }), parts: parts };
+      });
+    });
+  }, { async: true });
+
+  // 还原 file.exportStep 之前的用户选择(Rust 侧确认文件已写出后调用)。
+  def('file.exportRestore', 'file.export', function () {
+    var s = need('sel.selected'), prev = state.exportPrev || [];
+    invokeOn('sel.removeAll', [], s);
+    var bad = 0;
+    prev.forEach(function (v) { try { invokeOn('sel.add', [v], s); } catch (e) { bad++; } });
+    state.exportPrev = null;
+    return { restored: prev.length - bad, failed: bad };
   });
 
   def('err.last', 'err.hook', function () { return state.lastError; });

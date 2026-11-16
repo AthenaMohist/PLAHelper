@@ -4,6 +4,7 @@ pub mod cdp;
 pub mod connection;
 pub mod error;
 pub mod exec;
+pub mod export;
 pub mod i18n;
 pub mod protocol;
 pub mod query;

@@ -51,6 +51,7 @@ pub fn cap_label(c: &str) -> &'static str {
         cap::MAT_STATE => tr("材质与颜色状态(定义 + 指派)", "Material & colour state (definitions + assignments)"),
         cap::CFG_STATE => tr("配置(可见性 + 材质指派)", "Configurations (visibility + material assignments)"),
         cap::BOM_READ => tr("BOM(零件指纹 + 组 + 材质)", "BOM (part fingerprints + groups + materials)"),
+        cap::FILE_EXPORT => tr("导出 STEP(出图用)", "Export STEP (for drawings)"),
         cap::KEYMAP => tr("改按键绑定(运行时)", "Change keybindings (runtime)"),
         cap::CMD_DISPATCH => tr("注册 / 派发命令", "Register / dispatch commands"),
         cap::ERR_HOOK => tr("捕获命令报错", "Capture command errors"),

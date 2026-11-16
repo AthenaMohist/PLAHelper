@@ -53,6 +53,16 @@ pub async fn call_once(cdp_port: u16, hwnd: isize, name: &str, args: &Value) -> 
     Ok(shim::parse_reply(&raw)?)
 }
 
+/// D CLI 用: 导出 STEP(全流程见 `export.rs`)。ids = 稳定 id(空 = 全部可见)。
+pub async fn export_step_once(cdp_port: u16, hwnd: isize, path: &str, ids: &[String], format: Option<&str>) -> anyhow::Result<Value> {
+    let mut ws = tokio::time::timeout(Duration::from_secs(8), connect_page(cdp_port, hwnd))
+        .await
+        .map_err(|_| anyhow::anyhow!("connect timeout (8s)"))??;
+    let mut mid: u64 = 100;
+    eval_roundtrip(&mut ws, &mut mid, &shim::install_expr()).await?;
+    crate::cdp::export_step(&mut ws, &mut mid, hwnd, path, ids, format).await.map_err(|e| anyhow::anyhow!(e))
+}
+
 /// A5 CLI 用: 指定视角截图 → (PNG 字节, 回包去掉 data 后的其余字段)。
 pub async fn view_png_once(cdp_port: u16, hwnd: isize, args: &Value) -> anyhow::Result<(Vec<u8>, Value)> {
     let mut v = call_once(cdp_port, hwnd, api::CAM_VIEW, args).await?;

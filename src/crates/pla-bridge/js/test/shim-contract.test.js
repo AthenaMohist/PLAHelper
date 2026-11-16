@@ -1403,6 +1403,72 @@ const callAsync = async (name, args) => JSON.parse(await run(`window.__PLA__.cal
     assert.deepStrictEqual(r.v.skipped, []);
   });
 
+  await ta('D file.exportStep / exportRestore: 记下选择 → 按稳定 id 选零件 → export → 站内对话框选格式、点 OK → 还原选择', async () => {
+    const ed = ed3;
+    const S = ed.selection.selected;
+    // 假选择: 只要 solids 集合 + add / removeAll(与 Plasticity 同名)
+    const solids = S.solids && S.solids.add ? S.solids : new Set();
+    const saved = { solids: S.solids, add: S.add, removeAll: S.removeAll };
+    S.solids = solids;
+    S.add = (v) => solids.add(v);
+    S.removeAll = () => solids.clear();
+    const userPick = { user: true };
+    solids.clear();
+    solids.add(userPick);
+    // 假站内对话框: <export-step-58-dialog> 里有格式按钮 + NURBS 复选框; OK / Cancel 在外层容器
+    const clicks = [];
+    let open = null, exportCalls = 0, selAtExport = null;
+    const btn = (text) => ({ innerText: text, click() { clicks.push(text); if (text === 'OK') open = null; } });
+    const mkDialog = () => {
+      const fmt = ['AP203', 'AP214', 'AP242'].map(btn);
+      const cb = { name: 'saveAnalyticsToNurbs', checked: false, click() { this.checked = !this.checked; clicks.push('nurbs'); } };
+      const dlg = { innerText: 'EXPORT STEP\nFormat\nAP203\nAP214\nAP242', querySelectorAll: (q) => (q === 'button' ? fmt : []), querySelector: (q) => (q.indexOf('saveAnalyticsToNurbs') >= 0 ? cb : null) };
+      const wrap = { innerText: dlg.innerText + '\nEsc\nCancel\nOK', querySelectorAll: (q) => (q === 'button' ? fmt.concat([btn('Cancel'), btn('OK')]) : []), parentElement: null };
+      dlg.parentElement = wrap;
+      return dlg;
+    };
+    ed.export = () => { exportCalls++; selAtExport = [...solids]; open = mkDialog(); };
+    const q0 = ctx.document.querySelector;
+    ctx.document.querySelector = (sel) => (sel === 'export-step-58-dialog' ? open : q0(sel));
+    try {
+      const r = await callAsync('file.exportStep', { ids: ['sid0', 'sid2'], format: 'AP242', nurbs: true });
+      assert.ok(r.ok, JSON.stringify(r));
+      assert.strictEqual(r.v.selected, 2);
+      assert.strictEqual(r.v.format, 'AP242');
+      assert.strictEqual(r.v.prev, 1);
+      assert.strictEqual(r.v.names.length, 2, '回选上的零件名(出图端按名字从 STEP 里挑实体)');
+      assert.strictEqual(exportCalls, 1);
+      assert.strictEqual(selAtExport.length, 2, '导出时选择 = 要导的两个零件');
+      assert.ok(!selAtExport.includes(userPick), '用户原选择先拿掉');
+      assert.deepStrictEqual(clicks, ['AP242', 'nurbs', 'OK'], '先选格式、勾 NURBS, 再点外层容器里的 OK');
+      assert.strictEqual(open, null, '对话框已关');
+      const back = call('file.exportRestore');
+      assert.deepStrictEqual(back.v, { restored: 1, failed: 0 });
+      assert.deepStrictEqual([...solids], [userPick], '还原成用户原来的选择');
+      // 不给 ids = 全部可见: 导出时选择为空
+      clicks.length = 0;
+      const all = await callAsync('file.exportStep', {});
+      assert.strictEqual(all.v.selected, 0);
+      assert.strictEqual(selAtExport.length, 0, '空选择 = Plasticity 导出全部可见');
+      assert.deepStrictEqual(clicks, ['AP214', 'OK'], '默认格式 AP214, 不碰 NURBS');
+      call('file.exportRestore');
+      // 查不到的 id: 报错且不调导出
+      const before = exportCalls;
+      const bad = await callAsync('file.exportStep', { ids: ['nope'] });
+      assert.ok(!bad.ok && /ids not found/.test(bad.err), JSON.stringify(bad));
+      assert.strictEqual(exportCalls, before);
+      // 对话框没出现(另存为没被应答)→ 报错
+      ed.export = () => { exportCalls++; };
+      const none = await callAsync('file.exportStep', { ids: ['sid0'] });
+      assert.ok(!none.ok && /did not appear/.test(none.err), JSON.stringify(none));
+      call('file.exportRestore');
+    } finally {
+      ctx.document.querySelector = q0;
+      delete ed.export;
+      Object.assign(S, saved);
+    }
+  });
+
   await ta('N3d dim.signature / geo.resolve: 签名 → 改几何(面 id 全变)→ 按预测签名重新定位到新面; 偏差 / 次优差距如实报', async () => {
     const ed = ed3;
     const r = (await callAsync('cmd.exec', { ops: [{ op: 'box', p1: [900, 0, 0], p2: [910, 20, 0], height: 5 }] })).v;

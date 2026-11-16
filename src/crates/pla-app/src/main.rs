@@ -469,6 +469,29 @@ fn main() {
                 Err(e) => { eprintln!("CDP ERROR: {e:#}"); std::process::exit(1); }
             }
         },
+        "cdp-export-step" => {
+            // D: 导出 STEP(走 Plasticity 自己的导出): cdp-export-step [--hwnd N] [--format AP203|AP214|AP242] <路径.step> [稳定id,稳定id…]
+            let mut hwnd: isize = 0;
+            let mut format: Option<String> = None;
+            let mut rest: Vec<String> = Vec::new();
+            let mut it = a.iter();
+            while let Some(x) = it.next() {
+                match x.as_str() {
+                    "--hwnd" => hwnd = it.next().and_then(|v| v.parse().ok()).unwrap_or(0),
+                    "--format" => format = it.next().cloned(),
+                    other => rest.push(other.to_string()),
+                }
+            }
+            let Some(path) = rest.first().cloned() else {
+                eprintln!("用法: cdp-export-step [--hwnd N] [--format AP214] <绝对路径.step> [稳定id,…(省略 = 全部可见)]");
+                std::process::exit(2);
+            };
+            let ids: Vec<String> = rest.get(1).map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect()).unwrap_or_default();
+            match rt.block_on(pla_bridge::query::export_step_once(9333, hwnd, &path, &ids, format.as_deref())) {
+                Ok(v) => println!("{}", serde_json::to_string_pretty(&v).unwrap()),
+                Err(e) => { eprintln!("EXPORT ERROR: {e:#}"); std::process::exit(1); }
+            }
+        },
         "doc-list" => println!("{}", serde_json::to_string_pretty(&state.cmd_doc_list()).unwrap()),
         "snapshot-create" => { need(3);
             match state.cmd_snapshot_create(&a[0], Path::new(&a[1]), &a[2]) {

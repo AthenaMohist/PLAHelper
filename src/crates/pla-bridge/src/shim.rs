@@ -122,6 +122,9 @@ pub mod api {
     pub const CFG_RESTORE: &str = "cfg.restore";
     /// B1/B2: BOM 扫描(按配置 members 或当前可见; 相同件按几何指纹归并, 镜像件单列, 组路径)。
     pub const BOM_SCAN: &str = "bom.scan";
+    /// D: 导出 STEP(走 Plasticity 自己的导出; 主进程"另存为"由 export.rs 事先武装)/ 导完还原用户选择。
+    pub const FILE_EXPORT_STEP: &str = "file.exportStep";
+    pub const FILE_EXPORT_RESTORE: &str = "file.exportRestore";
 
     /// 全部接口名（契约测试用）。
     pub const ALL: &[&str] = &[
@@ -129,7 +132,7 @@ pub mod api {
         CMD_PING, ERR_LAST, TREE_LIST, SEL_CANCEL_COMMAND, SEL_CLEAR, SEL_APPLY, CAM_NAVIGATE, CAM_RENDER, CAM_THUMBNAIL, CAM_VP_RECT,
         CAM_SET_ORBIT_STEP, CAM_ROLL, KEYMAP_SET_BINDINGS, VP_SAVE, VP_RESTORE, MAT_SAVE, MAT_RESTORE, CMD_EXEC, CMD_FACTORIES,
         GEO_QUERY, HIST_BEGIN, HIST_ROLLBACK, HIST_COMMIT, GEO_SNAPS, GEO_MEASURE, CAM_VIEW, DIM_FACE, VIEW_HIGHLIGHT, DIM_DISTANCE, DIM_SIGNATURE, GEO_RESOLVE,
-        DIM_RECORD, DIM_MEASURE, DIM_FACES, UI_RCLICK, HOLE_MAKE, CFG_SAVE, CFG_RESTORE, BOM_SCAN,
+        DIM_RECORD, DIM_MEASURE, DIM_FACES, UI_RCLICK, HOLE_MAKE, CFG_SAVE, CFG_RESTORE, BOM_SCAN, FILE_EXPORT_STEP, FILE_EXPORT_RESTORE,
     ];
 }
 
@@ -168,13 +171,15 @@ pub mod cap {
     pub const CFG_STATE: &str = "cfg.state";
     /// B1/B2: BOM(实体指纹 + 组路径 + 材质)。
     pub const BOM_READ: &str = "bom.read";
+    /// D: 导出 STEP(导出入口 + 选择增删 + 站内对话框)。
+    pub const FILE_EXPORT: &str = "file.export";
     pub const BOOL_RUN: &str = "bool.run";
     pub const ASSET_PLACE: &str = "asset.place";
 
     /// 全部能力名（契约测试用）。
     pub const ALL: &[&str] = &[
         EDITOR, SEL_READ, SEL_WRITE, HIST_READ, CAM_READ, CAM_WRITE, CAM_NAV, CAM_STEP, CAM_ROLL, SEL_APPLY,
-        VP_STATE, KEYMAP, CMD_DISPATCH, ERR_HOOK, TREE, MAT_STATE, MAT_SET, CMD_EXEC, GEO_READ, HIST_WRITE, SNAP_READ, VIEW_HIGHLIGHT, MEASURE_WRITE, CFG_STATE, BOM_READ, BOOL_RUN, ASSET_PLACE,
+        VP_STATE, KEYMAP, CMD_DISPATCH, ERR_HOOK, TREE, MAT_STATE, MAT_SET, CMD_EXEC, GEO_READ, HIST_WRITE, SNAP_READ, VIEW_HIGHLIGHT, MEASURE_WRITE, CFG_STATE, BOM_READ, FILE_EXPORT, BOOL_RUN, ASSET_PLACE,
     ];
 }
 
