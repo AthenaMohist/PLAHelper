@@ -25,6 +25,9 @@ import Part
 import TechDraw
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import geomutil  # noqa: E402
+
 V = App.Vector
 T0 = time.time()
 rep = {"kind": "assembly", "steps": {}, "warnings": []}
@@ -156,19 +159,10 @@ rep["lines"] = [{"key": l.get("key"), "found": l["found"], "qty": l.get("qty")} 
 def cyl_faces(s):
     out = []
     for f in s.Faces:
-        su = f.Surface
-        if not isinstance(su, Part.Cylinder):
+        cy = geomutil.cylinder_of(f)  # 解析圆柱 + 几何上是圆柱的 B 样条面
+        if cy is None:
             continue
-        ax = su.Axis.normalize()
-        u0, u1, v0, v1 = f.ParameterRange
-        p, n = f.valueAt((u0 + u1) / 2, (v0 + v1) / 2), f.normalAt((u0 + u1) / 2, (v0 + v1) / 2)
-        c = su.Center
-        rad = (p - c) - ax * ((p - c).dot(ax))
-        if rad.Length < 1e-6:
-            continue
-        internal = n.dot(rad) < 0
-        ts = [(vx.Point - c).dot(ax) for vx in f.Vertexes] or [0.0]
-        out.append({"ax": ax, "c": c, "r": su.Radius, "in": internal, "t0": min(ts), "t1": max(ts)})
+        out.append({"ax": cy["ax"], "c": cy["c"], "r": cy["r"], "in": cy["internal"], "t0": cy["t0"], "t1": cy["t1"]})
     return out
 
 

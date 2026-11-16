@@ -276,6 +276,31 @@ pub fn is_import_group(name: &str) -> bool {
     [".step", ".stp", ".igs", ".iges", ".x_t", ".sat", ".sldasm", ".sldprt"].iter().any(|e| n.ends_with(e))
 }
 
+/// 看名字 / 料号像标准件(紧固件、销、轴承等: 不出零件图, 批量跳过; 单张还能出)。
+/// 规则: 含常见标准件词(螺钉 / 螺栓 / 螺母 / 垫圈 / 销 / 轴承 / 杯内六 / 沉头 / 平垫 / 弹垫 / 挡圈 / 键 …),
+/// 或标准号(GB/T、DIN、ISO 数字), 或 "M3x10" 这类规格写法开头 / 结尾。
+pub fn looks_standard(name: &str, pn: &str) -> bool {
+    let s = format!("{name} {pn}");
+    let low = s.to_lowercase();
+    const WORDS: [&str; 22] = [
+        "螺钉", "螺栓", "螺丝", "螺母", "垫圈", "平垫", "弹垫", "垫片", "销", "轴承", "杯内六", "内六角", "沉头", "半圆头", "挡圈", "卡簧", "平键", "铆钉", "screw", "bolt", "washer", "bearing",
+    ];
+    if WORDS.iter().any(|w| low.contains(w)) {
+        return true;
+    }
+    if low.contains("gb/t") || low.contains("din ") || low.contains("din9") || low.contains("iso 4") || low.contains("iso4") {
+        return true;
+    }
+    // M3x10 / M4×12 规格
+    let b = low.as_bytes();
+    (0..b.len()).any(|i| {
+        b[i] == b'm'
+            && (i == 0 || !b[i - 1].is_ascii_alphabetic())
+            && b.get(i + 1).is_some_and(|c| c.is_ascii_digit())
+            && low[i + 1..].trim_start_matches(|c: char| c.is_ascii_digit() || c == '.').starts_with(['x', '×', '*'])
+    })
+}
+
 /// 装配图 key: ASM_KEY = 整个范围; ASM_KEY + ":" + 组名 = 某个顶层组(方案 / 子装配)。
 pub fn asm_key(group: Option<&str>) -> String {
     match group {
@@ -641,6 +666,16 @@ pub fn book_file(dir: &Path, doc_key: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn standard_parts() {
+        for (n, pn) in [("杯内六M3x10.001", ""), ("M4×12 内六角", ""), ("Hex screw", ""), ("", "GB/T 70.1 M6"), ("轴承 6001", ""), ("销 3x10", "")] {
+            assert!(looks_standard(n, pn), "{n} {pn}");
+        }
+        for (n, pn) in [("Extruded.006", "904002001"), ("motor plate", ""), ("big platform", ""), ("Shaft adapter", ""), ("MX bracket", "")] {
+            assert!(!looks_standard(n, pn), "{n} {pn}");
+        }
+    }
 
     #[test]
     fn asm_lines_groups_and_purchased() {

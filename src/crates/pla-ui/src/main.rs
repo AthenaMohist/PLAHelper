@@ -4773,8 +4773,18 @@ impl PlaApp {
                 let bought = line.and_then(|l| l["members"].as_array()).is_some_and(|ms| {
                     !ms.is_empty() && ms.iter().all(|m| m["path"].as_array().is_some_and(|p| p.iter().any(|g| g.as_str().is_some_and(pla_ui::drawing::is_import_group))))
                 });
-                let label = format!("{}  {}  ×{qty}{}", get("pn"), get("name"), if bought { tr("  (外购)", "  (purchased)") } else { "" }).trim().to_string();
-                items.push(Item { key: r.key.clone(), label, title, member, bought });
+                // 标准件(螺钉 / 销 / 轴承 …, 看名字猜): 同外购一样不进批量, 单张还能出
+                let nm = if get("name").is_empty() { member.1.clone() } else { get("name") };
+                let standard = !bought && pla_ui::drawing::looks_standard(&nm, &get("pn"));
+                let tag = if bought {
+                    tr("  (外购)", "  (purchased)")
+                } else if standard {
+                    tr("  (标准件)", "  (standard part)")
+                } else {
+                    ""
+                };
+                let label = format!("{}  {}  ×{qty}{tag}", get("pn"), get("name")).trim().to_string();
+                items.push(Item { key: r.key.clone(), label, title, member, bought: bought || standard });
             }
             let info = |k: &str| infos.get(k).cloned().unwrap_or_default();
             let stem = self.doc_key.rsplit(['/', '\\']).next().unwrap_or("").to_string();
@@ -4987,8 +4997,10 @@ impl PlaApp {
             if !r.hole_groups.is_empty() {
                 let front: Vec<&pla_ui::drawing::HoleGroup> = r.hole_groups.iter().filter(|g| g.view == "Front").collect();
                 egui::CollapsingHeader::new(t!("孔组 {}(勾 = 标孔位)", "Hole groups {} (ticked = position dims)", r.hole_groups.len())).id_salt("draw-holes").default_open(true).show(ui, |ui| {
+                    // 默认(没点名)= 编译器报告里标了坐标的那些(均布在节圆上的孔组默认不标)
+                    let default_on: Vec<String> = front.iter().filter(|g| g.ordinate).map(|g| g.id.clone()).collect();
                     let mut on: Vec<String> = match &s.ordinate {
-                        None => front.iter().map(|g| g.id.clone()).collect(),
+                        None => default_on.clone(),
                         Some(v) => v.clone(),
                     };
                     let mut changed = false;
@@ -5008,8 +5020,8 @@ impl PlaApp {
                         }
                     }
                     if changed {
-                        let all = front.iter().all(|g| on.contains(&g.id)) && on.len() == front.len();
-                        s.ordinate = if all { None } else { Some(on) };
+                        let same = default_on.iter().all(|g| on.contains(g)) && on.len() == default_on.len();
+                        s.ordinate = if same { None } else { Some(on) };
                     }
                 });
             }

@@ -24,6 +24,9 @@ import Part
 import TechDraw
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import geomutil  # noqa: E402
+
 V = App.Vector
 T0 = time.time()
 rep = {"steps": {}, "warnings": [], "placed": []}
@@ -98,21 +101,10 @@ def find_holes(shape, axis_hint=None):
     bb = shape.BoundBox
     cyl = []
     for f in shape.Faces:
-        s = f.Surface
-        if not isinstance(s, Part.Cylinder):
-            continue
-        ax = s.Axis.normalize()
-        # 内表面: 面上一点的法向指向轴线
-        u0, u1, v0, v1 = f.ParameterRange
-        p = f.valueAt((u0 + u1) / 2, (v0 + v1) / 2)
-        n = f.normalAt((u0 + u1) / 2, (v0 + v1) / 2)
-        c = s.Center
-        rad = (p - c) - ax * ((p - c).dot(ax))
-        if rad.Length < 1e-6 or n.dot(rad) > 0:
-            continue  # 外圆柱(凸台)
-        # 轴向范围
-        ts = [(vx.Point - c).dot(ax) for vx in f.Vertexes] or [0]
-        cyl.append({"ax": ax, "c": c, "r": s.Radius, "t0": min(ts), "t1": max(ts), "span": abs(u1 - u0)})
+        cy = geomutil.cylinder_of(f)  # 解析圆柱, 或几何上是圆柱的 B 样条面
+        if cy is None or not cy["internal"]:
+            continue  # 不是圆柱 / 外圆柱(凸台)
+        cyl.append({"ax": cy["ax"], "c": cy["c"], "r": cy["r"], "t0": cy["t0"], "t1": cy["t1"], "span": cy["span"]})
     groups = []
     for cy in cyl:
         for g in groups:
@@ -120,7 +112,7 @@ def find_holes(shape, axis_hint=None):
             if abs(abs(a["ax"].dot(cy["ax"])) - 1) < 1e-6:
                 d = cy["c"] - a["c"]
                 off = d - a["ax"] * d.dot(a["ax"])
-                if off.Length < 1e-4:
+                if off.Length < max(0.01, 2e-3 * max(a["r"], cy["r"])):  # B 样条孔拟合出的轴心有误差(大孔可达几十微米); 真不同轴的孔不会这么近
                     cy["t0"], cy["t1"] = sorted([(cy["c"] + cy["ax"] * cy["t0"] - a["c"]).dot(a["ax"]), (cy["c"] + cy["ax"] * cy["t1"] - a["c"]).dot(a["ax"])])
                     g.append(cy)
                     break
@@ -175,7 +167,7 @@ def find_slots(bb, partial):
             sgn = 1 if pi_["ax"].dot(pj["ax"]) > 0 else -1
             base = (pj["c"] - pi_["c"]).dot(pi_["ax"])
             uu = sorted([base + sgn * u0, base + sgn * u1])
-            if not (1e-3 < L <= 20 * r) or abs(uu[0] - t0) > 1e-3 or abs(uu[1] - t1) > 1e-3:
+            if not (max(0.1, 0.02 * r) < L <= 20 * r) or abs(uu[0] - t0) > 1e-3 or abs(uu[1] - t1) > 1e-3:
                 continue
             used.update((i, j))
             ctr = pi_["c"] + w * 0.5
@@ -263,7 +255,7 @@ def callout(h, n):
     if h.get("cb") and h.get("slot"):
         s += "  " + D["counterbore"] + fmt(h["cb"][0]) + "×" + fmt(h["cb"][0] + h.get("cb_slot", h["slot"])) + D["depth"] + fmt(h["cb"][1])
     elif h.get("cb"):
-        s += "  " + D["counterbore"] + D["diameter"] + fmt(h["cb"][0]) + D["depth"] + fmt(h["cb"][1])
+        s += "  " + D["counterbore"] + D["diameter"] + fmt(h["cb"][0]) + (" " + h["cb_tol"] + " " if h.get("cb_tol") else "") + D["depth"] + fmt(h["cb"][1])
     if h.get("csk"):
         s += "  " + D["countersink"] + D["diameter"] + fmt(h["csk"])
     return s
@@ -573,6 +565,10 @@ for f_ in spec.get("fits") or []:
             if abs(h["d"] - d_) < 0.05 and not h.get("tap"):
                 h["tol"] = txt_
                 n_ += 1
+            elif h.get("cb") and abs(h["cb"][0] - d_) < 0.05:
+                # 配合在台阶孔的大径段(如电机止口 ⌀100 套在 ⌀83 通孔外面): 公差写在沉孔那段
+                h["cb_tol"] = txt_
+                n_ += 1
         if not n_:
             rep["warnings"].append("fit hole %s %s: no hole of that size" % (fmt(d_), code_))
     else:
@@ -752,6 +748,28 @@ def edges_of(view):
     return out
 
 
+def rtol(r):
+    """圆半径比较的容差: 解析圆 0.001; B 样条边拟合出来的半径会差一点, 按半径的 0.3% 放宽。"""
+    return max(1e-3, 3e-3 * r)
+
+
+def circle_edges(view):
+    """视图里的圆 / 圆弧边: 解析圆, 加上几何上是圆的 B 样条曲线(B 样条孔的投影)—— 包成同样的 .Curve.Radius / .Curve.Center。"""
+    from types import SimpleNamespace
+
+    out = []
+    for n, ed in edges_of(view):
+        if isinstance(ed.Curve, Part.Circle):
+            out.append((n, ed))
+            continue
+        if isinstance(ed.Curve, Part.Line):
+            continue
+        ci = geomutil.edge_circle(ed)
+        if ci:
+            out.append((n, SimpleNamespace(Curve=SimpleNamespace(Radius=ci[1], Center=ci[0]))))
+    return out
+
+
 def longest(view, axis):
     """视图里沿 x / y 最长的直线边。"""
     ls = [(n, e) for n, e in edges_of(view) if isinstance(e.Curve, Part.Line)]
@@ -907,7 +925,33 @@ def hole_groups():
     return out
 
 
+def bolt_circle(g):
+    """孔组的孔在视图平面上均布在一个圆上(≥ 3 个, 半径一致、相邻角度相等)→ (圆心(视图平面坐标), 节圆直径), 否则 None。
+    国标: 这种孔标 "8 x ⌀5 ↧5  ⌀62 均布", 不逐个标坐标(实测法兰 14 个孔的坐标挤成一串)。"""
+    if len(g["holes"]) < 3:
+        return None
+    bw_, bh_, _ = VAX[g["view"]]
+    pts = [((V(*h["at"]) - bb.Center).dot(bw_), (V(*h["at"]) - bb.Center).dot(bh_)) for h in g["holes"]]
+    cx_ = sum(p[0] for p in pts) / len(pts)
+    cy_ = sum(p[1] for p in pts) / len(pts)  # 均布的点, 圆心 = 质心
+    rs = [math.hypot(p[0] - cx_, p[1] - cy_) for p in pts]
+    R_ = sum(rs) / len(rs)
+    if R_ < 1e-3 or max(abs(r - R_) for r in rs) > max(0.02, 1e-3 * R_):
+        return None
+    angs = sorted(math.atan2(p[1] - cy_, p[0] - cx_) for p in pts)
+    gaps = [angs[i + 1] - angs[i] for i in range(len(angs) - 1)] + [angs[0] + 2 * math.pi - angs[-1]]
+    step = 2 * math.pi / len(pts)
+    if max(abs(x - step) for x in gaps) > math.radians(0.5):
+        return None
+    return (cx_, cy_), 2 * R_
+
+
 HOLE_GROUPS = hole_groups()
+for g_ in HOLE_GROUPS:
+    bc_ = bolt_circle(g_)
+    if bc_:
+        g_["pcd"] = round(bc_[1], 4)
+        g_["text"] += "  " + DIMS["diameter"] + fmt(bc_[1]) + DIMS.get("equally_spaced", "均布")
 HOLE_IDS = {g["id"] for g in HOLE_GROUPS}  # 孔标注尺寸对象的名字 = 孔组编号(导出时据此改成水平文字 + 引线)
 
 
@@ -923,7 +967,8 @@ def ordinate_groups():
             return [g for g in front if g["id"] in o["groups"]]
         if o.get("exclude"):
             return [g for g in front if g["id"] not in o["exclude"]]
-    return front
+    # 默认: 均布在节圆上的孔组不标坐标(已在孔标注里写 "⌀PCD 均布"); 明确点名的照点名
+    return [g for g in front if not g.get("pcd")]
 
 
 def group_positions(g):
@@ -945,15 +990,11 @@ def outer_round(vname):
     _, _, d = VAX[vname]
     best = None
     for f in shape.Faces:
-        s = f.Surface
-        if not isinstance(s, Part.Cylinder) or abs(abs(s.Axis.normalize().dot(d)) - 1) > 1e-6:
+        cy = geomutil.cylinder_of(f)
+        if cy is None or cy["internal"] or abs(abs(cy["ax"].dot(d)) - 1) > 1e-6:
             continue
-        u0, u1, v0, v1 = f.ParameterRange
-        p, n = f.valueAt((u0 + u1) / 2, (v0 + v1) / 2), f.normalAt((u0 + u1) / 2, (v0 + v1) / 2)
-        ax = s.Axis.normalize()
-        rad = (p - s.Center) - ax * ((p - s.Center).dot(ax))
-        if rad.Length > 1e-6 and n.dot(rad) > 0 and (best is None or s.Radius > best):
-            best = s.Radius
+        if best is None or cy["r"] > best:
+            best = cy["r"]
     bw_, bh_, _ = VAX[vname]
     if best and 2 * best >= 0.98 * max(ext(bw_), ext(bh_)):
         return best
@@ -967,7 +1008,7 @@ def shaft_tol(radius):
 def place_diameter(vname, radius, name):
     """在视图里找半径 = radius 的圆边, 标 ⌀(位置: 视图右上 / 左上 / 右下外侧, 避让)。有配合公差就带上: ⌀8 g6(-0.005/-0.014)。"""
     v, r = views[vname], R[vname]
-    circ = [(n, ed) for n, ed in edges_of(v) if isinstance(ed.Curve, Part.Circle) and abs(ed.Curve.Radius - radius) < 1e-3]
+    circ = [(n, ed) for n, ed in circle_edges(v) if abs(ed.Curve.Radius - radius) < rtol(radius)]
     if not circ:
         rep["warnings"].append("round %s: circle edge not found" % vname)
         return False
@@ -1003,15 +1044,10 @@ def outer_cyl_views(d):
     """直径 d 的外圆柱面在哪个视图里是圆(轴线 ∥ 视线)。"""
     out = []
     for f in shape.Faces:
-        s = f.Surface
-        if not isinstance(s, Part.Cylinder) or abs(2 * s.Radius - d) > 0.05:
+        cy = geomutil.cylinder_of(f)
+        if cy is None or cy["internal"] or abs(2 * cy["r"] - d) > 0.05:
             continue
-        u0, u1, v0, v1 = f.ParameterRange
-        p, n = f.valueAt((u0 + u1) / 2, (v0 + v1) / 2), f.normalAt((u0 + u1) / 2, (v0 + v1) / 2)
-        ax = s.Axis.normalize()
-        rad = (p - s.Center) - ax * ((p - s.Center).dot(ax))
-        if rad.Length < 1e-6 or n.dot(rad) <= 0:
-            continue
+        ax = cy["ax"]
         for vn, (_, _, vd) in VAX.items():
             if abs(abs(ax.dot(vd)) - 1) < 1e-6 and vn not in out:
                 out.append(vn)
@@ -1035,7 +1071,7 @@ def circle_for(vname, circles, h):
     px, py = (at - bb.Center).dot(bw_), (at - bb.Center).dot(bh_)
     best, bdist = None, 1e9
     for n, ed in circles:
-        if abs(ed.Curve.Radius - h["d"] / 2) > 1e-3:
+        if abs(ed.Curve.Radius - h["d"] / 2) > rtol(h["d"] / 2):
             continue
         c = ed.Curve.Center
         for sx in (1, -1):
@@ -1052,7 +1088,7 @@ for g in HOLE_GROUPS:
     vname, hs, txt = g["view"], g["holes"], g["text"]
     v, r = views[vname], R[vname]
     if vname not in circles_of:
-        circles_of[vname] = [(n, ed) for n, ed in edges_of(v) if isinstance(ed.Curve, Part.Circle)]
+        circles_of[vname] = circle_edges(v)
     circles = circles_of[vname]
     cxV, cyV = (r[0] + r[2]) / 2, (r[1] + r[3]) / 2
     hits = [(hh, circle_for(vname, circles, hh)) for hh in hs]
@@ -1090,7 +1126,7 @@ for g in HOLE_GROUPS:
 # 视图边坐标与页面的正负关系: 用视图里全部孔对圆边做四种正负的匹配, 取对上最多的(在主视上校准, 主视的模型 → 页面已由坐标尺寸验证)。
 def edge_signs(vname):
     bw_, bh_, _ = VAX[vname]
-    circles = circles_of.get(vname) or [(n, ed) for n, ed in edges_of(views[vname]) if isinstance(ed.Curve, Part.Circle)]
+    circles = circles_of.get(vname) or circle_edges(views[vname])
     hs = [h for h in holes if hole_view(h) == vname]
     best, bn = (1, 1), -1
     for sx in (1, -1):
@@ -1099,7 +1135,7 @@ def edge_signs(vname):
             for h in hs:
                 at = V(*h["at"])
                 px, py = (at - bb.Center).dot(bw_), (at - bb.Center).dot(bh_)
-                if any(abs(ed.Curve.Radius - h["d"] / 2) < 1e-3 and math.hypot(ed.Curve.Center.x - sx * px, ed.Curve.Center.y - sy * py) < 1e-2
+                if any(abs(ed.Curve.Radius - h["d"] / 2) < rtol(h["d"] / 2) and math.hypot(ed.Curve.Center.x - sx * px, ed.Curve.Center.y - sy * py) < 1e-2
                        for _, ed in circles):
                     n_ += 1
             if n_ > bn:
@@ -1133,13 +1169,13 @@ def draw_threads():
         bw_, bh_, _ = VAX[vname]
         vdir = V(views[vname].Direction) if hasattr(views[vname], "Direction") else front  # 视线: 由零件指向看的人
         cxV, cyV = vcenter(views[vname])
-        circles = circles_of.get(vname) or [(n, ed) for n, ed in edges_of(views[vname]) if isinstance(ed.Curve, Part.Circle)]
+        circles = circles_of.get(vname) or circle_edges(views[vname])
         for h in hs:
             if not h.get("through") and V(*h["axis"]).dot(vdir) <= 0:
                 continue  # 背面的盲孔: 看不见
             at = V(*h["at"])
             px, py = (at - bb.Center).dot(bw_), (at - bb.Center).dot(bh_)
-            hit = next((ed for _, ed in circles if abs(ed.Curve.Radius - h["d"] / 2) < 1e-3
+            hit = next((ed for _, ed in circles if abs(ed.Curve.Radius - h["d"] / 2) < rtol(h["d"] / 2)
                         and math.hypot(ed.Curve.Center.x - sx * px, ed.Curve.Center.y - sy * py) < 1e-2), None)
             if hit is None:
                 rep["warnings"].append("thread arc: no circle for %s at %s in %s" % (h["tap"], h["at"], vname))

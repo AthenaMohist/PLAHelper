@@ -15,10 +15,21 @@ Remove-Item $fcTemp -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force $fcTemp | Out-Null
 $env:FREECAD_USER_TEMP = $fcTemp
 $t = Get-Date
+$s0 = Get-Content -Raw -Encoding utf8 $specPath | ConvertFrom-Json
+$out0 = if ($s0.out) { $s0.out } else { Join-Path $here 'out' }
+$base0 = if ($s0.basename) { $s0.basename } elseif ($s0.title -and $s0.title.pn) { $s0.title.pn } else { 'drawing' }
+$report0 = Join-Path $out0 "$base0.report.json"
 $p = Start-Process "$FreeCAD\freecad.exe" -ArgumentList "`"$here\run_offscreen.py`"" -PassThru -WindowStyle Hidden
-if (-not $p.WaitForExit(900000)) { $p.Kill(); Write-Output "timeout (FreeCAD)"; exit 1 }
+# 等 FreeCAD 退出; 报告写出(= 编译完成)后最多再等 20 s —— 大图关文档时可能等后台消隐线程一直不退(实测编码器壳体 8 min 出完、进程挂到超时)
+$deadline = (Get-Date).AddSeconds(900); $doneAt = $null; $forced = $false
+while (-not $p.HasExited) {
+  if (-not $doneAt -and (Test-Path $report0) -and (Get-Item $report0).LastWriteTime -gt $t) { $doneAt = Get-Date }
+  if ($doneAt -and ((Get-Date) - $doneAt).TotalSeconds -gt 20) { $p.Kill(); $forced = $true; break }
+  if ((Get-Date) -gt $deadline) { $p.Kill(); Write-Output "timeout (FreeCAD)"; exit 1 }
+  Start-Sleep -Milliseconds 500
+}
 Remove-Item Env:QT_QPA_PLATFORM, Env:QT_QPA_FONTDIR, Env:FREECAD_USER_HOME, Env:FREECAD_USER_TEMP -ErrorAction SilentlyContinue
-if ($p.ExitCode -ne 0) { Write-Output ("compile failed (exit {0}), see compile_error.txt" -f $p.ExitCode); exit 1 }
+if (-not $forced -and $p.ExitCode -ne 0) { Write-Output ("compile failed (exit {0}), see compile_error.txt" -f $p.ExitCode); exit 1 }
 
 # 找输出(与 compile_freecad.py 的规则一致: spec.out 或 tools/drawing/out; basename 或 title.pn 或 drawing)
 $s = Get-Content -Raw -Encoding utf8 $specPath | ConvertFrom-Json

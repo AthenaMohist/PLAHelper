@@ -7,7 +7,7 @@ if ($List) { $Svg = @(Get-Content -Encoding utf8 $List | Where-Object { $_.Trim(
 $browser = @("${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe", "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe",
   "$env:ProgramFiles\Google\Chrome\Application\chrome.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
 if (-not $browser) { Write-Output "no Edge/Chrome"; exit 1 }
-$Out = [IO.Path]::GetFullPath((Join-Path (Get-Location).Path $Out))  # 浏览器的工作目录不是这里
+if (-not [IO.Path]::IsPathRooted($Out)) { $Out = [IO.Path]::GetFullPath((Join-Path (Get-Location).Path $Out)) }  # 浏览器的工作目录不是这里
 $pages = New-Object System.Collections.Generic.List[string]
 $sizes = @{}
 foreach ($f in $Svg) {
@@ -41,9 +41,11 @@ New-Item -ItemType Directory -Force $tmp | Out-Null
 [IO.File]::WriteAllText("$tmp\book.html", $html, (New-Object Text.UTF8Encoding $false))
 if (Test-Path $Out) { Remove-Item $Out -Force }
 $b = Start-Process $browser -PassThru -WindowStyle Hidden -ArgumentList '--headless=new', '--disable-gpu', '--no-first-run',
-  '--no-default-browser-check', '--no-pdf-header-footer', "--user-data-dir=$tmp\profile", "--print-to-pdf=$Out",
+  '--no-default-browser-check', '--no-pdf-header-footer', "--user-data-dir=$tmp\profile", "--print-to-pdf=$tmp\book.pdf",
   ("file:///" + ($tmp -replace '\\', '/') + "/book.html")
 if (-not $b.WaitForExit(180000)) { $b.Kill(); Write-Output "timeout (browser PDF)" }
 Start-Sleep -Milliseconds 300
+# 先写临时目录再搬: Start-Process 参数不带引号, 输出路径里的空格(文档名)会截断参数
+if (Test-Path "$tmp\book.pdf") { Move-Item "$tmp\book.pdf" $Out -Force }
 Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
 if (Test-Path $Out) { Write-Output ("done: {0} page(s) -> {1}" -f $pages.Count, $Out) } else { Write-Output "PDF not written"; exit 1 }
