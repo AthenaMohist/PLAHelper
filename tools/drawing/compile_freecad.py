@@ -31,6 +31,16 @@ rep = {"steps": {}, "warnings": [], "placed": []}
 
 def lap(name):
     rep["steps"][name] = round(time.time() - T0, 3)
+    progress(name)
+
+
+def progress(msg):
+    """进度写进 <out>/progress.log(挂住时看停在哪一步)。"""
+    try:
+        with open(os.path.join(OUT, "progress.log"), "a", encoding="utf-8") as f:
+            f.write("%7.2f %s\n" % (time.time() - T0, msg))
+    except Exception:
+        pass
 
 
 def q(x):
@@ -552,10 +562,14 @@ def spread(pos, sep):
     return out
 
 
+PAGE_SVG = []  # 页面级图形(页面毫米, SVG 坐标 y 向下): 坐标尺寸的引出线 + 数值, 最后合成一个 DrawViewSymbol
+
+
 def ordinates(vname):
     """坐标尺寸: 只取孔中心(不取圆角弧心), 基准 = 视图左下角, 末值 = 外形尺寸(所以不再另标总长 / 总宽)。
-    引出线: 视图边外一小段 → 斜折到散开后的文字位置; 线用 3D 装饰线(模型坐标), 不受视图 2D 坐标朝向影响。"""
-    v, r = views[vname], R[vname]
+    引出线: 视图边外一小段 → 斜折到散开后的文字位置。线和字都画进页面级 SVG(一个对象):
+    用视图装饰线时每加一条 TechDraw 就重算一次消隐(80 条 ≈ 200 s), 而且 3D 装饰线导出里不显示。"""
+    r = R[vname]
     bw_, bh_, bd_ = VAX[vname]
     pts = []
     for h in holes:
@@ -568,11 +582,8 @@ def ordinates(vname):
     hw, hh_ = ext(bw_) / 2, ext(bh_) / 2  # 模型单位, 以包围盒中心为原点
     fs = std["fonts"]["dim"]
     lw = std["lines"]["thin"]
+    fam = std["fonts"]["latin"]
     tick, gap, jog = ORD["tick"], ORD["gap"], 4.0  # 页面毫米
-
-    def p3(x, y):
-        """视图横 x / 竖 y(模型单位, 中心原点)→ 3D 点。"""
-        return bb.Center + bw_ * x + bh_ * y
 
     def uniq(vals):
         out = []
@@ -581,54 +592,64 @@ def ordinates(vname):
                 out.append(val)
         return out
 
-    def line(xa, ya, xb, yb):
-        v.makeCosmeticLine3D(p3(xa, ya), p3(xb, yb), 1, lw, (0.0, 0.0, 0.0))
+    def sy(y):
+        return H - y  # 页面 y(向上)→ SVG y(向下)
 
-    # Y: 左边, 文字横排
+    def poly(*pts_):
+        PAGE_SVG.append('<polyline points="%s" style="fill:none;stroke:#000;stroke-width:%g"/>'
+                        % (" ".join("%.3f,%.3f" % (x, sy(y)) for x, y in pts_), lw))
+
+    def text(x, y, s, anchor, rot=0):
+        tr_ = ' transform="rotate(%g %.3f %.3f)"' % (rot, x, sy(y)) if rot else ""
+        PAGE_SVG.append('<text x="%.3f" y="%.3f" style="font-family:%s;font-size:%gpx;text-anchor:%s;fill:#000"%s>%s</text>'
+                        % (x, sy(y), fam, fs, anchor, tr_, s))
+
+    # Y: 左边, 文字横排右对齐
     ys = uniq([-hh_, hh_] + [p[1] for p in pts])
     got = spread([cyp + y * scale for y in ys], fs + 0.8)
     wmax = 0.0
     for y, pg in zip(ys, got):
-        xa = -hw - gap / scale
-        xb = xa - tick / scale
-        line(xa, y, xb, y)
-        line(xb, y, xb - jog / scale, (pg - cyp) / scale)
+        py_ = cyp + y * scale
+        x0_ = r[0] - gap
+        x1_ = x0_ - tick
+        x2_ = x1_ - jog
+        poly((x0_, py_), (x1_, py_), (x2_, pg))
         txt = fmt(y + hh_)
         w = text_rect(0, 0, txt)[2] * 2
-        tx = r[0] - gap - tick - jog - 1.0 - w / 2
-        a = doc.addObject("TechDraw::DrawViewAnnotation", "OrdY")
-        page.addView(a)
-        a.Text = [txt]
-        a.TextSize = fs
-        a.Font = std["fonts"]["latin"]
-        a.X, a.Y = tx, pg
-        placer.take((tx - w / 2, pg - fs * 0.6, tx + w / 2, pg + fs * 0.6))
+        text(x2_ - 1.0, pg - fs * 0.35, txt, "end")
+        placer.take((x2_ - 1.0 - w, pg - fs * 0.6, x2_ - 1.0, pg + fs * 0.6))
         wmax = max(wmax, w)
     ord_extra["left"] = gap + tick + jog + 1.0 + wmax + 2
-    # X: 上边, 文字竖排
+    # X: 上边, 文字竖排(从下往上读)
     xs = uniq([-hw, hw] + [p[0] for p in pts])
     got = spread([cxp + x * scale for x in xs], fs + 0.8)
     hmax = 0.0
     for x, pg in zip(xs, got):
-        ya = hh_ + gap / scale
-        yb = ya + tick / scale
-        line(x, ya, x, yb)
-        line(x, yb, (pg - cxp) / scale, yb + jog / scale)
+        px_ = cxp + x * scale
+        y0_ = r[3] + gap
+        y1_ = y0_ + tick
+        y2_ = y1_ + jog
+        poly((px_, y0_), (px_, y1_), (pg, y2_))
         txt = fmt(x + hw)
         w = text_rect(0, 0, txt)[2] * 2
-        ty = r[3] + gap + tick + jog + 1.0 + w / 2
-        a = doc.addObject("TechDraw::DrawViewAnnotation", "OrdX")
-        page.addView(a)
-        a.Text = [txt]
-        a.TextSize = fs
-        a.Font = std["fonts"]["latin"]
-        a.Rotation = 90
-        a.X, a.Y = pg, ty
-        placer.take((pg - fs * 0.6, ty - w / 2, pg + fs * 0.6, ty + w / 2))
+        text(pg + fs * 0.35, y2_ + 1.0, txt, "start", rot=-90)
+        placer.take((pg - fs * 0.6, y2_ + 1.0, pg + fs * 0.6, y2_ + 1.0 + w))
         hmax = max(hmax, w)
     ord_extra["top"] = gap + tick + jog + 1.0 + hmax + 2
     rep["ordinates"] = {"view": vname, "x": [fmt(x + hw) for x in xs], "y": [fmt(y + hh_) for y in ys]}
     return True
+
+
+def flush_page_svg():
+    """PAGE_SVG → 一个铺满整页的 DrawViewSymbol(中心放在页面中心, 比例 1)。"""
+    if not PAGE_SVG:
+        return
+    sym = doc.addObject("TechDraw::DrawViewSymbol", "PageGraphics")
+    page.addView(sym)
+    sym.Symbol = ('<svg xmlns="http://www.w3.org/2000/svg" width="%gmm" height="%gmm" viewBox="0 0 %g %g">%s</svg>'
+                  % (W, H, W, H, "".join(PAGE_SVG)))
+    sym.Scale = 1.0
+    sym.X, sym.Y = W / 2, H / 2
 
 
 
@@ -709,6 +730,7 @@ for vname in VAX:
             placer.take(rr)
         add_dim(v, "Diameter", [n], "Hole%d" % k_i, spot, text=txt)
         k_i += 1
+flush_page_svg()
 doc.recompute()
 lap("dims")
 
@@ -758,12 +780,20 @@ if GUI:
                 vo.StandardAndStyle = "ISO Referencing"
             except Exception as e:
                 rep["warnings"].append("hole style: %s" % e)
+    progress("gui: open page")
     page.ViewObject.doubleClicked()
     for _ in range(20):
         Gui.updateGui()
         time.sleep(0.05)
-    TechDrawGui.exportPageAsPdf(page, os.path.join(OUT, BASE + ".pdf"))
+    progress("gui: export svg")
+    # 正式 PDF 不用 Qt 的写出器: 它嵌的字体子集(仿宋 / Arial Unicode / 回退到的 3ds-Light)Acrobat 报"页面有错误"、
+    # 尺寸文字不显示(浏览器能看)。正式 PDF 由 draw.ps1 在 FreeCAD 退出后用无头 Edge / Chrome 把 SVG 打印出来
+    # (在 FreeCAD 进程里起浏览器会挂住)。这里的 Qt PDF 只作没有浏览器时的备用: <base>.qt.pdf。
     TechDrawGui.exportPageAsSvg(page, os.path.join(OUT, BASE + ".svg"))
+    progress("gui: export qt pdf")
+    TechDrawGui.exportPageAsPdf(page, os.path.join(OUT, BASE + ".qt.pdf"))
+    progress("gui: done")
+    rep["paper_mm"] = [W, H]
 else:
     rep["warnings"].append("no GUI: PDF / SVG skipped (run freecad.exe with QT_QPA_PLATFORM=offscreen)")
 doc.saveAs(fc)

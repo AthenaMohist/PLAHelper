@@ -23,4 +23,12 @@ except BaseException:
     except BaseException:
         pass
 finally:
+    # 先正常关文档(删掉它在缓存里的恢复目录), 再硬退出; 否则下次启动会弹"恢复文档"对话框, 离屏模式下永远等着
+    try:
+        import FreeCAD as App
+
+        for name in list(App.listDocuments()):
+            App.closeDocument(name)
+    except BaseException:
+        pass
     os._exit(code)

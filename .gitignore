@@ -20,3 +20,4 @@ archive/
 /test/
 
 tools/drawing/out/
+__pycache__/
