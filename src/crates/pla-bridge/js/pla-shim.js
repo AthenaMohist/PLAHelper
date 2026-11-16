@@ -3221,9 +3221,27 @@
     var top = iso.length ? toSet(iso[iso.length - 1]) : null;
     var hid = st[NAMES.nodeVisSets[0]], inv = st[NAMES.nodeVisSets[1]];
     var out = [];
+    // 父组被隐藏的实体也不算可见(大纲里关掉整个"方案"组时, 组里实体自己的标记还是可见)
+    var G = get('ed.groupsDb'), groupHidden = new Map();
+    function underHiddenGroup(k) {
+      if (!G) return false;
+      var chain = [], hidden = false;
+      for (var guard = 0; guard < 32; guard++) {
+        var g;
+        try { g = invokeOn('groups.getParent', [k], G); } catch (e) { break; }
+        if (!g || g[NAMES.bom.groupId] === NAMES.bom.rootGroupId) break;
+        var gk = invokeOn('nodes.item2key', [g]);
+        if (groupHidden.has(gk)) { hidden = groupHidden.get(gk); break; }
+        chain.push(gk);
+        if (hid.has(gk) || inv.has(gk)) { hidden = true; break; }
+        k = gk;
+      }
+      chain.forEach(function (c) { groupHidden.set(c, hidden); });
+      return hidden;
+    }
     solidViews().forEach(function (v) {
       var k = invokeOn('nodes.item2key', [v]);
-      if (hid.has(k) || inv.has(k) || (top && !top.has(k))) return;
+      if (hid.has(k) || inv.has(k) || (top && !top.has(k)) || underHiddenGroup(k)) return;
       var sid = st[NAMES.node2id].get(k);
       if (sid) out.push({ id: sid, name: nameOf(v) });
     });

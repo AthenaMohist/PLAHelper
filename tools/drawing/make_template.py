@@ -7,8 +7,8 @@ from xml.sax.saxutils import escape
 A3 = (420.0, 297.0)
 
 
-def build(std, paper, kind="part"):
-    """kind = part(零件图, 右上角"其余"粗糙度)/ assembly(装配图, 不画粗糙度)。"""
+def build(std, paper, sheet="part"):
+    """sheet = part(零件图, 右上角"其余"粗糙度)/ assembly(装配图, 不画粗糙度)。"""
     W, H = std["paper"][paper]
     fr = std["frame"]
     o, band = fr["outer"], fr["zone_band"]
@@ -106,7 +106,7 @@ def build(std, paper, kind="part"):
     for i in range(12):
         a(field("tech_%d" % (i + 1), tx + 2, ty + 12 + i * 3.4, fonts["small"], "start", lines_[i] if i < len(lines_) else ""))
     # 其余粗糙度(右上角): "其余" + 去除材料符号 + Ra 值
-    if kind != "assembly":
+    if sheet != "assembly":
         rg = std["roughness"]
         rx_, ry_ = rg["x"] + dx, rg["y"]
         a(t % (rx_, ry_ + 2, fam, fonts["text"], "end", "", "其余"))

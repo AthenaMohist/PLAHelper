@@ -97,6 +97,7 @@ if aspec.get("step"):
     sh = Part.Shape()
     sh.read(aspec["step"])
     solids = list(sh.Solids)
+    lap("step read")
 else:
     solids = test_assembly()
 lines = [dict(l) for l in (aspec.get("lines") or [])]
@@ -110,21 +111,33 @@ if not lines:
             lines.append({"key": "L%d" % (len(lines) + 1), "name": "Part %d" % (len(lines) + 1), "qty": 1, "volume": s.Volume, "area": s.Area})
 
 
-def fp_err(s, l):
-    e = abs(s.Volume - l.get("volume", 0)) / max(l.get("volume") or 1e-9, 1e-9)
+# 体积 / 面积每次取都要重算质量属性(B 样条实体很慢): 每个实体只算一次
+SVA = [(s.Volume, s.Area) for s in solids]
+
+
+def fp_err(si, l):
+    vol, area = SVA[si]
+    e = abs(vol - l.get("volume", 0)) / max(l.get("volume") or 1e-9, 1e-9)
     if l.get("area"):
-        e += abs(s.Area - l["area"]) / max(l["area"], 1e-9)
+        e += abs(area - l["area"]) / max(l["area"], 1e-9)
     return e
 
 
 owner = []  # 每个实体属于哪一行(下标, 对不上 = None)
-for s in solids:
-    cands = [(fp_err(s, l), i) for i, l in enumerate(lines) if l.get("volume")]
+# 指纹表: 普通行 = 自己的体积 / 面积; 外购组件行(parts)= 组里每种实体的 [体积, 面积]
+FPS = []
+for i, l in enumerate(lines):
+    if l.get("parts"):
+        FPS += [({"volume": p[0], "area": p[1]}, i) for p in l["parts"] if p and p[0]]
+    elif l.get("volume"):
+        FPS.append((l, i))
+for si_, s in enumerate(solids):
+    cands = [(fp_err(si_, f), i) for f, i in FPS]
     e, i = min(cands) if cands else (1e9, None)
     owner.append(i if e < 0.02 else None)
 for i, l in enumerate(lines):
     l["found"] = sum(1 for o in owner if o == i)
-    if l.get("qty") and l["found"] != int(l["qty"]):
+    if l.get("qty") and not l.get("parts") and l["found"] != int(l["qty"]):
         rep["warnings"].append("line %s (%s): BOM qty %s, solids in STEP %d" % (l.get("pn") or l.get("name"), l.get("key"), l.get("qty"), l["found"]))
 unmatched = sum(1 for o in owner if o is None)
 if unmatched:
@@ -153,12 +166,21 @@ def cyl_faces(s):
     return out
 
 
+lap("match")
 FIT_TOL_D = 0.1  # 孔 / 轴建模直径差在这以内算"同一公称尺寸"
 cyls = [cyl_faces(s) if owner[i] is not None else [] for i, s in enumerate(solids)]
 fit_cands = {}
+BBS = []
+for s in solids:
+    b_ = s.BoundBox
+    b_.enlarge(0.1)
+    BBS.append(b_)
 for i in range(len(solids)):
     for j in range(len(solids)):
-        if i == j or owner[i] is None or owner[j] is None:
+        # 同一行(外购件内部 / 同种零件)不算配合; 包围盒不碰的不用比
+        if i == j or owner[i] is None or owner[j] is None or owner[i] == owner[j] or not cyls[i] or not cyls[j]:
+            continue
+        if not BBS[i].intersect(BBS[j]):
             continue
         for h in cyls[i]:
             if not h["in"]:
@@ -187,6 +209,7 @@ for i in range(len(solids)):
                                                 "count": 0, "at": [at.x, at.y, at.z], "axis": [h["ax"].x, h["ax"].y, h["ax"].z]})
                 c_["count"] += 1
 rep["fit_candidates"] = sorted(fit_cands.values(), key=lambda c: (-c["d"], c["id"]))
+lap("fits")
 
 doc = App.newDocument("asm")
 comp = Part.makeCompound(solids)
@@ -278,12 +301,24 @@ if not choice:
     choice = (paper, s, c, box)
     rep["warnings"].append("assembly does not fit: smallest scale used")
 paper, scale, (fx, fy), vbox = choice
+
+# 图上看不见的小实体(按这个比例画出来 < 0.8 mm, 如电路板上的 0402 电阻)不进视图: 消隐时间主要花在它们身上。
+# 只在去掉后整体包围盒不变时才去(视图边坐标以包围盒中心为原点, 变了序号 / 尺寸就对不上)。
+MIN_PAPER = float(spec.get("min_paper_mm", 0.8))
+keep = [s for s in solids if s.BoundBox.DiagonalLength * scale >= MIN_PAPER]
+if len(keep) < len(solids):
+    kb = Part.makeCompound(keep).BoundBox
+    if max(abs(kb.XMin - bb.XMin), abs(kb.XMax - bb.XMax), abs(kb.YMin - bb.YMin), abs(kb.YMax - bb.YMax), abs(kb.ZMin - bb.ZMin), abs(kb.ZMax - bb.ZMax)) < 1e-6:
+        part.Shape = Part.makeCompound(keep)
+        rep["dropped_small"] = len(solids) - len(keep)
+    else:
+        rep["warnings"].append("small solids kept: removing them would change the bounding box")
 W, H, AREA, PLR = layout(paper)
 rep["paper"], rep["scale"] = paper, scale
 
 tpl_path = os.path.join(OUT, "_tpl_%s_%s_asm.svg" % (std["name"], paper))
 with open(tpl_path, "w", encoding="utf-8") as f:
-    f.write(make_template.build(std, paper, kind="assembly"))
+    f.write(make_template.build(std, paper, sheet="assembly"))
 page = doc.addObject("TechDraw::DrawPage", "Page")
 tpl = doc.addObject("TechDraw::DrawSVGTemplate", "Template")
 tpl.Template = tpl_path
@@ -306,33 +341,43 @@ for name in ("Front", "Top", "Left"):
         grp.Anchor.Direction = front
         grp.Anchor.XDirection = right
         doc.recompute()
-try:
-    grp.AutoDistribute = True
-    grp.spacingX = GAPV
-    grp.spacingY = GAPV
-except Exception as e:
-    rep["warnings"].append("spacing: %s" % e)
-grp.X, grp.Y = fx, fy
-doc.recompute()
+# 子视图位置自己定(不靠 AutoDistribute: 它要等消隐算完才知道视图大小, 大装配要几分钟, 早读位置会全叠在一起)
 views = {v.Type: v for v in grp.Views}
+try:
+    grp.AutoDistribute = False
+except Exception as e:
+    rep["warnings"].append("autodistribute: %s" % e)
+views["Top"].X, views["Top"].Y = 0.0, -(Hm * scale / 2 + GAPV + Dm * scale / 2)
+views["Left"].X, views["Left"].Y = Wm * scale / 2 + GAPV + Dm * scale / 2, 0.0
+grp.X, grp.Y = fx, fy
+# 复杂装配(外购件 / 电路板几百个小零件)精确消隐很慢: 实体多时用 CoarseView(多边形消隐, 快很多, 装配图够用)
+COARSE = len(solids) > int(spec.get("coarse_above", 40))
+if COARSE:
+    for v in grp.Views:
+        try:
+            v.CoarseView = True
+        except Exception as e:
+            rep["warnings"].append("coarse: %s" % e)
+rep["coarse"] = COARSE
+doc.recompute()
+WAIT = min(600.0, 60.0 + 4.0 * len(solids))  # 消隐等多久(秒)
 
 
-def wait_views(vs, timeout=30.0):
+def wait_views(vs, timeout=None):
+    timeout = timeout or WAIT
     t = time.time()
     while time.time() - t < timeout:
         try:
             if all(v.getEdgeByIndex(0) is not None for v in vs):
+                rep.setdefault("hlr_wait", {})[",".join(v.Name for v in vs)] = round(time.time() - t, 1)
                 return True
         except Exception:
             pass
         if GUI:
             Gui.updateGui()
-        time.sleep(0.05)
+        time.sleep(0.1)
     rep["warnings"].append("views not ready after %.0fs" % timeout)
     return False
-
-
-wait_views(list(grp.Views))
 
 
 def vcenter(v):
@@ -369,6 +414,8 @@ iso.Source = [part]
 iso.Direction = (front + right + up).normalize()
 iso.XDirection = (right - front).normalize()
 iso.HardHidden = False
+if COARSE:
+    iso.CoarseView = True
 diag = bb.DiagonalLength
 free_l = max(r[2] for r in R.values()) + DIMB + 8
 free_w = AREA[2] - free_l
@@ -379,7 +426,7 @@ iso.ScaleType = "Custom"
 iso.X = (free_l + AREA[2]) / 2 if free_w > 50 else AREA[2] - diag * iso_s / 2
 iso.Y = (AREA[3] + PLR[3]) / 2 if free_w > 50 else AREA[3] - diag * iso_s / 2
 doc.recompute()
-wait_views([iso])
+wait_views(list(grp.Views) + [iso])  # 四个视图的消隐一起等(后台并行算)
 R["Iso"] = (q(iso.X) - diag * iso_s / 2, q(iso.Y) - diag * iso_s / 2.4, q(iso.X) + diag * iso_s / 2, q(iso.Y) + diag * iso_s / 2.4)
 rep["views"] = {k: [round(x, 1) for x in r] for k, r in R.items()}
 lap("views")
@@ -494,7 +541,7 @@ def visible_point(si, v):
 
 balloons = []  # {line, view, anchor(page), solid}
 for li, l in enumerate(lines):
-    idx = [i for i, o in enumerate(owner) if o == li]
+    idx = sorted((i for i, o in enumerate(owner) if o == li), key=lambda i: -SVA[i][0])[:8]  # 大的先试(外购件里的小零件看不清)
     got = None
     for vname in ("Front", "Left", "Top"):
         for si in idx:

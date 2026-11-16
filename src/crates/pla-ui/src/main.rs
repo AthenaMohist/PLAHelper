@@ -216,7 +216,7 @@ struct PlaApp {
     draw_batch_keys: Vec<String>,
     draw_book: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
     /// D3 装配图: 当前 BOM 范围的明细(每帧随出图面板刷新; 导出 / 编译装配图时用)。
-    draw_asm: Vec<pla_ui::drawing::AsmLine>,
+    draw_asm: std::collections::BTreeMap<String, Vec<pla_ui::drawing::AsmLine>>,
     lib: pla_ui::parts_lib::Library,
     lib_mtime: Option<std::time::SystemTime>,
     lib_checked: Option<Instant>,
@@ -2544,7 +2544,7 @@ impl PlaApp {
             draw_batch: None,
             draw_batch_keys: Vec::new(),
             draw_book: None,
-            draw_asm: Vec::new(),
+            draw_asm: Default::default(),
             lib: Default::default(),
             lib_mtime: None,
             lib_checked: None,
@@ -4606,9 +4606,9 @@ impl PlaApp {
         }
         let dir = pla_ui::drawing::dir(&self.doc_key);
         let step = pla_ui::drawing::file(&dir, &s, "step");
-        if key == pla_ui::drawing::ASM_KEY {
+        if pla_ui::drawing::is_asm(key) {
             // 装配图: 每次都重新导出整个范围(哪个零件动了都会影响装配)
-            let ids: Vec<String> = self.draw_asm.iter().flat_map(|l| l.ids.iter().cloned()).collect();
+            let ids: Vec<String> = self.draw_asm.get(key).into_iter().flatten().flat_map(|l| l.ids.iter().cloned()).collect();
             if ids.is_empty() {
                 self.set_notice((true, tr("BOM 里没有零件(先扫描 BOM)", "No parts in the BOM (scan the BOM first)").to_string()));
                 return;
@@ -4638,7 +4638,7 @@ impl PlaApp {
             Ok(v) => {
                 if let Some(mut s) = self.draw_sheets.get(&key).cloned() {
                     // 零件在组里时 STEP 会含全部可见实体 → 记下这个零件的体积 / 面积, 编译器按它挑
-                    if let Some(p) = v["parts"].as_array().filter(|a| a.len() == 1 && key != pla_ui::drawing::ASM_KEY).and_then(|a| a.first()) {
+                    if let Some(p) = v["parts"].as_array().filter(|a| a.len() == 1 && !pla_ui::drawing::is_asm(&key)).and_then(|a| a.first()) {
                         s.volume = p["volume"].as_f64();
                         s.area = p["area"].as_f64();
                     }
@@ -4665,12 +4665,12 @@ impl PlaApp {
         let dir = pla_ui::drawing::dir(&self.doc_key);
         let mut run = s.clone();
         run.title = title;
-        let spec = if key == pla_ui::drawing::ASM_KEY {
-            pla_ui::drawing::asm_spec(&run, &dir, &self.draw_asm)
+        let spec = if pla_ui::drawing::is_asm(key) {
+            pla_ui::drawing::asm_spec(&run, &dir, self.draw_asm.get(key).map(|v| v.as_slice()).unwrap_or(&[]))
         } else {
             let mut v = pla_ui::drawing::spec(&run, &dir, Some(&pla_ui::dims::path(&self.doc_key)));
             // D4: 装配图上记下的配合 → 本件孔 / 轴的公差
-            let fits = self.draw_sheets.get(pla_ui::drawing::ASM_KEY).map(|a| pla_ui::drawing::part_fits(&a.fits, key)).unwrap_or_default();
+            let fits: Vec<serde_json::Value> = self.draw_sheets.sheets.iter().filter(|a| pla_ui::drawing::is_asm(&a.key)).flat_map(|a| pla_ui::drawing::part_fits(&a.fits, key)).collect();
             if !fits.is_empty() {
                 v["fits"] = serde_json::json!(fits);
             }
@@ -4745,9 +4745,13 @@ impl PlaApp {
             label: String,
             title: std::collections::BTreeMap<String, String>,
             member: (String, String),
+            /// 外购: 全部实例都在导入的 STEP / IGES 组里(电机 / 电路板等的零件) —— 不出零件图
+            bought: bool,
         }
         let mut items: Vec<Item> = Vec::new();
-        let mut asm: Vec<pla_ui::drawing::AsmLine> = Vec::new();
+        // 装配图: key → 明细(整个范围 + 每个顶层组); 表格里的料号 / 名称 / 材料 / 表处按 BOM 行 key 取
+        let mut asms: Vec<(String, String, Vec<pla_ui::drawing::AsmLine>)> = Vec::new();
+        let mut infos: std::collections::HashMap<String, pla_ui::drawing::RowInfo> = std::collections::HashMap::new();
         if let Some(Ok(v)) = &self.bom_result {
             let (rows, _) = pla_ui::bom_table::build(v, &self.bom_tpl, &self.bom_edits, &self.lib);
             let cols = &self.bom_tpl.columns;
@@ -4756,26 +4760,7 @@ impl PlaApp {
                 let line = v["lines"].as_array().into_iter().flatten().find(|l| l["key"].as_str() == Some(r.key.as_str()));
                 let m = line.and_then(|l| l["members"].as_array()).and_then(|a| a.first());
                 let member = m.map(|m| (m["id"].as_str().unwrap_or("").to_string(), m["name"].as_str().unwrap_or("").to_string())).unwrap_or_default();
-                // 装配图明细: 每行全部实例的 id + 指纹(体积 / 面积)
-                let ids: Vec<String> = line
-                    .and_then(|l| l["members"].as_array())
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|m| m["id"].as_str().map(str::to_string))
-                    .collect();
-                let material = get("material");
-                asm.push(pla_ui::drawing::AsmLine {
-                    key: r.key.clone(),
-                    pn: get("pn"),
-                    name: if get("name").is_empty() { member.1.clone() } else { get("name") },
-                    qty: line.and_then(|l| l["qty"].as_u64()).unwrap_or(ids.len() as u64),
-                    density: pla_ui::drawing::guess_density(&material),
-                    material,
-                    note: get("finish"),
-                    volume: line.and_then(|l| l["volume"].as_f64()),
-                    area: line.and_then(|l| l["area"].as_f64()),
-                    ids,
-                });
+                infos.insert(r.key.clone(), pla_ui::drawing::RowInfo { pn: get("pn"), name: get("name"), material: get("material"), finish: get("finish") });
                 let mut title = std::collections::BTreeMap::new();
                 for id in ["pn", "name", "material", "finish"] {
                     let x = get(id);
@@ -4785,28 +4770,40 @@ impl PlaApp {
                 }
                 let qty = line.and_then(|l| l["qty"].as_u64()).unwrap_or(1);
                 title.insert("qty".into(), qty.to_string());
-                let label = format!("{}  {}  ×{qty}", get("pn"), get("name")).trim().to_string();
-                items.push(Item { key: r.key.clone(), label, title, member });
+                let bought = line.and_then(|l| l["members"].as_array()).is_some_and(|ms| {
+                    !ms.is_empty() && ms.iter().all(|m| m["path"].as_array().is_some_and(|p| p.iter().any(|g| g.as_str().is_some_and(pla_ui::drawing::is_import_group))))
+                });
+                let label = format!("{}  {}  ×{qty}{}", get("pn"), get("name"), if bought { tr("  (外购)", "  (purchased)") } else { "" }).trim().to_string();
+                items.push(Item { key: r.key.clone(), label, title, member, bought });
+            }
+            let info = |k: &str| infos.get(k).cloned().unwrap_or_default();
+            let stem = self.doc_key.rsplit(['/', '\\']).next().unwrap_or("").to_string();
+            let all = pla_ui::drawing::asm_lines(&v["lines"], &info, None);
+            if !all.is_empty() {
+                asms.push((pla_ui::drawing::asm_key(None), stem.clone(), all));
+            }
+            for g in pla_ui::drawing::asm_groups(&v["lines"]) {
+                let ls = pla_ui::drawing::asm_lines(&v["lines"], &info, Some(&g));
+                asms.push((pla_ui::drawing::asm_key(Some(&g)), g, ls));
             }
         }
-        // 装配图放第一行(合订本里也在最前)
-        if !asm.is_empty() {
-            let n: u64 = asm.iter().map(|l| l.qty).sum();
-            let stem = self.doc_key.rsplit(['/', '\\']).next().unwrap_or("").to_string();
+        // 装配图放最前(合订本里也在最前): 整个范围 + 每个顶层组(方案 / 子装配); 外购组件(导入的 STEP 组)合成一行
+        for (i, (k, name, ls)) in asms.iter().enumerate() {
+            let n: u64 = ls.iter().map(|l| l.qty).sum();
             let mut title = std::collections::BTreeMap::new();
-            title.insert("name".to_string(), t!("{stem} 装配", "{stem} assembly"));
+            title.insert("name".to_string(), t!("{name} 装配", "{name} assembly"));
             title.insert("qty".to_string(), "1".to_string());
-            items.insert(0, Item {
-                key: pla_ui::drawing::ASM_KEY.into(),
-                label: t!("装配图  ({} 种 / {n} 件)", "Assembly drawing  ({} kinds / {n} pcs)", asm.len()),
-                title,
-                member: (String::new(), String::new()),
-            });
+            let label = if i == 0 && k == pla_ui::drawing::ASM_KEY {
+                t!("装配图 · 全部  ({} 种 / {n} 件)", "Assembly · all  ({} kinds / {n} pcs)", ls.len())
+            } else {
+                t!("装配图 · {name}  ({} 种 / {n} 件)", "Assembly · {name}  ({} kinds / {n} pcs)", ls.len())
+            };
+            items.insert(i, Item { key: k.clone(), label, title, member: (String::new(), String::new()), bought: false });
         }
-        self.draw_asm = asm;
+        self.draw_asm = asms.into_iter().map(|(k, _, ls)| (k, ls)).collect();
         for s in &self.draw_sheets.sheets {
             if !items.iter().any(|i| i.key == s.key) {
-                items.push(Item { key: s.key.clone(), label: format!("{}  ({})", s.base, tr("不在当前范围", "not in the current scope")), title: Default::default(), member: (s.member.clone(), s.model_name.clone()) });
+                items.push(Item { key: s.key.clone(), label: format!("{}  ({})", s.base, tr("不在当前范围", "not in the current scope")), title: Default::default(), member: (s.member.clone(), s.model_name.clone()), bought: false });
             }
         }
         ui.horizontal(|ui| {
@@ -4838,6 +4835,8 @@ impl PlaApp {
         });
         // ---- 批量: 当前 BOM 范围里的零件(不在范围里的旧图不管) ----
         let mut batch: Option<bool> = None; // Some(包括已出过的?)
+        // 批量出哪些: 装配图 + 自制件(外购组件里的零件不出零件图)
+        let drawable = |it: &Item| pla_ui::drawing::is_asm(&it.key) || (!it.member.0.is_empty() && !it.bought);
         ui.horizontal(|ui| {
             if self.draw_batch.is_some() {
                 let (n, f) = self.draw_batch.as_ref().map(|(n, f)| (*n, f.len())).unwrap_or_default();
@@ -4853,8 +4852,8 @@ impl PlaApp {
                 }
             } else {
                 let free = self.draw_job.is_none() && !self.bom_busy;
-                let todo = items.iter().filter(|it| (!it.member.0.is_empty() || it.key == pla_ui::drawing::ASM_KEY) && self.draw_sheets.get(&it.key).map_or(true, |s| s.compiled.is_empty())).count();
-                let all = items.iter().filter(|it| !it.member.0.is_empty() || it.key == pla_ui::drawing::ASM_KEY).count();
+                let todo = items.iter().filter(|it| drawable(it) && self.draw_sheets.get(&it.key).map_or(true, |s| s.compiled.is_empty())).count();
+                let all = items.iter().filter(|it| drawable(it)).count();
                 if ui.add_enabled(free && todo > 0, egui::Button::new(t!("出未出的 {todo} 张", "Draw {todo} undrawn"))).on_hover_text(tr("按 BOM 顺序一张张出(每张约 20–90 s); 可以接着在 Plasticity 里干活, 但别关文档", "Draws one by one in BOM order (~20–90 s each); you can keep working in Plasticity, but keep the document open")).clicked() {
                     batch = Some(false);
                 }
@@ -4879,7 +4878,7 @@ impl PlaApp {
             }
         });
         if let Some(redo) = batch {
-            for it in items.iter().filter(|it| !it.member.0.is_empty() || it.key == pla_ui::drawing::ASM_KEY) {
+            for it in items.iter().filter(|it| drawable(it)) {
                 if !redo && self.draw_sheets.get(&it.key).is_some_and(|s| !s.compiled.is_empty()) {
                     continue;
                 }
@@ -4964,11 +4963,11 @@ impl PlaApp {
             if ui.add_enabled((s.front.is_some() || s.up.is_some()) && job.is_none(), egui::Button::new(tr("自动", "Auto")).small()).on_hover_text(tr("恢复自动选的朝向", "Back to the automatic orientation")).clicked() {
                 reorient = Some((None, None));
             }
-            if key != pla_ui::drawing::ASM_KEY {
+            if !pla_ui::drawing::is_asm(&key) {
                 ui.checkbox(&mut s.section, tr("剖视 A-A", "Section A-A"));
             }
         });
-        if key == pla_ui::drawing::ASM_KEY {
+        if pla_ui::drawing::is_asm(&key) {
             ui.label(
                 egui::RichText::new(tr(
                     "装配图每次都重新导出当前 BOM 范围的全部零件; 序号按视图外一圈顺时针编, 明细表跟着序号排",
@@ -5079,7 +5078,7 @@ impl PlaApp {
                     }
                     ui.end_row();
                 }
-                if key == pla_ui::drawing::ASM_KEY {
+                if pla_ui::drawing::is_asm(&key) {
                     return; // 装配图: 螺纹 / 密度是零件的事(重量按各零件材料汇总)
                 }
                 ui.label(egui::RichText::new(tr("孔径→螺纹", "Hole → thread")).color(COL_MUTED)).on_hover_text(tr(

@@ -254,8 +254,119 @@ pub struct AsmLine {
     pub area: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub density: Option<f64>,
+    /// 外购组件(导入的 STEP / IGES 组)合成一行时: 组里各实体的指纹 [体积, 面积](编译器按它认实体)。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub parts: Vec<[f64; 2]>,
     #[serde(skip)]
     pub ids: Vec<String>,
+}
+
+/// 明细表一行的文字(来自 BOM 表格: 料号 / 名称 / 材料 / 表处)。
+#[derive(Debug, Clone, Default)]
+pub struct RowInfo {
+    pub pn: String,
+    pub name: String,
+    pub material: String,
+    pub finish: String,
+}
+
+/// 组名像导入的文件(外购组件): .step / .stp / .igs / .iges / .x_t / .sat / .sldasm / .sldprt。
+pub fn is_import_group(name: &str) -> bool {
+    let n = name.trim().to_lowercase();
+    [".step", ".stp", ".igs", ".iges", ".x_t", ".sat", ".sldasm", ".sldprt"].iter().any(|e| n.ends_with(e))
+}
+
+/// 装配图 key: ASM_KEY = 整个范围; ASM_KEY + ":" + 组名 = 某个顶层组(方案 / 子装配)。
+pub fn asm_key(group: Option<&str>) -> String {
+    match group {
+        Some(g) => format!("{ASM_KEY}:{g}"),
+        None => ASM_KEY.to_string(),
+    }
+}
+
+pub fn is_asm(key: &str) -> bool {
+    key == ASM_KEY || key.starts_with(&format!("{ASM_KEY}:"))
+}
+
+/// bom.scan 的 lines → 装配图明细。group = 只要顶层组是它的实例(None = 全部)。
+/// 路径里第一个"导入文件"组及其下面的全部实体合成一行外购件(名称 = 文件名去扩展名, 数量 = 组里各零件实例数的最小值)。
+pub fn asm_lines(lines: &Value, info: &dyn Fn(&str) -> RowInfo, group: Option<&str>) -> Vec<AsmLine> {
+    let mut out: Vec<AsmLine> = Vec::new();
+    // 外购组: 前缀路径 → (行下标, 每个 BOM 行在组里的实例数)
+    let mut subs: Vec<(String, usize, BTreeMap<String, u64>)> = Vec::new();
+    for l in lines.as_array().into_iter().flatten() {
+        let key = l["key"].as_str().unwrap_or("").to_string();
+        let fp = [l["volume"].as_f64().unwrap_or(0.0), l["area"].as_f64().unwrap_or(0.0)];
+        let mut own: Option<usize> = None;
+        for m in l["members"].as_array().into_iter().flatten() {
+            let path: Vec<String> = m["path"].as_array().into_iter().flatten().filter_map(|p| p.as_str().map(str::to_string)).collect();
+            if let Some(g) = group {
+                if path.first().map(String::as_str) != Some(g) {
+                    continue;
+                }
+            }
+            let id = m["id"].as_str().unwrap_or("").to_string();
+            match path.iter().position(|p| is_import_group(p)) {
+                Some(i) => {
+                    let prefix = path[..=i].join("/");
+                    let si = match subs.iter().position(|s| s.0 == prefix) {
+                        Some(si) => si,
+                        None => {
+                            let stem = path[i].rsplit_once('.').map(|(a, _)| a).unwrap_or(&path[i]).trim().to_string();
+                            out.push(AsmLine { key: format!("@sub:{prefix}"), name: stem, note: "外购".into(), ..Default::default() });
+                            subs.push((prefix, out.len() - 1, BTreeMap::new()));
+                            subs.len() - 1
+                        }
+                    };
+                    let li = subs[si].1;
+                    *subs[si].2.entry(key.clone()).or_default() += 1;
+                    if !out[li].parts.iter().any(|p| p == &fp) {
+                        out[li].parts.push(fp);
+                    }
+                    out[li].ids.push(id);
+                }
+                None => {
+                    let li = *own.get_or_insert_with(|| {
+                        let r = info(&key);
+                        out.push(AsmLine {
+                            key: key.clone(),
+                            pn: r.pn,
+                            name: if r.name.is_empty() { m["name"].as_str().unwrap_or("").to_string() } else { r.name },
+                            density: guess_density(&r.material),
+                            material: r.material,
+                            note: r.finish,
+                            volume: l["volume"].as_f64(),
+                            area: l["area"].as_f64(),
+                            ..Default::default()
+                        });
+                        out.len() - 1
+                    });
+                    out[li].qty += 1;
+                    out[li].ids.push(id);
+                }
+            }
+        }
+    }
+    for (_, li, counts) in subs {
+        out[li].qty = counts.values().copied().min().unwrap_or(1).max(1);
+    }
+    out
+}
+
+/// 顶层组(方案 / 子装配)里够出装配图的: 合成外购件后至少 2 行; 外购组本身(顶层就是导入文件)不算。
+pub fn asm_groups(lines: &Value) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for l in lines.as_array().into_iter().flatten() {
+        for m in l["members"].as_array().into_iter().flatten() {
+            if let Some(g) = m["path"].as_array().and_then(|p| p.first()).and_then(|g| g.as_str()) {
+                if !is_import_group(g) && !names.iter().any(|n| n == g) {
+                    names.push(g.to_string());
+                }
+            }
+        }
+    }
+    names.retain(|g| asm_lines(lines, &|_| RowInfo::default(), Some(g)).len() >= 2);
+    names
 }
 
 /// 装配图方案 JSON(格式见 tools/drawing/compile_assembly.py 文件头)。
@@ -526,6 +637,44 @@ pub fn book_file(dir: &Path, doc_key: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn asm_lines_groups_and_purchased() {
+        let lines = json!([
+            {"key": "plate", "volume": 100.0, "area": 50.0, "members": [
+                {"id": "p1", "name": "Plate", "path": ["Solution H"]},
+                {"id": "p2", "name": "Plate", "path": ["SOLUTION V"]}]},
+            {"key": "screw", "volume": 1.0, "area": 2.0, "members": [
+                {"id": "s1", "name": "M3", "path": []}]},
+            // 电机: 每个方案一台, 导入组里两个零件
+            {"key": "m-body", "volume": 500.0, "area": 300.0, "members": [
+                {"id": "b1", "name": null, "path": ["SOLUTION V", "motor.STEP"]},
+                {"id": "b2", "name": null, "path": ["Solution H", "motor.STEP"]}]},
+            {"key": "m-pin", "volume": 0.1, "area": 0.5, "members": [
+                {"id": "q1", "name": null, "path": ["SOLUTION V", "motor.STEP", "sub"]},
+                {"id": "q2", "name": null, "path": ["SOLUTION V", "motor.STEP", "sub"]},
+                {"id": "q3", "name": null, "path": ["Solution H", "motor.STEP", "sub"]},
+                {"id": "q4", "name": null, "path": ["Solution H", "motor.STEP", "sub"]}]},
+            {"key": "clamp", "volume": 9.0, "area": 9.0, "members": [
+                {"id": "c1", "name": "jaw", "path": ["clamp.stp", "jaw"]}]}
+        ]);
+        let info = |k: &str| RowInfo { pn: if k == "plate" { "9001".into() } else { String::new() }, material: "6061".into(), ..Default::default() };
+        let h = asm_lines(&lines, &info, Some("Solution H"));
+        assert_eq!(h.len(), 2, "plate + one purchased motor line");
+        assert_eq!((h[0].pn.as_str(), h[0].qty, h[0].density), ("9001", 1, Some(2.7)));
+        let m = &h[1];
+        assert_eq!((m.key.as_str(), m.name.as_str(), m.qty, m.note.as_str()), ("@sub:Solution H/motor.STEP", "motor", 1, "外购"));
+        assert_eq!(m.parts, vec![[500.0, 300.0], [0.1, 0.5]]);
+        assert_eq!(m.ids, vec!["b2", "q3", "q4"]);
+        let all = asm_lines(&lines, &info, None);
+        assert_eq!(all.iter().map(|l| l.key.as_str()).collect::<Vec<_>>(), vec!["plate", "screw", "@sub:SOLUTION V/motor.STEP", "@sub:Solution H/motor.STEP", "@sub:clamp.stp"]);
+        assert_eq!(all[0].qty, 2);
+        assert_eq!(asm_groups(&lines), vec!["Solution H", "SOLUTION V"], "clamp.stp is a purchased part, not an assembly");
+        assert!(is_asm(&asm_key(Some("Solution H"))) && is_asm(ASM_KEY) && !is_asm("@sub:x") && !is_asm("plate"));
+        let v = serde_json::to_value(m).unwrap();
+        assert_eq!(v["parts"], json!([[500.0, 300.0], [0.1, 0.5]]));
+        assert!(v.get("volume").is_none());
+    }
 
     #[test]
     fn dim_edits_and_pick() {
