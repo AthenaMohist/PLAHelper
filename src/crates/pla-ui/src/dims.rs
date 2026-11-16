@@ -511,7 +511,7 @@ pub fn delete_many(doc_key: &str, names: &[String]) -> Result<usize, String> {
     Ok(n - list.len())
 }
 
-fn path(doc_key: &str) -> PathBuf {
+pub fn path(doc_key: &str) -> PathBuf {
     STORE.dir(doc_key).join(FILE)
 }
 

@@ -200,6 +200,15 @@ struct PlaApp {
     /// B4 零件库: BOM 窗口标签(0 清单 / 1 零件库); 库内容 + 修改时间 / 上次检查(外部改了热生效);
     /// 库里搜索词; 正在编辑的条目(副本)及其原料号(None = 新建); 行"库"菜单里的搜索词。
     bom_tab: u8,
+    /// D1 出图(BOM 窗口「出图」标签): 本文档的图设置(及所属文档)、选中的零件 key、进行中的任务、
+    /// 选中图的编译报告 + 预览 PNG(uri, 字节; uri 带修改时间, 换图即换)、输入缓冲。
+    draw_sheets: pla_ui::drawing::Sheets,
+    draw_doc: String,
+    draw_sel: Option<String>,
+    draw_job: Option<DrawJob>,
+    draw_report: Option<(String, pla_ui::drawing::Report)>,
+    draw_png: Option<(String, egui::load::Bytes)>,
+    draw_buf: std::collections::HashMap<String, String>,
     lib: pla_ui::parts_lib::Library,
     lib_mtime: Option<std::time::SystemTime>,
     lib_checked: Option<Instant>,
@@ -1910,6 +1919,36 @@ fn refresh_button(ui: &mut egui::Ui, size: f32) -> egui::Response {
     resp
 }
 
+/// D1 出图任务: 导出 STEP(等 CDP 回包 FILE_EXPORT_STEP)→ 编译(后台线程跑 tools/drawing/draw.ps1)。
+struct DrawJob {
+    key: String,
+    stage: DrawStage,
+    /// 编译线程的结果(stage = Compile 时)。
+    rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
+    t0: Instant,
+    /// 本次用的标题栏(BOM 值 + 本图覆盖), 导出完编译时用。
+    title: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum DrawStage {
+    Export,
+    Compile,
+}
+
+/// D1: 出图面板里可编辑的标题栏字段(id 与 tools/drawing/standards/GB.json 的 field 一致)。
+const DRAW_TITLE_FIELDS: &[(&str, &str, &str)] = &[
+    ("pn", "料号", "Part no."),
+    ("name", "名称", "Name"),
+    ("material", "材质", "Material"),
+    ("finish", "表处", "Finish"),
+    ("hardness", "硬度", "Hardness"),
+    ("project", "项目名称", "Project"),
+    ("designer", "设计", "Designer"),
+    ("reviewer", "审核", "Reviewer"),
+    ("version", "版本", "Version"),
+];
+
 /// R26: 截图纹理 URI —— egui 按 URI 缓存解码后的纹理, 只用名字(SS001/SG001…)做 URI 时,
 /// 换文件或删掉重拍同名项会一直显示第一张图。URI 里带上内容指纹(长度 + 稀疏采样哈希),
 /// 内容不同 → URI 不同 → 必然重新解码。采样而非全量哈希: 每帧每张图都要算, PNG 可达数 MB。
@@ -2486,6 +2525,13 @@ impl PlaApp {
             bom_edits_doc: String::new(),
             bom_cell_buf: Default::default(),
             bom_tab: 0,
+            draw_sheets: Default::default(),
+            draw_doc: String::new(),
+            draw_sel: None,
+            draw_job: None,
+            draw_report: None,
+            draw_png: None,
+            draw_buf: Default::default(),
             lib: Default::default(),
             lib_mtime: None,
             lib_checked: None,
@@ -2946,6 +2992,8 @@ impl PlaApp {
                         self.bom_result_scope = scope;
                     }
                 }
+                // D1 出图: STEP 导出回包 → 记下体积 / 面积 → 后台编译
+                pla_bridge::cdp::CdpEvent::CallResult { name, result } if name == pla_bridge::shim::api::FILE_EXPORT_STEP => self.draw_exported(result),
                 // C0 配置采集回包 → 截图 → 落盘(同材质状态的串行流程)
                 pla_bridge::cdp::CdpEvent::CallResult { name, result } if name == pla_bridge::shim::api::CFG_SAVE => match result {
                     Ok(v) => {
@@ -4408,6 +4456,416 @@ impl PlaApp {
         }
     }
 
+    // ---------------------------------------------------------------- D1 出图
+    /// 换文档 → 重读本文档的图设置; 收编译线程的结果。
+    fn draw_tick(&mut self) {
+        if self.draw_doc != self.doc_key {
+            self.draw_doc = self.doc_key.clone();
+            self.draw_sheets = pla_ui::drawing::load_in(&pla_ui::drawing::dir(&self.doc_key));
+            self.draw_sel = None;
+            self.draw_report = None;
+            self.draw_png = None;
+            self.draw_buf.clear();
+        }
+        let got = match self.draw_job.as_ref().and_then(|j| j.rx.as_ref()) {
+            Some(rx) => match rx.try_recv() {
+                Ok(r) => Some(r),
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Err(tr("编译线程意外退出", "The compile thread exited unexpectedly").to_string())),
+            },
+            None => None,
+        };
+        if let Some(r) = got {
+            let key = self.draw_job.take().map(|j| j.key).unwrap_or_default();
+            self.draw_compiled(&key, r);
+        }
+    }
+
+    fn draw_save(&mut self) {
+        if let Err(e) = pla_ui::drawing::save_in(&pla_ui::drawing::dir(&self.doc_key), &self.draw_sheets) {
+            self.set_notice((true, t!("出图设置保存失败: {e}", "Saving drawing settings failed: {e}")));
+        }
+    }
+
+    /// 出一张图: 没有 STEP(或要求重新导出)→ 先让 Plasticity 导出, 回包后编译; 否则直接编译。
+    fn draw_start(&mut self, key: &str, export: bool, title: std::collections::BTreeMap<String, String>) {
+        if self.draw_job.is_some() {
+            return;
+        }
+        let Some(s) = self.draw_sheets.get(key).cloned() else { return };
+        if pla_ui::drawing::tools_dir().is_none() || pla_ui::drawing::freecad_bin().is_none() {
+            self.set_notice((true, tr("出图需要 tools/drawing 编译器和 FreeCAD 1.1", "Drawing needs the tools/drawing compiler and FreeCAD 1.1").to_string()));
+            return;
+        }
+        let dir = pla_ui::drawing::dir(&self.doc_key);
+        let step = pla_ui::drawing::file(&dir, &s, "step");
+        if export || !step.exists() {
+            if s.member.is_empty() {
+                self.set_notice((true, tr("这张图没有对应的模型实体(重新扫描 BOM)", "No model solid for this drawing (rescan the BOM)").to_string()));
+                return;
+            }
+            self.cdp.send(pla_bridge::cdp::CdpCmd::ExportStep { path: step.display().to_string(), ids: vec![s.member.clone()], format: Some("AP214".into()) });
+            self.draw_job = Some(DrawJob { key: key.to_string(), stage: DrawStage::Export, rx: None, t0: Instant::now(), title });
+        } else {
+            self.draw_compile(key, title);
+        }
+    }
+
+    /// STEP 导出回包(只认出图面板发起的)。
+    fn draw_exported(&mut self, result: Result<serde_json::Value, String>) {
+        let Some(job) = self.draw_job.as_ref().filter(|j| j.stage == DrawStage::Export) else { return };
+        let (key, title) = (job.key.clone(), job.title.clone());
+        match result {
+            Ok(v) => {
+                if let Some(mut s) = self.draw_sheets.get(&key).cloned() {
+                    // 零件在组里时 STEP 会含全部可见实体 → 记下这个零件的体积 / 面积, 编译器按它挑
+                    if let Some(p) = v["parts"].as_array().filter(|a| a.len() == 1).and_then(|a| a.first()) {
+                        s.volume = p["volume"].as_f64();
+                        s.area = p["area"].as_f64();
+                    }
+                    s.exported = pla_ui::parts_lib::today();
+                    self.draw_sheets.upsert(s);
+                    self.draw_save();
+                }
+                self.draw_job = None;
+                self.draw_compile(&key, title);
+            }
+            Err(e) => {
+                self.draw_job = None;
+                self.set_notice((true, t!("导出 STEP 失败: {e}", "STEP export failed: {e}")));
+            }
+        }
+    }
+
+    fn draw_compile(&mut self, key: &str, title: std::collections::BTreeMap<String, String>) {
+        let (Some(s), Some(tools)) = (self.draw_sheets.get(key).cloned(), pla_ui::drawing::tools_dir()) else { return };
+        let dir = pla_ui::drawing::dir(&self.doc_key);
+        let mut run = s.clone();
+        run.title = title;
+        let spec = pla_ui::drawing::spec(&run, &dir, Some(&pla_ui::dims::path(&self.doc_key)));
+        let spec_file = pla_ui::drawing::file(&dir, &s, "spec.json");
+        if let Err(e) = std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&spec_file, serde_json::to_vec_pretty(&spec).unwrap_or_default())) {
+            self.set_notice((true, t!("写出图方案失败: {e}", "Writing the drawing spec failed: {e}")));
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(pla_ui::drawing::compile(&tools, &spec_file));
+        });
+        self.draw_job = Some(DrawJob { key: key.to_string(), stage: DrawStage::Compile, rx: Some(rx), t0: Instant::now(), title: Default::default() });
+    }
+
+    fn draw_compiled(&mut self, key: &str, r: Result<String, String>) {
+        match r {
+            Ok(_) => {
+                if let Some(mut s) = self.draw_sheets.get(key).cloned() {
+                    s.compiled = pla_ui::parts_lib::today();
+                    let base = s.base.clone();
+                    self.draw_sheets.upsert(s);
+                    self.draw_save();
+                    self.set_notice((false, t!("已出图 {base}", "Drawing {base} done")));
+                }
+                self.draw_load(key);
+            }
+            Err(e) => self.set_notice((true, t!("出图失败: {e}", "Drawing failed: {e}"))),
+        }
+    }
+
+    /// 读选中图的报告 + 预览。
+    fn draw_load(&mut self, key: &str) {
+        self.draw_report = None;
+        self.draw_png = None;
+        let Some(s) = self.draw_sheets.get(key).cloned() else { return };
+        let dir = pla_ui::drawing::dir(&self.doc_key);
+        if let Some(r) = pla_ui::drawing::load_report(&dir, &s) {
+            self.draw_report = Some((key.to_string(), r));
+        }
+        if let Ok(b) = std::fs::read(pla_ui::drawing::file(&dir, &s, "png")) {
+            self.draw_png = Some((png_uri("draw", &s.base, &b), b.into()));
+        }
+    }
+
+    fn open_path(&mut self, p: &std::path::Path) {
+        if let Err(e) = std::process::Command::new("cmd").args(["/C", "start", "", &p.display().to_string()]).spawn() {
+            self.set_notice((true, t!("打不开 {}: {e}", "Cannot open {}: {e}", p.display())));
+        }
+    }
+
+    /// BOM 窗口「出图」标签: 左 = 零件列表(BOM 扫描结果 + 已有的图), 右 = 选中零件的出图设置 / 修正 / 预览。
+    fn draw_ui(&mut self, ui: &mut egui::Ui) {
+        self.draw_tick();
+        if pla_ui::drawing::tools_dir().is_none() {
+            ui.label(egui::RichText::new(tr("找不到出图编译器(tools/drawing; 或设环境变量 PLA_DRAWING_DIR)", "Drawing compiler not found (tools/drawing; or set PLA_DRAWING_DIR)")).color(COL_RED));
+        }
+        if pla_ui::drawing::freecad_bin().is_none() {
+            ui.label(egui::RichText::new(tr("找不到 FreeCAD 1.1(出图后端, 装在默认位置)", "FreeCAD 1.1 not found (drawing backend, default install location)")).color(COL_RED));
+        }
+        // 零件列表: BOM 行(料号 / 名称 / 材料 + 第一个实例)
+        struct Item {
+            key: String,
+            label: String,
+            title: std::collections::BTreeMap<String, String>,
+            member: (String, String),
+        }
+        let mut items: Vec<Item> = Vec::new();
+        if let Some(Ok(v)) = &self.bom_result {
+            let (rows, _) = pla_ui::bom_table::build(v, &self.bom_tpl, &self.bom_edits, &self.lib);
+            let cols = &self.bom_tpl.columns;
+            for r in rows.iter().filter(|r| !r.manual) {
+                let get = |id: &str| cols.iter().position(|c| c.id == id).map(|i| r.cells[i].trim().to_string()).unwrap_or_default();
+                let line = v["lines"].as_array().into_iter().flatten().find(|l| l["key"].as_str() == Some(r.key.as_str()));
+                let m = line.and_then(|l| l["members"].as_array()).and_then(|a| a.first());
+                let member = m.map(|m| (m["id"].as_str().unwrap_or("").to_string(), m["name"].as_str().unwrap_or("").to_string())).unwrap_or_default();
+                let mut title = std::collections::BTreeMap::new();
+                for id in ["pn", "name", "material", "finish"] {
+                    let x = get(id);
+                    if !x.is_empty() {
+                        title.insert(id.to_string(), x);
+                    }
+                }
+                let qty = line.and_then(|l| l["qty"].as_u64()).unwrap_or(1);
+                title.insert("qty".into(), qty.to_string());
+                let label = format!("{}  {}  ×{qty}", get("pn"), get("name")).trim().to_string();
+                items.push(Item { key: r.key.clone(), label, title, member });
+            }
+        }
+        for s in &self.draw_sheets.sheets {
+            if !items.iter().any(|i| i.key == s.key) {
+                items.push(Item { key: s.key.clone(), label: format!("{}  ({})", s.base, tr("不在当前范围", "not in the current scope")), title: Default::default(), member: (s.member.clone(), s.model_name.clone()) });
+            }
+        }
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(t!("{} 个零件", "{} part(s)", items.len())).color(COL_MUTED));
+            if ui.add_enabled(!self.bom_busy, egui::Button::new(tr("重新扫描", "Rescan"))).clicked() {
+                let s = self.bom_scope.clone();
+                self.bom_scan(s);
+            }
+            if ui.button(tr("打开文件夹", "Open folder")).clicked() {
+                if let Err(e) = pla_ui::drawing::STORE.open_dir(&self.doc_key) {
+                    self.set_notice((true, e));
+                }
+            }
+        });
+        let mut pick: Option<usize> = None;
+        egui::ScrollArea::vertical().id_salt("draw-list").max_height(150.0).show(ui, |ui| {
+            for (i, it) in items.iter().enumerate() {
+                let sheet = self.draw_sheets.get(&it.key);
+                let mark = match sheet {
+                    Some(s) if !s.compiled.is_empty() => format!("  ✓ {}", s.compiled),
+                    _ => String::new(),
+                };
+                let busy = self.draw_job.as_ref().is_some_and(|j| j.key == it.key);
+                let text = egui::RichText::new(format!("{}{}{}", it.label, mark, if busy { "  …" } else { "" }));
+                if ui.selectable_label(self.draw_sel.as_deref() == Some(it.key.as_str()), text).clicked() {
+                    pick = Some(i);
+                }
+            }
+        });
+        if let Some(i) = pick {
+            let it = &items[i];
+            if self.draw_sheets.get(&it.key).is_none() {
+                let want = pla_ui::drawing::base_name(it.title.get("pn").map(|s| s.as_str()).unwrap_or(""), it.title.get("name").map(|s| s.as_str()).unwrap_or(&it.member.1));
+                let base = self.draw_sheets.unique_base(&it.key, &want);
+                let mut s = pla_ui::drawing::Sheet::new(&it.key, &base, &it.member.0, &it.member.1);
+                s.density = it.title.get("material").and_then(|m| pla_ui::drawing::guess_density(m));
+                self.draw_sheets.upsert(s);
+                self.draw_save();
+            } else if let Some(mut s) = self.draw_sheets.get(&it.key).cloned() {
+                // 实例可能换了(删了重建): 跟着 BOM 走
+                if !it.member.0.is_empty() && (s.member != it.member.0 || s.model_name != it.member.1) {
+                    s.member = it.member.0.clone();
+                    s.model_name = it.member.1.clone();
+                    self.draw_sheets.upsert(s);
+                    self.draw_save();
+                }
+            }
+            self.draw_sel = Some(it.key.clone());
+            self.draw_buf.clear();
+            let k = it.key.clone();
+            self.draw_load(&k);
+        }
+        ui.separator();
+        let Some(key) = self.draw_sel.clone() else {
+            ui.label(egui::RichText::new(tr("选一个零件出图(零件图, 国标第一角; 后台用 FreeCAD 编译, 约 20–90 s)", "Pick a part to draw (GB first-angle part drawing; compiled in the background with FreeCAD, ~20–90 s)")).color(COL_MUTED));
+            return;
+        };
+        let Some(mut s) = self.draw_sheets.get(&key).cloned() else { return };
+        let bom_title = items.iter().find(|i| i.key == key).map(|i| i.title.clone()).unwrap_or_default();
+        let orig = s.clone();
+        let mut go: Option<bool> = None; // Some(重新导出?)
+        let job = self.draw_job.as_ref().map(|j| (j.key == key, j.stage, j.t0.elapsed().as_secs()));
+        // ---- 操作 + 状态 ----
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(&s.base).strong());
+            let free = job.is_none();
+            if ui.add_enabled(free, egui::Button::new(tr("出图", "Draw"))).on_hover_text(tr("没有 STEP 时先从 Plasticity 导出; 有了直接按当前设置编译", "Exports a STEP from Plasticity if there is none, then compiles with the current settings")).clicked() {
+                go = Some(false);
+            }
+            if ui.add_enabled(free, egui::Button::new(tr("重新导出 STEP 并出图", "Re-export STEP and draw"))).on_hover_text(tr("模型改过之后用", "Use after the model changed")).clicked() {
+                go = Some(true);
+            }
+            let dir = pla_ui::drawing::dir(&self.doc_key);
+            let pdf = pla_ui::drawing::file(&dir, &s, "pdf");
+            if ui.add_enabled(pdf.exists(), egui::Button::new(tr("打开 PDF", "Open PDF"))).clicked() {
+                self.open_path(&pdf);
+            }
+            match job {
+                Some((true, DrawStage::Export, t)) => {
+                    ui.label(egui::RichText::new(t!("导出 STEP… {t}s", "Exporting STEP… {t}s")).color(COL_ACCENT));
+                }
+                Some((true, DrawStage::Compile, t)) => {
+                    ui.label(egui::RichText::new(t!("编译中… {t}s", "Compiling… {t}s")).color(COL_ACCENT));
+                }
+                Some((false, _, _)) => {
+                    ui.label(egui::RichText::new(tr("另一张图在出", "Another drawing is running")).color(COL_MUTED));
+                }
+                None => {}
+            }
+        });
+        // ---- 视图朝向(要先出过一次, 用报告里的实际朝向) ----
+        let axes = self.draw_report.as_ref().filter(|(k, _)| *k == key).and_then(|(_, r)| r.axes);
+        let mut reorient: Option<(Option<[f64; 3]>, Option<[f64; 3]>)> = None;
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(tr("主视", "Front view")).color(COL_MUTED));
+            ui.add_enabled_ui(axes.is_some() && job.is_none(), |ui| {
+                if let Some(a) = axes {
+                    if ui.small_button(tr("上下翻转", "Flip")).clicked() {
+                        let (f, u) = a.flipped();
+                        reorient = Some((Some(f), Some(u)));
+                    }
+                    if ui.small_button(tr("转 90°", "Rotate 90°")).clicked() {
+                        let (f, u) = a.rotated();
+                        reorient = Some((Some(f), Some(u)));
+                    }
+                    if ui.small_button(tr("看背面", "View the back")).clicked() {
+                        let (f, u) = a.back();
+                        reorient = Some((Some(f), Some(u)));
+                    }
+                } else {
+                    let _ = ui.small_button(tr("上下翻转", "Flip"));
+                }
+            });
+            if ui.add_enabled((s.front.is_some() || s.up.is_some()) && job.is_none(), egui::Button::new(tr("自动", "Auto")).small()).on_hover_text(tr("恢复自动选的朝向", "Back to the automatic orientation")).clicked() {
+                reorient = Some((None, None));
+            }
+            ui.checkbox(&mut s.section, tr("剖视 A-A", "Section A-A"));
+        });
+        if let Some((f, u)) = reorient {
+            s.front = f;
+            s.up = u;
+            go = Some(false);
+        }
+        // ---- 孔组: 勾 = 标孔位(坐标尺寸) ----
+        if let Some((_, r)) = self.draw_report.as_ref().filter(|(k, _)| *k == key) {
+            if !r.hole_groups.is_empty() {
+                let front: Vec<&pla_ui::drawing::HoleGroup> = r.hole_groups.iter().filter(|g| g.view == "Front").collect();
+                egui::CollapsingHeader::new(t!("孔组 {}(勾 = 标孔位)", "Hole groups {} (ticked = position dims)", r.hole_groups.len())).id_salt("draw-holes").default_open(true).show(ui, |ui| {
+                    let mut on: Vec<String> = match &s.ordinate {
+                        None => front.iter().map(|g| g.id.clone()).collect(),
+                        Some(v) => v.clone(),
+                    };
+                    let mut changed = false;
+                    for g in &r.hole_groups {
+                        if g.view == "Front" {
+                            let mut c = on.contains(&g.id);
+                            if ui.checkbox(&mut c, format!("{}  {}", g.id, g.text)).changed() {
+                                changed = true;
+                                if c {
+                                    on.push(g.id.clone());
+                                } else {
+                                    on.retain(|x| x != &g.id);
+                                }
+                            }
+                        } else {
+                            ui.label(egui::RichText::new(format!("{}  {}  ({})", g.id, g.text, g.view)).color(COL_MUTED));
+                        }
+                    }
+                    if changed {
+                        let all = front.iter().all(|g| on.contains(&g.id)) && on.len() == front.len();
+                        s.ordinate = if all { None } else { Some(on) };
+                    }
+                });
+            }
+            if !r.warnings.is_empty() {
+                egui::CollapsingHeader::new(t!("编译提示 {}", "Compiler notes {}", r.warnings.len())).id_salt("draw-warn").show(ui, |ui| {
+                    for w in &r.warnings {
+                        ui.label(egui::RichText::new(w).size(11.0).color(COL_MUTED));
+                    }
+                });
+            }
+        }
+        // ---- 标题栏 + 螺纹规则 + 密度 ----
+        egui::CollapsingHeader::new(tr("标题栏 / 螺纹 / 重量", "Title block / threads / weight")).id_salt("draw-title").show(ui, |ui| {
+            egui::Grid::new("draw-title-grid").num_columns(2).spacing([8.0, 3.0]).show(ui, |ui| {
+                for (id, zh, en) in DRAW_TITLE_FIELDS {
+                    ui.label(egui::RichText::new(tr(zh, en)).color(COL_MUTED));
+                    let from_bom = bom_title.get(*id).cloned().unwrap_or_default();
+                    let cur = s.title.get(*id).cloned().unwrap_or_default();
+                    let buf = self.draw_buf.entry(format!("t|{id}")).or_insert_with(|| cur.clone());
+                    let te = ui.add(egui::TextEdit::singleline(buf).hint_text(from_bom.clone()).desired_width(200.0).text_color(COL_ACCENT));
+                    if te.lost_focus() {
+                        let v = buf.trim().to_string();
+                        if v.is_empty() || v == from_bom {
+                            s.title.remove(*id);
+                        } else {
+                            s.title.insert(id.to_string(), v);
+                        }
+                    } else if !te.has_focus() {
+                        *buf = cur;
+                    }
+                    ui.end_row();
+                }
+                ui.label(egui::RichText::new(tr("孔径→螺纹", "Hole → thread")).color(COL_MUTED)).on_hover_text(tr(
+                    "没有打孔记录的螺纹底孔按孔径认, 如 3.3=M4, 2.5=M3(⌀3.2 也可能是过孔, 所以按项目填)",
+                    "Tapped holes without a hole record are recognised by diameter, e.g. 3.3=M4, 2.5=M3 (⌀3.2 may be a clearance hole, so set per project)",
+                ));
+                let cur: String = s.threads.iter().map(|(d, m)| format!("{d}={m}")).collect::<Vec<_>>().join(", ");
+                let buf = self.draw_buf.entry("threads".into()).or_insert_with(|| cur.clone());
+                let te = ui.add(egui::TextEdit::singleline(buf).hint_text("3.3=M4, 2.5=M3").desired_width(200.0));
+                if te.lost_focus() {
+                    s.threads = buf
+                        .split([',', '，', ';'])
+                        .filter_map(|p| p.split_once('=').map(|(d, m)| (d.trim().to_string(), m.trim().to_string())))
+                        .filter(|(d, m)| d.parse::<f64>().is_ok() && !m.is_empty())
+                        .collect();
+                } else if !te.has_focus() {
+                    *buf = cur;
+                }
+                ui.end_row();
+                ui.label(egui::RichText::new(tr("密度 g/cm³", "Density g/cm³")).color(COL_MUTED)).on_hover_text(tr("重量 = 体积 × 密度; 空 = 不填重量", "Weight = volume × density; empty = no weight"));
+                let cur = s.density.map(|d| d.to_string()).unwrap_or_default();
+                let buf = self.draw_buf.entry("density".into()).or_insert_with(|| cur.clone());
+                let te = ui.add(egui::TextEdit::singleline(buf).desired_width(80.0));
+                if te.lost_focus() {
+                    s.density = buf.trim().parse::<f64>().ok().filter(|d| *d > 0.0);
+                } else if !te.has_focus() {
+                    *buf = cur;
+                }
+                ui.end_row();
+            });
+        });
+        if s != orig {
+            self.draw_sheets.upsert(s.clone());
+            self.draw_save();
+        }
+        if let Some(export) = go {
+            let mut title = bom_title.clone();
+            title.extend(s.title.clone());
+            self.draw_start(&key, export, title);
+        }
+        // ---- 预览(点击打开 PDF) ----
+        if let Some((uri, bytes)) = self.draw_png.clone() {
+            let w = ui.available_width();
+            let r = ui.add(egui::Image::from_bytes(uri, bytes).max_width(w).rounding(2.0).sense(egui::Sense::click())).on_hover_text(tr("点击打开 PDF", "Click to open the PDF"));
+            if r.clicked() {
+                let p = pla_ui::drawing::file(&pla_ui::drawing::dir(&self.doc_key), &s, "pdf");
+                self.open_path(&p);
+            }
+        } else if job.is_none() {
+            ui.label(egui::RichText::new(tr("还没出过图", "Not drawn yet")).color(COL_MUTED));
+        }
+    }
+
     /// B1/B2 BOM 浮窗: 范围(当前可见 / 某个配置)→ 相同零件合并计数的清单; 导出 CSV; 每个配置各出一份。
     fn show_bom_window(&mut self, ctx: &egui::Context) {
         // 模板表列多(OYM 16 列): 默认宽一些, 表格在窗口内横向滚动
@@ -4435,7 +4893,7 @@ impl PlaApp {
                 // ---- 标签: 清单 / 零件库(B4) ----
                 self.lib_tick();
                 {
-                    let labels = vec![tr("清单", "List").to_string(), t!("零件库 {}", "Parts library {}", self.lib.entries.len())];
+                    let labels = vec![tr("清单", "List").to_string(), t!("零件库 {}", "Parts library {}", self.lib.entries.len()), tr("出图", "Drawings").to_string()];
                     let mut s = self.bom_tab as usize;
                     if rz_tabs(ui, &labels, &mut s, None) {
                         self.bom_tab = s as u8;
@@ -4444,6 +4902,11 @@ impl PlaApp {
                 }
                 if self.bom_tab == 1 {
                     self.lib_ui(ui);
+                    return;
+                }
+                if self.bom_tab == 2 {
+                    self.bom_template_tick();
+                    self.draw_ui(ui);
                     return;
                 }
                 // ---- 范围 + 操作 ----
@@ -9095,6 +9558,11 @@ impl eframe::App for PlaApp {
         }
         if self.show_dim {
             self.show_dim_window(ctx);
+        }
+        // D1 出图任务在后台跑, 窗口关了也要收结果
+        self.draw_tick();
+        if self.draw_job.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(500));
         }
         if self.show_bom {
             self.show_bom_window(ctx);

@@ -5,6 +5,7 @@ pub mod cdp_mode;
 pub mod configs;
 pub mod diag;
 pub mod dims;
+pub mod drawing;
 pub mod features;
 pub mod formula;
 pub mod hole_presets;

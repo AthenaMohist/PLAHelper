@@ -2,7 +2,7 @@
 # 1) freecad.exe 离屏跑 compile_freecad.py → <base>.svg / .dxf / .FCStd / .report.json(+ 备用 <base>.qt.pdf)
 # 2) 无头 Edge / Chrome 把 SVG 打印成 <base>.pdf —— Qt 写的 PDF Acrobat 报错、尺寸文字不显示, 浏览器打印的没问题。
 #    浏览器用临时配置目录, 不碰用户自己的浏览器配置; 在 FreeCAD 进程里起浏览器会挂住, 所以放在这里。
-param([Parameter(Mandatory = $true)][string]$Spec, [string]$FreeCAD = "$env:LOCALAPPDATA\Programs\FreeCAD 1.1\bin")
+param([Parameter(Mandatory = $true)][string]$Spec, [string]$FreeCAD = "$env:LOCALAPPDATA\Programs\FreeCAD 1.1\bin", [switch]$Png)
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $specPath = (Resolve-Path $Spec).Path
 $env:QT_QPA_PLATFORM = 'offscreen'
@@ -47,6 +47,19 @@ if (-not $browser -or -not (Test-Path $svgPath)) {
     ("file:///" + ($tmp -replace '\\', '/') + "/page.html")
   if (-not $b.WaitForExit(90000)) { $b.Kill(); Write-Output "timeout (browser PDF)" }
   Start-Sleep -Milliseconds 300
+  if ($Png) {
+    # 预览图(PLAhelper 出图面板用): 同一页 HTML 截屏, 宽 = 纸宽 mm × 96/25.4 × 1.5
+    $pngPath = Join-Path $out "$base.png"
+    $pw = [int]([double]$w * 96 / 25.4 * 1.5); $ph = [int]([double]$h * 96 / 25.4 * 1.5)
+    $html2 = $html -replace 'svg\{display:block;width:[^}]*\}', "svg{display:block;width:${pw}px;height:${ph}px}"
+    [IO.File]::WriteAllText("$tmp\shot.html", $html2, (New-Object Text.UTF8Encoding $false))
+    if (Test-Path $pngPath) { Remove-Item $pngPath -Force }
+    $b = Start-Process $browser -PassThru -WindowStyle Hidden -ArgumentList '--headless=new', '--disable-gpu', '--no-first-run',
+      '--no-default-browser-check', '--hide-scrollbars', "--user-data-dir=$tmp\profile", "--window-size=$pw,$ph", "--screenshot=$pngPath",
+      ("file:///" + ($tmp -replace '\\', '/') + "/shot.html")
+    if (-not $b.WaitForExit(60000)) { $b.Kill(); Write-Output "timeout (browser PNG)" }
+    Start-Sleep -Milliseconds 300
+  }
   Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
   if (-not (Test-Path $pdfPath)) { Copy-Item (Join-Path $out "$base.qt.pdf") $pdfPath -Force; Write-Output "browser PDF failed: using the Qt one" }
 }
