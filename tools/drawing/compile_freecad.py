@@ -302,6 +302,13 @@ if front_spec == "auto":
     ax_h = others[1][1]
 else:
     ax_h = V(0, 0, 1) if abs(front.z) < 0.9 else V(0, 1, 0)
+# 方案 up = 主视里朝上的方向(模型坐标; 自动选的上下 / 正反不合意时用, 如用户图与自动图上下颠倒 → up 取反)
+if spec.get("up"):
+    u = V(*spec["up"]).normalize()
+    if abs(u.dot(front)) > 1e-6:
+        rep["warnings"].append("up is not perpendicular to front: ignored")
+    else:
+        ax_h = u
 ax_w = ax_h.cross(front)
 rep["axes"] = {"front": [front.x, front.y, front.z], "right": [ax_w.x, ax_w.y, ax_w.z], "up": [ax_h.x, ax_h.y, ax_h.z]}
 
@@ -657,17 +664,16 @@ def spread(pos, sep):
 PAGE_SVG = []  # 页面级图形(页面毫米, SVG 坐标 y 向下): 坐标尺寸的引出线 + 数值, 最后合成一个 DrawViewSymbol
 
 
-def ordinates(vname):
-    """坐标尺寸: 只取孔中心(不取圆角弧心), 基准 = 视图左下角, 末值 = 外形尺寸(所以不再另标总长 / 总宽)。
+def ordinates(vname, hole_list):
+    """坐标尺寸: 只取 hole_list 里孔的中心(不取圆角弧心), 基准 = 视图左下角, 末值 = 外形尺寸(所以不再另标总长 / 总宽)。
     引出线: 视图边外一小段 → 斜折到散开后的文字位置。线和字都画进页面级 SVG(一个对象):
     用视图装饰线时每加一条 TechDraw 就重算一次消隐(80 条 ≈ 200 s), 而且 3D 装饰线导出里不显示。"""
     r = R[vname]
     bw_, bh_, bd_ = VAX[vname]
     pts = []
-    for h in holes:
-        if hole_view(h) == vname:
-            at = V(*h["at"])
-            pts.append(((at - bb.Center).dot(bw_), (at - bb.Center).dot(bh_)))
+    for h in hole_list:
+        at = V(*h["at"])
+        pts.append(((at - bb.Center).dot(bw_), (at - bb.Center).dot(bh_)))
     if not pts:
         return False
     cxp, cyp = (r[0] + r[2]) / 2, (r[1] + r[3]) / 2
@@ -746,11 +752,101 @@ def flush_page_svg():
 
 
 
-has_ord = bool(spec.get("ordinate", True)) and any(hole_view(h) == "Front" for h in holes) and ordinates("Front")
+# ---------------------------------------------------------------- 孔组: 按"在哪个视图里是圆" + 标注文字分组, 编号 H1…
+# 编号顺序固定(视图 主 → 俯 → 左, 组内件数多的在前, 再按文字), 方案 / 偏好 / agent 用编号挑"标哪些孔位"。
+def hole_groups():
+    out = []
+    for vname in VAX:
+        groups = {}
+        for h in holes:
+            if hole_view(h) == vname:
+                groups.setdefault(callout(h, 1), []).append(h)  # 按标注文字分组: 深度 11.9999 与 12 是同一组
+        for k, hs in sorted(groups.items(), key=lambda kv: (-len(kv[1]), kv[0])):
+            out.append({"view": vname, "text": callout(dict(hs[0]), len(hs)), "holes": hs})
+    for i, g in enumerate(out):
+        g["id"] = "H%d" % (i + 1)
+    return out
+
+
+HOLE_GROUPS = hole_groups()
+HOLE_IDS = {g["id"] for g in HOLE_GROUPS}  # 孔标注尺寸对象的名字 = 孔组编号(导出时据此改成水平文字 + 引线)
+
+
+def ordinate_groups():
+    """方案 ordinate: true / 省略 = 主视里全部孔组; false = 不标孔位; {"groups": ["H1", …]} 只标这些;
+    {"exclude": [...]} 除去这些。返回要标孔位的孔组。"""
+    o = spec.get("ordinate", True)
+    front = [g for g in HOLE_GROUPS if g["view"] == "Front"]
+    if o is False:
+        return []
+    if isinstance(o, dict):
+        if o.get("groups") is not None:
+            return [g for g in front if g["id"] in o["groups"]]
+        if o.get("exclude"):
+            return [g for g in front if g["id"] not in o["exclude"]]
+    return front
+
+
+def group_positions(g):
+    """孔组里各孔在其视图里的坐标(基准 = 视图左下角, 文档单位), 写进报告供挑选。"""
+    bw_, bh_, _ = VAX[g["view"]]
+    hw, hh_ = ext(bw_) / 2, ext(bh_) / 2
+    return [[fmt((V(*h["at"]) - bb.Center).dot(bw_) + hw), fmt((V(*h["at"]) - bb.Center).dot(bh_) + hh_)] for h in g["holes"]]
+
+
+ORD_GROUPS = ordinate_groups()
+rep["hole_groups"] = [{"id": g["id"], "view": g["view"], "text": g["text"], "count": len(g["holes"]),
+                       "positions": group_positions(g), "ordinate": g in ORD_GROUPS} for g in HOLE_GROUPS]
+has_ord = bool(ORD_GROUPS) and ordinates("Front", [h for g in ORD_GROUPS for h in g["holes"]])
+
+
+# ---------------------------------------------------------------- 圆形件: 视图轮廓是整圆 → 标直径, 不标长 × 宽
+def outer_round(vname):
+    """视图方向上最大的外圆柱面(凸, 轴线 ∥ 视线), 且直径 ≈ 视图外形(≥ 98%)→ 返回半径, 否则 None。"""
+    _, _, d = VAX[vname]
+    best = None
+    for f in shape.Faces:
+        s = f.Surface
+        if not isinstance(s, Part.Cylinder) or abs(abs(s.Axis.normalize().dot(d)) - 1) > 1e-6:
+            continue
+        u0, u1, v0, v1 = f.ParameterRange
+        p, n = f.valueAt((u0 + u1) / 2, (v0 + v1) / 2), f.normalAt((u0 + u1) / 2, (v0 + v1) / 2)
+        ax = s.Axis.normalize()
+        rad = (p - s.Center) - ax * ((p - s.Center).dot(ax))
+        if rad.Length > 1e-6 and n.dot(rad) > 0 and (best is None or s.Radius > best):
+            best = s.Radius
+    bw_, bh_, _ = VAX[vname]
+    if best and 2 * best >= 0.98 * max(ext(bw_), ext(bh_)):
+        return best
+    return None
+
+
+def place_diameter(vname, radius, name):
+    """在视图里找半径 = radius 的圆边, 标 ⌀(位置: 视图右上 / 左上 / 右下外侧, 避让)。"""
+    v, r = views[vname], R[vname]
+    circ = [(n, ed) for n, ed in edges_of(v) if isinstance(ed.Curve, Part.Circle) and abs(ed.Curve.Radius - radius) < 1e-3]
+    if not circ:
+        rep["warnings"].append("round %s: circle edge not found" % vname)
+        return False
+    txt = DIMS["diameter"] + fmt(2 * radius)
+    for ring in range(8):
+        off = G * 1.6 + ring * STEP
+        for p in ((r[2] + off, r[3] + off * 0.6), (r[0] - off, r[3] + off * 0.6), (r[2] + off, r[1] - off * 0.6)):
+            rr = text_rect(p[0], p[1], txt)
+            if placer.free(rr):
+                placer.take(rr)
+                add_dim(v, "Diameter", [circ[0][0]], name, p, fmt_spec=DIMS["diameter"] + FSPEC)
+                return True
+    return False
+
 
 # 外形: 主视 宽(上)、高(左); 厚度标在左视(上)。第一角里主视下面是俯视, 所以宽标在上面。
-# 有坐标尺寸时末值就是总长 / 总宽, 不再重复标。
-if not has_ord:
+# 有坐标尺寸时末值就是总长 / 总宽, 不再重复标; 主视轮廓是整圆 → 标直径。
+front_r = outer_round("Front")
+rep["round_front"] = bool(front_r)
+if front_r:
+    place_diameter("Front", front_r, "DiaOuter")
+elif not has_ord:
     place_linear("Front", "x", "top", "LenW", Wm)
     place_linear("Front", "y", "left", "LenH", Hm)
 place_linear("Left", "x", "top", "LenD", Dm)
@@ -776,53 +872,42 @@ def circle_for(vname, circles, h):
 
 
 # 孔: 按"在哪个视图里是圆"分视图, 同规格合并成一条标注("6 x ⌀4.3 贯穿"), 引线指向其中一个
-k_i = 0
-for vname in VAX:
-    groups = {}
-    for h in holes:
-        if hole_view(h) != vname:
-            continue
-        # 按标注文字分组(而不是原始浮点数): 深度 11.9999 与 12 标出来一样, 就是同一组
-        k = callout(h, 1)
-        groups.setdefault(k, []).append(h)
-    if not groups:
-        continue
+circles_of = {}
+for g in HOLE_GROUPS:
+    vname, hs, txt = g["view"], g["holes"], g["text"]
     v, r = views[vname], R[vname]
-    circles = [(n, ed) for n, ed in edges_of(v) if isinstance(ed.Curve, Part.Circle)]
+    if vname not in circles_of:
+        circles_of[vname] = [(n, ed) for n, ed in edges_of(v) if isinstance(ed.Curve, Part.Circle)]
+    circles = circles_of[vname]
     cxV, cyV = (r[0] + r[2]) / 2, (r[1] + r[3]) / 2
-    for k, hs in sorted(groups.items(), key=lambda kv: -len(kv[1])):
-        h0 = dict(hs[0])
-        txt = callout(h0, len(hs))
-        # 引线指向这组里最靠视图外缘的那个孔(引线短、少穿过图形)
-        hits = [(hh, circle_for(vname, circles, hh)) for hh in hs]
-        hits = [(hh, ht) for hh, ht in hits if ht]
-        if not hits:
-            rep["warnings"].append("no circle for hole %s in %s" % (h0, vname))
-            continue
-        # 候选位置: 视图四周外侧一圈圈往外; 对组里每个孔 × 每个空位算引线长, 取最短(引线短、少横穿图形)
-        best = None
-        for hh, (n, c) in hits:
-            px_, py_ = cxV + c.x, cyV + c.y
-            for ring in range(8):
-                off = G * 1.6 + ring * STEP
-                for p in ((px_ + off * 0.5, r[3] + off), (px_ - off * 0.5, r[3] + off),
-                          (px_ + off * 0.5, r[1] - off), (px_ - off * 0.5, r[1] - off),
-                          (r[2] + off + 12, py_ + off * 0.3), (r[0] - off - 12, py_ + off * 0.3)):
-                    rr = text_rect(p[0], p[1], txt)
-                    if not placer.free(rr):
-                        continue
-                    dist = math.hypot(p[0] - px_, p[1] - py_)
-                    if best is None or dist < best[0]:
-                        best = (dist, n, p, rr)
-        if best is None:
-            hh, (n, c) = hits[0]
-            spot = (r[2] + G * 2, cyV + c.y)
-            rep["warnings"].append("callout overlaps: " + txt)
-        else:
-            _, n, spot, rr = best
-            placer.take(rr)
-        add_dim(v, "Diameter", [n], "Hole%d" % k_i, spot, text=txt)
-        k_i += 1
+    hits = [(hh, circle_for(vname, circles, hh)) for hh in hs]
+    hits = [(hh, ht) for hh, ht in hits if ht]
+    if not hits:
+        rep["warnings"].append("no circle for hole group %s in %s" % (g["id"], vname))
+        continue
+    # 候选位置: 视图四周外侧一圈圈往外; 对组里每个孔 × 每个空位算引线长, 取最短(引线短、少横穿图形)
+    best = None
+    for hh, (n, c) in hits:
+        px_, py_ = cxV + c.x, cyV + c.y
+        for ring in range(8):
+            off = G * 1.6 + ring * STEP
+            for p in ((px_ + off * 0.5, r[3] + off), (px_ - off * 0.5, r[3] + off),
+                      (px_ + off * 0.5, r[1] - off), (px_ - off * 0.5, r[1] - off),
+                      (r[2] + off + 12, py_ + off * 0.3), (r[0] - off - 12, py_ + off * 0.3)):
+                rr = text_rect(p[0], p[1], txt)
+                if not placer.free(rr):
+                    continue
+                dist = math.hypot(p[0] - px_, p[1] - py_)
+                if best is None or dist < best[0]:
+                    best = (dist, n, p, rr)
+    if best is None:
+        hh, (n, c) = hits[0]
+        spot = (r[2] + G * 2, cyV + c.y)
+        rep["warnings"].append("callout overlaps: " + txt)
+    else:
+        _, n, spot, rr = best
+        placer.take(rr)
+    add_dim(v, "Diameter", [n], g["id"], spot, text=txt)
 flush_page_svg()
 doc.recompute()
 lap("dims")
@@ -868,7 +953,7 @@ if GUI:
         if sec is not None and o is sec and vo is not None and hasattr(vo, "ShowLabel"):
             vo.ShowLabel = True
         # 孔标注: 水平文字 + 引线(ISO referencing); 线性尺寸保持 ISO oriented
-        if vo is not None and o.Name.startswith("Hole") and hasattr(vo, "StandardAndStyle"):
+        if vo is not None and o.Name in HOLE_IDS and hasattr(vo, "StandardAndStyle"):
             try:
                 vo.StandardAndStyle = "ISO Referencing"
             except Exception as e:
