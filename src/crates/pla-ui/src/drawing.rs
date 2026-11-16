@@ -184,6 +184,47 @@ pub fn spec(s: &Sheet, dir: &Path, dims_file: Option<&Path>) -> Value {
     v
 }
 
+/// D3 装配图在图列表里的 key(不是 BOM 零件指纹)。
+pub const ASM_KEY: &str = "@assembly";
+
+/// 装配图的一行 BOM(明细表 + 实体指纹; ids = 全部实例的稳定 id, 导出整个装配用)。
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+pub struct AsmLine {
+    pub key: String,
+    pub pn: String,
+    pub name: String,
+    pub qty: u64,
+    pub material: String,
+    pub note: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub volume: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub area: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub density: Option<f64>,
+    #[serde(skip)]
+    pub ids: Vec<String>,
+}
+
+/// 装配图方案 JSON(格式见 tools/drawing/compile_assembly.py 文件头)。
+pub fn asm_spec(s: &Sheet, dir: &Path, lines: &[AsmLine]) -> Value {
+    let title: serde_json::Map<String, Value> = s.title.iter().filter(|(_, v)| !v.trim().is_empty()).map(|(k, v)| (k.clone(), json!(v))).collect();
+    let mut v = json!({
+        "standard": "GB",
+        "assembly": { "step": file(dir, s, "step").display().to_string(), "lines": lines },
+        "title": title,
+        "basename": s.base,
+        "out": dir.display().to_string(),
+    });
+    if let Some(f) = s.front {
+        v["front"] = json!(f);
+    }
+    if let Some(u) = s.up {
+        v["up"] = json!(u);
+    }
+    v
+}
+
 /// 按材料名猜密度(g/cm³); 认不出 → None(重量留空, 用户可填)。
 pub fn guess_density(material: &str) -> Option<f64> {
     let m = material.to_lowercase();
@@ -361,6 +402,23 @@ pub fn book_file(dir: &Path, doc_key: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn asm_spec_lines() {
+        let dir = std::env::temp_dir().join("pla-drawing-test");
+        let mut s = Sheet::new(ASM_KEY, "model1-asm", "", "");
+        s.title.insert("name".into(), "总装".into());
+        s.title.insert("pn".into(), "  ".into());
+        let l = AsmLine { key: "k1".into(), name: "Box".into(), qty: 5, volume: Some(447040.0), area: Some(35087.0), density: Some(2.7), ids: vec!["a".into()], ..Default::default() };
+        let v = asm_spec(&s, &dir, &[l]);
+        assert!(v["assembly"]["step"].as_str().unwrap().ends_with("model1-asm.step"));
+        assert_eq!(v["assembly"]["lines"][0]["qty"], 5);
+        assert_eq!(v["assembly"]["lines"][0]["volume"], 447040.0);
+        assert!(v["assembly"]["lines"][0].get("ids").is_none(), "ids are only for the export");
+        assert_eq!(v["title"]["name"], "总装");
+        assert!(v["title"].get("pn").is_none());
+        assert!(v.get("part").is_none() && v.get("front").is_none());
+    }
 
     #[test]
     fn spec_from_sheet() {

@@ -7,7 +7,8 @@ from xml.sax.saxutils import escape
 A3 = (420.0, 297.0)
 
 
-def build(std, paper):
+def build(std, paper, kind="part"):
+    """kind = part(零件图, 右上角"其余"粗糙度)/ assembly(装配图, 不画粗糙度)。"""
     W, H = std["paper"][paper]
     fr = std["frame"]
     o, band = fr["outer"], fr["zone_band"]
@@ -105,12 +106,13 @@ def build(std, paper):
     for i in range(12):
         a(field("tech_%d" % (i + 1), tx + 2, ty + 12 + i * 3.4, fonts["small"], "start", lines_[i] if i < len(lines_) else ""))
     # 其余粗糙度(右上角): "其余" + 去除材料符号 + Ra 值
-    rg = std["roughness"]
-    rx_, ry_ = rg["x"] + dx, rg["y"]
-    a(t % (rx_, ry_ + 2, fam, fonts["text"], "end", "", "其余"))
-    a('<path d="M %g %g L %g %g L %g %g H %g M %g %g H %g" style="fill:none;stroke:#000;stroke-width:%g"/>'
-      % (rx_ + 2, ry_ - 2, rx_ + 5, ry_ + 3, rx_ + 11, ry_ - 7, rx_ + 20, rx_ + 2.6, ry_ - 1, rx_ + 7.4, lines["thin"]))
-    a(field("roughness", rx_ + 9, ry_ - 7.8, fonts["text"], "start", std.get("roughness_default", "")))
+    if kind != "assembly":
+        rg = std["roughness"]
+        rx_, ry_ = rg["x"] + dx, rg["y"]
+        a(t % (rx_, ry_ + 2, fam, fonts["text"], "end", "", "其余"))
+        a('<path d="M %g %g L %g %g L %g %g H %g M %g %g H %g" style="fill:none;stroke:#000;stroke-width:%g"/>'
+          % (rx_ + 2, ry_ - 2, rx_ + 5, ry_ + 3, rx_ + 11, ry_ - 7, rx_ + 20, rx_ + 2.6, ry_ - 1, rx_ + 7.4, lines["thin"]))
+        a(field("roughness", rx_ + 9, ry_ - 7.8, fonts["text"], "start", std.get("roughness_default", "")))
     a('</svg>')
     return "\n".join(out)
 

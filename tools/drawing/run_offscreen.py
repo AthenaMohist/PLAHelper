@@ -8,8 +8,14 @@ import traceback
 HERE = os.path.dirname(os.path.abspath(__file__))
 code = 0
 try:
-    src = open(os.path.join(HERE, "compile_freecad.py"), encoding="utf-8").read()
-    exec(compile(src, os.path.join(HERE, "compile_freecad.py"), "exec"), {"__name__": "__compile__", "__file__": os.path.join(HERE, "compile_freecad.py")})
+    # 方案里有 assembly → 装配图编译器, 否则零件图
+    import json as _json
+
+    _sp = os.environ.get("PLA_DRAW_SPEC", "")
+    _is_asm = bool(_sp) and "assembly" in _json.load(open(_sp, encoding="utf-8-sig"))
+    script = os.path.join(HERE, "compile_assembly.py" if _is_asm else "compile_freecad.py")
+    src = open(script, encoding="utf-8").read()
+    exec(compile(src, script, "exec"), {"__name__": "__compile__", "__file__": script})
 except BaseException:
     code = 1
     try:
