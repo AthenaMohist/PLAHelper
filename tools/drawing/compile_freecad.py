@@ -908,6 +908,78 @@ for g in HOLE_GROUPS:
         _, n, spot, rr = best
         placer.take(rr)
     add_dim(v, "Diameter", [n], g["id"], spot, text=txt)
+
+
+# ---------------------------------------------------------------- 螺纹画法(国标): 孔是圆的视图里, 大径画约 3/4 圈细实线
+# (底孔 = 小径, 视图里本来就是粗实线圆)。缺口在右上象限。只画看得见的: 贯穿, 或入口朝着看的人; 背面的盲孔不画。
+# 视图边坐标与页面的正负关系: 用视图里全部孔对圆边做四种正负的匹配, 取对上最多的(在主视上校准, 主视的模型 → 页面已由坐标尺寸验证)。
+def edge_signs(vname):
+    bw_, bh_, _ = VAX[vname]
+    circles = circles_of.get(vname) or [(n, ed) for n, ed in edges_of(views[vname]) if isinstance(ed.Curve, Part.Circle)]
+    hs = [h for h in holes if hole_view(h) == vname]
+    best, bn = (1, 1), -1
+    for sx in (1, -1):
+        for sy in (1, -1):
+            n_ = 0
+            for h in hs:
+                at = V(*h["at"])
+                px, py = (at - bb.Center).dot(bw_), (at - bb.Center).dot(bh_)
+                if any(abs(ed.Curve.Radius - h["d"] / 2) < 1e-3 and math.hypot(ed.Curve.Center.x - sx * px, ed.Curve.Center.y - sy * py) < 1e-2
+                       for _, ed in circles):
+                    n_ += 1
+            if n_ > bn:
+                best, bn = (sx, sy), n_
+    return best, bn, len(hs)
+
+
+def thread_major(tap):
+    import re
+
+    m = re.match(r"\s*M\s*(\d+(?:\.\d+)?)", tap or "")
+    return float(m.group(1)) if m else None
+
+
+def draw_threads():
+    taps = [h for h in holes if h.get("tap") and thread_major(h["tap"]) and hole_view(h)]
+    if not taps:
+        return
+    # 边坐标 → 页面的正负: 主视 模型 → 页面 = (+, +), 所以 主视里 模型 → 边 的正负 = 边 → 页面的正负(各视图通用)
+    (ex, ey), got, tot = edge_signs("Front")
+    if tot == 0 or got == 0:
+        ex, ey = 1, 1
+        rep["warnings"].append("thread arcs: no holes in Front to calibrate edge signs, assumed (+,+)")
+    lw = std["lines"]["thin"]
+    drawn = 0
+    for vname in VAX:
+        hs = [h for h in taps if hole_view(h) == vname]
+        if not hs:
+            continue
+        (sx, sy), _, _ = edge_signs(vname)
+        bw_, bh_, _ = VAX[vname]
+        vdir = V(views[vname].Direction) if hasattr(views[vname], "Direction") else front  # 视线: 由零件指向看的人
+        cxV, cyV = vcenter(views[vname])
+        circles = circles_of.get(vname) or [(n, ed) for n, ed in edges_of(views[vname]) if isinstance(ed.Curve, Part.Circle)]
+        for h in hs:
+            if not h.get("through") and V(*h["axis"]).dot(vdir) <= 0:
+                continue  # 背面的盲孔: 看不见
+            at = V(*h["at"])
+            px, py = (at - bb.Center).dot(bw_), (at - bb.Center).dot(bh_)
+            hit = next((ed for _, ed in circles if abs(ed.Curve.Radius - h["d"] / 2) < 1e-3
+                        and math.hypot(ed.Curve.Center.x - sx * px, ed.Curve.Center.y - sy * py) < 1e-2), None)
+            if hit is None:
+                rep["warnings"].append("thread arc: no circle for %s at %s in %s" % (h["tap"], h["at"], vname))
+                continue
+            X = cxV + ex * hit.Curve.Center.x * scale
+            Y = H - (cyV + ey * hit.Curve.Center.y * scale)  # SVG y 向下
+            r_ = thread_major(h["tap"]) / 2 * scale
+            # 从顶点出发逆时针(屏幕上向左)走 270° 到右点: 缺口在右上象限
+            PAGE_SVG.append('<path d="M %.3f %.3f A %.3f %.3f 0 1 0 %.3f %.3f" style="fill:none;stroke:#000;stroke-width:%g"/>'
+                            % (X, Y - r_, r_, r_, X + r_, Y, lw))
+            drawn += 1
+    rep["thread_arcs"] = {"drawn": drawn, "tapped": len(taps), "edge_signs": [ex, ey]}
+
+
+draw_threads()
 flush_page_svg()
 doc.recompute()
 lap("dims")
