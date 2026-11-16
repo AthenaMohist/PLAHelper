@@ -209,6 +209,9 @@ struct PlaApp {
     draw_report: Option<(String, pla_ui::drawing::Report)>,
     draw_png: Option<(String, egui::load::Bytes)>,
     draw_buf: std::collections::HashMap<String, String>,
+    /// 批量出图: 待出的 (零件 key, 重新导出 STEP?, 标题栏); 本批 (总数, 失败的图名)。
+    draw_queue: std::collections::VecDeque<(String, bool, std::collections::BTreeMap<String, String>)>,
+    draw_batch: Option<(usize, Vec<String>)>,
     lib: pla_ui::parts_lib::Library,
     lib_mtime: Option<std::time::SystemTime>,
     lib_checked: Option<Instant>,
@@ -2532,6 +2535,8 @@ impl PlaApp {
             draw_report: None,
             draw_png: None,
             draw_buf: Default::default(),
+            draw_queue: Default::default(),
+            draw_batch: None,
             lib: Default::default(),
             lib_mtime: None,
             lib_checked: None,
@@ -4466,6 +4471,8 @@ impl PlaApp {
             self.draw_report = None;
             self.draw_png = None;
             self.draw_buf.clear();
+            self.draw_queue.clear();
+            self.draw_batch = None;
         }
         let got = match self.draw_job.as_ref().and_then(|j| j.rx.as_ref()) {
             Some(rx) => match rx.try_recv() {
@@ -4478,6 +4485,53 @@ impl PlaApp {
         if let Some(r) = got {
             let key = self.draw_job.take().map(|j| j.key).unwrap_or_default();
             self.draw_compiled(&key, r);
+        }
+        // 批量: 上一张出完(或起不来)就接下一张; 排空了报一次结果
+        while self.draw_job.is_none() {
+            let Some((key, export, title)) = self.draw_queue.pop_front() else { break };
+            self.draw_start(&key, export, title);
+            if self.draw_job.is_none() {
+                self.draw_failed(&key);
+            }
+        }
+        if self.draw_job.is_none() && self.draw_queue.is_empty() {
+            if let Some((n, failed)) = self.draw_batch.take() {
+                let ok = n.saturating_sub(failed.len());
+                let msg = if failed.is_empty() {
+                    t!("批量出图完成: {ok} 张", "Batch drawing done: {ok} sheet(s)")
+                } else {
+                    t!("批量出图: {ok} 张完成, 失败 {}: {}", "Batch drawing: {ok} done, {} failed: {}", failed.len(), failed.join(", "))
+                };
+                self.set_notice((!failed.is_empty(), msg));
+            }
+        }
+    }
+
+    /// 批量里有一张失败: 记下图名(单张出图时不记)。
+    fn draw_failed(&mut self, key: &str) {
+        let base = self.draw_sheets.get(key).map(|s| s.base.clone()).unwrap_or_else(|| key.to_string());
+        if let Some((_, f)) = self.draw_batch.as_mut() {
+            f.push(base);
+        }
+    }
+
+    /// 零件第一次出图: 建一张图(图名 = 料号或名字, 重名加 -2…; 密度按材料猜); 已有的跟着 BOM 换实例。
+    fn draw_ensure(&mut self, key: &str, title: &std::collections::BTreeMap<String, String>, member: &(String, String)) {
+        if self.draw_sheets.get(key).is_none() {
+            let want = pla_ui::drawing::base_name(title.get("pn").map(|s| s.as_str()).unwrap_or(""), title.get("name").map(|s| s.as_str()).unwrap_or(&member.1));
+            let base = self.draw_sheets.unique_base(key, &want);
+            let mut s = pla_ui::drawing::Sheet::new(key, &base, &member.0, &member.1);
+            s.density = title.get("material").and_then(|m| pla_ui::drawing::guess_density(m));
+            self.draw_sheets.upsert(s);
+            self.draw_save();
+        } else if let Some(mut s) = self.draw_sheets.get(key).cloned() {
+            // 实例可能换了(删了重建): 跟着 BOM 走
+            if !member.0.is_empty() && (s.member != member.0 || s.model_name != member.1) {
+                s.member = member.0.clone();
+                s.model_name = member.1.clone();
+                self.draw_sheets.upsert(s);
+                self.draw_save();
+            }
         }
     }
 
@@ -4529,9 +4583,13 @@ impl PlaApp {
                 }
                 self.draw_job = None;
                 self.draw_compile(&key, title);
+                if self.draw_job.is_none() {
+                    self.draw_failed(&key);
+                }
             }
             Err(e) => {
                 self.draw_job = None;
+                self.draw_failed(&key);
                 self.set_notice((true, t!("导出 STEP 失败: {e}", "STEP export failed: {e}")));
             }
         }
@@ -4565,9 +4623,15 @@ impl PlaApp {
                     self.draw_save();
                     self.set_notice((false, t!("已出图 {base}", "Drawing {base} done")));
                 }
-                self.draw_load(key);
+                // 批量时别把预览换成后台出的那张
+                if self.draw_sel.as_deref() == Some(key) {
+                    self.draw_load(key);
+                }
             }
-            Err(e) => self.set_notice((true, t!("出图失败: {e}", "Drawing failed: {e}"))),
+            Err(e) => {
+                self.draw_failed(key);
+                self.set_notice((true, t!("出图失败: {e}", "Drawing failed: {e}")));
+            }
         }
     }
 
@@ -4661,24 +4725,48 @@ impl PlaApp {
                 }
             }
         });
-        if let Some(i) = pick {
-            let it = &items[i];
-            if self.draw_sheets.get(&it.key).is_none() {
-                let want = pla_ui::drawing::base_name(it.title.get("pn").map(|s| s.as_str()).unwrap_or(""), it.title.get("name").map(|s| s.as_str()).unwrap_or(&it.member.1));
-                let base = self.draw_sheets.unique_base(&it.key, &want);
-                let mut s = pla_ui::drawing::Sheet::new(&it.key, &base, &it.member.0, &it.member.1);
-                s.density = it.title.get("material").and_then(|m| pla_ui::drawing::guess_density(m));
-                self.draw_sheets.upsert(s);
-                self.draw_save();
-            } else if let Some(mut s) = self.draw_sheets.get(&it.key).cloned() {
-                // 实例可能换了(删了重建): 跟着 BOM 走
-                if !it.member.0.is_empty() && (s.member != it.member.0 || s.model_name != it.member.1) {
-                    s.member = it.member.0.clone();
-                    s.model_name = it.member.1.clone();
-                    self.draw_sheets.upsert(s);
-                    self.draw_save();
+        // ---- 批量: 当前 BOM 范围里的零件(不在范围里的旧图不管) ----
+        let mut batch: Option<bool> = None; // Some(包括已出过的?)
+        ui.horizontal(|ui| {
+            if self.draw_batch.is_some() {
+                let (n, f) = self.draw_batch.as_ref().map(|(n, f)| (*n, f.len())).unwrap_or_default();
+                let left = self.draw_queue.len() + usize::from(self.draw_job.is_some());
+                ui.label(egui::RichText::new(t!("批量出图 {}/{n}(失败 {f})", "Batch {}/{n} ({f} failed)", (n + 1).saturating_sub(left).min(n))).color(COL_ACCENT));
+                if ui.small_button(tr("停止", "Stop")).on_hover_text(tr("正在出的这张出完就停", "Stops after the current sheet")).clicked() {
+                    // 当前这张出完为止; 没排上的不算失败
+                    let dropped = self.draw_queue.len();
+                    self.draw_queue.clear();
+                    if let Some((n, _)) = self.draw_batch.as_mut() {
+                        *n -= dropped;
+                    }
+                }
+            } else {
+                let free = self.draw_job.is_none() && !self.bom_busy;
+                let todo = items.iter().filter(|it| !it.member.0.is_empty() && self.draw_sheets.get(&it.key).map_or(true, |s| s.compiled.is_empty())).count();
+                let all = items.iter().filter(|it| !it.member.0.is_empty()).count();
+                if ui.add_enabled(free && todo > 0, egui::Button::new(t!("出未出的 {todo} 张", "Draw {todo} undrawn"))).on_hover_text(tr("按 BOM 顺序一张张出(每张约 20–90 s); 可以接着在 Plasticity 里干活, 但别关文档", "Draws one by one in BOM order (~20–90 s each); you can keep working in Plasticity, but keep the document open")).clicked() {
+                    batch = Some(false);
+                }
+                if ui.add_enabled(free && all > 0, egui::Button::new(t!("全部重出 {all} 张", "Redraw all {all}"))).on_hover_text(tr("每张都重新导出 STEP 再出图(模型改过之后用)", "Re-exports every STEP, then draws (use after the model changed)")).clicked() {
+                    batch = Some(true);
                 }
             }
+        });
+        if let Some(redo) = batch {
+            for it in items.iter().filter(|it| !it.member.0.is_empty()) {
+                if !redo && self.draw_sheets.get(&it.key).is_some_and(|s| !s.compiled.is_empty()) {
+                    continue;
+                }
+                self.draw_ensure(&it.key, &it.title, &it.member);
+                let mut title = it.title.clone();
+                title.extend(self.draw_sheets.get(&it.key).map(|s| s.title.clone()).unwrap_or_default());
+                self.draw_queue.push_back((it.key.clone(), redo, title));
+            }
+            self.draw_batch = Some((self.draw_queue.len(), Vec::new()));
+        }
+        if let Some(i) = pick {
+            let it = &items[i];
+            self.draw_ensure(&it.key, &it.title, &it.member);
             self.draw_sel = Some(it.key.clone());
             self.draw_buf.clear();
             let k = it.key.clone();
