@@ -134,7 +134,7 @@ for i, l in enumerate(lines):
 for si_, s in enumerate(solids):
     cands = [(fp_err(si_, f), i) for f, i in FPS]
     e, i = min(cands) if cands else (1e9, None)
-    owner.append(i if e < 0.02 else None)
+    owner.append(i if e < 0.05 else None)  # 导入的 B 样条件: STEP 里算的体积 / 面积与 Plasticity 差得多一点
 for i, l in enumerate(lines):
     l["found"] = sum(1 for o in owner if o == i)
     if l.get("qty") and not l.get("parts") and l["found"] != int(l["qty"]):
@@ -224,9 +224,16 @@ P = "User parameter:BaseApp/Preferences/Mod/TechDraw/"
 App.ParamGet(P + "Labels").SetString("LabelFont", std["fonts"]["latin"])
 App.ParamGet(P + "Labels").SetFloat("LabelSize", std["fonts"]["text"])
 App.ParamGet(P + "Dimensions").SetFloat("FontSize", std["fonts"]["dim"])
+HANDLE_FACES_WAS = App.ParamGet(P + "General").GetBool("HandleFaces", True)  # 用户设置: 导出完还原
+App.ParamGet(P + "General").SetBool("HandleFaces", False)  # 不找面(大装配找面要几分钟; 装配图不剖面线)
 
 # ---------------------------------------------------------------- 方向: 主视默认从前(-Y)往后看, Z 朝上(Plasticity 建模习惯)
-front = V(*(spec.get("front") or [0, -1, 0])).normalize()
+# 没指定: Z 朝上, 两个水平方向里长的那边横着放(从短边那侧看), 与零件图"长边水平"一致
+if spec.get("front"):
+    front = V(*spec["front"]).normalize()
+else:
+    front = V(0, -1, 0) if bb.XLength >= bb.YLength else V(-1, 0, 0)
+    rep["front"] = "auto"
 up = V(*(spec.get("up") or ([0, 0, 1] if abs(front.z) < 0.9 else [0, 1, 0]))).normalize()
 if abs(up.dot(front)) > 1e-6:
     rep["warnings"].append("up is not perpendicular to front: using default")
@@ -248,7 +255,10 @@ import make_template  # noqa: E402
 PL = ASM.get("parts_list", {"row_h": 7, "columns": [{"id": "no", "label": "序号", "w": 10}, {"id": "name", "label": "名称", "w": 60}, {"id": "qty", "label": "数量", "w": 12}]})
 BAL = ASM.get("balloon", {"r": 4.0, "font": 5.0, "gap": 1.5, "dot": 0.6, "offset": 14.0})
 PL_W = sum(c["w"] for c in PL["columns"])
-PL_H = PL["row_h"] * (len(lines) + 1)
+# 行多时分栏(国标: 不够高就在左边接着排, 每栏有表头); 每栏最多 PL_ROWS 行
+PL_ROWS = int(PL.get("max_rows", 22))
+PL_COLS = max(1, -(-len(lines) // PL_ROWS))
+PL_H = PL["row_h"] * (min(len(lines), PL_ROWS) + 1)
 SCALES = [5, 4, 2.5, 2, 1.5, 1, 1 / 1.5, 1 / 2, 1 / 2.5, 1 / 3, 1 / 4, 1 / 5, 1 / 10, 1 / 20, 1 / 50]
 GAPV = 26.0
 BAND = BAL["offset"] + 2 * BAL["r"] + 4  # 序号占的一圈
@@ -263,7 +273,7 @@ def layout(paper):
     tb_top = std["title_block"]["rows_top"]  # 标题栏上沿(按 A3 量, 跟着下边走 → 页面 y 向上 = 297 − rows_top)
     area_b = 297 - tb_top
     area = (inner_l + 4, area_b + 4, inner_r - 4, inner_t - 4)
-    pl = (inner_r - PL_W, area_b, inner_r, area_b + PL_H)  # 明细表(页面坐标, y 向上)
+    pl = (inner_r - PL_W * PL_COLS, area_b, inner_r, area_b + PL_H)  # 明细表(页面坐标, y 向上; 多栏往左)
     return W, H, area, pl
 
 
@@ -305,131 +315,177 @@ paper, scale, (fx, fy), vbox = choice
 # 图上看不见的小实体(按这个比例画出来 < 0.8 mm, 如电路板上的 0402 电阻)不进视图: 消隐时间主要花在它们身上。
 # 只在去掉后整体包围盒不变时才去(视图边坐标以包围盒中心为原点, 变了序号 / 尺寸就对不上)。
 MIN_PAPER = float(spec.get("min_paper_mm", 0.8))
-keep = [s for s in solids if s.BoundBox.DiagonalLength * scale >= MIN_PAPER]
-if len(keep) < len(solids):
-    kb = Part.makeCompound(keep).BoundBox
-    if max(abs(kb.XMin - bb.XMin), abs(kb.XMax - bb.XMax), abs(kb.YMin - bb.YMin), abs(kb.YMax - bb.YMax), abs(kb.ZMin - bb.ZMin), abs(kb.ZMax - bb.ZMax)) < 1e-6:
-        part.Shape = Part.makeCompound(keep)
-        rep["dropped_small"] = len(solids) - len(keep)
+# B 样条面很多的实体(IGES 转来的外购件, 如伺服驱动器 1200+ 个 B 样条面)精确消隐要十几分钟 →
+# 画成外形包围盒(国标允许外购件简化画外形)。可见点判断也用简化后的(distToShape 同样慢)。
+ANALYTIC = (Part.Plane, Part.Cylinder, Part.Cone, Part.Sphere, Part.Toroid)
+BS_MAX = int(spec.get("simplify_bspline_faces", 100))
+# 外购件门槛更低: 实测 XYZ 台里一个 112 个 B 样条面的实体从上往下看消隐卡死(OCC; 从前面看 0.5 s)
+BS_MAX_BOUGHT = int(spec.get("simplify_bspline_faces_purchased", 50))
+
+
+def round_section(s, k):
+    """沿第 k 轴看截面是圆的: 截面四个角附近(内缩 10%)在 5 个轴向位置上都不在实体里(方盒子的角是实的)。
+    实测伺服驱动器包围盒两边也差不到 5%, 只看包围盒会被画成圆盘。"""
+    b_ = s.BoundBox
+    lo = [b_.XMin, b_.YMin, b_.ZMin]
+    ln = [b_.XLength, b_.YLength, b_.ZLength]
+    i, j = [n for n in range(3) if n != k]
+    for t in (0.1, 0.3, 0.5, 0.7, 0.9):
+        for ci in (0.1, 0.9):
+            for cj in (0.1, 0.9):
+                p = [0.0, 0.0, 0.0]
+                p[k] = lo[k] + ln[k] * t
+                p[i] = lo[i] + ln[i] * ci
+                p[j] = lo[j] + ln[j] * cj
+                try:
+                    if s.isInside(V(*p), 1e-3, True):
+                        return False
+                except Exception:
+                    return False
+    return True
+
+
+def outline(s):
+    """简化外形: 包围盒两边差 < 5% → 沿第三轴的圆柱(编码器 / 电机), 否则长方体。包围盒不变。"""
+    b_ = s.BoundBox
+    L = [(b_.XLength, V(1, 0, 0)), (b_.YLength, V(0, 1, 0)), (b_.ZLength, V(0, 0, 1))]
+    for k in range(3):
+        a_, c_ = [L[j][0] for j in range(3) if j != k]
+        if max(a_, c_) > 1e-6 and abs(a_ - c_) / max(a_, c_) < 0.05 and L[k][0] > 1e-3 and round_section(s, k):
+            r_ = min(a_, c_) / 2
+            ax = L[k][1]
+            base = V(b_.Center.x, b_.Center.y, b_.Center.z) - ax * (L[k][0] / 2)
+            # 不往复合体里塞孤立顶点保包围盒: 实测会让某个方向的消隐整个返回空(俯视 0 条边);
+            # 视图原点本来就取所画形体的包围盒, 圆柱略小一点无妨
+            return Part.makeCylinder(r_, L[k][0], base, ax)
+    return Part.makeBox(max(b_.XLength, 1e-3), max(b_.YLength, 1e-3), max(b_.ZLength, 1e-3), V(b_.XMin, b_.YMin, b_.ZMin))
+
+
+DRAW = []  # 画图 / 遮挡判断用的实体(下标与 solids 一致; None = 太小不画)
+simplified = 0
+for si_, s in enumerate(solids):
+    if s.BoundBox.DiagonalLength * scale < MIN_PAPER:
+        DRAW.append(None)
+        continue
+    nbs = sum(1 for f in s.Faces if not isinstance(f.Surface, ANALYTIC))
+    bought = owner[si_] is not None and bool(lines[owner[si_]].get("parts"))
+    if nbs > (BS_MAX_BOUGHT if bought else BS_MAX):
+        DRAW.append(outline(s))
+        simplified += 1
     else:
-        rep["warnings"].append("small solids kept: removing them would change the bounding box")
+        DRAW.append(s)
+keep = [d for d in DRAW if d is not None]
+if keep and (simplified or len(keep) < len(solids)):
+    part.Shape = Part.makeCompound(keep)
+    # 视图边坐标的原点 = 所画形体的包围盒中心: 以画的为准(去掉 / 简化通常不改包围盒, 改了也只差一点)
+    bb = part.Shape.BoundBox
+rep["dropped_small"] = len(solids) - len(keep)
+rep["simplified"] = simplified
+if simplified:
+    rep["warnings"].append("%d complex solid(s) drawn as a simplified outline (box / cylinder; > %d B-spline faces, purchased > %d)" % (simplified, BS_MAX, BS_MAX_BOUGHT))
 W, H, AREA, PLR = layout(paper)
 rep["paper"], rep["scale"] = paper, scale
 
-tpl_path = os.path.join(OUT, "_tpl_%s_%s_asm.svg" % (std["name"], paper))
-with open(tpl_path, "w", encoding="utf-8") as f:
-    f.write(make_template.build(std, paper, sheet="assembly"))
-page = doc.addObject("TechDraw::DrawPage", "Page")
-tpl = doc.addObject("TechDraw::DrawSVGTemplate", "Template")
-tpl.Template = tpl_path
-page.Template = tpl
-
-# ---------------------------------------------------------------- 三视图(第一角, 不画虚线)+ 轴测
-grp = doc.addObject("TechDraw::DrawProjGroup", "Proj")
-page.addView(grp)
-grp.Source = [part]
-grp.ProjectionType = std.get("projection", "First angle")
-grp.ScaleType = "Custom"
-grp.Scale = scale
-for name in ("Front", "Top", "Left"):
-    it = grp.addProjection(name)
-    try:
-        it.HardHidden = False
-    except Exception:
-        pass
-    if name == "Front":
-        grp.Anchor.Direction = front
-        grp.Anchor.XDirection = right
-        doc.recompute()
-# 子视图位置自己定(不靠 AutoDistribute: 它要等消隐算完才知道视图大小, 大装配要几分钟, 早读位置会全叠在一起)
-views = {v.Type: v for v in grp.Views}
-try:
-    grp.AutoDistribute = False
-except Exception as e:
-    rep["warnings"].append("autodistribute: %s" % e)
-views["Top"].X, views["Top"].Y = 0.0, -(Hm * scale / 2 + GAPV + Dm * scale / 2)
-views["Left"].X, views["Left"].Y = Wm * scale / 2 + GAPV + Dm * scale / 2, 0.0
-grp.X, grp.Y = fx, fy
-# 复杂装配(外购件 / 电路板几百个小零件)精确消隐很慢: 实体多时用 CoarseView(多边形消隐, 快很多, 装配图够用)
-COARSE = len(solids) > int(spec.get("coarse_above", 40))
-if COARSE:
-    for v in grp.Views:
-        try:
-            v.CoarseView = True
-        except Exception as e:
-            rep["warnings"].append("coarse: %s" % e)
-rep["coarse"] = COARSE
-doc.recompute()
-WAIT = min(600.0, 60.0 + 4.0 * len(solids))  # 消隐等多久(秒)
+TEMPLATE_SVG = make_template.build(std, paper, sheet="assembly")
 
 
-def wait_views(vs, timeout=None):
-    timeout = timeout or WAIT
-    t = time.time()
-    while time.time() - t < timeout:
-        try:
-            if all(v.getEdgeByIndex(0) is not None for v in vs):
-                rep.setdefault("hlr_wait", {})[",".join(v.Name for v in vs)] = round(time.time() - t, 1)
-                return True
-        except Exception:
-            pass
-        if GUI:
-            Gui.updateGui()
-        time.sleep(0.1)
-    rep["warnings"].append("views not ready after %.0fs" % timeout)
-    return False
+# ---------------------------------------------------------------- 视图: 自己投影(TechDraw.projectEx, 同步), 自己写 SVG
+# 不用 TechDraw 页面: 界面模式下视图在后台线程算、要靠刷界面推进, 110 个实体的装配 4 个视图等了 13 min 还没算完;
+# 同样的投影直接调 projectEx 每个视图约 10 s。做法: 把装配平移到包围盒中心、转到视图坐标系(X = 页面右, Y = 页面上,
+# Z = 朝看的人), 沿 +Z 投影 → 投影坐标就是视图坐标(实测: 沿 +Z 投影 x = 世界 X、y = 世界 Y, 不居中)。
+class View:
+    def __init__(self, name, X, Y, Z, s):
+        self.Name, self.X, self.Y, self.Z, self.s = name, X.normalize(), Y.normalize(), Z.normalize(), s
+        self.c = (0.0, 0.0)  # 页面上视图中心(= 包围盒中心的投影)
+
+    def local(self, p):
+        d = p - bb.Center
+        return d.dot(self.X), d.dot(self.Y)
+
+    def page(self, p):
+        x, y = self.local(p)
+        return self.c[0] + x * self.s, self.c[1] + y * self.s
+
+    def size(self):
+        corners = [V(x, y, z) for x in (bb.XMin, bb.XMax) for y in (bb.YMin, bb.YMax) for z in (bb.ZMin, bb.ZMax)]
+        xs = [(c - bb.Center).dot(self.X) for c in corners]
+        ys = [(c - bb.Center).dot(self.Y) for c in corners]
+        return (max(xs) - min(xs)) * self.s, (max(ys) - min(ys)) * self.s
+
+    def rect(self):
+        w, h = self.size()
+        return (self.c[0] - w / 2, self.c[1] - h / 2, self.c[0] + w / 2, self.c[1] + h / 2)
 
 
-def vcenter(v):
-    if v in grp.Views:
-        return q(grp.X) + q(v.X), q(grp.Y) + q(v.Y)
-    return q(v.X), q(v.Y)
-
-
-def frame(v):
-    """视图边坐标(实测): e = ((p − C)·X, (p − C)·U), X = XDirection, U = Direction × XDirection, C = 包围盒中心。"""
-    X = V(v.XDirection).normalize()
-    D = V(v.Direction).normalize()
-    return X, D.cross(X), D
-
-
-def to_page(v, p):
-    X, U, _ = frame(v)
-    vx, vy = vcenter(v)
-    return vx + (p - bb.Center).dot(X) * scale, vy + (p - bb.Center).dot(U) * scale
-
-
-def vrect(v):
-    X, U, _ = frame(v)
-    vx, vy = vcenter(v)
-    w, h = ext(X) * scale, ext(U) * scale
-    return (vx - w / 2, vy - h / 2, vx + w / 2, vy + h / 2)
-
-
-R = {n: vrect(views[n]) for n in ("Front", "Top", "Left")}
-
-iso = doc.addObject("TechDraw::DrawViewPart", "Iso")
-page.addView(iso)
-iso.Source = [part]
-iso.Direction = (front + right + up).normalize()
-iso.XDirection = (right - front).normalize()
-iso.HardHidden = False
-if COARSE:
-    iso.CoarseView = True
+# 第一角: 俯视在主视下面(页面上 = −主视方向, 朝看的人 = 上), 左视在主视右边(页面右 = 主视方向, 朝看的人 = −右)
+views = {
+    "Front": View("Front", right, up, front, scale),
+    "Top": View("Top", right, -front, up, scale),
+    "Left": View("Left", front, up, -right, scale),
+}
+views["Front"].c = (fx, fy)
+views["Top"].c = (fx, fy - (Hm * scale / 2 + GAPV + Dm * scale / 2))
+views["Left"].c = (fx + Wm * scale / 2 + GAPV + Dm * scale / 2, fy)
+R = {n: v.rect() for n, v in views.items()}
+iso_dir = (front + right + up).normalize()
+iso_x = (right - front).normalize()
+iso_y = iso_dir.cross(iso_x)
 diag = bb.DiagonalLength
 free_l = max(r[2] for r in R.values()) + DIMB + 8
 free_w = AREA[2] - free_l
 free_h = AREA[3] - (PLR[3] + 8)
 iso_s = next((s for s in SCALES if diag * s <= max(min(free_w, free_h * 1.2), 50) and s <= scale), SCALES[-1])
-iso.Scale = iso_s
-iso.ScaleType = "Custom"
-iso.X = (free_l + AREA[2]) / 2 if free_w > 50 else AREA[2] - diag * iso_s / 2
-iso.Y = (AREA[3] + PLR[3]) / 2 if free_w > 50 else AREA[3] - diag * iso_s / 2
-doc.recompute()
-wait_views(list(grp.Views) + [iso])  # 四个视图的消隐一起等(后台并行算)
-R["Iso"] = (q(iso.X) - diag * iso_s / 2, q(iso.Y) - diag * iso_s / 2.4, q(iso.X) + diag * iso_s / 2, q(iso.Y) + diag * iso_s / 2.4)
+views["Iso"] = View("Iso", iso_x, iso_y, iso_dir, iso_s)
+views["Iso"].c = ((free_l + AREA[2]) / 2 if free_w > 50 else AREA[2] - diag * iso_s / 2,
+                  (AREA[3] + PLR[3]) / 2 if free_w > 50 else AREA[3] - diag * iso_s / 2)
+R["Iso"] = views["Iso"].rect()
 rep["views"] = {k: [round(x, 1) for x in r] for k, r in R.items()}
+
+DRAW_SHAPE = Part.makeCompound([d for d in DRAW if d is not None])
+VIEW_SVG = []
+LWV = std["lines"]["visible"]
+DEFL = float(spec.get("deflection_mm", 0.05))  # 曲线离散精度(页面毫米)
+
+
+def project_view(v):
+    """投影一个视图 → 可见轮廓的折线(页面坐标, SVG y 向下)。"""
+    sh = DRAW_SHAPE.copy()
+    sh.translate(-bb.Center)
+    m = App.Matrix(v.X.x, v.X.y, v.X.z, 0, v.Y.x, v.Y.y, v.Y.z, 0, v.Z.x, v.Z.y, v.Z.z, 0, 0, 0, 0, 1)
+    sh.transformShape(m)  # 刚体旋转(就地); 视图轴都是正交右手系
+    if abs(m.determinant() - 1) > 1e-6:
+        rep["warnings"].append("view %s: axes not a rotation (det %.3f)" % (v.Name, m.determinant()))
+    t0 = time.time()
+    r = TechDraw.projectEx(sh, V(0, 0, 1))
+    edges = list(r[0].Edges) + list(r[3].Edges)  # 可见的棱边 + 外形轮廓线(圆柱等的侧影)
+    out = []
+    for e in edges:
+        try:
+            pts = e.discretize(Deflection=DEFL / max(v.s, 1e-6))
+        except Exception:
+            continue
+        if len(pts) < 2:
+            continue
+        out.append(" ".join("%.3f,%.3f" % (v.c[0] + p.x * v.s, H - (v.c[1] + p.y * v.s)) for p in pts))
+    rep.setdefault("hlr", {})[v.Name] = {"s": round(time.time() - t0, 1), "edges": len(edges)}
+    if not edges:
+        rep["warnings"].append("view %s: hidden-line removal returned no edges" % v.Name)
+    return out
+
+
+for vn in ("Front", "Top", "Left", "Iso"):
+    lines_ = project_view(views[vn])
+    VIEW_SVG.append('<g style="fill:none;stroke:#000;stroke-width:%g;stroke-linecap:round;stroke-linejoin:round">' % LWV
+                    + "".join('<polyline points="%s"/>' % pl for pl in lines_) + "</g>")
 lap("views")
+
+
+def frame(v):
+    return v.X, v.Y, v.Z
+
+
+def to_page(v, p):
+    return v.page(p)
 
 # ---------------------------------------------------------------- 页面级图形(页面毫米, SVG y 向下)
 PAGE_SVG = []
@@ -493,7 +549,9 @@ dim_v(rL[1], rL[3], rL[2], rL[2] + 10, Hm)
 def visible_point(si, v):
     """实体 si 在视图 v 里看得见的点: 朝向看的人的面上取点(大面优先), 朝看的人射线不碰别的实体(也不再穿回自己)。"""
     _, _, D = frame(v)
-    s = solids[si]
+    s = DRAW[si]
+    if s is None:
+        return None  # 太小, 图上没画
     faces = sorted(s.Faces, key=lambda f: -f.Area)
     big = bb.DiagonalLength * 2 + 10
     def samples():
@@ -519,14 +577,18 @@ def visible_point(si, v):
 
     tried = 0
     for p in samples():
-        if tried >= 16:
+        if tried >= 10:
             break
         tried += 1
         ray = Part.LineSegment(p + D * 0.05, p + D * big).toShape()
-        rb = ray.BoundBox
+        px_, py_, pz_ = p.dot(v.X), p.dot(v.Y), p.dot(D)
         blocked = False
-        for j, o in enumerate(solids):
-            if not o.BoundBox.intersect(rb):
+        for j, o in enumerate(DRAW):
+            if o is None:
+                continue
+            # 粗筛: 包围盒在视图平面上的投影要盖住这个点, 且有部分在点的前面(朝看的人一侧)
+            x0_, x1_, y0_, y1_, z1_ = BOX2D[v.Name][j]
+            if not (x0_ - 1e-3 <= px_ <= x1_ + 1e-3 and y0_ - 1e-3 <= py_ <= y1_ + 1e-3 and z1_ > pz_ + 0.04):
                 continue
             try:
                 if o.distToShape(ray)[0] < 1e-4:
@@ -539,9 +601,19 @@ def visible_point(si, v):
     return None
 
 
+def box2d(o, v):
+    b_ = o.BoundBox
+    cs = [V(x, y, z) for x in (b_.XMin, b_.XMax) for y in (b_.YMin, b_.YMax) for z in (b_.ZMin, b_.ZMax)]
+    xs, ys, zs = [c.dot(v.X) for c in cs], [c.dot(v.Y) for c in cs], [c.dot(v.Z) for c in cs]
+    return (min(xs), max(xs), min(ys), max(ys), max(zs))
+
+
+# 每个视图: 各实体包围盒在视图平面上的投影 + 最靠前的深度(遮挡粗筛用)
+BOX2D = {vn: [box2d(o, views[vn]) if o is not None else None for o in DRAW] for vn in ("Front", "Left", "Top")}
+
 balloons = []  # {line, view, anchor(page), solid}
 for li, l in enumerate(lines):
-    idx = sorted((i for i, o in enumerate(owner) if o == li), key=lambda i: -SVA[i][0])[:8]  # 大的先试(外购件里的小零件看不清)
+    idx = sorted((i for i, o in enumerate(owner) if o == li), key=lambda i: -SVA[i][0])[:3]  # 大的先试(外购件里的小零件看不清)
     got = None
     for vname in ("Front", "Left", "Top"):
         for si in idx:
@@ -594,9 +666,9 @@ for b in balloons:
     if b["view"] == "Left":
         top.append(b)
         continue
-    u = (ax - rF[0]) / max(rF[2] - rF[0], 1e-6)
-    w = (ay - rF[1]) / max(rF[3] - rF[1], 1e-6)
-    (top if w > u or (b["view"] == "Front" and w > 0.6) else left).append(b)
+    # 离哪条边近就走哪边(页面距离): 左边列 / 上面排; 右半边的点一律走上排(免得引线横穿整个视图)
+    d_left, d_top = ax - rF[0], rF[3] - ay
+    (top if d_top < d_left or ax > (rF[0] + rF[2]) / 2 else left).append(b)
     if b["view"] == "Top" and b in top:
         top.remove(b)
         left.append(b)  # 俯视在主视下面: 只能走左列
@@ -679,25 +751,35 @@ rep["fits"] = fits_done
 
 # ---------------------------------------------------------------- 明细表: 标题栏正上方, 表头在下, 序号由下往上
 rh = PL["row_h"]
-x0 = PLR[0]
 yb = PLR[1]
 lw_k = std["lines"]["frame"]
 cols = PL["columns"]
-xs_ = [x0]
-for c in cols:
-    xs_.append(xs_[-1] + c["w"])
-nrow = len(lines) + 1
-top_y = yb + rh * nrow
-# 外框粗线, 内部细线
-PAGE_SVG.append('<rect x="%.3f" y="%.3f" width="%.3f" height="%.3f" style="fill:none;stroke:#000;stroke-width:%g"/>'
-                % (x0, sy(top_y), xs_[-1] - x0, rh * nrow, lw_k))
-for k in range(1, nrow):
-    line(x0, yb + k * rh, xs_[-1], yb + k * rh, lw_k if k == 1 else LW)
-for x in xs_[1:-1]:
-    line(x, yb, x, top_y, LW)
 fs = std["fonts"]["text"]
-for c, a_, b_ in zip(cols, xs_, xs_[1:]):
-    text((a_ + b_) / 2, yb + rh * 0.3, c["label"], fs)
+
+
+def col_xs(ci):
+    """第 ci 栏(0 = 最右, 往左接续)的列分界 x。"""
+    x0_ = PLR[2] - (ci + 1) * PL_W
+    xs = [x0_]
+    for c in cols:
+        xs.append(xs[-1] + c["w"])
+    return xs
+
+
+for ci in range(PL_COLS):
+    xs_ = col_xs(ci)
+    n_here = min(PL_ROWS, len(lines) - ci * PL_ROWS)
+    nrow = n_here + 1
+    top_y = yb + rh * nrow
+    # 外框粗线, 内部细线; 每栏都有表头
+    PAGE_SVG.append('<rect x="%.3f" y="%.3f" width="%.3f" height="%.3f" style="fill:none;stroke:#000;stroke-width:%g"/>'
+                    % (xs_[0], sy(top_y), xs_[-1] - xs_[0], rh * nrow, lw_k))
+    for k in range(1, nrow):
+        line(xs_[0], yb + k * rh, xs_[-1], yb + k * rh, lw_k if k == 1 else LW)
+    for x in xs_[1:-1]:
+        line(x, yb, x, top_y, LW)
+    for c, a_, b_ in zip(cols, xs_, xs_[1:]):
+        text((a_ + b_) / 2, yb + rh * 0.3, c["label"], fs)
 
 
 def fit(s, w, size):
@@ -707,7 +789,9 @@ def fit(s, w, size):
 
 
 for l in sorted(lines, key=lambda l: l["no"]):
-    y = yb + rh * l["no"]
+    ci, ri = divmod(l["no"] - 1, PL_ROWS)
+    xs_ = col_xs(ci)
+    y = yb + rh * (ri + 1)
     vals = {"no": l["no"], "pn": l.get("pn", ""), "name": l.get("name", ""), "qty": l.get("qty", l.get("found", "")),
             "material": l.get("material", ""), "note": l.get("note", "")}
     for c, a_, b_ in zip(cols, xs_, xs_[1:]):
@@ -721,17 +805,9 @@ for l in sorted(lines, key=lambda l: l["no"]):
             text(a_ + 1.2, y + rh * 0.3, v, size, anchor="start")
 rep["parts_list"] = [{"no": l["no"], "key": l.get("key"), "pn": l.get("pn"), "name": l.get("name"), "qty": l.get("qty")} for l in sorted(lines, key=lambda l: l["no"])]
 
-if PAGE_SVG:
-    sym = doc.addObject("TechDraw::DrawViewSymbol", "PageGraphics")
-    page.addView(sym)
-    sym.Symbol = ('<svg xmlns="http://www.w3.org/2000/svg" width="%gmm" height="%gmm" viewBox="0 0 %g %g">%s</svg>'
-                  % (W, H, W, H, "".join(PAGE_SVG)))
-    sym.Scale = 1.0
-    sym.X, sym.Y = W / 2, H / 2
-doc.recompute()
 lap("annotations")
 
-# ---------------------------------------------------------------- 标题栏
+# ---------------------------------------------------------------- 标题栏: 直接填模板里的可编辑字段(freecad:editable="字段")
 title = dict(spec.get("title", {}))
 title.setdefault("scale", "1:1" if abs(scale - 1) < 1e-9 else ("%s:1" % fmt(scale, 2) if scale > 1 else "1:%s" % fmt(1 / scale, 2)))
 title.setdefault("paper", paper)
@@ -742,42 +818,34 @@ if "weight" not in title and lines and all(l.get("density") and l.get("volume") 
     g = sum(float(l["density"]) * float(l["volume"]) / 1000.0 * float(l.get("qty") or l.get("found") or 0) for l in lines)
     title["weight"] = (fmt(g / 1000.0, 2) + " kg") if g >= 10000 else (fmt(g, 1) + " g")
 title.pop("density", None)
-texts = dict(tpl.EditableTexts)
-for i, ln in enumerate(spec.get("tech") or std.get("tech_requirements_assembly") or std["tech_requirements"]):
-    title["tech_%d" % (i + 1)] = ln
-for i in range(len(spec.get("tech") or std.get("tech_requirements_assembly") or []), 12):
-    title.setdefault("tech_%d" % (i + 1), "")
-for k, v in title.items():
-    if k in texts:
-        texts[k] = str(v)
-    elif not k.startswith("tech_"):
+tech = spec.get("tech") or std.get("tech_requirements_assembly") or std["tech_requirements"]
+for i in range(12):
+    title["tech_%d" % (i + 1)] = tech[i] if i < len(tech) else ""
+import re  # noqa: E402
+
+svg = TEMPLATE_SVG
+seen = set()
+
+
+def fill(m):
+    k = m.group(1)
+    seen.add(k)
+    return m.group(0)[: m.start(2) - m.start(0)] + esc(title.get(k, "")) + m.group(0)[m.end(2) - m.start(0):]
+
+
+svg = re.sub(r'freecad:editable="([^"]+)"[^>]*><tspan>(.*?)</tspan>', lambda m: fill(m) if m.group(1) in title else m.group(0), svg)
+for k in title:
+    if k not in seen and not k.startswith("tech_"):
         rep["warnings"].append("title field not in template: " + k)
-tpl.EditableTexts = texts
-doc.recompute()
 lap("title")
 
-# ---------------------------------------------------------------- 导出(与零件图同: SVG + 备用 Qt PDF; 正式 PDF 由 draw.ps1 用浏览器打印)
-TechDraw.writeDXFPage(page, os.path.join(OUT, BASE + ".dxf"))
-if GUI:
-    import TechDrawGui
-
-    for o in doc.Objects:
-        vo = getattr(o, "ViewObject", None)
-        if vo is not None and hasattr(vo, "Font"):
-            try:
-                vo.Font = std["fonts"]["latin"]
-            except Exception:
-                pass
-    page.ViewObject.doubleClicked()
-    for _ in range(20):
-        Gui.updateGui()
-        time.sleep(0.05)
-    TechDrawGui.exportPageAsSvg(page, os.path.join(OUT, BASE + ".svg"))
-    TechDrawGui.exportPageAsPdf(page, os.path.join(OUT, BASE + ".qt.pdf"))
-    rep["paper_mm"] = [W, H]
-else:
-    rep["warnings"].append("no GUI: PDF / SVG skipped (run freecad.exe with QT_QPA_PLATFORM=offscreen)")
-doc.saveAs(os.path.join(OUT, BASE + ".FCStd"))
+# ---------------------------------------------------------------- 导出: 一页 SVG(模板 + 视图 + 序号 / 尺寸 / 明细表); PDF / PNG 由 draw.ps1 用浏览器出
+body = "".join(VIEW_SVG) + "".join(PAGE_SVG)
+svg = svg.replace("</svg>", body + "</svg>")
+with open(os.path.join(OUT, BASE + ".svg"), "w", encoding="utf-8") as f:
+    f.write(svg)
+rep["paper_mm"] = [W, H]
+App.ParamGet(P + "General").SetBool("HandleFaces", HANDLE_FACES_WAS)
 lap("total")
 rep["out"] = {"dir": OUT, "base": BASE}
 with open(os.path.join(OUT, BASE + ".report.json"), "w", encoding="utf-8") as f:

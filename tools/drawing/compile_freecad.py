@@ -262,6 +262,7 @@ App.ParamGet(P + "Dimensions").SetFloat("FontSize", std["fonts"]["dim"])
 App.ParamGet(P + "Dimensions").SetInt("StandardAndStyle", 0)  # ISO oriented(国标同)
 App.ParamGet(P + "Dimensions").SetBool("UseGlobalDecimals", False)
 App.ParamGet(P + "Dimensions").SetInt("AltDecimals", DIMS["decimals"])
+App.ParamGet(P + "General").SetBool("HandleFaces", True)  # 剖面线要找面(装配图编译器会临时关掉, 这里显式打开)
 
 # ---------------------------------------------------------------- 图页 + 模板
 paper = spec.get("paper", "A3")
