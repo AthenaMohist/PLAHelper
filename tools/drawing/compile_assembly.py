@@ -81,9 +81,12 @@ def esc(s):
 # ---------------------------------------------------------------- 实体 → BOM 行
 def test_assembly():
     """内置样例(没给 STEP 时): 底板 + 4 个螺柱 + 顶块 + 侧板。"""
-    sols = [Part.makeBox(120, 80, 10)]
+    plate = Part.makeBox(120, 80, 10)
+    pins = []
     for x, y in ((15, 15), (105, 15), (15, 65), (105, 65)):
-        sols.append(Part.makeCylinder(4, 40, V(x, y, 10)))
+        plate = plate.cut(Part.makeCylinder(4, 10, V(x, y, 0)))
+        pins.append(Part.makeCylinder(4, 50, V(x, y, 0)))  # 穿过底板: 配合候选 ⌀8
+    sols = [plate] + pins
     sols.append(Part.makeBox(60, 40, 20, V(30, 20, 10)))
     sols.append(Part.makeBox(120, 6, 50, V(0, 80, 0)))
     return sols
@@ -128,6 +131,62 @@ if unmatched:
     rep["warnings"].append("%d solid(s) in the STEP match no BOM line (drawn, no balloon)" % unmatched)
 rep["solids"] = len(solids)
 rep["lines"] = [{"key": l.get("key"), "found": l["found"], "qty": l.get("qty")} for l in lines]
+
+
+# ---------------------------------------------------------------- D2 配合候选: 不同零件之间同轴、直径相同的孔(内圆柱)/ 轴(外圆柱)
+def cyl_faces(s):
+    out = []
+    for f in s.Faces:
+        su = f.Surface
+        if not isinstance(su, Part.Cylinder):
+            continue
+        ax = su.Axis.normalize()
+        u0, u1, v0, v1 = f.ParameterRange
+        p, n = f.valueAt((u0 + u1) / 2, (v0 + v1) / 2), f.normalAt((u0 + u1) / 2, (v0 + v1) / 2)
+        c = su.Center
+        rad = (p - c) - ax * ((p - c).dot(ax))
+        if rad.Length < 1e-6:
+            continue
+        internal = n.dot(rad) < 0
+        ts = [(vx.Point - c).dot(ax) for vx in f.Vertexes] or [0.0]
+        out.append({"ax": ax, "c": c, "r": su.Radius, "in": internal, "t0": min(ts), "t1": max(ts)})
+    return out
+
+
+FIT_TOL_D = 0.1  # 孔 / 轴建模直径差在这以内算"同一公称尺寸"
+cyls = [cyl_faces(s) if owner[i] is not None else [] for i, s in enumerate(solids)]
+fit_cands = {}
+for i in range(len(solids)):
+    for j in range(len(solids)):
+        if i == j or owner[i] is None or owner[j] is None:
+            continue
+        for h in cyls[i]:
+            if not h["in"]:
+                continue
+            for s_ in cyls[j]:
+                if s_["in"] or abs(2 * h["r"] - 2 * s_["r"]) > FIT_TOL_D:
+                    continue
+                if abs(abs(h["ax"].dot(s_["ax"])) - 1) > 1e-6:
+                    continue
+                dv = s_["c"] - h["c"]
+                if (dv - h["ax"] * dv.dot(h["ax"])).Length > 0.01:
+                    continue  # 不同轴
+                # 轴向重叠
+                a0, a1 = h["t0"], h["t1"]
+                b0, b1 = sorted([(s_["c"] + s_["ax"] * s_["t0"] - h["c"]).dot(h["ax"]), (s_["c"] + s_["ax"] * s_["t1"] - h["c"]).dot(h["ax"])])
+                lo, hi_ = max(a0, b0), min(a1, b1)
+                if hi_ - lo < 0.05:
+                    continue
+                d = round(2 * h["r"], 2)
+                hk, sk = lines[owner[i]].get("key"), lines[owner[j]].get("key")
+                cid = "%s|%s|%s" % (hk, sk, fmt(d))
+                at = h["c"] + h["ax"] * ((lo + hi_) / 2)
+                c_ = fit_cands.setdefault(cid, {"id": cid, "d": d, "hole_key": hk, "shaft_key": sk,
+                                                "hole": lines[owner[i]].get("pn") or lines[owner[i]].get("name"),
+                                                "shaft": lines[owner[j]].get("pn") or lines[owner[j]].get("name"),
+                                                "count": 0, "at": [at.x, at.y, at.z], "axis": [h["ax"].x, h["ax"].y, h["ax"].z]})
+                c_["count"] += 1
+rep["fit_candidates"] = sorted(fit_cands.values(), key=lambda c: (-c["d"], c["id"]))
 
 doc = App.newDocument("asm")
 comp = Part.makeCompound(solids)
@@ -525,6 +584,51 @@ for b in order:
     PAGE_SVG.append('<circle cx="%.3f" cy="%.3f" r="%g" style="fill:none;stroke:#000;stroke-width:%g"/>' % (bx, sy(by), r_, LW))
     text(bx, by - BAL["font"] * 0.35, b["no"], BAL["font"])
 rep["balloons"] = [{"no": b["no"], "key": lines[b["line"]].get("key"), "view": b["view"], "anchor": [round(b["anchor"][0], 1), round(b["anchor"][1], 1)]} for b in order]
+
+# ---------------------------------------------------------------- 配合标注: "⌀10 H7/g6", 引线指到孔轴线上(孔轴 ⟂ 视线的视图里)
+fits_done = []
+# 已占的地方: 视图(及轴测)、序号圈、外形尺寸带
+OCC = [r for r in R.values()]
+OCC += [(b["at"][0] - r_ - 1, b["at"][1] - r_ - 1, b["at"][0] + r_ + 1, b["at"][1] + r_ + 1) for b in order]
+OCC += [(rT[0], rT[1] - 14, rT[2], rT[1]), (rL[0], rL[1] - 14, rL[2], rL[1]), (rL[2], rL[1], rL[2] + 14, rL[3])]
+for f in spec.get("fits") or []:
+    cand = fit_cands.get(f.get("id", ""))
+    code = (f.get("code") or "").strip()
+    if not cand or not code:
+        continue
+    at, ax = V(*cand["at"]), V(*cand["axis"])
+    vname = next((n for n in ("Front", "Left", "Top") if abs(ax.dot(frame(views[n])[2])) < 0.2), None)
+    if not vname:
+        rep["warnings"].append("fit %s: no view shows the side of the hole" % cand["id"])
+        continue
+    px, py = to_page(views[vname], at)
+    txt = "%s%s %s" % (DIMS["diameter"], fmt(cand["d"]), code)
+    w = sum(std["fonts"]["dim"] * (1.0 if ord(ch) > 0x2E80 else 0.62) for ch in txt)
+    rr = R[vname]
+    # 文字放在视图外的空地(视图下方 → 右侧 → 上方, 一圈圈往外), 避开视图 / 序号 / 已放的配合标注; 引线折到轴线上的点
+    fs_ = std["fonts"]["dim"]
+    spot = None
+    for ring in range(10):
+        o = 5 + ring * 5.5
+        for cx_, cy_ in ((px - w / 2, rr[1] - o), (rr[2] + o, py + 4), (px - w / 2, rr[3] + o), (px + 4, rr[1] - o), (px - w - 4, rr[1] - o)):
+            box_ = (cx_ - 1, cy_ - 1.5, cx_ + w + 1, cy_ + fs_ + 0.5)
+            inside = AREA[0] <= box_[0] and box_[2] <= AREA[2] and AREA[1] <= box_[1] and box_[3] <= AREA[3]
+            if inside and not any(hit(box_, u) for u in OCC) and not hit(box_, PLR):
+                spot = (cx_, cy_, box_)
+                break
+        if spot:
+            break
+    if not spot:
+        rep["warnings"].append("fit %s: no free place for the label" % cand["id"])
+        continue
+    tx, ty, box_ = spot
+    OCC.append(box_)
+    line(px, py, tx if tx > px else tx + w, ty - 0.8)
+    line(tx, ty - 0.8, tx + w, ty - 0.8)
+    PAGE_SVG.append('<circle cx="%.3f" cy="%.3f" r="%g" style="fill:#000;stroke:none"/>' % (px, sy(py), BAL["dot"]))
+    text(tx, ty, txt, std["fonts"]["dim"], anchor="start")
+    fits_done.append({"id": cand["id"], "code": code, "view": vname})
+rep["fits"] = fits_done
 
 # ---------------------------------------------------------------- 明细表: 标题栏正上方, 表头在下, 序号由下往上
 rh = PL["row_h"]

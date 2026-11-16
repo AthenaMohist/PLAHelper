@@ -463,6 +463,30 @@ def apply_threads(holes):
 
 
 holes = apply_threads(holes)
+
+
+# D4: 配合 → 本件公差(ISO 286 查表)。方案 fits: [{"d": 8, "role": "hole" | "shaft", "code": "H7"}](来自装配图里记的配合)。
+# 孔: 同直径的孔标注带公差带 + 偏差 "⌀8 H7(+0.015/0)"; 轴: 同直径的外圆柱标 ⌀ 带公差(见下面 SHAFT_TOL)。
+import iso286  # noqa: E402  (HERE 已在 sys.path)
+
+SHAFT_TOL = {}  # 直径(round 2)→ 公差文字
+for f_ in spec.get("fits") or []:
+    try:
+        d_, code_ = float(f_["d"]), str(f_["code"]).strip()
+        txt_ = iso286.tol_text(d_, code_)
+    except Exception as e:
+        rep["warnings"].append("fit %s: %s" % (f_, e))
+        continue
+    if f_.get("role") == "hole":
+        n_ = 0
+        for h in holes:
+            if abs(h["d"] - d_) < 0.05 and not h.get("tap"):
+                h["tol"] = txt_
+                n_ += 1
+        if not n_:
+            rep["warnings"].append("fit hole %s %s: no hole of that size" % (fmt(d_), code_))
+    else:
+        SHAFT_TOL[round(d_, 2)] = txt_
 rep["holes"] = holes
 
 def hole_view(h):
@@ -821,21 +845,29 @@ def outer_round(vname):
     return None
 
 
+def shaft_tol(radius):
+    return next((t for d, t in SHAFT_TOL.items() if abs(d - 2 * radius) < 0.05), None)
+
+
 def place_diameter(vname, radius, name):
-    """在视图里找半径 = radius 的圆边, 标 ⌀(位置: 视图右上 / 左上 / 右下外侧, 避让)。"""
+    """在视图里找半径 = radius 的圆边, 标 ⌀(位置: 视图右上 / 左上 / 右下外侧, 避让)。有配合公差就带上: ⌀8 g6(-0.005/-0.014)。"""
     v, r = views[vname], R[vname]
     circ = [(n, ed) for n, ed in edges_of(v) if isinstance(ed.Curve, Part.Circle) and abs(ed.Curve.Radius - radius) < 1e-3]
     if not circ:
         rep["warnings"].append("round %s: circle edge not found" % vname)
         return False
-    txt = DIMS["diameter"] + fmt(2 * radius)
+    tol = shaft_tol(radius)
+    txt = DIMS["diameter"] + fmt(2 * radius) + (" " + tol if tol else "")
     for ring in range(8):
         off = G * 1.6 + ring * STEP
         for p in ((r[2] + off, r[3] + off * 0.6), (r[0] - off, r[3] + off * 0.6), (r[2] + off, r[1] - off * 0.6)):
             rr = text_rect(p[0], p[1], txt)
             if placer.free(rr):
                 placer.take(rr)
-                add_dim(v, "Diameter", [circ[0][0]], name, p, fmt_spec=DIMS["diameter"] + FSPEC)
+                if tol:
+                    add_dim(v, "Diameter", [circ[0][0]], name, p, text=txt)
+                else:
+                    add_dim(v, "Diameter", [circ[0][0]], name, p, fmt_spec=DIMS["diameter"] + FSPEC)
                 return True
     return False
 
@@ -850,6 +882,34 @@ elif not has_ord:
     place_linear("Front", "x", "top", "LenW", Wm)
     place_linear("Front", "y", "left", "LenH", Hm)
 place_linear("Left", "x", "top", "LenD", Dm)
+
+
+def outer_cyl_views(d):
+    """直径 d 的外圆柱面在哪个视图里是圆(轴线 ∥ 视线)。"""
+    out = []
+    for f in shape.Faces:
+        s = f.Surface
+        if not isinstance(s, Part.Cylinder) or abs(2 * s.Radius - d) > 0.05:
+            continue
+        u0, u1, v0, v1 = f.ParameterRange
+        p, n = f.valueAt((u0 + u1) / 2, (v0 + v1) / 2), f.normalAt((u0 + u1) / 2, (v0 + v1) / 2)
+        ax = s.Axis.normalize()
+        rad = (p - s.Center) - ax * ((p - s.Center).dot(ax))
+        if rad.Length < 1e-6 or n.dot(rad) <= 0:
+            continue
+        for vn, (_, _, vd) in VAX.items():
+            if abs(abs(ax.dot(vd)) - 1) < 1e-6 and vn not in out:
+                out.append(vn)
+    return out
+
+
+# 配合的轴径(主视外径已标的除外): 在它是圆的视图里标 ⌀ + 公差
+for i_, (d_, _) in enumerate(sorted(SHAFT_TOL.items())):
+    if front_r and abs(2 * front_r - d_) < 0.05:
+        continue
+    vs_ = outer_cyl_views(d_)
+    if not vs_ or not place_diameter(vs_[0], d_ / 2, "DiaFit%d" % (i_ + 1)):
+        rep["warnings"].append("fit shaft %s: no view shows it as a circle" % fmt(d_))
 
 
 def circle_for(vname, circles, h):

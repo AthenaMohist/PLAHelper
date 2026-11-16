@@ -4668,7 +4668,13 @@ impl PlaApp {
         let spec = if key == pla_ui::drawing::ASM_KEY {
             pla_ui::drawing::asm_spec(&run, &dir, &self.draw_asm)
         } else {
-            pla_ui::drawing::spec(&run, &dir, Some(&pla_ui::dims::path(&self.doc_key)))
+            let mut v = pla_ui::drawing::spec(&run, &dir, Some(&pla_ui::dims::path(&self.doc_key)));
+            // D4: 装配图上记下的配合 → 本件孔 / 轴的公差
+            let fits = self.draw_sheets.get(pla_ui::drawing::ASM_KEY).map(|a| pla_ui::drawing::part_fits(&a.fits, key)).unwrap_or_default();
+            if !fits.is_empty() {
+                v["fits"] = serde_json::json!(fits);
+            }
+            v
         };
         let spec_file = pla_ui::drawing::file(&dir, &s, "spec.json");
         if let Err(e) = std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&spec_file, serde_json::to_vec_pretty(&spec).unwrap_or_default())) {
@@ -5007,6 +5013,42 @@ impl PlaApp {
                         s.ordinate = if all { None } else { Some(on) };
                     }
                 });
+            }
+            // ---- D2 配合(装配图): 候选 = 不同零件之间同轴同径的孔 / 轴; 选了代号 → 装配图标 "⌀8 H7/g6", 两边零件图标公差 ----
+            if !r.fit_candidates.is_empty() {
+                egui::CollapsingHeader::new(t!("配合 {}(选代号 → 装配图标注 + 零件图公差)", "Fits {} (pick a code → assembly label + part tolerances)", r.fit_candidates.len()))
+                    .id_salt("draw-fits")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        egui::Grid::new("draw-fits-grid").num_columns(3).spacing([8.0, 3.0]).show(ui, |ui| {
+                            for c in &r.fit_candidates {
+                                ui.label(format!("⌀{}  {} ⟷ {}  ×{}", pla_ui::drawing::fmt_d(c.d), c.hole, c.shaft, c.count)).on_hover_text(tr("孔 ⟷ 轴, 件数 = 这样的配合处数", "hole ⟷ shaft, count = places with this fit"));
+                                let cur = s.fits.iter().find(|f| f.id == c.id).map(|f| f.code.clone()).unwrap_or_default();
+                                let mut pick = cur.clone();
+                                egui::ComboBox::from_id_salt(("fit", c.id.as_str())).selected_text(if cur.is_empty() { "—".to_string() } else { cur.clone() }).width(80.0).show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut pick, String::new(), "—");
+                                    for (code, zh, en) in pla_ui::drawing::FIT_CODES {
+                                        ui.selectable_value(&mut pick, code.to_string(), format!("{code}  {}", tr(zh, en)));
+                                    }
+                                });
+                                let buf = self.draw_buf.entry(format!("fit|{}", c.id)).or_insert_with(|| cur.clone());
+                                let te = ui.add(egui::TextEdit::singleline(buf).hint_text("H7/g6").desired_width(70.0));
+                                if te.lost_focus() && buf.trim() != cur {
+                                    pick = buf.trim().to_string();
+                                } else if !te.has_focus() {
+                                    *buf = cur.clone();
+                                }
+                                if pick != cur {
+                                    s.fits.retain(|f| f.id != c.id);
+                                    if !pick.is_empty() {
+                                        s.fits.push(pla_ui::drawing::Fit { id: c.id.clone(), d: c.d, hole_key: c.hole_key.clone(), shaft_key: c.shaft_key.clone(), code: pick });
+                                    }
+                                }
+                                ui.end_row();
+                            }
+                        });
+                        ui.label(egui::RichText::new(tr("改了配合: 重出装配图 + 相关零件图(零件图公差按 ISO 286 查表)", "After changing fits: redraw the assembly and the affected parts (part tolerances from ISO 286)")).size(11.0).color(COL_MUTED));
+                    });
             }
             if !r.warnings.is_empty() {
                 egui::CollapsingHeader::new(t!("编译提示 {}", "Compiler notes {}", r.warnings.len())).id_salt("draw-warn").show(ui, |ui| {

@@ -64,6 +64,9 @@ pub struct Sheet {
     pub exported: String,
     #[serde(default)]
     pub compiled: String,
+    /// 装配图: 记下的配合(零件图出图时据此标本件公差)。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fits: Vec<Fit>,
 }
 
 impl Sheet {
@@ -84,6 +87,7 @@ impl Sheet {
             area: None,
             exported: String::new(),
             compiled: String::new(),
+            fits: Vec::new(),
         }
     }
 }
@@ -222,6 +226,10 @@ pub fn asm_spec(s: &Sheet, dir: &Path, lines: &[AsmLine]) -> Value {
     if let Some(u) = s.up {
         v["up"] = json!(u);
     }
+    let fits: Vec<Value> = s.fits.iter().filter(|f| !f.code.trim().is_empty()).map(|f| json!({ "id": f.id, "code": f.code })).collect();
+    if !fits.is_empty() {
+        v["fits"] = json!(fits);
+    }
     v
 }
 
@@ -279,6 +287,66 @@ pub struct HoleGroup {
     pub ordinate: bool,
 }
 
+/// 装配图编译器找到的配合候选(id 只当不透明字符串用)。
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+pub struct FitCand {
+    pub id: String,
+    pub d: f64,
+    #[serde(default)]
+    pub hole_key: String,
+    #[serde(default)]
+    pub shaft_key: String,
+    #[serde(default)]
+    pub hole: String,
+    #[serde(default)]
+    pub shaft: String,
+    #[serde(default)]
+    pub count: usize,
+}
+
+/// 记下的配合(装配图那张图上): 孔 / 轴零件 + 公称直径 + 配合代号 "H7/g6"。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Fit {
+    pub id: String,
+    pub d: f64,
+    pub hole_key: String,
+    pub shaft_key: String,
+    pub code: String,
+}
+
+/// 常用配合(基孔制为主): 间隙 / 过渡 / 过盈。
+pub const FIT_CODES: &[(&str, &str, &str)] = &[
+    ("H7/g6", "间隙(精密滑动)", "clearance (sliding)"),
+    ("H7/h6", "间隙(定位)", "clearance (locating)"),
+    ("H8/f7", "间隙(转动)", "clearance (running)"),
+    ("H7/js6", "过渡", "transition"),
+    ("H7/k6", "过渡(定位)", "transition (locating)"),
+    ("H7/n6", "过渡(紧)", "transition (tight)"),
+    ("H7/p6", "过盈(压入)", "interference (press)"),
+    ("H7/s6", "过盈(重压)", "interference (heavy press)"),
+];
+
+/// 直径显示: 两位小数, 去尾零(8 / 6.6 / 12.25)。
+pub fn fmt_d(d: f64) -> String {
+    let s = format!("{d:.2}");
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
+/// 某个零件在记下的配合里的角色 → 零件图方案的 fits: [{d, role, code}]("H7/g6" 孔取 H7、轴取 g6)。
+pub fn part_fits(fits: &[Fit], key: &str) -> Vec<Value> {
+    let mut out = Vec::new();
+    for f in fits {
+        let (h, s) = f.code.split_once('/').map(|(a, b)| (a.trim(), b.trim())).unwrap_or(("", ""));
+        if f.hole_key == key && !h.is_empty() {
+            out.push(json!({ "d": f.d, "role": "hole", "code": h }));
+        }
+        if f.shaft_key == key && !s.is_empty() {
+            out.push(json!({ "d": f.d, "role": "shaft", "code": s }));
+        }
+    }
+    out
+}
+
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq)]
 pub struct Axes {
     pub front: [f64; 3],
@@ -308,6 +376,9 @@ impl Axes {
 pub struct Report {
     #[serde(default)]
     pub hole_groups: Vec<HoleGroup>,
+    /// 装配图: 配合候选(不同零件之间同轴同径的孔 / 轴)。
+    #[serde(default)]
+    pub fit_candidates: Vec<FitCand>,
     #[serde(default)]
     pub axes: Option<Axes>,
     #[serde(default)]
@@ -402,6 +473,20 @@ pub fn book_file(dir: &Path, doc_key: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fits_to_parts() {
+        let f = Fit { id: "a|b|8".into(), d: 8.0, hole_key: "plate".into(), shaft_key: "pin".into(), code: "H7/g6".into() };
+        assert_eq!(part_fits(&[f.clone()], "plate"), vec![json!({"d": 8.0, "role": "hole", "code": "H7"})]);
+        assert_eq!(part_fits(&[f.clone()], "pin"), vec![json!({"d": 8.0, "role": "shaft", "code": "g6"})]);
+        assert!(part_fits(&[f.clone()], "other").is_empty());
+        let mut s = Sheet::new(ASM_KEY, "asm", "", "");
+        s.fits = vec![f, Fit { code: " ".into(), ..Default::default() }];
+        let v = asm_spec(&s, Path::new("x"), &[]);
+        assert_eq!(v["fits"], json!([{"id": "a|b|8", "code": "H7/g6"}]), "blank codes are not sent");
+        let back: Sheets = serde_json::from_str(&serde_json::to_string(&Sheets { sheets: vec![s.clone()] }).unwrap()).unwrap();
+        assert_eq!(back.sheets[0], s);
+    }
 
     #[test]
     fn asm_spec_lines() {
