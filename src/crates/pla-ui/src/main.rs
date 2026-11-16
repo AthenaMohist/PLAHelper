@@ -305,6 +305,13 @@ struct PlaApp {
     /// P2 记录列表: 组; 搜索词; 筛选(0 全部 / 1 尺寸 / 2 收藏); 按实体分组视图 + 其中收起的实体名;
     /// 组改名(id + 输入); 待确认删除的组 id。
     dims_groups: Vec<pla_ui::dims::Group>,
+    /// P5: 参数(常量 / 变量 / 函数)与最近一次求值(参数 + 尺寸)。
+    dims_params: Vec<pla_ui::params::Param>,
+    dims_eval: pla_ui::params::Eval,
+    /// P5: 参数表折叠; 参数改名中(id)+ 输入。
+    params_open: bool,
+    param_rename: Option<String>,
+    param_rename_buf: String,
     rec_search: String,
     rec_filter: u8,
     rec_by_solid: bool,
@@ -2553,6 +2560,11 @@ impl PlaApp {
             dim_tab_doc: String::new(),
             dim_tab_dot: false,
             dims_groups: Vec::new(),
+            dims_params: Vec::new(),
+            dims_eval: Default::default(),
+            params_open: true,
+            param_rename: None,
+            param_rename_buf: String::new(),
             rec_search: String::new(),
             rec_filter: 0,
             rec_by_solid: false,
@@ -2790,7 +2802,7 @@ impl PlaApp {
                                         rec.id = old.id.clone();
                                         rec.parent = old.parent.clone();
                                         rec.origin = old.origin.clone();
-                                        rec.follow = old.follow;
+                                        rec.expr = old.expr.clone();
                                     }
                                     pla_ui::dims::update(&self.doc_key, &rec).map(|_| rec.name.clone())
                                 } else {
@@ -2974,7 +2986,7 @@ impl PlaApp {
                             let units = v["units"].as_str().unwrap_or("").to_string();
                             let rec = |mode: &str, kind: &str, faces: Vec<serde_json::Value>, value: f64| pla_ui::dims::DimRecord {
                                 name: String::new(), mode: mode.into(), kind: kind.into(), faces, opposite: None, side: 0, sym: 0, cyl: None,
-                                value, units: units.clone(), created: 0, fav: false, id: String::new(), parent: None, origin: "auto".into(), follow: false,
+                                value, units: units.clone(), created: 0, fav: false, id: String::new(), parent: None, origin: "auto".into(), follow: false, expr: None,
                             };
                             let num = |k: &str| spec[k].as_f64().unwrap_or(0.0);
                             let depth = v["depth"].as_f64().unwrap_or(0.0);
@@ -3843,60 +3855,58 @@ impl PlaApp {
         })
     }
 
-    /// P4 组联动: 组驱动值改成 target → 组里跟随的尺寸逐条改成 target(每条走"按签名定位 + 读 + 应用 + 刷新记录"同一条路);
-    /// 整个过程包在事务里(hist.begin … commit), 任何一条失败 → 撤回本次已改的全部(hist.rollback)。每条是一个撤销步。
-    fn link_start(&mut self, gid: &str, target: f64) {
+    /// P5: 参数 / 表达式变了 → 重新求值, 绑定了表达式且目标值与当前值不同的尺寸逐条改(每条走"按签名定位 + 读 + 应用 +
+    /// 刷新记录"同一条路; 后改的尺寸若引用先改的尺寸, 用的是求值时的值 —— 求值一次算全)。整个过程包在事务里
+    /// (hist.begin … commit), 任何一条失败 → 撤回本次已改的全部(hist.rollback)。每条是一个撤销步。
+    fn formula_run(&mut self, label: &str) {
+        self.dims_reload();
+        let bad: Vec<String> = self.dims_eval.targets.iter().filter_map(|(n, r)| r.as_ref().err().map(|e| format!("{n}: {e}"))).collect();
+        if !bad.is_empty() {
+            self.set_notice((true, t!("表达式有错, 没有改模型: {}", "Expression errors, model unchanged: {}", bad.join("; "))));
+            return;
+        }
+        let cur: std::collections::BTreeMap<String, f64> = self.dims_list.iter().map(|d| (d.name.clone(), d.value)).collect();
+        let changes = self.dims_eval.changes(&cur, 5e-4);
+        if changes.is_empty() {
+            self.set_notice((false, t!("{label}: 绑定的尺寸都已是计算值", "{label}: bound dimensions already match")));
+            return;
+        }
         if self.link_run.is_some() || self.dim_busy || self.dim_pending.is_some() {
             self.set_notice((true, tr("上一次修改还没完成, 稍后再改", "The previous change is still running; try again shortly").into()));
-            return;
-        }
-        let Some(g) = self.dims_groups.iter().find(|g| g.id == gid).cloned() else { return };
-        if let Err(e) = pla_ui::dims::set_group_value(&self.doc_key, gid, Some(target)) {
-            self.set_notice((true, t!("组值保存失败: {e}", "Saving the group value failed: {e}")));
-            return;
-        }
-        self.dims_reload();
-        let queue: std::collections::VecDeque<String> = pla_ui::dims::sorted(self.dims_list.clone())
-            .into_iter()
-            .filter(|d| d.parent.as_deref() == Some(gid) && d.follow && (d.value - target).abs() > 5e-4)
-            .map(|d| d.name)
-            .collect();
-        if queue.is_empty() {
-            self.set_notice((false, t!("组 {} = {}: 跟随的尺寸都已是这个值", "Group {} = {}: following dimensions already match", g.name, fmt3(target))));
             return;
         }
         if !self.require_feature(Feature::DimFace) {
             return;
         }
         self.cdp.send(pla_bridge::cdp::CdpCmd::Call { name: pla_bridge::shim::api::HIST_BEGIN, args: serde_json::Value::Null });
-        let total = queue.len();
-        self.link_run = Some(LinkRun { group: g.name, target, queue, total });
+        let total = changes.len();
+        self.link_run = Some(LinkRun { label: label.to_string(), queue: changes.into_iter().collect(), total });
         self.link_next();
     }
 
-    /// P4: 联动的下一条(没有了 → 提交事务)。
+    /// P5: 下一条(没有了 → 提交事务)。
     fn link_next(&mut self) {
         let Some(run) = self.link_run.as_mut() else { return };
         let next = run.queue.pop_front();
-        let (gname, target, total) = (run.group.clone(), run.target, run.total);
-        match next.and_then(|n| self.dims_list.iter().find(|d| d.name == n).cloned()) {
-            Some(rec) => {
-                self.set_notice((false, t!("组 {gname} 联动: {} → {}…", "Group {gname}: {} → {}…", rec.name, fmt3(target))));
+        let (label, total) = (run.label.clone(), run.total);
+        match next.and_then(|(n, t)| self.dims_list.iter().find(|d| d.name == n).cloned().map(|d| (d, t))) {
+            Some((rec, target)) => {
+                self.set_notice((false, t!("{label}: {} → {}…", "{label}: {} → {}…", rec.name, fmt3(target))));
                 self.dim_record_call(&rec, DimPending::Apply(rec.clone(), target));
             }
             None => {
                 self.link_run = None;
                 self.cdp.send(pla_bridge::cdp::CdpCmd::Call { name: pla_bridge::shim::api::HIST_COMMIT, args: serde_json::Value::Null });
-                self.set_notice((false, t!("组 {gname}: {total} 处已改为 {}", "Group {gname}: {total} dimension(s) set to {}", fmt3(target))));
+                self.set_notice((false, t!("{label}: 已改 {total} 处尺寸", "{label}: {total} dimension(s) changed")));
             }
         }
     }
 
-    /// P4: 联动中某条失败 → 撤回本次已改的全部。
+    /// P5: 某条失败 → 撤回本次已改的全部。
     fn link_fail(&mut self, why: &str) {
         let Some(run) = self.link_run.take() else { return };
         self.cdp.send(pla_bridge::cdp::CdpCmd::Call { name: pla_bridge::shim::api::HIST_ROLLBACK, args: serde_json::Value::Null });
-        self.set_notice((true, t!("组 {} 联动失败, 已撤回本次全部修改: {why}", "Group {} linking failed; all changes of this run rolled back: {why}", run.group)));
+        self.set_notice((true, t!("{} 失败, 已撤回本次全部修改: {why}", "{} failed; all changes of this run rolled back: {why}", run.label)));
     }
 
     /// B1/B2: 按范围扫一次 BOM(None = 当前可见; Some(配置名) = 该配置抓取时的可见实体, 不用切换显示)。
@@ -4764,8 +4774,10 @@ impl PlaApp {
     /// P2: 从文件重读尺寸记录与组(任何增删改之后)。
     fn dims_reload(&mut self) {
         let f = pla_ui::dims::load_file(&self.doc_key);
+        self.dims_eval = pla_ui::dims::evaluate(&f);
         self.dims_list = f.dims;
         self.dims_groups = f.groups;
+        self.dims_params = f.params;
     }
 
     /// N3d: 「操作」标题行右侧 ——当前选择正是某条记录 → 显示记录名(保存按钮在「记录」标签, 用户 2026-11-15)。
@@ -5100,6 +5112,7 @@ impl PlaApp {
             parent: None,
             origin: "manual".into(),
             follow: false,
+            expr: None,
         };
         let mut all = ids;
         all.extend(opp);
@@ -5300,12 +5313,208 @@ impl PlaApp {
     /// N3d: 已记录尺寸列表。交互同快照墙: ★ 收藏(置顶)、✎ / 双击名字改名、↻ 用当前尺寸更新(确认)、管理 = 勾选批量删除;
     /// 点条目空白处 = 载入并在 Plasticity 里选中; 条目里的数值框直接改 + Enter / 右键 = 载入并应用;
     /// 悬停 = 三级面板显示详细信息与缩略图(条目本身不放截图)。cur = 当前编辑区读到的尺寸(更新用)。
+    /// P5 参数表: 常量 / 变量 / 函数。行 = 类型徽标(点一下换类型)· 名字(双击改名, 引用它的表达式跟着改)· 值或表达式框
+    /// (Enter / 右键 = 保存并按新值改模型)· 计算值(出错红色 ⚠, 悬停看原因)· ×。返回是否有输入框在编辑。
+    fn params_ui(&mut self, ui: &mut egui::Ui) -> bool {
+        enum PAct {
+            Add(&'static str),
+            Kind(String, &'static str),
+            Expr(String, String, String),
+            RenameStart(String),
+            RenameCommit(String),
+            Delete(String),
+        }
+        let mut acts: Vec<PAct> = Vec::new();
+        let mut focus = false;
+        let busy = self.dim_pending.is_some() || self.dim_busy || self.link_run.is_some();
+        // 标题行: ▸/▾ 参数 (n) ······ ＋常量 ＋变量 ＋函数
+        let (row, hdr) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 20.0), egui::Sense::click());
+        let cy = row.center().y;
+        let tri = egui::pos2(row.left() + 5.0, cy);
+        let pts = if self.params_open {
+            vec![tri + egui::vec2(-4.0, -2.5), tri + egui::vec2(4.0, -2.5), tri + egui::vec2(0.0, 3.5)]
+        } else {
+            vec![tri + egui::vec2(-2.5, -4.0), tri + egui::vec2(-2.5, 4.0), tri + egui::vec2(3.5, 0.0)]
+        };
+        ui.painter().add(egui::Shape::convex_polygon(pts, COL_MUTED, egui::Stroke::NONE));
+        let tr_ = paint_text(ui.painter(), egui::pos2(row.left() + 14.0, cy), egui::Align2::LEFT_CENTER, tr("参数", "PARAMETERS"), 12.0, COL_SECTION, true);
+        ui.painter().text(egui::pos2(tr_.right() + 6.0, cy), egui::Align2::LEFT_CENTER, format!("{}", self.dims_params.len()), egui::FontId::proportional(11.0), COL_MUTED);
+        let mut bx = row.right();
+        for (kind, label, tip) in [
+            ("func", tr("＋函数", "+Func"), tr("由其它名字算出来的表达式, 如 W/2 - T", "An expression of other names, e.g. W/2 - T")),
+            ("var", tr("＋变量", "+Var"), tr("平时拨的数, 如宽度 W", "A number you turn, e.g. width W")),
+            ("const", tr("＋常量", "+Const"), tr("固定的数, 如板厚 T(显示锁定)", "A fixed number, e.g. sheet thickness T (shown locked)")),
+        ] {
+            let font = egui::FontId::proportional(11.5);
+            let w = ui.fonts(|f| f.layout_no_wrap(label.into(), font.clone(), COL_ACCENT).size().x);
+            let r = egui::Rect::from_min_max(egui::pos2(bx - w, row.top()), egui::pos2(bx, row.bottom()));
+            let b = ui.interact(r, ui.id().with(("param-add", kind)), egui::Sense::click());
+            ui.painter().text(egui::pos2(bx, cy), egui::Align2::RIGHT_CENTER, label, font, if b.hovered() { egui::Color32::WHITE } else { COL_ACCENT });
+            if b.on_hover_text(tip).clicked() {
+                acts.push(PAct::Add(kind));
+            }
+            bx -= w + 10.0;
+        }
+        if hdr.clicked() {
+            self.params_open = !self.params_open;
+        }
+        if self.params_open {
+            if self.dims_params.is_empty() {
+                ui.label(egui::RichText::new(tr("还没有参数。常量 / 变量是数, 函数是表达式; 尺寸记录点 ƒ 可绑定表达式, 改参数时一起改模型。", "No parameters yet. Constants / variables are numbers, functions are expressions; click ƒ on a saved dimension to bind it, and changing a parameter updates the model.")).size(11.0).color(COL_MUTED));
+            }
+            for p in self.dims_params.clone() {
+                let (r, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 26.0), egui::Sense::hover());
+                ui.painter().rect_filled(r, egui::Rounding::same(6.0), COL_CARD);
+                let cy = r.center().y;
+                // 类型徽标: 常 / 变 / ƒ(点一下 常 → 变 → ƒ → 常)
+                let (badge, bcol) = match p.kind.as_str() {
+                    "const" => (tr("常", "C"), egui::Color32::from_gray(200)),
+                    "func" => ("ƒ", rgb_hex(pla_bridge::shim::HIGHLIGHT_CANDIDATE)),
+                    _ => (tr("变", "V"), COL_ACCENT),
+                };
+                let br = egui::Rect::from_min_size(egui::pos2(r.left() + 4.0, cy - 9.0), egui::vec2(20.0, 18.0));
+                let bresp = ui.interact(br, ui.id().with(("param-kind", &p.id)), egui::Sense::click());
+                ui.painter().rect_stroke(br, egui::Rounding::same(4.0), egui::Stroke::new(1.0_f32, if bresp.hovered() { egui::Color32::WHITE } else { bcol }));
+                ui.painter().text(br.center(), egui::Align2::CENTER_CENTER, badge, egui::FontId::proportional(11.5), bcol);
+                let kind_tip = match p.kind.as_str() { "const" => tr("常量(点一下换类型)", "Constant (click to change type)"), "func" => tr("函数(点一下换类型)", "Function (click to change type)"), _ => tr("变量(点一下换类型)", "Variable (click to change type)") };
+                if bresp.on_hover_text(kind_tip).clicked() {
+                    let next = match p.kind.as_str() { "const" => "var", "var" => "func", _ => "const" };
+                    acts.push(PAct::Kind(p.id.clone(), next));
+                }
+                // ×
+                let xr = egui::Rect::from_center_size(egui::pos2(r.right() - 12.0, cy), egui::vec2(18.0, 18.0));
+                let xb = ui.interact(xr, ui.id().with(("param-del", &p.id)), egui::Sense::click());
+                ui.painter().text(xr.center(), egui::Align2::CENTER_CENTER, "×", egui::FontId::proportional(13.0), if xb.hovered() { egui::Color32::WHITE } else { COL_MUTED });
+                if xb.on_hover_text(tr("删除(还有表达式引用它时不让删)", "Delete (refused while expressions use it)")).clicked() {
+                    acts.push(PAct::Delete(p.id.clone()));
+                }
+                // 计算值 / 错误
+                let val_r = egui::Rect::from_min_max(egui::pos2(r.right() - 92.0, cy - 10.0), egui::pos2(r.right() - 26.0, cy + 10.0));
+                match self.dims_eval.values.get(&p.name) {
+                    Some(Ok(v)) => {
+                        ui.painter().text(egui::pos2(val_r.right(), cy), egui::Align2::RIGHT_CENTER, if p.kind == "func" { format!("= {}", fmt3(*v)) } else { String::new() }, egui::FontId::proportional(11.5), COL_MUTED);
+                    }
+                    Some(Err(e)) => {
+                        ui.painter().text(egui::pos2(val_r.right(), cy), egui::Align2::RIGHT_CENTER, "⚠", egui::FontId::proportional(13.0), COL_RED);
+                        ui.interact(val_r, ui.id().with(("param-err", &p.id)), egui::Sense::hover()).on_hover_text(e.clone());
+                    }
+                    None => {}
+                }
+                // 值 / 表达式框
+                let fr = egui::Rect::from_min_max(egui::pos2(r.left() + 100.0, cy - 10.0), egui::pos2(val_r.left() - 6.0, cy + 10.0));
+                ui.painter().rect_filled(fr, egui::Rounding::same(5.0), COL_FIELD);
+                let key = format!("p:{}", p.id);
+                let buf = self.dims_vals.entry(key.clone()).or_insert_with(|| p.expr.clone());
+                let te = ui.put(
+                    fr.shrink2(egui::vec2(4.0, 2.0)),
+                    egui::TextEdit::singleline(buf).frame(false).font(egui::FontId::proportional(12.5))
+                        .horizontal_align(if p.kind == "func" { egui::Align::LEFT } else { egui::Align::Center })
+                        .text_color(if p.kind == "const" { egui::Color32::from_gray(200) } else { egui::Color32::WHITE }),
+                );
+                let focused = te.has_focus();
+                if focused {
+                    self.dims_edit_row = Some(key.clone());
+                }
+                let editing = focused || self.dims_edit_row.as_deref() == Some(key.as_str());
+                focus |= editing;
+                let enter = te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                let rclick = editing && right_click_confirm(ui);
+                if (enter || rclick) && !busy {
+                    self.dims_edit_row = None;
+                    ui.memory_mut(|m| m.surrender_focus(te.id));
+                    if buf.trim() != p.expr {
+                        acts.push(PAct::Expr(p.id.clone(), p.name.clone(), buf.trim().to_string()));
+                    }
+                } else if !focused && editing && ui.input(|i| i.pointer.primary_pressed() || i.key_pressed(egui::Key::Escape)) {
+                    self.dims_edit_row = None;
+                    *buf = p.expr.clone();
+                } else if !editing {
+                    *buf = p.expr.clone();
+                }
+                // 名字(双击改名)
+                let name_r = egui::Rect::from_min_max(egui::pos2(br.right() + 6.0, cy - 10.0), egui::pos2(fr.left() - 6.0, cy + 10.0));
+                if self.param_rename.as_deref() == Some(p.id.as_str()) {
+                    ui.painter().rect_filled(name_r, egui::Rounding::same(5.0), COL_FIELD);
+                    let e = ui.put(name_r.shrink2(egui::vec2(4.0, 2.0)), egui::TextEdit::singleline(&mut self.param_rename_buf).frame(false).font(egui::FontId::proportional(12.5)));
+                    e.request_focus();
+                    focus = true;
+                    let (en, esc) = ui.input(|i| (i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Escape)));
+                    if en || right_click_confirm(ui) {
+                        acts.push(PAct::RenameCommit(p.id.clone()));
+                    } else if esc {
+                        self.param_rename = None;
+                    }
+                } else {
+                    let (shown, size, _) = fit_text(ui, &p.name, name_r.width().max(20.0), 12.5, 10.0);
+                    paint_text(ui.painter(), egui::pos2(name_r.left(), cy), egui::Align2::LEFT_CENTER, &shown, size, egui::Color32::WHITE, true);
+                    let used = pla_ui::dims::users_of(&pla_ui::dims::DimsFile { params: self.dims_params.clone(), dims: self.dims_list.clone(), ..Default::default() }, &p.name);
+                    let tip = if used.is_empty() { tr("双击改名 · 还没有表达式用到它", "Double-click to rename · not used by any expression yet").to_string() } else { t!("双击改名 · 被 {} 引用", "Double-click to rename · used by {}", used.join(", ")) };
+                    if ui.interact(name_r, ui.id().with(("param-name", &p.id)), egui::Sense::click()).on_hover_text(tip).double_clicked() {
+                        acts.push(PAct::RenameStart(p.id.clone()));
+                    }
+                }
+                ui.add_space(2.0);
+            }
+        }
+        for a in acts {
+            match a {
+                PAct::Add(kind) => match pla_ui::dims::add_param(&self.doc_key, kind) {
+                    Ok(name) => {
+                        self.dims_reload();
+                        self.params_open = true;
+                        if let Some(p) = self.dims_params.iter().find(|p| p.name == name) {
+                            self.param_rename_buf = name.clone();
+                            self.param_rename = Some(p.id.clone());
+                        }
+                    }
+                    Err(e) => self.set_notice((true, t!("新建参数失败: {e}", "New parameter failed: {e}"))),
+                },
+                PAct::Kind(id, k) => {
+                    if let Err(e) = pla_ui::dims::update_param(&self.doc_key, &id, None, Some(k), None) {
+                        self.set_notice((true, t!("改类型失败: {e}", "Changing the type failed: {e}")));
+                    }
+                    self.dims_reload();
+                }
+                PAct::Expr(id, name, e) => {
+                    self.dims_vals.remove(&format!("p:{id}"));
+                    match pla_ui::dims::update_param(&self.doc_key, &id, None, None, Some(&e)) {
+                        Ok(()) => self.formula_run(&format!("{name} = {e}")),
+                        Err(err) => self.set_notice((true, t!("保存参数失败: {err}", "Saving the parameter failed: {err}"))),
+                    }
+                }
+                PAct::RenameStart(id) => {
+                    self.param_rename_buf = self.dims_params.iter().find(|p| p.id == id).map(|p| p.name.clone()).unwrap_or_default();
+                    self.param_rename = Some(id);
+                }
+                PAct::RenameCommit(id) => {
+                    self.param_rename = None;
+                    let new = self.param_rename_buf.trim().to_string();
+                    if let Err(e) = pla_ui::dims::update_param(&self.doc_key, &id, Some(&new), None, None) {
+                        self.set_notice((true, t!("改名失败: {e}", "Rename failed: {e}")));
+                    }
+                    // 引用它的表达式已跟着改; 尺寸记录框里的表达式缓存清掉
+                    self.dims_vals.clear();
+                    self.dims_reload();
+                }
+                PAct::Delete(id) => {
+                    if let Err(e) = pla_ui::dims::delete_param(&self.doc_key, &id) {
+                        self.set_notice((true, t!("不能删: {e}", "Cannot delete: {e}")));
+                    }
+                    self.dims_reload();
+                }
+            }
+        }
+        ui.add_space(4.0);
+        focus
+    }
+
     fn dim_saved_ui(&mut self, ui: &mut egui::Ui, cur: Option<serde_json::Value>) {
         if !self.dims_loaded {
             self.dims_reload();
             self.dims_loaded = true;
         }
         ui.add_space(8.0);
+        let pfocus = self.params_ui(ui);
         let (row, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 20.0), egui::Sense::hover());
         paint_text(ui.painter(), egui::pos2(row.left(), row.center().y), egui::Align2::LEFT_CENTER, tr("已记录", "SAVED"), 12.0, COL_SECTION, true);
         if !self.dims_list.is_empty() {
@@ -5322,7 +5531,7 @@ impl PlaApp {
         }
         if self.dims_list.is_empty() {
             ui.label(egui::RichText::new(tr("还没有记录。在「操作」标签读出尺寸后, 点上方的 ＋ 保存当前尺寸。", "Nothing saved yet. Read a dimension in the Operate tab, then click + Save current dimension above.")).size(11.5).color(COL_MUTED));
-            self.dims_row_focus = false;
+            self.dims_row_focus = pfocus;
             return;
         }
         enum Act {
@@ -5344,9 +5553,8 @@ impl PlaApp {
             GroupRenameCommit(String),
             GroupDelete(String),
             SolidToggle(String),
-            // P4 联动
-            GroupValue(String, f64),
-            Follow(String, bool),
+            // P5 绑定 / 解除 / 改表达式(None = 解除)
+            ExprSet(String, Option<String>),
         }
         let mut acts: Vec<Act> = Vec::new();
         // ---- 工具行: 搜索 · 筛选(全部 / 尺寸 / ★) · 按实体 · ＋组 ----
@@ -5485,7 +5693,7 @@ impl PlaApp {
                     } else {
                         r.left() + 24.0
                     };
-                    let name_right = if !virt && !hole { r.right() - 118.0 } else { r.right() - 64.0 };
+                    let name_right = r.right() - 64.0;
                     let name_r = egui::Rect::from_min_max(egui::pos2(name_left, cy - 10.0), egui::pos2(name_right, cy + 10.0));
                     if !virt && self.grp_rename.as_deref() == Some(id.as_str()) {
                         ui.painter().rect_filled(name_r, egui::Rounding::same(5.0), COL_STEPPER);
@@ -5522,44 +5730,6 @@ impl PlaApp {
                             acts.push(Act::GroupFav(id.clone(), !fav));
                         }
                     }
-                    // P4 组驱动值(用户组): 输入 + Enter / 右键 = 组里跟随的尺寸全部改成这个值
-                    if !virt && !hole {
-                        let gval = self.dims_groups.iter().find(|g| &g.id == id).and_then(|g| g.value);
-                        let units = self.dims_list.iter().find(|d| d.parent.as_deref() == Some(id.as_str())).map(|d| d.units.clone()).unwrap_or_default();
-                        let u = match units.as_str() { "millimeter" => "mm", "centimeter" => "cm", "meter" => "m", "inch" => "in", "foot" => "ft", x => x };
-                        let fr = egui::Rect::from_min_max(egui::pos2(r.right() - 112.0, cy - 10.0), egui::pos2(r.right() - 64.0, cy + 10.0));
-                        ui.painter().rect_filled(fr, egui::Rounding::same(5.0), COL_STEPPER);
-                        let key = format!("g:{id}");
-                        let shown = gval.map(fmt3).unwrap_or_default();
-                        let buf = self.dims_vals.entry(key.clone()).or_insert_with(|| shown.clone());
-                        let te = ui.put(
-                            fr.shrink2(egui::vec2(4.0, 2.0)),
-                            egui::TextEdit::singleline(buf).frame(false).horizontal_align(egui::Align::Center).font(egui::FontId::proportional(12.5)).text_color(egui::Color32::WHITE).hint_text("—"),
-                        );
-                        ui.painter().text(egui::pos2(fr.right() + 3.0, cy), egui::Align2::LEFT_CENTER, u, egui::FontId::proportional(11.0), COL_MUTED);
-                        let focused = te.has_focus();
-                        if focused {
-                            self.dims_edit_row = Some(key.clone());
-                        }
-                        let editing = focused || self.dims_edit_row.as_deref() == Some(key.as_str());
-                        focus_any |= editing;
-                        let enter = te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                        let rclick = editing && right_click_confirm(ui);
-                        if (enter || rclick) && !busy {
-                            self.dims_edit_row = None;
-                            ui.memory_mut(|m| m.surrender_focus(te.id));
-                            match buf.trim().parse::<f64>() {
-                                Ok(t) if t > 0.0 => acts.push(Act::GroupValue(id.clone(), t)),
-                                _ => *buf = shown.clone(),
-                            }
-                        } else if !focused && editing && ui.input(|i| i.pointer.primary_pressed() || i.key_pressed(egui::Key::Escape)) {
-                            self.dims_edit_row = None;
-                            *buf = shown.clone();
-                        } else if !editing {
-                            *buf = shown.clone();
-                        }
-                        te.on_hover_text(tr("组的驱动值: 改它 = 组里跟随(●)的尺寸全部改成这个值(任何一条失败整次撤回)", "Group driving value: setting it changes every following (●) dimension in the group (all rolled back if one fails)"));
-                    }
                     if resp.clicked() {
                         acts.push(if *virt { Act::SolidToggle(id.clone()) } else { Act::GroupCollapse(id.clone(), !collapsed) });
                     }
@@ -5593,19 +5763,20 @@ impl PlaApp {
                 acts.push(Act::Fav(rec.name.clone(), !rec.fav));
             }
             x += 20.0;
-            // P4 在用户组里: 跟随(●)/ 独立(○)组的驱动值
-            if rec.parent.as_ref().is_some_and(|p| self.dims_groups.iter().any(|g| &g.id == p && g.kind == "group")) {
-                let tr_ = egui::Rect::from_min_size(egui::pos2(x, cy - 8.0), egui::vec2(16.0, 16.0));
-                let t = ui.interact(tr_, ui.id().with(("dims-follow", &rec.name)), egui::Sense::click());
-                let col = if t.hovered() { egui::Color32::WHITE } else if rec.follow { COL_ACCENT } else { COL_MUTED };
-                if rec.follow {
-                    ui.painter().circle_filled(tr_.center(), 4.5, col);
+            // P5 ƒ: 绑定表达式(橙 = 由表达式驱动; 灰 = 没绑定, 点一下绑定, 先填当前值)
+            let bound = rec.expr.is_some();
+            {
+                let tr_ = egui::Rect::from_min_size(egui::pos2(x, cy - 9.0), egui::vec2(16.0, 18.0));
+                let t = ui.interact(tr_, ui.id().with(("dims-expr", &rec.name)), egui::Sense::click());
+                let col = if t.hovered() { egui::Color32::WHITE } else if bound { COL_ACCENT } else { COL_MUTED };
+                ui.painter().text(tr_.center(), egui::Align2::CENTER_CENTER, "ƒ", egui::FontId::proportional(13.5), col);
+                let tip = if bound {
+                    t!("由表达式驱动: = {}(点一下解除绑定)", "Driven by an expression: = {} (click to unbind)", rec.expr.as_deref().unwrap_or(""))
                 } else {
-                    ui.painter().circle_stroke(tr_.center(), 4.5, egui::Stroke::new(1.3_f32, col));
-                }
-                let tip = if rec.follow { tr("跟随组的驱动值(点一下改为独立)", "Follows the group value (click: independent)") } else { tr("独立, 不随组值改(点一下改为跟随)", "Independent of the group value (click: follow)") };
+                    tr("绑定表达式: 数值框改成填表达式(可引用参数和其它尺寸名, 如 W/2 - 3)", "Bind an expression: the field then takes an expression (parameters / other dimension names, e.g. W/2 - 3)").to_string()
+                };
                 if t.on_hover_text(tip).clicked() {
-                    acts.push(Act::Follow(rec.name.clone(), !rec.follow));
+                    acts.push(Act::ExprSet(rec.name.clone(), if bound { None } else { Some(fmt3(rec.value)) }));
                 }
                 x += 16.0;
             }
@@ -5651,10 +5822,12 @@ impl PlaApp {
             let unit_w = 22.0;
             let fr = egui::Rect::from_min_max(egui::pos2(r.right() - 84.0 - 66.0 - unit_w, cy - 11.0), egui::pos2(r.right() - 84.0 - unit_w, cy + 11.0));
             ui.painter().rect_filled(fr, egui::Rounding::same(5.0), COL_FIELD);
-            let buf = self.dims_vals.entry(rec.name.clone()).or_insert_with(|| fmt3(rec.value));
+            // P5: 绑定了表达式 → 框里是表达式(橙色), 改它 = 改表达式并按新值改模型; 没绑定 → 框里是数值
+            let shown_txt = rec.expr.clone().unwrap_or_else(|| fmt3(rec.value));
+            let buf = self.dims_vals.entry(rec.name.clone()).or_insert_with(|| shown_txt.clone());
             let te = ui.put(
                 fr.shrink2(egui::vec2(4.0, 2.0)),
-                egui::TextEdit::singleline(buf).frame(false).horizontal_align(egui::Align::Center).font(egui::FontId::proportional(12.5)).text_color(egui::Color32::WHITE),
+                egui::TextEdit::singleline(buf).frame(false).horizontal_align(egui::Align::Center).font(egui::FontId::proportional(12.5)).text_color(if bound { COL_ACCENT } else { egui::Color32::WHITE }),
             );
             ui.painter().text(egui::pos2(fr.right() + 4.0, cy), egui::Align2::LEFT_CENTER, u, egui::FontId::proportional(11.0), COL_MUTED);
             let focused = te.has_focus();
@@ -5671,17 +5844,23 @@ impl PlaApp {
                 // 确认 = 应用并强制退出编辑(右键点在框上时焦点不会自己丢, 不退出的话框里不会刷新成新值 —— 用户 2026-11-15)
                 self.dims_edit_row = None;
                 ui.memory_mut(|m| m.surrender_focus(te.id));
-                match buf.trim().parse::<f64>() {
-                    Ok(t) if t >= 0.0 && (t - rec.value).abs() > 5e-4 => acts.push(Act::Value(rec.clone(), t)),
-                    _ => *buf = fmt3(rec.value),
+                if bound {
+                    if buf.trim() != shown_txt {
+                        acts.push(Act::ExprSet(rec.name.clone(), Some(buf.trim().to_string())));
+                    }
+                } else {
+                    match buf.trim().parse::<f64>() {
+                        Ok(t) if t >= 0.0 && (t - rec.value).abs() > 5e-4 => acts.push(Act::Value(rec.clone(), t)),
+                        _ => *buf = shown_txt.clone(),
+                    }
                 }
             } else if !focused && editing && ui.input(|i| i.pointer.primary_pressed() || i.key_pressed(egui::Key::Escape)) {
                 // 左键点了别处 / Esc = 放弃这次输入
                 self.dims_edit_row = None;
-                *buf = fmt3(rec.value);
+                *buf = shown_txt.clone();
             } else if !editing {
-                // 没在编辑: 永远显示记录里的值(不缓存旧输入 —— 否则改完后记录已更新, 框里还停在旧数, 用户 2026-11-15 图1)
-                *buf = fmt3(rec.value);
+                // 没在编辑: 永远显示记录里的值 / 表达式(不缓存旧输入 —— 否则改完后记录已更新, 框里还停在旧数, 用户 2026-11-15 图1)
+                *buf = shown_txt.clone();
             }
             // 名字 / 改名
             let name_r = egui::Rect::from_min_max(egui::pos2(x, cy - 11.0), egui::pos2(fr.left() - 50.0, cy + 11.0));
@@ -5711,7 +5890,21 @@ impl PlaApp {
                 }
             }
             let kind = match rec.kind.as_str() { "thickness" => tr("厚度", "Thick."), "radius" => tr("半径", "Radius"), "filletRadius" => tr("圆角", "Fillet"), "distance" => tr("距离", "Dist."), _ => "" };
-            ui.painter().text(egui::pos2(fr.left() - 8.0, cy), egui::Align2::RIGHT_CENTER, kind, egui::FontId::proportional(11.5), COL_MUTED);
+            if bound {
+                // 绑定: 框左边显示当前值(与计算值不同 = 待应用, 橙色; 表达式出错 = 红色 ⚠, 悬停看原因)
+                let (txt, col, tip) = match self.dims_eval.targets.get(&rec.name) {
+                    Some(Ok(t)) if (t - rec.value).abs() > 5e-4 => (format!("{} → {}", fmt3(rec.value), fmt3(*t)), COL_ACCENT, tr("与计算值不同: 改任一参数 / 表达式时一起应用", "Differs from the computed value: applied with the next parameter / expression change").to_string()),
+                    Some(Ok(_)) => (fmt3(rec.value), COL_MUTED, String::new()),
+                    Some(Err(e)) => ("⚠".to_string(), COL_RED, e.clone()),
+                    None => (fmt3(rec.value), COL_MUTED, String::new()),
+                };
+                let lr = paint_text(ui.painter(), egui::pos2(fr.left() - 8.0, cy), egui::Align2::RIGHT_CENTER, &txt, 11.5, col, false);
+                if !tip.is_empty() {
+                    ui.interact(lr, ui.id().with(("dims-expr-val", &rec.name)), egui::Sense::hover()).on_hover_text(tip);
+                }
+            } else {
+                ui.painter().text(egui::pos2(fr.left() - 8.0, cy), egui::Align2::RIGHT_CENTER, kind, egui::FontId::proportional(11.5), COL_MUTED);
+            }
             // 条目空白处单击 = 载入(管理模式 = 勾选)
             if resp.clicked() {
                 if self.dims_manage {
@@ -5747,7 +5940,7 @@ impl PlaApp {
             }
             ui.add_space(2.0);
         }
-        self.dims_row_focus = focus_any;
+        self.dims_row_focus = focus_any || pfocus;
         for a in acts {
             match a {
                 Act::Load(rec) => self.dim_load(&rec),
@@ -5838,15 +6031,15 @@ impl PlaApp {
                     self.dims_reload();
                 }
                 Act::GroupDelete(id) => self.grp_del_confirm = Some(id),
-                Act::GroupValue(id, t) => {
-                    self.dims_vals.remove(&format!("g:{id}"));
-                    self.link_start(&id, t);
-                }
-                Act::Follow(name, f) => {
-                    if let Err(e) = pla_ui::dims::set_follow(&self.doc_key, &name, f) {
-                        self.set_notice((true, t!("设置失败: {e}", "Setting failed: {e}")));
+                Act::ExprSet(name, expr) => {
+                    self.dims_vals.remove(&name);
+                    match pla_ui::dims::set_dim_expr(&self.doc_key, &name, expr.as_deref()) {
+                        Ok(()) => match &expr {
+                            Some(e) => self.formula_run(&format!("{name} = {e}")),
+                            None => self.dims_reload(),
+                        },
+                        Err(e) => self.set_notice((true, t!("设置表达式失败: {e}", "Setting the expression failed: {e}"))),
                     }
-                    self.dims_reload();
                 }
                 Act::SolidToggle(s) => {
                     if !self.rec_solid_closed.remove(&s) {
@@ -6933,10 +7126,11 @@ fn header_extra_and_show(
 }
 
 /// P4: 一次组联动(组名、目标值、待改的尺寸名队列、总条数)。
+/// P5: 一次"按表达式改模型": 要改的 (尺寸名, 目标值) 逐条走同一条应用链路, 包在一个事务里。
 struct LinkRun {
-    group: String,
-    target: f64,
-    queue: std::collections::VecDeque<String>,
+    /// 触发原因(状态栏显示, 如 "W = 120")。
+    label: String,
+    queue: std::collections::VecDeque<(String, f64)>,
     total: usize,
 }
 

@@ -56,16 +56,19 @@ pub struct DimRecord {
     /// P2: "manual" = 用户记录 / 挂入; "auto" = 特征工具生成(删特征时一起删)。
     #[serde(default = "origin_manual")]
     pub origin: String,
-    /// P4: 在组里时是否跟随组的驱动值(移入组默认跟随, 移出即独立)。
-    #[serde(default)]
+    /// 旧 P4"跟随组的驱动值"(已取消, 载入时迁移成表达式 = 组名变量, 然后清掉; 只为读旧文件保留)。
+    #[serde(default, skip_serializing)]
     pub follow: bool,
+    /// P5: 驱动这条尺寸的表达式(引用参数 / 其它尺寸名, 见 `params.rs`); None = 不绑定(值就是读到的值)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expr: Option<String>,
 }
 
 fn origin_manual() -> String {
     "manual".into()
 }
 
-/// P2: 用户建的组(文件夹)。组里的尺寸可折叠查看、整组操作; 以后组可带驱动值(P4 联动)。
+/// P2: 用户建的组(文件夹)。组里的尺寸可折叠查看、整组操作(组只做归类; 联动改用 P5 参数 / 表达式)。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Group {
     pub id: String,
@@ -85,8 +88,8 @@ pub struct Group {
     /// P3: 特征参数(孔: type / d / depth / cbD / cbDepth / cskD / std / usage …), 悬停详情与以后"按规格重做"用。
     #[serde(default)]
     pub spec: Option<Value>,
-    /// P4: 组的驱动值(文档单位); 改它 = 组里跟随的尺寸全部改成这个值。None = 还没设。
-    #[serde(default)]
+    /// 旧 P4 组驱动值(已取消, 载入时迁移成同名变量; 只为读旧文件保留)。
+    #[serde(default, skip_serializing)]
     pub value: Option<f64>,
 }
 
@@ -103,12 +106,16 @@ pub struct DimsFile {
     pub dims: Vec<DimRecord>,
     #[serde(default)]
     pub groups: Vec<Group>,
-    /// 下一个 id 序号(id = d<n> / g<n>)。
+    /// 下一个 id 序号(id = d<n> / g<n> / p<n>)。
     #[serde(default)]
     pub next_id: u64,
+    /// P5: 参数(常量 / 变量 / 函数)。
+    #[serde(default)]
+    pub params: Vec<crate::params::Param>,
 }
 
-const FILE_VERSION: u32 = 2;
+/// v3 = 加了 params 与尺寸的 expr; 旧的组驱动值 / 跟随迁移成参数 + 表达式。
+const FILE_VERSION: u32 = 3;
 const GROUP_PREFIX: &str = "G";
 
 fn now_secs() -> u64 {
@@ -146,8 +153,63 @@ impl DimsFile {
                 changed = true;
             }
         }
+        changed |= self.migrate_group_values();
+        for i in 0..self.params.len() {
+            if self.params[i].id.is_empty() {
+                let id = self.new_id('p');
+                self.params[i].id = id;
+                changed = true;
+            }
+        }
         changed
     }
+
+    /// 旧 P4 → P5: 有驱动值的用户组 → 同名变量(名字不合法 / 重名时改写成合法唯一名); 组里跟随的尺寸 → 表达式 = 该变量。
+    fn migrate_group_values(&mut self) -> bool {
+        let mut changed = false;
+        for gi in 0..self.groups.len() {
+            let Some(v) = self.groups[gi].value.take() else { continue };
+            changed = true;
+            if self.groups[gi].kind != "group" {
+                continue;
+            }
+            let gid = self.groups[gi].id.clone();
+            let mut base: String = self.groups[gi].name.chars().map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' }).collect();
+            if !crate::params::valid_name(&base) {
+                base = format!("G_{base}");
+            }
+            let mut name = base.clone();
+            let mut k = 2;
+            while self.name_taken(&name) {
+                name = format!("{base}_{k}");
+                k += 1;
+            }
+            let id = self.new_id('p');
+            self.params.push(crate::params::Param { id, name: name.clone(), kind: "var".into(), expr: fmt_num(v), note: String::new() });
+            for d in &mut self.dims {
+                if d.follow && d.parent.as_deref() == Some(gid.as_str()) {
+                    d.expr = Some(name.clone());
+                }
+            }
+        }
+        for d in &mut self.dims {
+            if d.follow {
+                d.follow = false;
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// 名字是否已被参数或尺寸占用。
+    pub fn name_taken(&self, name: &str) -> bool {
+        self.params.iter().any(|p| p.name == name) || self.dims.iter().any(|d| d.name == name)
+    }
+}
+
+fn fmt_num(v: f64) -> String {
+    let s = format!("{v:.6}");
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
 /// 读整个文件(v1 数组自动迁移成 v2 并写回; 没有文件 → 空)。
@@ -291,13 +353,10 @@ pub fn set_parent(doc_key: &str, names: &[String], parent: Option<&str>) -> Resu
             return Err(format!("no group {p}"));
         }
     }
-    // 移入用户组 = 默认跟随组的驱动值(P4); 移入特征 / 移出 = 独立
-    let into_group = parent.is_some_and(|p| f.groups.iter().any(|g| g.id == p && g.kind == "group"));
     let mut n = 0;
     for d in &mut f.dims {
         if names.contains(&d.name) {
             d.parent = parent.map(String::from);
-            d.follow = into_group;
             n += 1;
         }
     }
@@ -305,18 +364,96 @@ pub fn set_parent(doc_key: &str, names: &[String], parent: Option<&str>) -> Resu
     Ok(n)
 }
 
-/// P4: 设组的驱动值。
-pub fn set_group_value(doc_key: &str, id: &str, value: Option<f64>) -> Result<(), String> {
+// ---------------------------------------------------------------- P5 参数 / 表达式
+
+/// 新建参数(kind = const / var / func), 默认名 C1 / V1 / F1…, 默认表达式: 数 = "0"; 函数 = "0"。返回名字。
+pub fn add_param(doc_key: &str, kind: &str) -> Result<String, String> {
+    if !crate::params::KINDS.contains(&kind) {
+        return Err(format!("unknown parameter kind {kind}"));
+    }
     let mut f = load_file(doc_key);
-    f.groups.iter_mut().find(|g| g.id == id).ok_or(format!("no group {id}"))?.value = value;
+    let taken: std::collections::BTreeSet<String> = f.params.iter().map(|p| p.name.clone()).chain(f.dims.iter().map(|d| d.name.clone())).collect();
+    let name = crate::params::default_name(kind, &taken);
+    let id = f.new_id('p');
+    f.params.push(crate::params::Param { id, name: name.clone(), kind: kind.into(), expr: "0".into(), note: String::new() });
+    save_file(doc_key, &f)?;
+    Ok(name)
+}
+
+/// 改参数: 名字(合法、不与参数 / 尺寸重名; 引用它的表达式跟着改)/ 类型 / 表达式。
+pub fn update_param(doc_key: &str, id: &str, name: Option<&str>, kind: Option<&str>, expr: Option<&str>) -> Result<(), String> {
+    let mut f = load_file(doc_key);
+    let i = f.params.iter().position(|p| p.id == id).ok_or(format!("no parameter {id}"))?;
+    if let Some(k) = kind {
+        if !crate::params::KINDS.contains(&k) {
+            return Err(format!("unknown parameter kind {k}"));
+        }
+        f.params[i].kind = k.into();
+    }
+    if let Some(e) = expr {
+        f.params[i].expr = e.trim().to_string();
+    }
+    if let Some(n) = name.map(str::trim) {
+        let old = f.params[i].name.clone();
+        if n != old {
+            if !crate::params::valid_name(n) {
+                return Err(format!("invalid name {n}"));
+            }
+            if f.name_taken(n) {
+                return Err(format!("name {n} already used"));
+            }
+            f.params[i].name = n.to_string();
+            rename_refs_in(&mut f, &old, n);
+        }
+    }
     save_file(doc_key, &f)
 }
 
-/// P4: 尺寸是否跟随所在组的驱动值。
-pub fn set_follow(doc_key: &str, name: &str, follow: bool) -> Result<(), String> {
+/// 删参数。还有表达式引用它 → 拒绝并列出引用者(先改掉那些表达式)。
+pub fn delete_param(doc_key: &str, id: &str) -> Result<(), String> {
     let mut f = load_file(doc_key);
-    f.dims.iter_mut().find(|d| d.name == name).ok_or(format!("no dimension named {name}"))?.follow = follow;
+    let i = f.params.iter().position(|p| p.id == id).ok_or(format!("no parameter {id}"))?;
+    let name = f.params[i].name.clone();
+    let users = users_of(&f, &name);
+    if !users.is_empty() {
+        return Err(format!("{name} is used by {}", users.join(", ")));
+    }
+    f.params.remove(i);
     save_file(doc_key, &f)
+}
+
+/// 设 / 清尺寸的表达式(None 或空 = 不绑定)。
+pub fn set_dim_expr(doc_key: &str, name: &str, expr: Option<&str>) -> Result<(), String> {
+    let mut f = load_file(doc_key);
+    let d = f.dims.iter_mut().find(|d| d.name == name).ok_or(format!("no dimension named {name}"))?;
+    d.expr = expr.map(str::trim).filter(|e| !e.is_empty()).map(String::from);
+    save_file(doc_key, &f)
+}
+
+/// 引用某名字的参数 / 尺寸。
+pub fn users_of(f: &DimsFile, name: &str) -> Vec<String> {
+    let mut out: Vec<String> = f.params.iter().filter(|p| crate::params::refs(&p.expr).iter().any(|r| r == name)).map(|p| p.name.clone()).collect();
+    out.extend(f.dims.iter().filter(|d| d.expr.as_deref().is_some_and(|e| crate::params::refs(e).iter().any(|r| r == name))).map(|d| d.name.clone()));
+    out
+}
+
+fn rename_refs_in(f: &mut DimsFile, old: &str, new: &str) {
+    for p in &mut f.params {
+        p.expr = crate::params::rename_ref(&p.expr, old, new);
+    }
+    for d in &mut f.dims {
+        if let Some(e) = d.expr.as_mut() {
+            *e = crate::params::rename_ref(e, old, new);
+        }
+    }
+}
+
+/// 当前文件求值(参数 + 尺寸)。
+pub fn evaluate(f: &DimsFile) -> crate::params::Eval {
+    crate::params::evaluate(&crate::params::Inputs {
+        params: &f.params,
+        dims: f.dims.iter().map(|d| (d.name.as_str(), d.value, d.expr.as_deref())).collect(),
+    })
 }
 
 /// 记录的缩略图(记录 / 更新时截的视口, 悬停详情里显示): `<目录>/<名字>.png`。
@@ -336,15 +473,19 @@ pub fn rename(doc_key: &str, old: &str, new: &str) -> Result<(), String> {
     if new.is_empty() {
         return Err("empty name".into());
     }
-    let mut list = load(doc_key);
-    if new != old && list.iter().any(|r| r.name == new) {
+    let mut f = load_file(doc_key);
+    if new != old && f.name_taken(new) {
         return Err(format!("name {new} already exists"));
     }
-    match list.iter_mut().find(|r| r.name == old) {
+    match f.dims.iter_mut().find(|r| r.name == old) {
         Some(r) => r.name = new.to_string(),
         None => return Err(format!("no dimension named {old}")),
     }
-    save(doc_key, &list)?;
+    // P5: 引用旧名字的表达式跟着改
+    if new != old {
+        rename_refs_in(&mut f, old, new);
+    }
+    save_file(doc_key, &f)?;
     let _ = std::fs::rename(png_path(doc_key, old), png_path(doc_key, new));
     Ok(())
 }
@@ -451,6 +592,7 @@ mod tests {
             parent: None,
             origin: "manual".into(),
             follow: false,
+            expr: None,
         }
     }
 
@@ -468,8 +610,8 @@ mod tests {
         }
         std::fs::write(path(&doc), serde_json::to_vec(&v).unwrap()).unwrap();
         let f = load_file(&doc);
-        assert_eq!((f.version, f.dims.len(), f.dims[0].id.as_str(), f.dims[0].origin.as_str()), (2, 1, "d1", "manual"));
-        assert!(std::fs::read_to_string(path(&doc)).unwrap().contains("\"version\": 2"), "迁移后写回");
+        assert_eq!((f.version, f.dims.len(), f.dims[0].id.as_str(), f.dims[0].origin.as_str()), (FILE_VERSION, 1, "d1", "manual"));
+        assert!(std::fs::read_to_string(path(&doc)).unwrap().contains(&format!("\"version\": {FILE_VERSION}")), "迁移后写回");
         // 组: 新建 / 挂入 / 改名 / 折叠 / 删组(子项回顶层); 尺寸增删不影响组
         let g = add_group(&doc).unwrap();
         assert_eq!(load_groups(&doc)[0].name, "G001");
@@ -485,12 +627,6 @@ mod tests {
         save(&doc, &l).unwrap();
         assert_eq!(load_groups(&doc).len(), 1, "存尺寸不丢组");
         assert!(load(&doc).iter().all(|d| d.parent.as_deref() == Some(g.as_str())));
-        // P4: 移入用户组默认跟随; 组驱动值; 单条改独立
-        assert!(load(&doc).iter().all(|d| d.follow), "移入组 = 跟随");
-        set_group_value(&doc, &g, Some(2.5)).unwrap();
-        assert_eq!(load_groups(&doc)[0].value, Some(2.5));
-        set_follow(&doc, "D002", false).unwrap();
-        assert!(!load(&doc).iter().find(|d| d.name == "D002").unwrap().follow);
         delete_group(&doc, &g).unwrap();
         assert!(load_groups(&doc).is_empty());
         assert!(load(&doc).iter().all(|d| d.parent.is_none()), "删组: 子项回顶层");
@@ -510,6 +646,54 @@ mod tests {
         assert!(!l.iter().any(|d| d.name.starts_with("H001.")), "自动子尺寸随特征删除");
         assert!(l.iter().any(|d| d.name == "D001" && d.parent.is_none()), "手动挂入的回到顶层");
         assert_eq!(load_groups(&doc).iter().map(|g| (g.name.as_str(), g.kind.as_str())).collect::<Vec<_>>(), vec![("H002", "hole")]);
+        let _ = std::fs::remove_dir_all(STORE.dir(&doc));
+    }
+
+    #[test]
+    fn params_exprs_and_p4_migration() {
+        let doc = format!("__test_dims_params_{}", std::process::id());
+        let _ = std::fs::remove_dir_all(STORE.dir(&doc));
+        // 旧 P4 文件: 组 "外壳 壁厚" 驱动值 2.5, D001 跟随、D002 不跟随
+        std::fs::create_dir_all(STORE.dir(&doc)).unwrap();
+        let old = serde_json::json!({ "version": 2, "next_id": 3,
+            "groups": [{ "id": "g1", "name": "外壳 壁厚", "kind": "group", "value": 2.5 }],
+            "dims": [
+                { "name": "D001", "mode": "face", "kind": "thickness", "faces": [], "value": 2.0, "id": "d1", "parent": "g1", "follow": true },
+                { "name": "D002", "mode": "face", "kind": "thickness", "faces": [], "value": 4.0, "id": "d2", "parent": "g1", "follow": false }
+            ] });
+        std::fs::write(path(&doc), serde_json::to_vec(&old).unwrap()).unwrap();
+        let f = load_file(&doc);
+        assert_eq!(f.params.len(), 1);
+        assert_eq!((f.params[0].name.as_str(), f.params[0].kind.as_str(), f.params[0].expr.as_str()), ("外壳_壁厚", "var", "2.5"), "组值 → 同名变量(空格换成 _)");
+        assert_eq!(f.dims[0].expr.as_deref(), Some("外壳_壁厚"), "跟随的尺寸 → 表达式 = 该变量");
+        assert_eq!(f.dims[1].expr, None);
+        assert_eq!(f.groups[0].value, None);
+        let raw = std::fs::read_to_string(path(&doc)).unwrap();
+        assert!(!raw.contains("\"follow\"") && !raw.contains("\"value\": 2.5"), "旧字段不再写出: {raw}");
+        assert_eq!(evaluate(&f).changes(&[("D001".to_string(), 2.0)].into_iter().collect(), 5e-4), vec![("D001".to_string(), 2.5)]);
+        // 参数增改删 + 重名 / 非法名 / 改名跟着改表达式 / 被引用不能删
+        let v = add_param(&doc, "var").unwrap();
+        assert_eq!(v, "V1");
+        let vid = load_file(&doc).params.iter().find(|p| p.name == "V1").unwrap().id.clone();
+        update_param(&doc, &vid, None, None, Some("100")).unwrap();
+        set_dim_expr(&doc, "D002", Some(" V1 / 25 ")).unwrap();
+        assert_eq!(load(&doc)[1].expr.as_deref(), Some("V1 / 25"));
+        assert!(update_param(&doc, &vid, Some("D001"), None, None).is_err(), "与尺寸重名");
+        assert!(update_param(&doc, &vid, Some("1x"), None, None).is_err(), "非法名");
+        update_param(&doc, &vid, Some("W"), None, None).unwrap();
+        assert_eq!(load(&doc)[1].expr.as_deref(), Some("W / 25"), "改名: 引用跟着改");
+        assert!(delete_param(&doc, &vid).unwrap_err().contains("D002"), "被引用不能删");
+        // 尺寸改名: 表达式里的引用跟着改; 与参数重名拒绝
+        let fid = { add_param(&doc, "func").unwrap(); load_file(&doc).params.iter().find(|p| p.name == "F1").unwrap().id.clone() };
+        update_param(&doc, &fid, None, None, Some("D001 * 2")).unwrap();
+        rename(&doc, "D001", "壁厚").unwrap();
+        assert_eq!(load_file(&doc).params.iter().find(|p| p.name == "F1").unwrap().expr, "壁厚 * 2");
+        assert!(rename(&doc, "壁厚", "W").is_err(), "与参数重名");
+        let e = evaluate(&load_file(&doc));
+        assert_eq!(e.targets["D002"], Ok(4.0));
+        assert_eq!(e.values["F1"], Ok(5.0), "壁厚 绑定 外壳_壁厚 = 2.5 → ×2");
+        set_dim_expr(&doc, "D002", None).unwrap();
+        delete_param(&doc, &vid).unwrap();
         let _ = std::fs::remove_dir_all(STORE.dir(&doc));
     }
 
