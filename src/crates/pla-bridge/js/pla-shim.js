@@ -417,7 +417,8 @@
     'sel.read':  { needs: ['sel.selected', 'sel.size'], optional: selKindKeys },
     'sel.write': { needs: ['exec.cancel'] },
     'sel.apply': { needs: ['ed.geo', 'geo.lookupTopo', 'geo.lookupItem', 'cs.onClick', 'ed.enqueue',
-                           'cmd.selectionBaseHolder', 'sig.commandEnded', 'exec.cancel', 'sel.selected'] },
+                           'cmd.selectionBaseHolder', 'sig.commandEnded', 'exec.cancel', 'sel.selected'],
+                   optional: ['sel.add', 'sel.removeAll'] },  // 实体点面没选上时命令内直接加入(兜底)
     'hist.read': { needs: ['ed.undoStack', 'ed.geoVersion'] },
     'cam.read':  { needs: ['vp.camera'], optional: ['vp.orbit'].concat(orbitKeys) },
     'cam.write': { needs: ['vp.camera', 'vp.orbit', 'oc.quaternionEnd', 'oc.targetEnd', 'oc.radiusEnd', 'vp.render'] },
@@ -1036,6 +1037,14 @@
     return { distance: 1, point: point, intersectable: view, object: view, distance2d: 0 };
   }
 
+  // 实体 / 片体的第一个面的版本 id(面组 versionIds); 没有 → null
+  function firstFaceId(view) {
+    var g = view && view[NAMES.shellGroups.face];
+    var ids = g && g[NAMES.groupVersionIds];
+    if (!ids || !ids.length) return null;
+    return String(ids[0]);
+  }
+
   // 选择命令: 继承 Plasticity 的 SelectionCommand(从已注册的选择类命令原型链取基类, 原生点击命令类只在闭包里)。
   // execute 里逐项走 changeSelection.onClick(与真实点击同一处理), 整个选择集只占一个撤销步。
   function selectionCommandClass() {
@@ -1050,13 +1059,27 @@
         var sel = need('sel.selected');
         var drills = 0;
         var self = this;
+        var direct = 0;
         this.plaEntries.forEach(function (en, i) {
+          var mod = i === 0 && self.plaReplace ? NAMES.modReplace : NAMES.modAdd;
+          if (NAMES.topologyKinds.indexOf(en.kind) < 0 && en.kind !== 'curve') {
+            // 实体 / 片体: 拾取只会命中面, 拿实体对象本身当命中物点下去什么也不选(全是实体的选择集还原失败, 用户 2026-11-16)。
+            // 改为点它的第一个面: 点未介入实体上的面 = 选中整个实体(与手点一致)。仍没选上(如该实体已介入) → 命令内直接加入。
+            var fid = firstFaceId(en.view), fv = fid !== null ? viewOf('face', fid) : null;
+            if (fv) onClick.call(cs, [hitFor(fv)], mod, 0);
+            if (idList(sel, en.kind).indexOf(String(en.id)) < 0) {
+              if (mod === NAMES.modReplace && !fv) invokeOn('sel.removeAll', [], sel);
+              invokeOn('sel.add', [en.view], sel);
+              direct++;
+            }
+            return;
+          }
           var hit = hitFor(en.view);
-          onClick.call(cs, [hit], i === 0 && self.plaReplace ? NAMES.modReplace : NAMES.modAdd, 0);
+          onClick.call(cs, [hit], mod, 0);
           // 点击语义: 未介入实体上的面可能先选中整个实体 → 同一命令内再点一次下钻。
           if (idList(sel, en.kind).indexOf(String(en.id)) < 0) { drills++; onClick.call(cs, [hit], NAMES.modAdd, 0); }
         });
-        this.plaReport = { drills: drills };
+        this.plaReport = { drills: drills, direct: direct };
       }
     }
     state.selCmd = { base: Base, cls: PlaApplySelection };

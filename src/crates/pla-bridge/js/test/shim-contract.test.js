@@ -112,7 +112,9 @@ function mkEditor(opts = {}) {
   // 几何库: 面(版本 id '<实体>f<序号>')与实体
   const box = { min: v3(0, 0, 0), getCenter(t) { t.set(1, 2, 3); return t; } };
   const faceViews = {};
-  const solidViews = { 1: { isSolid: true, id: 1 }, 2: { isSolid: true, id: 2 }, 3: { isSolid: true, id: 3 }, 7: { isSolid: true, id: 7 } };
+  // 实体视图带面组(faces.versionIds), 与 Plasticity 一样
+  const solidViews = { 1: { isSolid: true, id: 1, faces: { versionIds: ['1f10', '1f11'] } }, 2: { isSolid: true, id: 2, faces: { versionIds: ['2f20', '2f21'] } },
+                       3: { isSolid: true, id: 3, faces: { versionIds: ['3f30'] } }, 7: { isSolid: true, id: 7 } };
   ['1f10', '1f11', '2f20', '2f21', '3f30'].forEach((vid) => { faceViews[vid] = { isFace: true, versionId: vid, solid: vid.split('f')[0], parentItem: solidViews[vid.split('f')[0]], getBoundingBox: () => box }; });
   class Plane {}
   class Cylinder {}
@@ -230,7 +232,8 @@ function mkEditor(opts = {}) {
         const o = hits[0].object;
         this.clicks.push([o.versionId || o.id, mod]);
         if (mod === 0) ['solidIds', 'sheetIds', 'faceIds', 'edgeIds', 'curveIds'].forEach((k) => s[k].clear());
-        if (o.isSolid) { s.solidIds.add(o.id); return; }
+        // 真机: 拾取只会命中面 / 边, 把实体对象本身当命中物点下去什么也不选(用户 2026-11-16 报的"全是实体的选择集还原不了")
+        if (o.isSolid) return;
         const sid = Number(o.solid);
         const engaged = s.solidIds.has(sid) || [...s.faceIds].some((f) => faceKey(f).split('f')[0] === o.solid);
         if (!engaged && !opts.directFace) s.solidIds.add(sid);
@@ -739,6 +742,17 @@ const callAsync = async (name, args) => JSON.parse(await run(`window.__PLA__.cal
     assert.deepStrictEqual([...s.faceIds].map(faceKey).sort(), ['1f10', '2f20', '2f21', '3f30'], '追加不清空');
     const none = await callAsync('sel.apply', { items: [{ kind: 'face', id: 'nope' }] });
     assert.strictEqual(none.v.how, 'nothing', '没有可选的成员就不入队命令');
+  });
+
+  await ta('sel.apply: 全是实体的选择集(用户 2026-11-16 报的 bug)→ 点各实体的第一个面选中整个实体, 不选中面', async () => {
+    const r = await callAsync('sel.apply', { items: [{ kind: 'solid', id: '1' }, { kind: 'solid', id: '2' }] });
+    assert.ok(r.ok, JSON.stringify(r));
+    assert.deepStrictEqual([...s.solidIds].sort(), [1, 2]);
+    assert.strictEqual(s.faceIds.size, 0, '不留面');
+    assert.deepStrictEqual(r.v.missing, []);
+    assert.strictEqual(r.v.selected, 2);
+    const clicks = ed3.changeSelection.clicks.slice(-2).map((c) => c[0]);
+    assert.deepStrictEqual(clicks, ['1f10', '2f20'], '点的是面, 不是实体对象');
   });
 
   await ta('sel.apply 入队前先取消活动命令(否则新命令排队不执行)', async () => {
