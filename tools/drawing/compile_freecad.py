@@ -159,7 +159,7 @@ def find_holes(shape, axis_hint=None):
         depth = None if through else round(s1 - s0 if cb is None else (s1 - s0) - 0, 4)
         top = c + a["ax"] * (span_hi if entry_hi else span_lo)
         holes.append({"at": [round(top.x, 4), round(top.y, 4), round(top.z, 4)], "axis": [round(ax.x, 6), round(ax.y, 6), round(ax.z, 6)],
-                      "d": round(2 * rmin, 4), "through": through, "depth": depth, "cb": cb})
+                      "d": round(2 * rmin, 4), "through": through, "depth": depth, "cb": cb, "len": round(span_hi - span_lo, 4)})
     return holes
 
 
@@ -977,6 +977,101 @@ def draw_threads():
                             % (X, Y - r_, r_, r_, X + r_, Y, lw))
             drawn += 1
     rep["thread_arcs"] = {"drawn": drawn, "tapped": len(taps), "edge_signs": [ex, ey]}
+    draw_thread_sides(taps, ex, ey)
+
+
+# 孔轴 ⟂ 视线的视图里的螺纹(国标): 大径两条细线平行孔轴, 画到螺纹长度, 螺纹终止线 = 粗线横过大径。
+#   剖视里(孔轴在剖切面上, 被剖开): 实线; 剖面线 TechDraw 已画到孔壁(= 小径)。
+#   一般视图里(孔在里面看不见): 全画虚线。
+# 视图边坐标(实测): e = ((p − C)·X, (p − C)·U), X = 视图 XDirection, U = Direction × XDirection,
+# C = 视图所画形体的包围盒中心(剖视 = 留下的那一半)。边 → 页面的正负沿用主视校准的 (ex, ey)。
+def view_frame(v, sh):
+    X = V(v.XDirection).normalize()
+    U = V(v.Direction).normalize().cross(X)
+    return X, U, sh.BoundBox.Center
+
+
+def kept_half(v, sec_spec_):
+    """剖视留下的那一半: 两半里投影外形与视图边包围盒对得上的那个(对不上就用整体)。"""
+    X = V(v.XDirection).normalize()
+    U = V(v.Direction).normalize().cross(X)
+    es = [ed for _, ed in edges_of(v)]
+    if not es:
+        return shape
+    xs = [p.Point.x for ed in es for p in ed.Vertexes]
+    ys = [p.Point.y for ed in es for p in ed.Vertexes]
+    want = (max(xs) - min(xs), max(ys) - min(ys))
+    O, N = V(*sec_spec_["origin"]), V(*sec_spec_["normal"]).normalize()
+    big = 4 * (bb.DiagonalLength + 10)
+    best, berr = shape, 1e9
+    for sgn in (1, -1):
+        try:
+            # 半空间: 以 O 为中心、沿 sgn·N 一侧的大盒子
+            n = N * sgn
+            u = n.cross(V(1, 0, 0)) if abs(n.x) < 0.9 else n.cross(V(0, 1, 0))
+            u.normalize()
+            w = n.cross(u)
+            box = Part.makeBox(big, big, big)
+            m = App.Matrix(u.x, w.x, n.x, 0, u.y, w.y, n.y, 0, u.z, w.z, n.z, 0, 0, 0, 0, 1)
+            box = box.transformGeometry(m)
+            box.translate(O - u * (big / 2) - w * (big / 2))
+            half = shape.common(box)
+            if half.isNull() or half.Volume < 1e-6:
+                continue
+            hb = half.BoundBox
+            corners = [V(x, y, z) for x in (hb.XMin, hb.XMax) for y in (hb.YMin, hb.YMax) for z in (hb.ZMin, hb.ZMax)]
+            px = [c.dot(X) for c in corners]
+            py = [c.dot(U) for c in corners]
+            err = abs((max(px) - min(px)) - want[0]) + abs((max(py) - min(py)) - want[1])
+            if err < berr:
+                best, berr = half, err
+        except Exception as e:
+            rep["warnings"].append("section half: %s" % e)
+    return best
+
+
+def draw_thread_sides(taps, ex, ey):
+    lw, lk = std["lines"]["thin"], std["lines"]["visible"]
+    dash = std["lines"].get("hidden_dash", "2 1")
+    targets = [(views[n], shape, False) for n in VAX]
+    if sec is not None and isinstance(sec_spec, dict):
+        targets.append((sec, kept_half(sec, sec_spec), True))
+    drawn = 0
+    for v, sh, is_sec in targets:
+        X, U, C = view_frame(v, sh)
+        D = V(v.Direction).normalize()
+        vx, vy = vcenter(v)
+
+        def page(p):
+            e0, e1 = (p - C).dot(X), (p - C).dot(U)
+            return vx + ex * e0 * scale, H - (vy + ey * e1 * scale)
+
+        for h in taps:
+            a = V(*h["axis"]).normalize()  # 由材料指向入口外侧
+            if abs(a.dot(D)) > 1e-3:
+                continue  # 孔在这个视图里是圆(另有 3/4 圈画法)
+            at = V(*h["at"])
+            if is_sec:
+                N = V(*sec_spec["normal"]).normalize()
+                if abs((at - V(*sec_spec["origin"])).dot(N)) > 1e-3:
+                    continue  # 不在剖切面上: 剖视里不画虚线
+            L = h.get("len") if h.get("through") else h.get("depth")
+            L = L or h.get("len") or h.get("depth")
+            if not L:
+                continue
+            R_ = thread_major(h["tap"]) / 2
+            side = a.cross(D).normalize()  # 视图平面内、垂直孔轴
+            end = at - a * L
+            style = "fill:none;stroke:#000;stroke-width:%g%s" % (lw, "" if is_sec else ";stroke-dasharray:%s" % dash)
+            for s_ in (1, -1):
+                p0, p1 = page(at + side * (R_ * s_)), page(end + side * (R_ * s_))
+                PAGE_SVG.append('<path d="M %.3f %.3f L %.3f %.3f" style="%s"/>' % (p0[0], p0[1], p1[0], p1[1], style))
+            if not h.get("through"):
+                p0, p1 = page(end + side * R_), page(end - side * R_)
+                st = ("fill:none;stroke:#000;stroke-width:%g" % lk) if is_sec else style
+                PAGE_SVG.append('<path d="M %.3f %.3f L %.3f %.3f" style="%s"/>' % (p0[0], p0[1], p1[0], p1[1], st))
+            drawn += 1
+    rep["thread_sides"] = {"drawn": drawn}
 
 
 draw_threads()

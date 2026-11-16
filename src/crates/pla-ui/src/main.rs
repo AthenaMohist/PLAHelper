@@ -212,6 +212,9 @@ struct PlaApp {
     /// 批量出图: 待出的 (零件 key, 重新导出 STEP?, 标题栏); 本批 (总数, 失败的图名)。
     draw_queue: std::collections::VecDeque<(String, bool, std::collections::BTreeMap<String, String>)>,
     draw_batch: Option<(usize, Vec<String>)>,
+    /// 本批的零件顺序(出完合订用); 合订 PDF 的后台线程。
+    draw_batch_keys: Vec<String>,
+    draw_book: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
     lib: pla_ui::parts_lib::Library,
     lib_mtime: Option<std::time::SystemTime>,
     lib_checked: Option<Instant>,
@@ -2537,6 +2540,8 @@ impl PlaApp {
             draw_buf: Default::default(),
             draw_queue: Default::default(),
             draw_batch: None,
+            draw_batch_keys: Vec::new(),
+            draw_book: None,
             lib: Default::default(),
             lib_mtime: None,
             lib_checked: None,
@@ -4503,8 +4508,53 @@ impl PlaApp {
                     t!("批量出图: {ok} 张完成, 失败 {}: {}", "Batch drawing: {ok} done, {} failed: {}", failed.len(), failed.join(", "))
                 };
                 self.set_notice((!failed.is_empty(), msg));
+                // 出成了两张以上 → 顺手合订一份
+                if ok >= 2 {
+                    let keys = std::mem::take(&mut self.draw_batch_keys);
+                    self.draw_book_start(&keys);
+                }
             }
         }
+        let got = self.draw_book.as_ref().and_then(|rx| match rx.try_recv() {
+            Ok(r) => Some(r),
+            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Err(tr("合订线程意外退出", "The combine thread exited unexpectedly").to_string())),
+        });
+        if let Some(r) = got {
+            self.draw_book = None;
+            match r {
+                Ok(_) => {
+                    let p = pla_ui::drawing::book_file(&pla_ui::drawing::dir(&self.doc_key), &self.doc_key);
+                    self.set_notice((false, t!("已合订: {}", "Combined: {}", p.display())));
+                }
+                Err(e) => self.set_notice((true, t!("合订 PDF 失败: {e}", "Combining the PDF failed: {e}"))),
+            }
+        }
+    }
+
+    /// 按 keys 的顺序把出过的图(有 SVG 的)合成一份 PDF(后台线程)。
+    fn draw_book_start(&mut self, keys: &[String]) {
+        if self.draw_book.is_some() {
+            return;
+        }
+        let Some(tools) = pla_ui::drawing::tools_dir() else { return };
+        let dir = pla_ui::drawing::dir(&self.doc_key);
+        let svgs: Vec<std::path::PathBuf> = keys
+            .iter()
+            .filter_map(|k| self.draw_sheets.get(k))
+            .map(|s| pla_ui::drawing::file(&dir, s, "svg"))
+            .filter(|p| p.exists())
+            .collect();
+        if svgs.is_empty() {
+            self.set_notice((true, tr("还没有出过的图可合订", "No drawings to combine yet").to_string()));
+            return;
+        }
+        let out = pla_ui::drawing::book_file(&dir, &self.doc_key);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(pla_ui::drawing::book(&tools, &out, &svgs));
+        });
+        self.draw_book = Some(rx);
     }
 
     /// 批量里有一张失败: 记下图名(单张出图时不记)。
@@ -4751,6 +4801,21 @@ impl PlaApp {
                     batch = Some(true);
                 }
             }
+            let done = items.iter().filter(|it| self.draw_sheets.get(&it.key).is_some_and(|s| !s.compiled.is_empty())).count();
+            if self.draw_book.is_some() {
+                ui.label(egui::RichText::new(tr("合订中…", "Combining…")).color(COL_ACCENT));
+            } else if ui
+                .add_enabled(done > 0 && self.draw_batch.is_none(), egui::Button::new(t!("合订 PDF({done} 张)", "Combine PDF ({done})")))
+                .on_hover_text(tr("按 BOM 顺序把出过的图合成一份 PDF(批量出完会自动合订)", "Combines the drawn sheets into one PDF in BOM order (done automatically after a batch)"))
+                .clicked()
+            {
+                let keys: Vec<String> = items.iter().map(|it| it.key.clone()).collect();
+                self.draw_book_start(&keys);
+            }
+            let bookp = pla_ui::drawing::book_file(&pla_ui::drawing::dir(&self.doc_key), &self.doc_key);
+            if bookp.exists() && self.draw_book.is_none() && ui.button(tr("打开合订本", "Open combined")).clicked() {
+                self.open_path(&bookp);
+            }
         });
         if let Some(redo) = batch {
             for it in items.iter().filter(|it| !it.member.0.is_empty()) {
@@ -4763,6 +4828,8 @@ impl PlaApp {
                 self.draw_queue.push_back((it.key.clone(), redo, title));
             }
             self.draw_batch = Some((self.draw_queue.len(), Vec::new()));
+            // 合订按 BOM 顺序收全部图(含之前出过、这批没重出的)
+            self.draw_batch_keys = items.iter().map(|it| it.key.clone()).collect();
         }
         if let Some(i) = pick {
             let it = &items[i];
@@ -9649,7 +9716,7 @@ impl eframe::App for PlaApp {
         }
         // D1 出图任务在后台跑, 窗口关了也要收结果
         self.draw_tick();
-        if self.draw_job.is_some() {
+        if self.draw_job.is_some() || self.draw_book.is_some() {
             ctx.request_repaint_after(Duration::from_millis(500));
         }
         if self.show_bom {

@@ -330,6 +330,34 @@ pub fn compile(tools: &Path, spec_file: &Path) -> Result<String, String> {
     }
 }
 
+/// 多张图合成一份 PDF(tools/drawing/book.ps1: 每张 SVG 一页, 纸张按各自报告)。同步执行, 放后台线程里调。
+pub fn book(tools: &Path, out: &Path, svgs: &[PathBuf]) -> Result<String, String> {
+    // 路径清单写文件(文件名里可能有逗号, 不能走 -Svg a,b)
+    let list = out.with_extension("list.txt");
+    std::fs::write(&list, svgs.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("\n")).map_err(|e| format!("{}: {e}", list.display()))?;
+    let mut cmd = std::process::Command::new("powershell");
+    cmd.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]).arg(tools.join("book.ps1")).arg("-Out").arg(out).arg("-List").arg(&list);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let o = cmd.output().map_err(|e| format!("powershell: {e}"))?;
+    let _ = std::fs::remove_file(&list);
+    let text = String::from_utf8_lossy(&o.stdout).trim().to_string();
+    if o.status.success() && out.exists() {
+        Ok(text.lines().last().unwrap_or("").to_string())
+    } else {
+        Err(text)
+    }
+}
+
+/// 合订本的文件名: <文档名>.drawings.pdf, 放在出图目录里。
+pub fn book_file(dir: &Path, doc_key: &str) -> PathBuf {
+    let stem = doc_key.rsplit(['/', '\\']).next().unwrap_or("drawings");
+    dir.join(format!("{}.drawings.pdf", base_name("", stem)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
