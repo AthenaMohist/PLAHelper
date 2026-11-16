@@ -385,6 +385,10 @@ pub fn asm_spec(s: &Sheet, dir: &Path, lines: &[AsmLine]) -> Value {
     if let Some(u) = s.up {
         v["up"] = json!(u);
     }
+    // 某个组的装配图: 零件在组里时 Plasticity 导出全部可见实体 → 只画对得上本组明细的实体
+    if s.key.starts_with(&format!("{ASM_KEY}:")) {
+        v["only_listed"] = json!(true);
+    }
     let fits: Vec<Value> = s.fits.iter().filter(|f| !f.code.trim().is_empty()).map(|f| json!({ "id": f.id, "code": f.code })).collect();
     if !fits.is_empty() {
         v["fits"] = json!(fits);

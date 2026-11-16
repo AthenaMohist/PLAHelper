@@ -4823,7 +4823,7 @@ impl PlaApp {
             for (i, it) in items.iter().enumerate() {
                 let sheet = self.draw_sheets.get(&it.key);
                 let mark = match sheet {
-                    Some(s) if !s.compiled.is_empty() => format!("  ✓ {}", s.compiled),
+                    Some(s) if !s.compiled.is_empty() => t!("  · 已出 {}", "  · drawn {}", s.compiled),
                     _ => String::new(),
                 };
                 let busy = self.draw_job.as_ref().is_some_and(|j| j.key == it.key);
@@ -5021,7 +5021,8 @@ impl PlaApp {
                     .show(ui, |ui| {
                         egui::Grid::new("draw-fits-grid").num_columns(3).spacing([8.0, 3.0]).show(ui, |ui| {
                             for c in &r.fit_candidates {
-                                ui.label(format!("⌀{}  {} ⟷ {}  ×{}", pla_ui::drawing::fmt_d(c.d), c.hole, c.shaft, c.count)).on_hover_text(tr("孔 ⟷ 轴, 件数 = 这样的配合处数", "hole ⟷ shaft, count = places with this fit"));
+                                // 代号放前面(零件名可能很长, 放后面被挤出窗口的是说明而不是下拉框); Ø / ↔ 用面板字体里有的字
+                                let desc = format!("Ø{}  {} ↔ {}  ×{}", pla_ui::drawing::fmt_d(c.d), c.hole, c.shaft, c.count);
                                 let cur = s.fits.iter().find(|f| f.id == c.id).map(|f| f.code.clone()).unwrap_or_default();
                                 let mut pick = cur.clone();
                                 egui::ComboBox::from_id_salt(("fit", c.id.as_str())).selected_text(if cur.is_empty() { "—".to_string() } else { cur.clone() }).width(80.0).show_ui(ui, |ui| {
@@ -5037,6 +5038,7 @@ impl PlaApp {
                                 } else if !te.has_focus() {
                                     *buf = cur.clone();
                                 }
+                                ui.label(egui::RichText::new(desc).size(12.0)).on_hover_text(tr("孔 ↔ 轴, ×N = 这样的配合处数", "hole ↔ shaft, ×N = places with this fit"));
                                 if pick != cur {
                                     s.fits.retain(|f| f.id != c.id);
                                     if !pick.is_empty() {

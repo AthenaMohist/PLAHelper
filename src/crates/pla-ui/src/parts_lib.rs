@@ -298,8 +298,33 @@ pub fn mtime_in(dir: &Path) -> Option<std::time::SystemTime> {
     std::fs::metadata(path_in(dir)).and_then(|m| m.modified()).ok()
 }
 
-/// 今天(本地时区不可得时用 UTC 日期即可, 只做"记录日期")。
+/// 今天(本地日期; Windows 用 GetLocalTime —— 用户在 UTC+8, 凌晨记成"昨天"会让人以为没出新图)。
 pub fn today() -> String {
+    #[cfg(windows)]
+    {
+        #[repr(C)]
+        #[derive(Default)]
+        struct SystemTime {
+            year: u16,
+            month: u16,
+            day_of_week: u16,
+            day: u16,
+            hour: u16,
+            minute: u16,
+            second: u16,
+            ms: u16,
+        }
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetLocalTime(t: *mut SystemTime);
+        }
+        let mut t = SystemTime::default();
+        // SAFETY: GetLocalTime 只写入调用方提供的 SYSTEMTIME 结构(8 个 u16, 与上面布局一致)。
+        unsafe { GetLocalTime(&mut t) };
+        if t.year > 0 {
+            return format!("{:04}-{:02}-{:02}", t.year, t.month, t.day);
+        }
+    }
     let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) as i64;
     let days = secs.div_euclid(86_400);
     // 1970-01-01 起的天数 → 公历(Howard Hinnant 算法)

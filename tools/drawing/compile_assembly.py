@@ -140,8 +140,14 @@ for i, l in enumerate(lines):
     if l.get("qty") and not l.get("parts") and l["found"] != int(l["qty"]):
         rep["warnings"].append("line %s (%s): BOM qty %s, solids in STEP %d" % (l.get("pn") or l.get("name"), l.get("key"), l.get("qty"), l["found"]))
 unmatched = sum(1 for o in owner if o is None)
+ONLY_LISTED = bool(spec.get("only_listed"))  # 某个组的装配图: STEP 里有组外的可见实体(Plasticity 写出全部可见), 对不上的不画
 if unmatched:
-    rep["warnings"].append("%d solid(s) in the STEP match no BOM line (drawn, no balloon)" % unmatched)
+    rep["warnings"].append("%d solid(s) in the STEP match no BOM line (%s)" % (unmatched, "not drawn: outside this group" if ONLY_LISTED else "drawn, no balloon"))
+if ONLY_LISTED and unmatched:
+    keep_i = [i for i, o in enumerate(owner) if o is not None]
+    solids = [solids[i] for i in keep_i]
+    owner = [owner[i] for i in keep_i]
+    SVA = [SVA[i] for i in keep_i]
 rep["solids"] = len(solids)
 rep["lines"] = [{"key": l.get("key"), "found": l["found"], "qty": l.get("qty")} for l in lines]
 
