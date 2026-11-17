@@ -3061,6 +3061,10 @@ impl PlaApp {
                 // B1/B2 BOM 扫描回包: 批量模式 → 导出这一份再扫下一个配置; 否则显示
                 pla_bridge::cdp::CdpEvent::CallResult { name, result } if name == pla_bridge::shim::api::BOM_SCAN => {
                     self.bom_busy = false;
+                    // 增量更新: 改过几何的零件(key 变了、实体还是那个)→ BOM 填写和出图设置跟过去
+                    if let Ok(v) = &result {
+                        self.identity_migrate(v);
+                    }
                     let scope = self.bom_pending_scope.take().flatten();
                     if let Some((mut queue, mut done)) = self.bom_batch.take() {
                         let label = Self::bom_scope_label(&scope);
@@ -4821,6 +4825,7 @@ impl PlaApp {
             Ok(_) => {
                 if let Some(mut s) = self.draw_sheets.get(key).cloned() {
                     s.compiled = pla_ui::parts_lib::today();
+                    s.model_changed = false;
                     let base = s.base.clone();
                     self.draw_sheets.upsert(s);
                     self.draw_save();
@@ -4887,6 +4892,63 @@ impl PlaApp {
             let _ = tx.send(r);
         });
         self.draw_up_job = Some((key.to_string(), rx));
+    }
+
+    /// 增量更新(每次 BOM 扫描回包): 记 key → 实例 id, 找出"同一实体换了 key"的零件, 把 BOM 填写 / 链接 / 排除和出图设置迁过去。
+    /// 以前没有 ids 记录的旧图: 用图上记的实体 id(member)补上, 这样早先因改模型变成"不在当前范围"的图也能接回来。
+    fn identity_migrate(&mut self, scan: &serde_json::Value) {
+        let dir = pla_ui::drawing::dir(&self.doc_key);
+        let mut sheets = if self.draw_doc == self.doc_key { self.draw_sheets.clone() } else { pla_ui::drawing::load_in(&dir) };
+        let mut ids = pla_ui::identity::load(&self.doc_key);
+        for s in sheets.sheets.iter().filter(|s| !pla_ui::drawing::is_asm(&s.key) && !s.member.is_empty()) {
+            ids.entry(s.key.clone()).or_insert_with(|| vec![s.member.clone()]);
+        }
+        let renames = pla_ui::identity::track(&mut ids, scan);
+        if let Err(e) = pla_ui::identity::save(&self.doc_key, &ids) {
+            self.set_notice((true, t!("零件身份记录保存失败: {e}", "Saving part identities failed: {e}")));
+        }
+        if renames.is_empty() {
+            return;
+        }
+        let mut edits = if self.bom_edits_doc == self.doc_key { self.bom_edits.clone() } else { pla_ui::bom_table::load_edits(&self.doc_key) };
+        let (mut nb, mut nd) = (0, 0);
+        for (old, new) in &renames {
+            nb += usize::from(edits.rename_key(old, new));
+            nd += usize::from(sheets.rename_key(&dir, old, new));
+            if self.draw_sel.as_deref() == Some(old.as_str()) {
+                self.draw_sel = Some(new.clone());
+            }
+        }
+        if nb > 0 {
+            if let Err(e) = pla_ui::bom_table::save_edits(&self.doc_key, &edits) {
+                self.set_notice((true, t!("BOM 填写保存失败: {e}", "Saving BOM entries failed: {e}")));
+            }
+            if self.bom_edits_doc == self.doc_key {
+                self.bom_edits = edits;
+                self.bom_cell_buf.clear();
+            }
+        }
+        if nd > 0 {
+            if let Err(e) = pla_ui::drawing::save_in(&dir, &sheets) {
+                self.set_notice((true, t!("出图设置保存失败: {e}", "Saving drawing settings failed: {e}")));
+            }
+            if self.draw_doc == self.doc_key {
+                self.draw_sheets = sheets;
+                if let Some(k) = self.draw_sel.clone() {
+                    self.draw_load(&k);
+                }
+            }
+        }
+        if nb + nd > 0 {
+            self.set_notice((
+                false,
+                t!(
+                    "{} 个零件改过模型: 沿用了原来的 BOM 填写({nb})和出图设置({nd}), 图标成「待重出」",
+                    "{} part(s) changed shape: kept their BOM entries ({nb}) and drawing settings ({nd}); drawings marked for redraw",
+                    renames.len()
+                ),
+            ));
+        }
     }
 
     // ---------------------------------------------------------------- D5 出图助手
@@ -5085,18 +5147,7 @@ impl PlaApp {
             items.insert(i, Item { key: k.clone(), label, title, member: (String::new(), String::new()), bought: false });
         }
         self.draw_asm = asms.into_iter().map(|(k, _, ls)| (k, ls)).collect();
-        // D8: 模型改过 = 几何指纹变了, 旧图成了"不在当前范围"。同一个实体(member)的旧图上有上传图纸 → 新 key → 旧 key, 提示沿用
-        let carry: std::collections::HashMap<String, String> = items
-            .iter()
-            .filter(|it| !it.member.0.is_empty() && self.draw_sheets.get(&it.key).map_or(true, |s| s.uploaded.is_none()))
-            .filter_map(|it| {
-                self.draw_sheets
-                    .sheets
-                    .iter()
-                    .find(|s| s.uploaded.is_some() && s.member == it.member.0 && !items.iter().any(|i| i.key == s.key))
-                    .map(|s| (it.key.clone(), s.key.clone()))
-            })
-            .collect();
+        // (模型改过的零件: BOM 扫描回包时 identity_migrate 已经把整张图迁到新 key, 这里不用再找旧图)
         let locked_keys: std::collections::HashSet<String> = self.draw_sheets.sheets.iter().filter(|s| s.locked()).map(|s| s.key.clone()).collect();
         for s in &self.draw_sheets.sheets {
             if !items.iter().any(|i| i.key == s.key) {
@@ -5160,8 +5211,8 @@ impl PlaApp {
                         _ => String::new(),
                     },
                 };
-                if carry.contains_key(&it.key) {
-                    mark.push_str(tr("  · 模型改过, 有旧的上传图纸", "  · model changed, old upload exists"));
+                if sheet.is_some_and(|s| s.model_changed && !s.locked()) {
+                    mark.push_str(tr("  · 模型改过, 待重出", "  · model changed, redraw"));
                 }
                 let busy = self.draw_job.as_ref().is_some_and(|j| j.key == it.key);
                 let text = egui::RichText::new(format!("{}{}{}", it.label, mark, if busy { "  …" } else { "" }));
@@ -5191,7 +5242,8 @@ impl PlaApp {
                 }
             } else {
                 let free = self.draw_job.is_none() && !self.bom_busy;
-                let todo = items.iter().filter(|it| drawable(it) && self.draw_sheets.get(&it.key).map_or(true, |s| s.compiled.is_empty())).count();
+                // 没出过的 + 模型改过待重出的
+                let todo = items.iter().filter(|it| drawable(it) && self.draw_sheets.get(&it.key).map_or(true, |s| s.compiled.is_empty() || s.model_changed)).count();
                 let all = items.iter().filter(|it| drawable(it)).count();
                 if ui.add_enabled(free && todo > 0, egui::Button::new(t!("出未出的 {todo} 张", "Draw {todo} undrawn"))).on_hover_text(tr("按 BOM 顺序一张张出(每张约 20–90 s); 可以接着在 Plasticity 里干活, 但别关文档", "Draws one by one in BOM order (~20–90 s each); you can keep working in Plasticity, but keep the document open")).clicked() {
                     batch = Some(false);
@@ -5222,7 +5274,7 @@ impl PlaApp {
         });
         if let Some(redo) = batch {
             for it in items.iter().filter(|it| drawable(it)) {
-                if !redo && self.draw_sheets.get(&it.key).is_some_and(|s| !s.compiled.is_empty()) {
+                if !redo && self.draw_sheets.get(&it.key).is_some_and(|s| !s.compiled.is_empty() && !s.model_changed) {
                     continue;
                 }
                 self.draw_ensure(&it.key, &it.title, &it.member);
@@ -5293,7 +5345,7 @@ impl PlaApp {
             Unlock,
             Relock,
             Delete,
-            Carry(String),
+            DropRefs(Vec<String>),
         }
         let mut up_act: Option<UpAct> = None;
         let up_busy = self.draw_up_job.as_ref().is_some_and(|(k, _)| *k == key);
@@ -5304,11 +5356,16 @@ impl PlaApp {
         if let Some(p) = ui.ctx().input(|i| i.raw.dropped_files.iter().find_map(|f| f.path.clone())) {
             up_act = Some(UpAct::Drop(p));
         }
-        if let Some(old) = carry.get(&key) {
+        // 增量更新: 模型改过 → 设置都沿用了; 提示要重出, 并列出新报告里已经对不上的修正
+        if s.model_changed && !locked {
+            ui.label(egui::RichText::new(tr("模型改过: 原来的出图设置都沿用了, 点「出图」按新模型重出", "The model changed: all drawing settings were kept; click Draw to redraw from the new model")).color(COL_YELLOW));
+        }
+        let stale: Vec<String> = self.draw_report.as_ref().filter(|(k, _)| *k == key && !s.model_changed).map(|(_, r)| pla_ui::drawing::stale_refs(&s, r)).unwrap_or_default();
+        if !stale.is_empty() {
             ui.horizontal_wrapped(|ui| {
-                ui.label(egui::RichText::new(tr("模型改过(几何变了), 旧版本有上传的图纸。", "The model changed (geometry differs); the old version has an uploaded drawing.")).color(COL_YELLOW));
-                if ui.small_button(tr("沿用旧图纸(待确认)", "Carry it over (to confirm)")).on_hover_text(tr("把旧的上传图纸挂到现在的零件上, 标成「待确认」; 核对后点「仍然有效」或重新上传", "Attaches the old upload to the current part, marked \"to confirm\"; check it, then click \"Still valid\" or upload again")).clicked() {
-                    up_act = Some(UpAct::Carry(old.clone()));
+                ui.label(egui::RichText::new(t!("这些修正在新图里找不到了(模型改了, 尺寸重新命名): {}", "These corrections no longer match the new drawing (model changed, dimensions renamed): {}", stale.join(", "))).color(COL_YELLOW));
+                if ui.small_button(tr("清理", "Clean up")).on_hover_text(tr("去掉这些名字的隐藏 / 关键 / 文字 / 公差 / 孔位设置", "Removes hide / key / text / tolerance / hole-position settings for these names")).clicked() {
+                    up_act = Some(UpAct::DropRefs(stale.clone()));
                 }
             });
         }
@@ -5999,14 +6056,13 @@ impl PlaApp {
             match act {
                 UpAct::Pick => self.draw_upload_start(&key, None),
                 UpAct::Drop(p) => self.draw_upload_start(&key, Some(p)),
-                UpAct::Carry(old) => {
-                    let up = self.draw_sheets.sheets.iter_mut().find(|x| x.key == old).and_then(|x| x.uploaded.take());
-                    if let (Some(mut u), Some(mut cur)) = (up, self.draw_sheets.get(&key).cloned()) {
-                        u.stale = true;
-                        cur.uploaded = Some(u);
+                UpAct::DropRefs(names) => {
+                    if let Some(mut cur) = self.draw_sheets.get(&key).cloned() {
+                        pla_ui::drawing::drop_refs(&mut cur, &names);
                         self.draw_sheets.upsert(cur);
+                        self.draw_save();
+                        self.draw_buf.clear();
                     }
-                    self.draw_save();
                 }
                 other => {
                     if let Some(mut cur) = self.draw_sheets.get(&key).cloned() {

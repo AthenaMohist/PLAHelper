@@ -167,6 +167,30 @@ pub fn save_edits(doc_key: &str, e: &Edits) -> Result<(), String> {
 }
 
 impl Edits {
+    /// 增量更新: 零件改了几何(key 变了)→ 填写 / 链接 / 排除跟到新 key。新 key 上已有的不覆盖。返回是否动了。
+    pub fn rename_key(&mut self, old: &str, new: &str) -> bool {
+        let mut changed = false;
+        if let Some(m) = self.parts.remove(old) {
+            let dst = self.parts.entry(new.into()).or_default();
+            for (k, v) in m {
+                dst.entry(k).or_insert(v);
+            }
+            changed = true;
+        }
+        if let Some(pn) = self.links.remove(old) {
+            self.links.entry(new.into()).or_insert(pn);
+            changed = true;
+        }
+        if let Some(i) = self.excluded.iter().position(|k| k == old) {
+            self.excluded.remove(i);
+            if !self.excluded.iter().any(|k| k == new) {
+                self.excluded.push(new.into());
+            }
+            changed = true;
+        }
+        changed
+    }
+
     /// 新手动行, 返回它的 id。
     pub fn add_manual(&mut self) -> String {
         self.next_manual += 1;
@@ -454,6 +478,21 @@ mod tests {
         let (rows, _) = build(&scan, &t, &e, &lib);
         assert_eq!(rows[0].link, None);
         assert_eq!(rows[0].cells[col("name")], "杯内六M4x14");
+    }
+
+    #[test]
+    fn rename_key_moves_entries() {
+        let mut e = Edits::default();
+        e.set_cell("old", "unit_price", "6.1", "0");
+        e.links.insert("old".into(), "904009023".into());
+        e.excluded.push("gone".into());
+        e.set_cell("new", "unit", "包", "pc");
+        assert!(e.rename_key("old", "new"));
+        assert_eq!((e.parts["new"]["unit_price"].as_str(), e.parts["new"]["unit"].as_str()), ("6.1", "包"));
+        assert_eq!(e.links["new"], "904009023");
+        assert!(!e.parts.contains_key("old") && !e.links.contains_key("old"));
+        assert!(e.rename_key("gone", "gone2") && e.excluded == vec!["gone2".to_string()]);
+        assert!(!e.rename_key("nothing", "x"));
     }
 
     #[test]

@@ -11,6 +11,7 @@ pub mod features;
 pub mod formula;
 pub mod hole_presets;
 pub mod hotkey;
+pub mod identity;
 pub mod llm;
 pub mod matstate;
 pub mod notes;

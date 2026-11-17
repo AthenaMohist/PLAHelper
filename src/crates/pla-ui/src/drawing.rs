@@ -100,6 +100,9 @@ pub struct Sheet {
     /// D8: 用户上传的图纸(锁定时以它为准, 不再生成)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uploaded: Option<Uploaded>,
+    /// 增量更新: 模型改过(从旧 key 迁过来), 图要重出; 出完清掉。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub model_changed: bool,
 }
 
 /// D8 第一层: 上传的图纸。文件复制进出图目录(`<base>.uploaded.<ext>`), PDF / 图片转成每页一张 PNG(`<base>.up-N.png`)供预览和合订。
@@ -305,6 +308,7 @@ impl Sheet {
             parts_list: BTreeMap::new(),
             edits: 0,
             uploaded: None,
+            model_changed: false,
         }
     }
 }
@@ -328,6 +332,53 @@ impl Sheets {
             Some(x) => *x = s,
             None => self.sheets.push(s),
         }
+    }
+
+    /// 增量更新: 零件改了几何(key 变了)→ 这张图连同全部修正跟到新 key; 旧 STEP 改名 .prev.step(要重新导出),
+    /// 标"模型改过"; 上传的图纸标"待确认"; 装配图里的配合 / 序号 / 明细覆盖也跟着改 key。新 key 已经有人改过的图就不动它。
+    pub fn rename_key(&mut self, dir: &Path, old: &str, new: &str) -> bool {
+        let mut changed = false;
+        for a in self.sheets.iter_mut().filter(|s| is_asm(&s.key)) {
+            for f in &mut a.fits {
+                for k in [&mut f.hole_key, &mut f.shaft_key] {
+                    if k == old {
+                        *k = new.to_string();
+                        changed = true;
+                    }
+                }
+            }
+            if let Some(b) = a.balloons.remove(old) {
+                a.balloons.insert(new.into(), b);
+                changed = true;
+            }
+            if let Some(p) = a.parts_list.remove(old) {
+                a.parts_list.insert(new.into(), p);
+                changed = true;
+            }
+        }
+        if !self.sheets.iter().any(|s| s.key == old) {
+            return changed;
+        }
+        if let Some(j) = self.sheets.iter().position(|s| s.key == new) {
+            let dst = &self.sheets[j];
+            let pristine = dst.edits == 0 && dst.compiled.is_empty() && dst.uploaded.is_none();
+            if !pristine {
+                return changed;
+            }
+            self.sheets.remove(j);
+        }
+        let Some(s) = self.sheets.iter_mut().find(|s| s.key == old) else { return changed };
+        s.key = new.to_string();
+        s.model_changed = true;
+        s.exported.clear();
+        let step = file(dir, s, "step");
+        if step.exists() {
+            let _ = std::fs::rename(&step, file(dir, s, "prev.step"));
+        }
+        if let Some(u) = s.uploaded.as_mut() {
+            u.stale = true;
+        }
+        true
     }
 
     /// 文件名不和别的图重: 重了加 -2 / -3 …
@@ -938,6 +989,29 @@ pub struct Report {
     pub section: Option<Value>,
 }
 
+/// 增量更新后: 修正里引用的尺寸名 / 孔组在新报告里已经没有了(模型改了, 编译器重新命名)→ 列出来给用户清理。
+pub fn stale_refs(s: &Sheet, r: &Report) -> Vec<String> {
+    let has = |n: &str| r.placed.iter().any(|p| p.name == n) || s.dims_add.iter().any(|a| a.name == n);
+    let mut out: Vec<String> = s.dims_hide.iter().chain(&s.dims_key).chain(s.dims_text.keys()).chain(s.dims_tol.keys()).filter(|n| !has(n)).cloned().collect();
+    if let Some(o) = &s.ordinate {
+        out.extend(o.iter().filter(|g| !r.hole_groups.iter().any(|h| &h.id == *g)).cloned());
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// 去掉这些名字的修正(隐藏 / 关键 / 文字 / 公差 / 孔位孔组)。
+pub fn drop_refs(s: &mut Sheet, names: &[String]) {
+    s.dims_hide.retain(|n| !names.contains(n));
+    s.dims_key.retain(|n| !names.contains(n));
+    s.dims_text.retain(|n, _| !names.contains(n));
+    s.dims_tol.retain(|n, _| !names.contains(n));
+    if let Some(o) = s.ordinate.as_mut() {
+        o.retain(|g| !names.contains(g));
+    }
+}
+
 pub fn load_report(dir: &Path, s: &Sheet) -> Option<Report> {
     let p = dir.join(format!("{}.report.json", s.base));
     std::fs::read_to_string(p).ok().and_then(|t| serde_json::from_str(t.trim_start_matches('\u{feff}')).ok())
@@ -1073,6 +1147,50 @@ pub fn book_file(dir: &Path, doc_key: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rename_key_keeps_corrections() {
+        let d = std::env::temp_dir().join(format!("pla_rename_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let mut all = Sheets::default();
+        let mut s = Sheet::new("old", "904002001", "m1", "Plate");
+        s.dims_tol.insert("DiaOuter".into(), "h7".into());
+        s.dims_hide.push("LenW".into());
+        s.compiled = "2026-11-17".into();
+        s.exported = "2026-11-17".into();
+        all.upsert(s.clone());
+        std::fs::write(file(&d, &s, "step"), "step").unwrap();
+        let mut asm = Sheet::new(ASM_KEY, "asm", "", "");
+        asm.fits.push(Fit { id: "f".into(), d: 8.0, hole_key: "old".into(), shaft_key: "pin".into(), code: "H7/g6".into() });
+        asm.balloons.insert("old".into(), BalloonEdit { hide: true, ..Default::default() });
+        all.upsert(asm);
+        // 新 key 上已经有一张没人碰过的空图(旧版本建的)→ 被替换
+        all.upsert(Sheet::new("new", "904002001-2", "m1", "Plate"));
+        assert!(all.rename_key(&d, "old", "new"));
+        let n = all.get("new").unwrap();
+        assert_eq!((n.base.as_str(), n.dims_tol["DiaOuter"].as_str(), n.model_changed, n.exported.as_str()), ("904002001", "h7", true, ""));
+        assert!(all.get("old").is_none() && all.sheets.len() == 2);
+        assert!(!file(&d, n, "step").exists() && file(&d, n, "prev.step").exists(), "旧 STEP 改名, 出图时重新导出");
+        let a = all.get(ASM_KEY).unwrap();
+        assert_eq!(a.fits[0].hole_key, "new");
+        assert!(a.balloons.contains_key("new"));
+        // 新 key 上的图人改过 → 不覆盖
+        let mut other = Sheet::new("x2", "B", "m2", "B");
+        other.edits = 3;
+        all.upsert(other);
+        all.upsert(Sheet::new("x1", "A", "m2", "A"));
+        assert!(!all.rename_key(&d, "x1", "x2"));
+        assert_eq!(all.get("x2").unwrap().edits, 3);
+        // 重出后报告里没有 LenW 了 → 列出来, 清理
+        let mut r = Report::default();
+        r.placed.push(Placed { name: "DiaOuter".into(), text: None, shown: None, value: None, at: [0.0, 0.0], hidden: false });
+        let mut n = all.get("new").unwrap().clone();
+        assert_eq!(stale_refs(&n, &r), vec!["LenW".to_string()]);
+        drop_refs(&mut n, &["LenW".into()]);
+        assert!(n.dims_hide.is_empty() && n.dims_tol.contains_key("DiaOuter"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     #[test]
     fn uploads_lock_and_book_pages() {
