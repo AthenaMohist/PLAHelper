@@ -215,6 +215,12 @@ struct PlaApp {
     bom_col_w: std::collections::HashMap<String, f32>,
     bom_freeze: usize,
     bom_cols_dirty: bool,
+    /// 图纸预览窗口(贴生产窗口右边): 窗口状态 / 上次对齐时生产窗口的外框 / 当前图 uri(换图时缩放复位)/ 缩放 / 平移。
+    draw_prev_win: FloatWin,
+    draw_prev_anchor: Option<[f32; 4]>,
+    draw_prev_uri: Option<String>,
+    draw_zoom: f32,
+    draw_pan: egui::Vec2,
     /// 批量出图: 待出的 (零件 key, 重新导出 STEP?, 标题栏); 本批 (总数, 失败的图名)。
     draw_queue: std::collections::VecDeque<(String, bool, std::collections::BTreeMap<String, String>)>,
     draw_batch: Option<(usize, Vec<String>)>,
@@ -2554,6 +2560,11 @@ impl PlaApp {
                 .unwrap_or_default(),
             bom_freeze: pla_ui::prefs::load_value(BOM_COLS_KEY).and_then(|v| v["freeze"].as_u64()).unwrap_or(0) as usize,
             bom_cols_dirty: false,
+            draw_prev_win: FloatWin::load(DRAW_PREV_RECT_KEY),
+            draw_prev_anchor: None,
+            draw_prev_uri: None,
+            draw_zoom: 1.0,
+            draw_pan: egui::Vec2::ZERO,
             draw_queue: Default::default(),
             draw_batch: None,
             draw_batch_keys: Vec::new(),
@@ -5546,44 +5557,155 @@ impl PlaApp {
             title.extend(s.title.clone());
             self.draw_start(&key, export, title);
         }
-        // ---- 预览(点击打开 PDF) ----
-        if let Some((uri, bytes)) = self.draw_png.clone() {
-            let w = ui.available_width();
-            let r = ui
-                .add(egui::Image::from_bytes(uri, bytes).max_width(w).rounding(2.0).sense(egui::Sense::click()))
-                .on_hover_text(tr("单击 = 选中最近的尺寸; 双击 = 打开 PDF", "Click = select the nearest dimension; double-click = open the PDF"));
-            let paper = self.draw_report.as_ref().filter(|(k, _)| *k == key).and_then(|(_, r)| r.paper_mm).unwrap_or([420.0, 297.0]);
-            if r.double_clicked() {
-                let p = pla_ui::drawing::file(&pla_ui::drawing::dir(&self.doc_key), &s, "pdf");
-                self.open_path(&p);
-            } else if r.clicked() {
-                if let Some(pos) = r.interact_pointer_pos() {
-                    let fx = ((pos.x - r.rect.left()) / r.rect.width()) as f64;
-                    let fy = ((pos.y - r.rect.top()) / r.rect.height()) as f64;
-                    if let Some(b) = pla_ui::drawing::nearest_balloon(&bal_rep, paper, fx, fy) {
-                        self.draw_buf.insert("balsel".into(), b.key.clone().unwrap_or_default());
-                    } else {
-                        let hit = pla_ui::drawing::nearest_dim(&placed, paper, fx, fy).map(|p| p.name.clone()).unwrap_or_default();
-                        self.draw_buf.insert("dimsel".into(), hit);
-                        self.draw_buf.insert("balsel".into(), String::new());
+        // 预览在旁边的图纸窗口(show_draw_preview): 选了零件就显示, 切换就切换
+        let _ = (&bal_rep, &bal_sel, &placed, &sel_dim);
+        if self.draw_png.is_none() && job.is_none() {
+            ui.label(egui::RichText::new(tr("还没出过图", "Not drawn yet")).color(COL_MUTED));
+        }
+    }
+
+    /// 图纸预览窗口: 生产窗口「出图」标签选了零件时贴在它右边常显示(切换零件跟着换, 不选就消失; × = 取消选择)。
+    /// 窗口可拖动 / 调大小; 图: 滚轮缩放(以光标为中心)、拖动平移、「适应」复位; 单击选尺寸 / 序号, 双击打开 PDF。
+    fn show_draw_preview(&mut self, ctx: &egui::Context) {
+        let Some(key) = self.draw_sel.clone().filter(|_| self.show_bom && self.bom_tab == 2) else {
+            if self.draw_prev_win.open_rect.is_some() {
+                self.draw_prev_win.closed();
+            }
+            return;
+        };
+        let Some(s) = self.draw_sheets.get(&key).cloned() else { return };
+        // 贴在生产窗口右边(屏幕放不下就放左边); 生产窗口挪过(松手后)就跟过去
+        let anchor = self.bom_win.saved_rect.or(self.bom_win.open_rect);
+        let size = self.draw_prev_win.saved_rect.map(|r| [r[2], r[3]]).unwrap_or([720.0, anchor.map(|a| a[3].max(480.0)).unwrap_or(560.0)]);
+        let place = |a: [f32; 4]| -> [f32; 2] {
+            let screen_w = ctx.input(|i| i.viewport().monitor_size).map(|m| m.x).unwrap_or(1920.0);
+            let x = if a[0] + a[2] + 6.0 + size[0] <= screen_w { a[0] + a[2] + 6.0 } else { (a[0] - 6.0 - size[0]).max(0.0) };
+            [x, a[1]]
+        };
+        if self.draw_prev_win.open_rect.is_none() {
+            if let Some(a) = anchor {
+                let p = place(a);
+                self.draw_prev_win.open_rect = Some([p[0], p[1], size[0], size[1]]);
+            }
+            self.draw_prev_anchor = anchor;
+        } else if anchor != self.draw_prev_anchor {
+            if let Some(a) = anchor {
+                let p = place(a);
+                ctx.send_viewport_cmd_to(egui::ViewportId::from_hash_of("panel-draw-prev"), egui::ViewportCommand::OuterPosition(egui::pos2(p[0], p[1])));
+            }
+            self.draw_prev_anchor = anchor;
+        }
+        let rep = self.draw_report.as_ref().filter(|(k, _)| *k == key).map(|(_, r)| r.clone());
+        let paper = rep.as_ref().and_then(|r| r.paper_mm).unwrap_or([420.0, 297.0]);
+        let placed = rep.as_ref().map(|r| r.placed.clone()).unwrap_or_default();
+        let bal_rep = rep.as_ref().map(|r| r.balloons.clone()).unwrap_or_default();
+        let sel_dim = self.draw_buf.get("dimsel").cloned().unwrap_or_default();
+        let bal_sel = self.draw_buf.get("balsel").cloned().unwrap_or_default();
+        let png = self.draw_png.clone();
+        if png.as_ref().map(|p| &p.0) != self.draw_prev_uri.as_ref() {
+            self.draw_prev_uri = png.as_ref().map(|p| p.0.clone());
+            self.draw_zoom = 1.0;
+            self.draw_pan = egui::Vec2::ZERO;
+        }
+        let busy = self.draw_job.as_ref().is_some_and(|j| j.key == key);
+        let mut zoom = self.draw_zoom;
+        let mut pan = self.draw_pan;
+        let mut pick: Option<(f64, f64)> = None;
+        let mut open_pdf = false;
+        let mut win = std::mem::take(&mut self.draw_prev_win);
+        let open = floating_window(
+            ctx,
+            FloatSpec {
+                id: "panel-draw-prev",
+                prefs_key: DRAW_PREV_RECT_KEY,
+                title: tr("图纸", "Drawing"),
+                subtitle: s.base.clone(),
+                close_tip: tr("关闭(取消选择零件)", "Close (deselects the part)"),
+                default_rect: [200.0, 120.0, size[0], size[1]],
+                min_size: egui::vec2(320.0, 240.0),
+                resizable: true,
+                fit_height: false,
+            },
+            &mut win,
+            |ui| {
+                ui.horizontal(|ui| {
+                    if ui.small_button(tr("适应", "Fit")).on_hover_text(tr("缩放复位", "Reset zoom")).clicked() {
+                        zoom = 1.0;
+                        pan = egui::Vec2::ZERO;
+                    }
+                    ui.label(egui::RichText::new(format!("{:.0}%", zoom * 100.0)).color(COL_MUTED));
+                    ui.label(
+                        egui::RichText::new(tr("滚轮缩放 · 拖动平移 · 单击选尺寸 / 序号 · 双击打开 PDF", "Wheel = zoom · drag = pan · click = pick · double-click = open PDF"))
+                            .size(11.0)
+                            .color(COL_MUTED),
+                    );
+                    if busy {
+                        ui.label(egui::RichText::new(tr("出图中…", "Drawing…")).color(COL_ACCENT));
+                    }
+                });
+                let (area, resp) = ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
+                ui.painter().rect_filled(area, 2.0, egui::Color32::from_gray(40));
+                let Some((uri, bytes)) = png.clone() else {
+                    ui.painter().text(area.center(), egui::Align2::CENTER_CENTER, tr("还没出过图", "Not drawn yet"), egui::FontId::proportional(13.0), COL_MUTED);
+                    return;
+                };
+                let aspect = (paper[0] / paper[1]) as f32;
+                let fit_w = area.width().min(area.height() * aspect);
+                // 滚轮: 以光标为中心缩放(0.2 ~ 12 倍)
+                if resp.hovered() {
+                    let dy = ui.input(|i| i.smooth_scroll_delta.y);
+                    if dy != 0.0 {
+                        let nz = (zoom * (dy * 0.003).exp()).clamp(0.2, 12.0);
+                        if let Some(m) = resp.hover_pos() {
+                            let c = area.center() + pan;
+                            pan += (m - c) * (1.0 - nz / zoom);
+                        }
+                        zoom = nz;
                     }
                 }
+                if resp.dragged() {
+                    pan += resp.drag_delta();
+                }
+                let sz = egui::vec2(fit_w * zoom, fit_w * zoom / aspect);
+                let img = egui::Rect::from_center_size(area.center() + pan, sz);
+                let painter = ui.painter_at(area);
+                ui.set_clip_rect(area);
+                egui::Image::from_bytes(uri, bytes).paint_at(ui, img);
+                let to_scr = |at: [f64; 2]| egui::pos2(img.left() + (at[0] / paper[0]) as f32 * img.width(), img.top() + (1.0 - at[1] / paper[1]) as f32 * img.height());
+                if let Some(b) = bal_rep.iter().find(|b| !bal_sel.is_empty() && b.key.as_deref() == Some(bal_sel.as_str())) {
+                    painter.circle_stroke(to_scr(b.at), 12.0 * zoom.sqrt(), egui::Stroke::new(2.0_f32, COL_ACCENT));
+                }
+                if let Some(p) = placed.iter().find(|p| !sel_dim.is_empty() && p.name == sel_dim) {
+                    painter.circle_stroke(to_scr(p.at), 14.0 * zoom.sqrt(), egui::Stroke::new(2.0_f32, COL_ACCENT));
+                }
+                if resp.double_clicked() {
+                    open_pdf = true;
+                } else if resp.clicked() {
+                    if let Some(pos) = resp.interact_pointer_pos().filter(|p| img.contains(*p)) {
+                        pick = Some((((pos.x - img.left()) / img.width()) as f64, ((pos.y - img.top()) / img.height()) as f64));
+                    }
+                }
+            },
+        );
+        self.draw_prev_win = win;
+        self.draw_zoom = zoom;
+        self.draw_pan = pan;
+        if let Some((fx, fy)) = pick {
+            if let Some(b) = pla_ui::drawing::nearest_balloon(&bal_rep, paper, fx, fy) {
+                self.draw_buf.insert("balsel".into(), b.key.clone().unwrap_or_default());
+            } else {
+                let hit = pla_ui::drawing::nearest_dim(&placed, paper, fx, fy).map(|p| p.name.clone()).unwrap_or_default();
+                self.draw_buf.insert("dimsel".into(), hit);
+                self.draw_buf.insert("balsel".into(), String::new());
             }
-            // 选中的序号: 圈出来
-            if let Some(b) = bal_rep.iter().find(|b| !bal_sel.is_empty() && b.key.as_deref() == Some(bal_sel.as_str())) {
-                let c = egui::pos2(r.rect.left() + (b.at[0] / paper[0]) as f32 * r.rect.width(), r.rect.top() + (1.0 - b.at[1] / paper[1]) as f32 * r.rect.height());
-                ui.painter().circle_stroke(c, 12.0, egui::Stroke::new(2.0_f32, COL_ACCENT));
-            }
-            // 选中的尺寸: 在预览上圈出来
-            if let Some(p) = placed.iter().find(|p| !sel_dim.is_empty() && p.name == sel_dim) {
-                let c = egui::pos2(
-                    r.rect.left() + (p.at[0] / paper[0]) as f32 * r.rect.width(),
-                    r.rect.top() + (1.0 - p.at[1] / paper[1]) as f32 * r.rect.height(),
-                );
-                ui.painter().circle_stroke(c, 14.0, egui::Stroke::new(2.0_f32, COL_ACCENT));
-            }
-        } else if job.is_none() {
-            ui.label(egui::RichText::new(tr("还没出过图", "Not drawn yet")).color(COL_MUTED));
+        }
+        if open_pdf {
+            let p = pla_ui::drawing::file(&pla_ui::drawing::dir(&self.doc_key), &s, "pdf");
+            self.open_path(&p);
+        }
+        if !open {
+            self.draw_sel = None;
+            self.draw_prev_win.closed();
         }
     }
 
@@ -8410,6 +8532,7 @@ const NOTES_RECT_KEY: &str = "notes_rect";
 const DIM_RECT_KEY: &str = "dim_rect";
 const BOM_RECT_KEY: &str = "bom_rect";
 const BOM_COLS_KEY: &str = "bom_cols";
+const DRAW_PREV_RECT_KEY: &str = "draw_prev_rect";
 
 /// 固定宽度、左对齐、超长截断的标签(表格里各行对齐用)。
 fn fixed_label(ui: &mut egui::Ui, w: f32, text: egui::RichText) -> egui::Response {
@@ -10385,6 +10508,7 @@ impl eframe::App for PlaApp {
         if self.show_bom {
             self.show_bom_window(ctx);
         }
+        self.show_draw_preview(ctx);
 
         // ---- R15: 设置项悬停三级面板(面板本帧登记, 本帧渲染; 不悬停即关闭) ----
         if let Some(h) = INFO_HINT.with(|x| x.borrow_mut().take()) {
