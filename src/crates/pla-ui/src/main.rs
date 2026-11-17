@@ -56,7 +56,10 @@ const COL_GRAY_DOT: egui::Color32 = egui::Color32::from_rgb(0x77, 0x77, 0x77);
 /// 工具栏固定逻辑尺寸: 圆点+分隔线+6 按钮+分隔线+关闭键。
 /// 宽 246(R8-1: +30 视口状态按钮); 高 30。
 /// R30: +30 笔记按钮 → 276。R34: +30 材质状态按钮 → 306。
-const TOOLBAR_SIZE: [f32; 2] = [306.0, 30.0];
+/// 宽度 = 状态点 + 6 个按钮(24 + 间距 6); 2026-11-17 九个按钮减到六个, 306 → 216。
+const TOOLBAR_SIZE: [f32; 2] = [216.0, 30.0];
+/// 配置窗口(配置 / 视口 / 材质 / 选择集 四个标签共用一个 OS 窗口)。
+const CFG_PANEL_ID: &str = "panel-config";
 /// 面板整体右移微调(逻辑 px, 按 ppp 缩放; R6-2e 用户要求再偏右 10)。
 const SNAP_RIGHT_SHIFT: f32 = 10.0;
 /// 吸附垂直微调(逻辑 pt, 按 ppp 缩放; 仅作用于探测命中分支)。
@@ -94,11 +97,9 @@ const ROUNDING: f32 = 10.0;
 /// 工具栏按钮列(横向排列, 顺序即产品顺序)。
 /// R7-5: 手动快照移入快照墙头部(图标钮); R7-11: 刷新实体移入选择集窗口头部 —
 /// 一级工具栏只留面板开关类按钮。R8-1: 加视口状态。
-const TOOLBAR_ACTIONS: [Action; 9] = [
+/// 用户 2026-11-17: 视口 / 材质 / 选择集并入配置窗口成为二级标签 → 工具栏只留一个配置按钮(快捷键仍可直达各标签)。
+const TOOLBAR_ACTIONS: [Action; 6] = [
     Action::ToggleSnapshots,
-    Action::ToggleEntities,
-    Action::ToggleVpState,
-    Action::ToggleMatState,
     Action::ToggleConfig,
     Action::ToggleBom,
     Action::ToggleDim,
@@ -448,6 +449,10 @@ struct PlaApp {
     ms_update_target: Option<String>,
     /// C0 配置面板: 同材质状态(采集回包 → 截图 → 落盘)。
     show_config: bool,
+    /// 配置窗口上次停留的标签(工具栏按钮重开时回到这里)。
+    cfg_last: PanelId,
+    /// 标签点击: 下一帧切换(本帧同一个视口已经画过, 不能再画一次)。
+    cfg_pending_tab: Option<PanelId>,
     cfg_wall: state_wall::StateWall,
     cfg_pending_state: Option<String>,
     cfg_shot_path: Option<String>,
@@ -2721,6 +2726,8 @@ impl PlaApp {
             ms_shot_path: None,
             ms_update_target: None,
             show_config: false,
+            cfg_last: PanelId::Config,
+            cfg_pending_tab: None,
             cfg_wall: state_wall::StateWall::default(),
             cfg_pending_state: None,
             cfg_shot_path: None,
@@ -3513,32 +3520,16 @@ impl PlaApp {
                     self.snap_infos = pla_ui::snapshot::load_meta_infos(&self.doc_key);
                 }
             }
-            Action::ToggleEntities => {
-                self.show_entities = !self.show_entities;
-                if self.show_entities {
-                    self.close_secondary_panels_except(PanelId::Entities);
-                    self.sel_saved_loaded = false;
-                }
-            }
-            Action::ToggleVpState => {
-                self.show_vpstate = !self.show_vpstate;
-                if self.show_vpstate {
-                    self.close_secondary_panels_except(PanelId::VpState);
-                    self.vp_wall.loaded = false;
-                }
-            }
-            Action::ToggleMatState => {
-                self.show_matstate = !self.show_matstate;
-                if self.show_matstate {
-                    self.close_secondary_panels_except(PanelId::MatState);
-                    self.ms_wall.loaded = false;
-                }
-            }
+            // 视口 / 材质 / 选择集 = 配置窗口的标签: 快捷键直达该标签; 已经停在该标签 = 关窗口
+            Action::ToggleEntities => self.toggle_cfg_tab(PanelId::Entities),
+            Action::ToggleVpState => self.toggle_cfg_tab(PanelId::VpState),
+            Action::ToggleMatState => self.toggle_cfg_tab(PanelId::MatState),
+            // 工具栏配置按钮: 窗口开着(任意标签)= 关; 关着 = 回到上次的标签
             Action::ToggleConfig => {
-                self.show_config = !self.show_config;
-                if self.show_config {
-                    self.close_secondary_panels_except(PanelId::Config);
-                    self.cfg_wall.loaded = false;
+                if self.cfg_group_open() {
+                    self.close_cfg_group();
+                } else {
+                    self.open_cfg_tab(self.cfg_last);
                 }
             }
             Action::ToggleDim => {
@@ -7617,7 +7608,7 @@ impl PlaApp {
 
     /// R34: 视口状态 / 材质状态面板(同一套墙, 按 kind 取存储/文字/功能/CDP 命令)。返回面板是否仍开着。
     fn state_panel(&mut self, ctx: &egui::Context, desired: egui::Pos2, kind: StatePanel) -> bool {
-        let (store, text, size, id, title, f_save, f_apply) = match kind {
+        let (store, text, size, f_save, f_apply) = match kind {
             StatePanel::Vp => (
                 pla_ui::vpstate::STORE,
                 state_wall::WallText {
@@ -7628,8 +7619,6 @@ impl PlaApp {
                     update_confirm: |n| t!("用当前视口状态覆盖「{n}」? 原内容不可恢复", "Overwrite \"{n}\" with the current view state? The old content cannot be recovered"),
                 },
                 PANEL_VPSTATE,
-                "panel-vpstate",
-                tr("视口状态", "View states"),
                 Feature::VpSave,
                 Feature::VpApply,
             ),
@@ -7643,8 +7632,6 @@ impl PlaApp {
                     update_confirm: |n| t!("用当前材质与指派覆盖「{n}」? 原内容不可恢复", "Overwrite \"{n}\" with the current materials and assignments? The old content cannot be recovered"),
                 },
                 PANEL_MATSTATE,
-                "panel-matstate",
-                tr("材质状态", "Material states"),
                 Feature::MatSave,
                 Feature::MatApply,
             ),
@@ -7661,8 +7648,6 @@ impl PlaApp {
                     update_confirm: |n| t!("用当前的显示 / 隐藏与材质覆盖配置「{n}」? 原内容不可恢复", "Overwrite configuration \"{n}\" with the current visibility and materials? The old content cannot be recovered"),
                 },
                 PANEL_CONFIG,
-                "panel-config",
-                tr("配置", "Configurations"),
                 Feature::CfgSave,
                 Feature::CfgApply,
             ),
@@ -7719,7 +7704,14 @@ impl PlaApp {
             }
         };
         let mut outcome = state_wall::WallOutcome::default();
-        header_extra_and_show(ctx, id, title, desired, egui::vec2(size[0], size[1]), &mut flag, true, |ui| {
+        let cur_tab = match kind {
+            StatePanel::Vp => PanelId::VpState,
+            StatePanel::Mat => PanelId::MatState,
+            StatePanel::Cfg => PanelId::Config,
+        };
+        let mut tab_click = None;
+        header_extra_and_show(ctx, CFG_PANEL_ID, cfg_title(), desired, egui::vec2(size[0], size[1]), &mut flag, true, |ui| {
+            tab_click = cfg_tabs(ui, cur_tab);
             for b in &blocked {
                 ui.label(egui::RichText::new(b).small().color(COL_RED));
             }
@@ -7729,6 +7721,9 @@ impl PlaApp {
             StatePanel::Vp => self.vp_wall = wall,
             StatePanel::Mat => self.ms_wall = wall,
             StatePanel::Cfg => self.cfg_wall = wall,
+        }
+        if tab_click.is_some() {
+            self.cfg_pending_tab = tab_click;
         }
         for n in outcome.notices {
             self.set_notice(n);
@@ -7814,6 +7809,57 @@ impl PlaApp {
             w.rename = None;
         }
         flag
+    }
+
+    /// 配置窗口开着(任意一个标签)。
+    fn cfg_group_open(&self) -> bool {
+        self.show_config || self.show_vpstate || self.show_matstate || self.show_entities
+    }
+
+    fn close_cfg_group(&mut self) {
+        self.show_config = false;
+        self.show_vpstate = false;
+        self.show_matstate = false;
+        self.show_entities = false;
+    }
+
+    /// 打开配置窗口并停在 tab(其余二级面板照旧互斥关掉); 每次切到某标签都重新读存档墙。
+    fn open_cfg_tab(&mut self, tab: PanelId) {
+        self.close_secondary_panels_except(tab);
+        match tab {
+            PanelId::Entities => {
+                self.show_entities = true;
+                self.sel_saved_loaded = false;
+            }
+            PanelId::VpState => {
+                self.show_vpstate = true;
+                self.vp_wall.loaded = false;
+            }
+            PanelId::MatState => {
+                self.show_matstate = true;
+                self.ms_wall.loaded = false;
+            }
+            _ => {
+                self.show_config = true;
+                self.cfg_wall.loaded = false;
+            }
+        }
+        self.cfg_last = tab;
+    }
+
+    /// 快捷键: 已经停在这个标签 = 关窗口; 否则打开 / 切到它。
+    fn toggle_cfg_tab(&mut self, tab: PanelId) {
+        let on = match tab {
+            PanelId::Entities => self.show_entities,
+            PanelId::VpState => self.show_vpstate,
+            PanelId::MatState => self.show_matstate,
+            _ => self.show_config,
+        };
+        if on {
+            self.close_cfg_group();
+        } else {
+            self.open_cfg_tab(tab);
+        }
     }
 
     /// R8b: 二级面板统一互斥 — 打开一个, 关掉其余全部。
@@ -8314,6 +8360,29 @@ fn show_child_window(
     add_contents: impl FnOnce(&mut egui::Ui),
 ) {
     header_extra_and_show(parent, id, title, desired, size, open, active, add_contents, None)
+}
+
+fn cfg_title() -> &'static str {
+    tr("配置", "Configurations")
+}
+
+/// 配置窗口顶部的二级标签(配置 / 视口 / 材质 / 选择集); 点了别的标签 → 返回它。
+fn cfg_tabs(ui: &mut egui::Ui, cur: PanelId) -> Option<PanelId> {
+    let mut hit = None;
+    ui.horizontal(|ui| {
+        for (tab, label, tip) in [
+            (PanelId::Config, tr("配置", "Configs"), tr("显示 / 隐藏 + 材质 = 一个方案", "Visibility + materials = one variant")),
+            (PanelId::VpState, tr("视口", "Views"), tr("视角 / 着色 / 隐藏 / 网格", "Camera / shading / hidden / grid")),
+            (PanelId::MatState, tr("材质", "Materials"), tr("材质定义 + 指派", "Material definitions + assignments")),
+            (PanelId::Entities, tr("选择集", "Selections"), tr("保存 / 恢复一组选择", "Save / restore a selection")),
+        ] {
+            if ui.selectable_label(cur == tab, label).on_hover_text(tip).clicked() && cur != tab {
+                hit = Some(tab);
+            }
+        }
+    });
+    ui.separator();
+    hit
 }
 
 /// 同 show_child_window, 但允许在标题右侧、× 左侧插入图标按钮区(R7-5 快照墙)。
@@ -9030,10 +9099,7 @@ impl eframe::App for PlaApp {
                     for a in TOOLBAR_ACTIONS {
                         let active = match a {
                             Action::ToggleSnapshots => self.show_snapshots,
-                            Action::ToggleEntities => self.show_entities,
-                            Action::ToggleVpState => self.show_vpstate,
-                            Action::ToggleMatState => self.show_matstate,
-                            Action::ToggleConfig => self.show_config,
+                            Action::ToggleConfig => self.cfg_group_open(),
                             Action::ToggleDim => self.show_dim,
                             Action::ToggleBom => self.show_bom,
                             Action::ToggleSettings => self.show_settings,
@@ -9177,17 +9243,9 @@ impl eframe::App for PlaApp {
             if self.show_snapshots {
                 open.insert("panel-snapshots");
             }
-            if self.show_entities {
-                open.insert("panel-entities");
-            }
-            if self.show_vpstate {
-                open.insert("panel-vpstate");
-            }
-            if self.show_matstate {
-                open.insert("panel-matstate");
-            }
-            if self.show_config {
-                open.insert("panel-config");
+            // 配置 / 视口 / 材质 / 选择集 = 同一个窗口的四个标签(共用 panel-config)
+            if self.cfg_group_open() {
+                open.insert(CFG_PANEL_ID);
             }
             if self.show_settings {
                 open.insert("panel-settings");
@@ -9693,15 +9751,17 @@ impl eframe::App for PlaApp {
                         &tsv,
                     );
                 });
+                let mut tab_click = None;
                 header_extra_and_show(
                     ctx,
-                    "panel-entities",
-                    tr("选择集", "Selection sets"),
+                    CFG_PANEL_ID,
+                    cfg_title(),
                     desired,
                     egui::vec2(PANEL_ENTITIES[0], PANEL_ENTITIES[1]),
                     &mut flag,
                     true,
                     |ui| {
+                        tab_click = cfg_tabs(ui, PanelId::Entities);
                         let open_err: Option<String> = None;
                         let inner_tip = std::cell::RefCell::new(None::<(String, String)>);
 
@@ -10131,6 +10191,9 @@ impl eframe::App for PlaApp {
                     self.sel_selected.clear();
                     self.sel_rename = None;
                 }
+                if tab_click.is_some() {
+                    self.cfg_pending_tab = tab_click;
+                }
                 self.show_entities = flag;
             }
         }
@@ -10149,6 +10212,13 @@ impl eframe::App for PlaApp {
         if self.show_config {
             if let Some(desired) = next_pos(&mut stack_y, PANEL_CONFIG[1]) {
                 self.show_config = self.state_panel(ctx, desired, StatePanel::Cfg);
+            }
+        }
+        // 标签切换放到四个标签都画完之后(同一个视口一帧只画一次), 下一帧生效
+        if let Some(tab) = self.cfg_pending_tab.take() {
+            if self.cfg_group_open() {
+                self.open_cfg_tab(tab);
+                ctx.request_repaint();
             }
         }
 
