@@ -74,6 +74,42 @@ pub struct Sheet {
     pub dims_key: Vec<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub dims_text: BTreeMap<String, String>,
+    /// 技术要求(人改过的全文, 一行一条); None = 规范默认 + 按配合自动加的条目。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tech: Option<Vec<String>>,
+    /// 装配剖视: 剖哪个视图(None = 主视 "Front"; "Left")、过哪个配合的轴线(配合候选 id; None = 自动)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section_view: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section_fit: Option<String>,
+    /// 装配图: 人改序号(按明细行 key): 不标 / 指定视图 / 左列或上排。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub balloons: BTreeMap<String, BalloonEdit>,
+    /// 装配图: 明细表单元格覆盖(按明细行 key → 列 id(pn / name / qty / material / note)→ 文字)。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub parts_list: BTreeMap<String, BTreeMap<String, String>>,
+    /// D6 指标: 这张图被人修正过几次(设置每变一次 +1)。
+    #[serde(default)]
+    pub edits: u32,
+}
+
+/// 装配图一个序号的人改项。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct BalloonEdit {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hide: bool,
+    /// "Front" / "Left" / "Top"; None = 自动。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view: Option<String>,
+    /// "left" / "top"; None = 自动。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub side: Option<String>,
+}
+
+impl BalloonEdit {
+    pub fn is_default(&self) -> bool {
+        *self == BalloonEdit::default()
+    }
 }
 
 impl Sheet {
@@ -98,6 +134,12 @@ impl Sheet {
             dims_hide: Vec::new(),
             dims_key: Vec::new(),
             dims_text: BTreeMap::new(),
+            tech: None,
+            section_view: None,
+            section_fit: None,
+            balloons: BTreeMap::new(),
+            parts_list: BTreeMap::new(),
+            edits: 0,
         }
     }
 }
@@ -106,6 +148,9 @@ impl Sheet {
 pub struct Sheets {
     #[serde(default)]
     pub sheets: Vec<Sheet>,
+    /// 人标的外购组件(组名; 名字不像导入文件的组, 如 "heidhan encoder"): 合成明细一行, 组里零件不出零件图。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub purchased: Vec<String>,
 }
 
 impl Sheets {
@@ -199,7 +244,27 @@ pub fn spec(s: &Sheet, dir: &Path, dims_file: Option<&Path>) -> Value {
     if !s.dims_hide.is_empty() || !s.dims_key.is_empty() || !text.is_empty() {
         v["dims"] = json!({ "hide": s.dims_hide, "key": s.dims_key, "text": text });
     }
+    put_tech(&mut v, s);
     v
+}
+
+/// 人改过的技术要求(去掉空行; 全空 = 用默认)。
+fn put_tech(v: &mut Value, s: &Sheet) {
+    if let Some(t) = &s.tech {
+        let t: Vec<&str> = t.iter().map(|l| l.trim_end()).filter(|l| !l.trim().is_empty()).collect();
+        if !t.is_empty() {
+            v["tech"] = json!(t);
+        }
+    }
+}
+
+/// 技术要求文本框 ↔ 行列表。
+pub fn tech_text(lines: &[String]) -> String {
+    lines.join("\n")
+}
+
+pub fn tech_lines(text: &str) -> Vec<String> {
+    text.lines().map(|l| l.trim_end().to_string()).filter(|l| !l.trim().is_empty()).collect()
 }
 
 /// 编译报告里放了的一个尺寸(页面毫米, 原点左下)。
@@ -257,6 +322,9 @@ pub struct AsmLine {
     /// 外购组件(导入的 STEP / IGES 组)合成一行时: 组里各实体的指纹 [体积, 面积](编译器按它认实体)。
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub parts: Vec<[f64; 2]>,
+    /// 标准件(螺钉 / 销 / 轴承 …): 装配剖视里被剖到也画外形。
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub nocut: bool,
     #[serde(skip)]
     pub ids: Vec<String>,
 }
@@ -315,7 +383,9 @@ pub fn is_asm(key: &str) -> bool {
 
 /// bom.scan 的 lines → 装配图明细。group = 只要顶层组是它的实例(None = 全部)。
 /// 路径里第一个"导入文件"组及其下面的全部实体合成一行外购件(名称 = 文件名去扩展名, 数量 = 组里各零件实例数的最小值)。
-pub fn asm_lines(lines: &Value, info: &dyn Fn(&str) -> RowInfo, group: Option<&str>) -> Vec<AsmLine> {
+/// purchased = 人标的外购组(组名, 与名字像导入文件的组同样处理)。
+pub fn asm_lines(lines: &Value, info: &dyn Fn(&str) -> RowInfo, group: Option<&str>, purchased: &[String]) -> Vec<AsmLine> {
+    let is_sub = |p: &str| is_import_group(p) || purchased.iter().any(|g| g == p);
     let mut out: Vec<AsmLine> = Vec::new();
     // 外购组: 前缀路径 → (行下标, 每个 BOM 行在组里的实例数)
     let mut subs: Vec<(String, usize, BTreeMap<String, u64>)> = Vec::new();
@@ -331,13 +401,17 @@ pub fn asm_lines(lines: &Value, info: &dyn Fn(&str) -> RowInfo, group: Option<&s
                 }
             }
             let id = m["id"].as_str().unwrap_or("").to_string();
-            match path.iter().position(|p| is_import_group(p)) {
+            match path.iter().position(|p| is_sub(p)) {
                 Some(i) => {
                     let prefix = path[..=i].join("/");
                     let si = match subs.iter().position(|s| s.0 == prefix) {
                         Some(si) => si,
                         None => {
-                            let stem = path[i].rsplit_once('.').map(|(a, _)| a).unwrap_or(&path[i]).trim().to_string();
+                            let stem = if is_import_group(&path[i]) {
+                                path[i].rsplit_once('.').map(|(a, _)| a).unwrap_or(&path[i]).trim().to_string()
+                            } else {
+                                path[i].trim().to_string()
+                            };
                             out.push(AsmLine { key: format!("@sub:{prefix}"), name: stem, note: "外购".into(), ..Default::default() });
                             subs.push((prefix, out.len() - 1, BTreeMap::new()));
                             subs.len() - 1
@@ -353,10 +427,17 @@ pub fn asm_lines(lines: &Value, info: &dyn Fn(&str) -> RowInfo, group: Option<&s
                 None => {
                     let li = *own.get_or_insert_with(|| {
                         let r = info(&key);
+                        // 没起名的实体(导入件里常见, 表格里显示成 "null"): 名字 → 实体名 → "零件 N"
+                        let blank = |s: &str| s.trim().is_empty() || s.trim().eq_ignore_ascii_case("null");
+                        let mut nm = if blank(&r.name) { m["name"].as_str().unwrap_or("").to_string() } else { r.name.clone() };
+                        if blank(&nm) {
+                            nm = format!("零件 {}", out.len() + 1); // 图纸按国标, 中文
+                        }
                         out.push(AsmLine {
+                            nocut: looks_standard(&nm, &r.pn),
                             key: key.clone(),
                             pn: r.pn,
-                            name: if r.name.is_empty() { m["name"].as_str().unwrap_or("").to_string() } else { r.name },
+                            name: nm.clone(),
                             density: guess_density(&r.material),
                             material: r.material,
                             note: r.finish,
@@ -379,27 +460,72 @@ pub fn asm_lines(lines: &Value, info: &dyn Fn(&str) -> RowInfo, group: Option<&s
 }
 
 /// 顶层组(方案 / 子装配)里够出装配图的: 合成外购件后至少 2 行; 外购组本身(顶层就是导入文件)不算。
-pub fn asm_groups(lines: &Value) -> Vec<String> {
+pub fn asm_groups(lines: &Value, purchased: &[String]) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
     for l in lines.as_array().into_iter().flatten() {
         for m in l["members"].as_array().into_iter().flatten() {
             if let Some(g) = m["path"].as_array().and_then(|p| p.first()).and_then(|g| g.as_str()) {
-                if !is_import_group(g) && !names.iter().any(|n| n == g) {
+                if !is_import_group(g) && !purchased.iter().any(|p| p == g) && !names.iter().any(|n| n == g) {
                     names.push(g.to_string());
                 }
             }
         }
     }
-    names.retain(|g| asm_lines(lines, &|_| RowInfo::default(), Some(g)).len() >= 2);
+    names.retain(|g| asm_lines(lines, &|_| RowInfo::default(), Some(g), purchased).len() >= 2);
     names
+}
+
+/// BOM 里出现的全部组名(路径上的每一级, 按出现顺序): 面板里让人勾"外购"。名字像导入文件的不列(已自动当外购)。
+pub fn all_groups(lines: &Value) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for l in lines.as_array().into_iter().flatten() {
+        for m in l["members"].as_array().into_iter().flatten() {
+            // 导入文件组里面的子组已经算外购, 不列
+            for g in m["path"].as_array().into_iter().flatten().filter_map(|g| g.as_str()).take_while(|g| !is_import_group(g)) {
+                if !names.iter().any(|n| n == g) {
+                    names.push(g.to_string());
+                }
+            }
+        }
+    }
+    names
+}
+
+/// 零件的全部实例都在外购组里(导入文件组或人标的组)。
+pub fn member_bought(members: &Value, purchased: &[String]) -> bool {
+    members.as_array().is_some_and(|ms| {
+        !ms.is_empty()
+            && ms.iter().all(|m| m["path"].as_array().is_some_and(|p| p.iter().filter_map(|g| g.as_str()).any(|g| is_import_group(g) || purchased.iter().any(|x| x == g))))
+    })
 }
 
 /// 装配图方案 JSON(格式见 tools/drawing/compile_assembly.py 文件头)。
 pub fn asm_spec(s: &Sheet, dir: &Path, lines: &[AsmLine]) -> Value {
     let title: serde_json::Map<String, Value> = s.title.iter().filter(|(_, v)| !v.trim().is_empty()).map(|(k, v)| (k.clone(), json!(v))).collect();
+    // 明细表人改的格子覆盖 BOM 带来的文字
+    let mut lv = serde_json::to_value(lines).unwrap_or_else(|_| json!([]));
+    for l in lv.as_array_mut().into_iter().flatten() {
+        let key = l["key"].as_str().unwrap_or("").to_string();
+        for (col, txt) in s.parts_list.get(&key).into_iter().flatten() {
+            let t = txt.trim();
+            if t.is_empty() {
+                continue;
+            }
+            l[col.as_str()] = if col == "qty" { t.parse::<u64>().map(|n| json!(n)).unwrap_or_else(|_| json!(t)) } else { json!(t) };
+        }
+    }
     let mut v = json!({
         "standard": "GB",
-        "assembly": { "step": file(dir, s, "step").display().to_string(), "lines": lines },
+        "assembly": { "step": file(dir, s, "step").display().to_string(), "lines": lv },
+        "section": if s.section {
+            let mut o = json!({ "view": s.section_view.clone().unwrap_or_else(|| "Front".into()) });
+            if let Some(f) = &s.section_fit {
+                o["fit"] = json!(f);
+            }
+            o
+        } else {
+            Value::Null
+        },
         "title": title,
         "basename": s.base,
         "out": dir.display().to_string(),
@@ -418,7 +544,50 @@ pub fn asm_spec(s: &Sheet, dir: &Path, lines: &[AsmLine]) -> Value {
     if !fits.is_empty() {
         v["fits"] = json!(fits);
     }
+    let be: BTreeMap<&String, &BalloonEdit> = s.balloons.iter().filter(|(_, e)| !e.is_default()).collect();
+    if !be.is_empty() {
+        v["balloon_edit"] = json!(be);
+    }
+    put_tech(&mut v, s);
     v
+}
+
+/// 编译报告里的一个序号(页面毫米, 原点左下)。
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+pub struct BalloonRep {
+    pub no: u32,
+    #[serde(default)]
+    pub key: Option<String>,
+    #[serde(default)]
+    pub view: String,
+    #[serde(default)]
+    pub side: String,
+    #[serde(default)]
+    pub at: [f64; 2],
+}
+
+/// 明细表一行(报告里, 按序号)。
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+pub struct PlRep {
+    pub no: u32,
+    #[serde(default)]
+    pub key: Option<String>,
+    #[serde(default)]
+    pub pn: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub qty: Option<Value>,
+}
+
+/// 预览上点的位置(0..1, 原点左上)→ 最近的序号圈(页面上 8 mm 以内)。
+pub fn nearest_balloon(bs: &[BalloonRep], paper: [f64; 2], fx: f64, fy: f64) -> Option<&BalloonRep> {
+    let (x, y) = (fx * paper[0], (1.0 - fy) * paper[1]);
+    bs.iter()
+        .map(|b| (((b.at[0] - x).powi(2) + (b.at[1] - y).powi(2)).sqrt(), b))
+        .filter(|(d, _)| *d < 8.0)
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|(_, b)| b)
 }
 
 /// 按材料名猜密度(g/cm³); 认不出 → None(重量留空, 用户可填)。
@@ -578,11 +747,69 @@ pub struct Report {
     pub warnings: Vec<String>,
     #[serde(default)]
     pub round_front: bool,
+    /// 装配图: 序号 / 明细表(按序号)。
+    #[serde(default)]
+    pub balloons: Vec<BalloonRep>,
+    #[serde(default)]
+    pub parts_list: Vec<PlRep>,
+    /// 实际用的技术要求 / 自动生成的默认(面板编辑框的起点 / "恢复默认")。
+    #[serde(default)]
+    pub tech: Vec<String>,
+    #[serde(default)]
+    pub tech_default: Vec<String>,
+    /// 装配剖视: 实际剖的视图 / 过哪里 / 剖了几个零件。
+    #[serde(default)]
+    pub section: Option<Value>,
 }
 
 pub fn load_report(dir: &Path, s: &Sheet) -> Option<Report> {
     let p = dir.join(format!("{}.report.json", s.base));
     std::fs::read_to_string(p).ok().and_then(|t| serde_json::from_str(t.trim_start_matches('\u{feff}')).ok())
+}
+
+// ---------------- D6 偏好(全局, 跨文档): 人改过一次、设为默认后每张图都用 ----------------
+
+/// 出图偏好: 标题栏默认字段(设计 / 审核 / 项目 / 表处 …)、零件图 / 装配图的技术要求。存 `<数据目录>/drawing-prefs.json`。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Prefs {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub title: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tech_part: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tech_asm: Option<Vec<String>>,
+}
+
+/// 标题栏里"每张图都一样"的字段(设为默认时只存这些; 料号 / 名称 / 材料是零件自己的)。
+pub const PREF_TITLE_FIELDS: &[&str] = &["designer", "reviewer", "project", "finish", "hardness", "version"];
+
+impl Prefs {
+    pub fn path() -> PathBuf {
+        crate::prefs::data_dir().join("drawing-prefs.json")
+    }
+    pub fn load() -> Prefs {
+        Self::load_from(&Self::path())
+    }
+    pub fn load_from(p: &Path) -> Prefs {
+        std::fs::read_to_string(p).ok().and_then(|s| serde_json::from_str(s.trim_start_matches('\u{feff}')).ok()).unwrap_or_default()
+    }
+    pub fn save_to(&self, p: &Path) -> Result<(), String> {
+        if let Some(d) = p.parent() {
+            std::fs::create_dir_all(d).map_err(|e| e.to_string())?;
+        }
+        std::fs::write(p, serde_json::to_vec_pretty(self).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+    }
+    /// 出图时的有效设置: 标题栏 = 偏好 < BOM < 本图; 技术要求 = 本图 < 偏好(按图的种类)。
+    pub fn apply(&self, s: &Sheet, bom_title: &BTreeMap<String, String>) -> (BTreeMap<String, String>, Sheet) {
+        let mut title = self.title.clone();
+        title.extend(bom_title.iter().map(|(k, v)| (k.clone(), v.clone())));
+        title.extend(s.title.iter().filter(|(_, v)| !v.trim().is_empty()).map(|(k, v)| (k.clone(), v.clone())));
+        let mut run = s.clone();
+        if run.tech.is_none() {
+            run.tech = if is_asm(&s.key) { self.tech_asm.clone() } else { self.tech_part.clone() };
+        }
+        (title, run)
+    }
 }
 
 // ---------------- 编译器位置与运行 ----------------
@@ -698,17 +925,36 @@ mod tests {
                 {"id": "c1", "name": "jaw", "path": ["clamp.stp", "jaw"]}]}
         ]);
         let info = |k: &str| RowInfo { pn: if k == "plate" { "9001".into() } else { String::new() }, material: "6061".into(), ..Default::default() };
-        let h = asm_lines(&lines, &info, Some("Solution H"));
+        let h = asm_lines(&lines, &info, Some("Solution H"), &[]);
         assert_eq!(h.len(), 2, "plate + one purchased motor line");
         assert_eq!((h[0].pn.as_str(), h[0].qty, h[0].density), ("9001", 1, Some(2.7)));
         let m = &h[1];
         assert_eq!((m.key.as_str(), m.name.as_str(), m.qty, m.note.as_str()), ("@sub:Solution H/motor.STEP", "motor", 1, "外购"));
         assert_eq!(m.parts, vec![[500.0, 300.0], [0.1, 0.5]]);
         assert_eq!(m.ids, vec!["b2", "q3", "q4"]);
-        let all = asm_lines(&lines, &info, None);
+        let all = asm_lines(&lines, &info, None, &[]);
         assert_eq!(all.iter().map(|l| l.key.as_str()).collect::<Vec<_>>(), vec!["plate", "screw", "@sub:SOLUTION V/motor.STEP", "@sub:Solution H/motor.STEP", "@sub:clamp.stp"]);
         assert_eq!(all[0].qty, 2);
-        assert_eq!(asm_groups(&lines), vec!["Solution H", "SOLUTION V"], "clamp.stp is a purchased part, not an assembly");
+        assert!(!all[0].nocut);
+        assert_eq!(asm_groups(&lines, &[]), vec!["Solution H", "SOLUTION V"], "clamp.stp is a purchased part, not an assembly");
+        // 人标外购: 没起文件名的组也合成一行(名称 = 组名), 组里零件算外购
+        let lines2 = json!([
+            {"key": "plate", "volume": 1.0, "area": 1.0, "members": [{"id": "p1", "name": "Plate", "path": ["Solution H"]}]},
+            {"key": "e1", "volume": 2.0, "area": 2.0, "members": [{"id": "e1", "name": "disc", "path": ["Solution H", "heidhan encoder"]}]},
+            {"key": "e2", "volume": 3.0, "area": 3.0, "members": [{"id": "e2", "name": "hub", "path": ["Solution H", "heidhan encoder", "x"]}]}
+        ]);
+        let p = vec!["heidhan encoder".to_string()];
+        let h2 = asm_lines(&lines2, &info, Some("Solution H"), &p);
+        assert_eq!(h2.len(), 2);
+        assert_eq!((h2[1].name.as_str(), h2[1].note.as_str(), h2[1].parts.len()), ("heidhan encoder", "外购", 2));
+        assert_eq!(asm_lines(&lines2, &info, Some("Solution H"), &[]).len(), 3);
+        assert_eq!(all_groups(&lines2), vec!["Solution H", "heidhan encoder", "x"]);
+        assert_eq!(all_groups(&lines), vec!["Solution H", "SOLUTION V"], "groups inside imported files are not listed");
+        assert!(member_bought(&lines2[1]["members"], &p) && !member_bought(&lines2[1]["members"], &[]) && !member_bought(&lines2[0]["members"], &p));
+        let scr = asm_lines(&json!([{"key": "s", "volume": 1.0, "area": 1.0, "members": [{"id": "s1", "name": "杯内六M3x10", "path": []}]}]), &|_| RowInfo::default(), None, &[]);
+        assert!(scr[0].nocut, "standard parts are not sectioned");
+        let unnamed = asm_lines(&json!([{"key": "u", "volume": 1.0, "area": 1.0, "members": [{"id": "u1", "name": null, "path": []}]}]), &|_| RowInfo { name: "null".into(), ..Default::default() }, None, &[]);
+        assert_eq!(unnamed[0].name, "零件 1");
         assert!(is_asm(&asm_key(Some("Solution H"))) && is_asm(ASM_KEY) && !is_asm("@sub:x") && !is_asm("plate"));
         let v = serde_json::to_value(m).unwrap();
         assert_eq!(v["parts"], json!([[500.0, 300.0], [0.1, 0.5]]));
@@ -747,7 +993,7 @@ mod tests {
         s.fits = vec![f, Fit { code: " ".into(), ..Default::default() }];
         let v = asm_spec(&s, Path::new("x"), &[]);
         assert_eq!(v["fits"], json!([{"id": "a|b|8", "code": "H7/g6"}]), "blank codes are not sent");
-        let back: Sheets = serde_json::from_str(&serde_json::to_string(&Sheets { sheets: vec![s.clone()] }).unwrap()).unwrap();
+        let back: Sheets = serde_json::from_str(&serde_json::to_string(&Sheets { sheets: vec![s.clone()], ..Default::default() }).unwrap()).unwrap();
         assert_eq!(back.sheets[0], s);
     }
 
@@ -766,6 +1012,53 @@ mod tests {
         assert_eq!(v["title"]["name"], "总装");
         assert!(v["title"].get("pn").is_none());
         assert!(v.get("part").is_none() && v.get("front").is_none());
+        assert_eq!(v["section"], json!({"view": "Front"}));
+        assert!(v.get("balloon_edit").is_none() && v.get("tech").is_none());
+        // 人改: 剖左视过某配合、序号、明细格子、技术要求
+        s.section_view = Some("Left".into());
+        s.section_fit = Some("a|b|8".into());
+        s.balloons.insert("k1".into(), BalloonEdit { side: Some("top".into()), ..Default::default() });
+        s.balloons.insert("k2".into(), BalloonEdit::default());
+        s.parts_list.insert("k1".into(), BTreeMap::from([("name".to_string(), "底座".to_string()), ("qty".to_string(), "6".to_string()), ("note".to_string(), " ".to_string())]));
+        s.tech = Some(vec!["1.a".into(), "  ".into(), "2.b".into()]);
+        let l = AsmLine { key: "k1".into(), name: "Box".into(), qty: 5, ..Default::default() };
+        let v = asm_spec(&s, &dir, &[l]);
+        assert_eq!(v["section"], json!({"view": "Left", "fit": "a|b|8"}));
+        assert_eq!(v["balloon_edit"], json!({"k1": {"side": "top"}}), "default edits are not sent");
+        assert_eq!((v["assembly"]["lines"][0]["name"].clone(), v["assembly"]["lines"][0]["qty"].clone()), (json!("底座"), json!(6)));
+        assert_eq!(v["assembly"]["lines"][0]["note"], "", "blank override keeps the BOM text");
+        assert_eq!(v["tech"], json!(["1.a", "2.b"]));
+        s.section = false;
+        assert!(asm_spec(&s, &dir, &[]).get("section").is_some_and(|x| x.is_null()));
+        assert_eq!(tech_lines("1.a \n\n  2.b"), vec!["1.a", "  2.b"]);
+        let back: Sheets = serde_json::from_str(&serde_json::to_string(&Sheets { sheets: vec![s.clone()], purchased: vec!["g".into()] }).unwrap()).unwrap();
+        assert_eq!(back.sheets[0], s);
+        assert_eq!(back.purchased, vec!["g"]);
+    }
+
+    #[test]
+    fn prefs_and_balloon_pick() {
+        let p = std::env::temp_dir().join(format!("pla-drawing-prefs-{}.json", std::process::id()));
+        let mut pr = Prefs::default();
+        pr.title.insert("designer".into(), "F".into());
+        pr.title.insert("finish".into(), "阳极".into());
+        pr.tech_asm = Some(vec!["1.x".into()]);
+        pr.save_to(&p).unwrap();
+        let pr = Prefs::load_from(&p);
+        let _ = std::fs::remove_file(&p);
+        let mut s = Sheet::new(ASM_KEY, "a", "", "");
+        s.title.insert("finish".into(), "本图".into());
+        let bom = BTreeMap::from([("name".to_string(), "总装".to_string())]);
+        let (t, run) = pr.apply(&s, &bom);
+        assert_eq!((t["designer"].as_str(), t["finish"].as_str(), t["name"].as_str()), ("F", "本图", "总装"));
+        assert_eq!(run.tech, Some(vec!["1.x".to_string()]));
+        let (_, run) = pr.apply(&Sheet::new("part", "p", "", ""), &bom);
+        assert_eq!(run.tech, None, "part sheets use tech_part");
+        let r: Report = serde_json::from_str(r#"{"balloons":[{"no":1,"key":"a","view":"Front","side":"left","anchor":[1,2],"at":[30,200]},{"no":2,"key":"b","at":[50,250]}],
+            "parts_list":[{"no":1,"key":"a","name":"x","qty":2}],"tech":["1.a"],"tech_default":["1.a"],"section":{"view":"Front"}}"#).unwrap();
+        assert_eq!(nearest_balloon(&r.balloons, [420.0, 297.0], 31.0 / 420.0, 1.0 - 201.0 / 297.0).map(|b| b.no), Some(1));
+        assert!(nearest_balloon(&r.balloons, [420.0, 297.0], 0.5, 0.5).is_none());
+        assert_eq!(r.parts_list[0].qty, Some(json!(2)));
     }
 
     #[test]

@@ -1302,8 +1302,21 @@ if "weight" not in title and title.get("density"):
     title["weight"] = fmt(shape.Volume * float(title.pop("density")) / 1000.0, 1) + " g"
 title.pop("density", None)
 texts = dict(tpl.EditableTexts)
-for i, line in enumerate(spec.get("tech") or std["tech_requirements"]):
-    title["tech_%d" % (i + 1)] = line
+# 技术要求: 人改过的(spec.tech)优先; 否则规范默认 + 配合面粗糙度(IT6 → Ra0.8, IT7 → Ra1.6 …)
+fit_codes = []
+for f_ in spec.get("fits") or []:
+    try:
+        fit_codes.append((float(f_["d"]), str(f_["code"]).strip()))
+    except Exception:
+        pass
+tech_default = iso286.numbered(std["tech_requirements"], iso286.part_tech(fit_codes, DIMS["diameter"]))
+tech = spec.get("tech") or tech_default
+rep["tech"], rep["tech_default"] = tech, tech_default
+tech_lines = iso286.wrap(tech, float(spec.get("tech_width_chars", 34)))
+if len(tech_lines) > 12:
+    rep["warnings"].append("technical requirements: %d lines after wrapping, the box holds 12" % len(tech_lines))
+for i in range(12):
+    title["tech_%d" % (i + 1)] = tech_lines[i] if i < len(tech_lines) else ""
 for k, v in title.items():
     if k in texts:
         texts[k] = str(v)

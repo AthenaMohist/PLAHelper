@@ -8,6 +8,11 @@
 #                              "volume": 123.4, "area": 567.8, "density": 2.7 }, … ] },     BOM 每种零件一行(体积 / 面积 = 指纹)
 #   "front": [0,-1,0], "up": [0,0,1],          主视方向 / 主视朝上(省 = 从前往后看、Z 朝上)
 #   "balloons": "auto",                        序号: 自动在主视(看不见的用左视 / 俯视)上找可见点
+#   "balloon_edit": { "<行 key>": { "hide": true, "view": "Left", "side": "left" | "top" } },   人改序号: 不标 / 指定视图 / 左列或上排
+#   "section": "auto" | null | { "view": "Front" | "Left", "fit": "<配合候选 id>" | "at": [x,y,z] },
+#                                              全剖: 剖切面 ⟂ 该视图视线, 默认过选了代号的最大配合的轴线(否则最大候选, 否则包围盒中心);
+#                                              行 "nocut": true(标准件 / 实心轴)和外购组件被剖到也画外形(国标: 沿轴线剖切按不剖画)
+#   "fits": [{ "id": "<候选 id>", "code": "H7/g6" }],   配合标注; 技术要求按配合性质自动加条目(除非给了 tech)
 #   "title": {...}, "tech": [...], "out": "<目录>", "basename": "<文件名>" }
 #
 # 做法: STEP 里每个实体按体积 + 面积对上 BOM 行(相同件的多个实例归同一行); 三视图(第一角, 不画虚线)+ 轴测;
@@ -442,6 +447,126 @@ R["Iso"] = views["Iso"].rect()
 rep["views"] = {k: [round(x, 1) for x in r] for k, r in R.items()}
 
 DRAW_SHAPE = Part.makeCompound([d for d in DRAW if d is not None])
+VDRAW = {vn: DRAW for vn in ("Front", "Top", "Left", "Iso")}  # 每个视图画的实体(剖视那个换成剖开的)
+
+
+# ---------------------------------------------------------------- 装配剖视(全剖): 剖切面 ⟂ 视线, 留后半; 剖面按零件画不同剖面线
+def section_plan():
+    s_ = spec.get("section", "auto")
+    if not s_:
+        return None
+    if s_ == "auto":
+        s_ = {}
+    if not isinstance(s_, dict):
+        return None
+    vn = s_.get("view", "Front")
+    if vn not in ("Front", "Left", "Top"):
+        return None
+    n = views[vn].Z
+    o = None
+    why = "center"
+    if s_.get("at"):
+        o, why = V(*s_["at"]), "at"
+    elif s_.get("fit") == "@center":
+        pass  # 人选: 过包围盒中心
+    else:
+        # 过配合轴线(轴线要 ⟂ 视线, 剖切面才过轴线): 指定的 → 选了代号的最大直径 → 最大候选
+        coded = {f.get("id") for f in spec.get("fits") or [] if (f.get("code") or "").strip()}
+        cands = [c for c in fit_cands.values() if abs(V(*c["axis"]).dot(n)) < 0.05]
+        pick = None
+        if s_.get("fit"):
+            pick = next((c for c in cands if c["id"] == s_["fit"]), None)
+        if pick is None:
+            pick = max((c for c in cands if c["id"] in coded), key=lambda c: c["d"], default=None)
+        if pick is None:
+            pick = max(cands, key=lambda c: (c["d"], c["count"]), default=None)
+        if pick is not None:
+            o, why = V(*pick["at"]), "fit " + pick["id"]
+    if o is None:
+        o = V(bb.Center.x, bb.Center.y, bb.Center.z)
+    return {"view": vn, "o": o, "n": n, "why": why, "symbol": s_.get("symbol", "A")}
+
+
+def solid_bar(s, n):
+    """实心回转件(销 / 实心轴): 圆柱面全是外圆柱、同一根轴、轴 ⟂ 剖切面法向, 没有孔 → 国标沿轴线剖切按不剖画。"""
+    axis = None
+    c0 = None
+    ncyl = 0
+    for f in s.Faces:
+        if isinstance(f.Surface, Part.Plane):
+            continue
+        cy = geomutil.cylinder_of(f)
+        if cy is None:
+            if isinstance(f.Surface, (Part.Cone, Part.Sphere, Part.Toroid)):
+                continue  # 倒角 / 球头 / 圆角
+            return False
+        if cy["internal"]:
+            return False
+        if axis is None:
+            axis, c0 = cy["ax"], cy["c"]
+        else:
+            dv = cy["c"] - c0
+            if abs(abs(cy["ax"].dot(axis)) - 1) > 1e-4 or (dv - axis * dv.dot(axis)).Length > 0.02:
+                return False
+        ncyl += 1
+    return ncyl > 0 and abs(axis.dot(n)) < 0.05
+
+
+SEC = section_plan()
+CUT_FACES = []  # (行下标, 剖面 Face)
+if SEC:
+    t0_ = time.time()
+    o, n = SEC["o"], SEC["n"]
+    vX, vY = views[SEC["view"]].X, views[SEC["view"]].Y
+    L_ = bb.DiagonalLength * 3 + 100
+    half = Part.makeBox(L_, L_, L_, V(-L_ / 2, -L_ / 2, -L_))  # 本地 z ≤ 0 = 剖切面后面
+    half.transformShape(App.Matrix(vX.x, vY.x, n.x, o.x, vX.y, vY.y, n.y, o.y, vX.z, vY.z, n.z, o.z, 0, 0, 0, 1))
+    sec_draw = []
+    ncut = nfail = nkeep = 0
+    for si_, s in enumerate(DRAW):
+        if s is None:
+            sec_draw.append(None)
+            continue
+        b_ = s.BoundBox
+        ds = [(V(x, y, z) - o).dot(n) for x in (b_.XMin, b_.XMax) for y in (b_.YMin, b_.YMax) for z in (b_.ZMin, b_.ZMax)]
+        if min(ds) >= -1e-6:
+            sec_draw.append(None)  # 整个在剖切面前面: 剖视里拿掉
+            continue
+        if max(ds) <= 1e-6:
+            sec_draw.append(s)  # 整个在后面
+            continue
+        li = owner[si_]
+        l_ = lines[li] if li is not None else {}
+        # 国标: 标准件 / 实心轴(行 nocut)、外购组件、简化外形被剖到按不剖画
+        if l_.get("nocut") or l_.get("parts") or s is not solids[si_] or solid_bar(s, n):
+            sec_draw.append(s)
+            nkeep += 1
+            continue
+        try:
+            c_ = s.common(half)
+            if c_.isNull() or not c_.Solids:
+                raise ValueError("empty")
+            c_ = c_.Solids[0] if len(c_.Solids) == 1 else Part.makeCompound(c_.Solids)
+        except Exception:
+            nfail += 1
+            sec_draw.append(s)
+            continue
+        ncut += 1
+        sec_draw.append(c_)
+        for f in c_.Faces:
+            if isinstance(f.Surface, Part.Plane):
+                try:
+                    fn = f.normalAt(*f.Surface.parameter(f.CenterOfMass))
+                except Exception:
+                    continue
+                if fn.dot(n) > 0.999 and abs((f.CenterOfMass - o).dot(n)) < 1e-3:
+                    CUT_FACES.append((li, f))
+    VDRAW[SEC["view"]] = sec_draw
+    rep["section"] = {"view": SEC["view"], "through": SEC["why"], "cut": ncut, "uncut": nkeep, "failed": nfail, "faces": len(CUT_FACES),
+                      "s": round(time.time() - t0_, 1)}
+    if nfail:
+        rep["warnings"].append("section: %d solid(s) could not be cut (drawn whole)" % nfail)
+    lap("section")
 VIEW_SVG = []
 LWV = std["lines"]["visible"]
 DEFL = float(spec.get("deflection_mm", 0.05))  # 曲线离散精度(页面毫米)
@@ -449,7 +574,7 @@ DEFL = float(spec.get("deflection_mm", 0.05))  # 曲线离散精度(页面毫米
 
 def project_view(v):
     """投影一个视图 → 可见轮廓的折线(页面坐标, SVG y 向下)。"""
-    sh = DRAW_SHAPE.copy()
+    sh = DRAW_SHAPE.copy() if VDRAW[v.Name] is DRAW else Part.makeCompound([d for d in VDRAW[v.Name] if d is not None])
     sh.translate(-bb.Center)
     m = App.Matrix(v.X.x, v.X.y, v.X.z, 0, v.Y.x, v.Y.y, v.Y.z, 0, v.Z.x, v.Z.y, v.Z.z, 0, 0, 0, 0, 1)
     sh.transformShape(m)  # 刚体旋转(就地); 视图轴都是正交右手系
@@ -478,6 +603,46 @@ for vn in ("Front", "Top", "Left", "Iso"):
     VIEW_SVG.append('<g style="fill:none;stroke:#000;stroke-width:%g;stroke-linecap:round;stroke-linejoin:round">' % LWV
                     + "".join('<polyline points="%s"/>' % pl for pl in lines_) + "</g>")
 lap("views")
+
+# 剖面线: 同一零件同一种, 相邻零件(剖面区域挨着)换方向 / 间距(贪心着色); 薄到图上 < 1 mm 的剖面涂黑(国标允许)
+HATCHES = [(45, 3.0), (135, 3.0), (45, 1.8), (135, 1.8), (45, 4.5), (135, 4.5), (0, 2.4), (90, 2.4)]
+if CUT_FACES:
+    sv = views[SEC["view"]]
+    regions = {}  # 行 → [页面矩形]
+    polys = []  # (行, path d, 涂黑?)
+    for li, f in CUT_FACES:
+        d_ = []
+        xs_, ys_ = [], []
+        for w in f.Wires:
+            try:
+                pts = w.discretize(Deflection=DEFL / max(sv.s, 1e-6))
+            except Exception:
+                continue
+            pp = [sv.page(p) for p in pts]
+            if len(pp) < 3:
+                continue
+            xs_ += [p[0] for p in pp]
+            ys_ += [p[1] for p in pp]
+            d_.append("M " + " L ".join("%.3f %.3f" % (x, H - y) for x, y in pp) + " Z")
+        if not d_:
+            continue
+        thin = min(max(xs_) - min(xs_), max(ys_) - min(ys_)) < 1.0
+        polys.append((li, " ".join(d_), thin))
+        regions.setdefault(li, []).append((min(xs_) - 0.3, min(ys_) - 0.3, max(xs_) + 0.3, max(ys_) + 0.3))
+    # 邻接: 剖面包围盒碰到; 按行号顺序贪心取第一个邻居没用的花样
+    keys_ = sorted(regions, key=lambda k: (k is None, k if k is not None else 0))
+    pat = {}
+    for k in keys_:
+        used = {pat[j] for j in pat if any(hit(a, b) for a in regions[k] for b in regions[j])}
+        pat[k] = next((i for i in range(len(HATCHES)) if i not in used), len(pat) % len(HATCHES))
+    defs = []
+    for i, (ang, sp) in enumerate(HATCHES):
+        defs.append('<pattern id="ahatch%d" patternUnits="userSpaceOnUse" width="%g" height="%g" patternTransform="rotate(%g)">'
+                    '<line x1="0" y1="0" x2="0" y2="%g" style="stroke:#000;stroke-width:%g"/></pattern>' % (i, sp, sp, ang, sp, std["lines"]["thin"] * 0.7))
+    VIEW_SVG.insert(0, "<defs>%s</defs>" % "".join(defs))
+    VIEW_SVG.append("".join('<path d="%s" style="fill:%s;fill-rule:evenodd;stroke:none"/>' % (d_, "#000" if thin else "url(#ahatch%d)" % pat[li])
+                            for li, d_, thin in polys))
+    rep["section"]["hatch"] = {str(lines[k].get("key") if k is not None else None): pat[k] for k in pat}
 
 
 def frame(v):
@@ -544,12 +709,59 @@ dim_h(rT[0], rT[2], rT[1], rT[1] - 10, Wm)
 dim_h(rL[0], rL[2], rL[1], rL[1] - 10, Dm)
 dim_v(rL[1], rL[3], rL[2], rL[2] + 10, Hm)
 
+EXTRA_OCC = []  # 剖视名 / 剖切符号占的地方(配合标注要避开)
+
+
+def section_marks():
+    """剖视名 "A-A"(剖视上方)+ 剖切符号: 相邻视图里剖切面的迹线两端画粗短画 + 投射方向箭头 + 字母。"""
+    sym = SEC["symbol"]
+    fs_ = std["fonts"]["title"]
+    tvn = "Top" if SEC["view"] == "Front" else "Front"
+    tv = views[tvn]
+    n = SEC["n"]
+    if abs(n.dot(tv.Z)) > 0.1:
+        return
+    nx, ny = n.dot(tv.X), n.dot(tv.Y)
+    nl = math.hypot(nx, ny) or 1
+    nx, ny = nx / nl, ny / nl
+    ux, uy = -ny, nx  # 迹线方向(页面)
+    px, py = tv.page(SEC["o"])
+    r = R[tvn]
+    # 迹线出视图的参数(两头)
+    ts = []
+    for lo_, hi_, p_, u_ in ((r[0], r[2], px, ux), (r[1], r[3], py, uy)):
+        if abs(u_) > 1e-9:
+            ts += sorted(((lo_ - p_) / u_, (hi_ - p_) / u_))
+    if len(ts) < 2:
+        return
+    if len(ts) == 4:
+        t_lo, t_hi = max(ts[0], ts[2]), min(ts[1], ts[3])
+    else:
+        t_lo, t_hi = ts[0], ts[1]
+    thick = std["lines"]["visible"] * 1.6
+    for t_, sg in ((t_lo, -1), (t_hi, 1)):
+        a0, a1 = t_ + sg * 1.5, t_ + sg * 7.5
+        line(px + ux * a0, py + uy * a0, px + ux * a1, py + uy * a1, thick)
+        # 箭头: 粗短画外端, 垂直于迹线, 指投射方向(看的人朝 −n 看)
+        qx, qy = px + ux * a1, py + uy * a1
+        ex_, ey_ = qx - nx * 6, qy - ny * 6
+        line(qx, qy, ex_, ey_)
+        arrow(ex_, ey_, -nx, -ny)
+        lx_, ly_ = ex_ + ux * sg * 2.5 - nx * 1.5, ey_ + uy * sg * 2.5 - ny * 1.5
+        text(lx_, ly_ - fs_ * 0.35, sym, fs_)
+        EXTRA_OCC.append((min(qx, ex_, lx_) - 4, min(qy, ey_, ly_) - 4, max(qx, ex_, lx_) + 4, max(qy, ey_, ly_) + 4))
+
+
+if SEC:
+    section_marks()
+
 
 # ---------------------------------------------------------------- 序号: 每行一个实例上的可见点
 def visible_point(si, v):
     """实体 si 在视图 v 里看得见的点: 朝向看的人的面上取点(大面优先), 朝看的人射线不碰别的实体(也不再穿回自己)。"""
     _, _, D = frame(v)
-    s = DRAW[si]
+    VD = VDRAW[v.Name]
+    s = VD[si]
     if s is None:
         return None  # 太小, 图上没画
     faces = sorted(s.Faces, key=lambda f: -f.Area)
@@ -583,7 +795,7 @@ def visible_point(si, v):
         ray = Part.LineSegment(p + D * 0.05, p + D * big).toShape()
         px_, py_, pz_ = p.dot(v.X), p.dot(v.Y), p.dot(D)
         blocked = False
-        for j, o in enumerate(DRAW):
+        for j, o in enumerate(VD):
             if o is None:
                 continue
             # 粗筛: 包围盒在视图平面上的投影要盖住这个点, 且有部分在点的前面(朝看的人一侧)
@@ -609,13 +821,20 @@ def box2d(o, v):
 
 
 # 每个视图: 各实体包围盒在视图平面上的投影 + 最靠前的深度(遮挡粗筛用)
-BOX2D = {vn: [box2d(o, views[vn]) if o is not None else None for o in DRAW] for vn in ("Front", "Left", "Top")}
+BOX2D = {vn: [box2d(o, views[vn]) if o is not None else None for o in VDRAW[vn]] for vn in ("Front", "Left", "Top")}
 
+BED = spec.get("balloon_edit") or {}  # 人改: 行 key → {hide, view, side}
 balloons = []  # {line, view, anchor(page), solid}
 for li, l in enumerate(lines):
+    ed = BED.get(str(l.get("key"))) or {}
+    if ed.get("hide"):
+        continue
     idx = sorted((i for i, o in enumerate(owner) if o == li), key=lambda i: -SVA[i][0])[:3]  # 大的先试(外购件里的小零件看不清)
     got = None
-    for vname in ("Front", "Left", "Top"):
+    order_v = ("Front", "Left", "Top")
+    if ed.get("view") in order_v:
+        order_v = (ed["view"],) + tuple(x for x in order_v if x != ed["view"])
+    for vname in order_v:
         for si in idx:
             p = visible_point(si, views[vname])
             if p is not None:
@@ -672,6 +891,15 @@ for b in balloons:
     if b["view"] == "Top" and b in top:
         top.remove(b)
         left.append(b)  # 俯视在主视下面: 只能走左列
+# 人改: 指定走左列 / 上排(俯视里的点只能走左列)
+for b in list(left) + list(top):
+    side = (BED.get(str(lines[b["line"]].get("key"))) or {}).get("side")
+    if side == "left" and b in top:
+        top.remove(b)
+        left.append(b)
+    elif side == "top" and b in left and b["view"] != "Top":
+        left.remove(b)
+        top.append(b)
 sep = 2 * BAL["r"] + BAL["gap"]
 left.sort(key=lambda b: b["anchor"][1])  # 由下往上
 ys = spread([b["anchor"][1] for b in left], sep, lo=AREA[1] + BAL["r"] + 1, hi=AREA[3] - BAND)
@@ -681,6 +909,40 @@ top.sort(key=lambda b: b["anchor"][0])  # 由左往右
 xs = spread([b["anchor"][0] for b in top], sep, lo=col_x + sep, hi=AREA[2] - BAL["r"] - 1)
 for b, x in zip(top, xs):
     b["at"] = (x, row_y)
+
+
+def seg_cross(p1, p2, p3, p4):
+    """两条线段是否真相交(端点相碰不算)。"""
+    def o(a, b, c):
+        return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+    d1, d2, d3, d4 = o(p3, p4, p1), o(p3, p4, p2), o(p1, p2, p3), o(p1, p2, p4)
+    return d1 * d2 < -1e-9 and d3 * d4 < -1e-9
+
+
+def untangle(group):
+    """同一列 / 排里引线交叉的两个序号对调位置(圆圈位置不变, 换谁占), 直到没有交叉; 再按位置重排(编号跟着位置走)。"""
+    for _ in range(len(group) * len(group) + 10):
+        swapped = False
+        for i in range(len(group)):
+            for j in range(i + 1, len(group)):
+                a, b = group[i], group[j]
+                if seg_cross(a["anchor"], a["at"], b["anchor"], b["at"]):
+                    a["at"], b["at"] = b["at"], a["at"]
+                    swapped = True
+        if not swapped:
+            break
+
+
+def crossings(bs):
+    return sum(1 for i in range(len(bs)) for j in range(i + 1, len(bs)) if seg_cross(bs[i]["anchor"], bs[i]["at"], bs[j]["anchor"], bs[j]["at"]))
+
+
+x_before = crossings(left + top)
+untangle(left)
+untangle(top)
+left.sort(key=lambda b: b["at"][1])
+top.sort(key=lambda b: b["at"][0])
+rep["leader_crossings"] = {"before": x_before, "after": crossings(left + top)}
 # 编号 = 顺时针排列顺序: 左列由下往上, 再上排由左往右
 order = left + top
 for n, b in enumerate(order, start=1):
@@ -702,7 +964,35 @@ for b in order:
     PAGE_SVG.append('<circle cx="%.3f" cy="%.3f" r="%g" style="fill:#000;stroke:none"/>' % (ax, sy(ay), BAL["dot"]))
     PAGE_SVG.append('<circle cx="%.3f" cy="%.3f" r="%g" style="fill:none;stroke:#000;stroke-width:%g"/>' % (bx, sy(by), r_, LW))
     text(bx, by - BAL["font"] * 0.35, b["no"], BAL["font"])
-rep["balloons"] = [{"no": b["no"], "key": lines[b["line"]].get("key"), "view": b["view"], "anchor": [round(b["anchor"][0], 1), round(b["anchor"][1], 1)]} for b in order]
+if SEC:
+    # 剖视名 "A-A" 写在剖视上方; 位置挑一个不被序号引线穿过的(中间优先, 再往两边)
+    sym = SEC["symbol"]
+    rv = R[SEC["view"]]
+    fs_ = std["fonts"]["title"]
+    lw_ = 3 * fs_ * 0.62 + 2
+    cx0 = (rv[0] + rv[2]) / 2
+    best = None
+    for k in range(0, 40):
+        for sg in ((1,) if k == 0 else (1, -1)):
+            cx_ = cx0 + sg * k * 4
+            if cx_ - lw_ / 2 < rv[0] or cx_ + lw_ / 2 > rv[2]:
+                continue
+            box_ = (cx_ - lw_ / 2, rv[3] + 1.5, cx_ + lw_ / 2, rv[3] + 2.5 + fs_)
+            corners = [(box_[0], box_[1]), (box_[2], box_[1]), (box_[2], box_[3]), (box_[0], box_[3])]
+            n_hit = sum(1 for b in order for e in range(4)
+                        if seg_cross(b["anchor"], b["at"], corners[e], corners[(e + 1) % 4])
+                        or (box_[0] <= b["anchor"][0] <= box_[2] and box_[1] <= b["anchor"][1] <= box_[3]))
+            if best is None or n_hit < best[0]:
+                best = (n_hit, cx_, box_)
+            if n_hit == 0:
+                break
+        if best and best[0] == 0:
+            break
+    if best:
+        text(best[1], rv[3] + 2.5, "%s-%s" % (sym, sym), fs_)
+        EXTRA_OCC.append(best[2])
+rep["balloons"] = [{"no": b["no"], "key": lines[b["line"]].get("key"), "view": b["view"], "side": "left" if b in left else "top",
+                    "anchor": [round(b["anchor"][0], 1), round(b["anchor"][1], 1)], "at": [round(b["at"][0], 1), round(b["at"][1], 1)]} for b in order]
 
 # ---------------------------------------------------------------- 配合标注: "⌀10 H7/g6", 引线指到孔轴线上(孔轴 ⟂ 视线的视图里)
 fits_done = []
@@ -710,6 +1000,7 @@ fits_done = []
 OCC = [r for r in R.values()]
 OCC += [(b["at"][0] - r_ - 1, b["at"][1] - r_ - 1, b["at"][0] + r_ + 1, b["at"][1] + r_ + 1) for b in order]
 OCC += [(rT[0], rT[1] - 14, rT[2], rT[1]), (rL[0], rL[1] - 14, rL[2], rL[1]), (rL[2], rL[1], rL[2] + 14, rL[3])]
+OCC += EXTRA_OCC
 for f in spec.get("fits") or []:
     cand = fit_cands.get(f.get("id", ""))
     code = (f.get("code") or "").strip()
@@ -820,9 +1111,19 @@ if "weight" not in title and lines and all(l.get("density") and l.get("volume") 
     g = sum(float(l["density"]) * float(l["volume"]) / 1000.0 * float(l.get("qty") or l.get("found") or 0) for l in lines)
     title["weight"] = (fmt(g / 1000.0, 2) + " kg") if g >= 10000 else (fmt(g, 1) + " g")
 title.pop("density", None)
-tech = spec.get("tech") or std.get("tech_requirements_assembly") or std["tech_requirements"]
+import iso286  # noqa: E402
+
+# 技术要求: 人改过的(spec.tech)优先; 否则规范默认 + 按标了的配合性质加条目(过盈 → 压装 / 热装, 过渡 → 压入, 间隙 → 灵活)
+fit_pairs = [(fit_cands[f["id"]]["d"], f["code"]) for f in fits_done if f["id"] in fit_cands]
+tech_default = iso286.numbered(std.get("tech_requirements_assembly") or std["tech_requirements"], iso286.asm_tech(fit_pairs, DIMS["diameter"]))
+tech = spec.get("tech") or tech_default
+rep["tech"], rep["tech_default"] = tech, tech_default
+TECH_W = float(spec.get("tech_width_chars", 34))  # 技术要求框 90 mm / 2.5 mm 字高
+tech_lines = iso286.wrap(tech, TECH_W)
+if len(tech_lines) > 12:
+    rep["warnings"].append("technical requirements: %d lines after wrapping, the box holds 12" % len(tech_lines))
 for i in range(12):
-    title["tech_%d" % (i + 1)] = tech[i] if i < len(tech) else ""
+    title["tech_%d" % (i + 1)] = tech_lines[i] if i < len(tech_lines) else ""
 import re  # noqa: E402
 
 svg = TEMPLATE_SVG

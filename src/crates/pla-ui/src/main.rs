@@ -217,6 +217,8 @@ struct PlaApp {
     draw_book: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
     /// D3 装配图: 当前 BOM 范围的明细(每帧随出图面板刷新; 导出 / 编译装配图时用)。
     draw_asm: std::collections::BTreeMap<String, Vec<pla_ui::drawing::AsmLine>>,
+    /// D6 出图偏好(全局; 第一次用时读)。
+    draw_prefs: Option<pla_ui::drawing::Prefs>,
     lib: pla_ui::parts_lib::Library,
     lib_mtime: Option<std::time::SystemTime>,
     lib_checked: Option<Instant>,
@@ -2545,6 +2547,7 @@ impl PlaApp {
             draw_batch_keys: Vec::new(),
             draw_book: None,
             draw_asm: Default::default(),
+            draw_prefs: None,
             lib: Default::default(),
             lib_mtime: None,
             lib_checked: None,
@@ -4588,6 +4591,18 @@ impl PlaApp {
         }
     }
 
+    fn prefs_get(&mut self) -> &pla_ui::drawing::Prefs {
+        self.draw_prefs.get_or_insert_with(pla_ui::drawing::Prefs::load)
+    }
+
+    fn prefs_set(&mut self, p: pla_ui::drawing::Prefs) {
+        match p.save_to(&pla_ui::drawing::Prefs::path()) {
+            Ok(()) => self.set_notice((false, tr("已存为默认(以后每张图都用)", "Saved as default (used for every drawing)").to_string())),
+            Err(e) => self.set_notice((true, t!("保存偏好失败: {e}", "Saving preferences failed: {e}"))),
+        }
+        self.draw_prefs = Some(p);
+    }
+
     fn draw_save(&mut self) {
         if let Err(e) = pla_ui::drawing::save_in(&pla_ui::drawing::dir(&self.doc_key), &self.draw_sheets) {
             self.set_notice((true, t!("出图设置保存失败: {e}", "Saving drawing settings failed: {e}")));
@@ -4663,7 +4678,8 @@ impl PlaApp {
     fn draw_compile(&mut self, key: &str, title: std::collections::BTreeMap<String, String>) {
         let (Some(s), Some(tools)) = (self.draw_sheets.get(key).cloned(), pla_ui::drawing::tools_dir()) else { return };
         let dir = pla_ui::drawing::dir(&self.doc_key);
-        let mut run = s.clone();
+        // D6: 偏好(标题栏默认字段、技术要求)垫在底下, BOM / 本图覆盖
+        let (title, mut run) = self.prefs_get().apply(&s, &title);
         run.title = title;
         let spec = if pla_ui::drawing::is_asm(key) {
             pla_ui::drawing::asm_spec(&run, &dir, self.draw_asm.get(key).map(|v| v.as_slice()).unwrap_or(&[]))
@@ -4770,9 +4786,7 @@ impl PlaApp {
                 }
                 let qty = line.and_then(|l| l["qty"].as_u64()).unwrap_or(1);
                 title.insert("qty".into(), qty.to_string());
-                let bought = line.and_then(|l| l["members"].as_array()).is_some_and(|ms| {
-                    !ms.is_empty() && ms.iter().all(|m| m["path"].as_array().is_some_and(|p| p.iter().any(|g| g.as_str().is_some_and(pla_ui::drawing::is_import_group))))
-                });
+                let bought = line.is_some_and(|l| pla_ui::drawing::member_bought(&l["members"], &self.draw_sheets.purchased));
                 // 标准件(螺钉 / 销 / 轴承 …, 看名字猜): 同外购一样不进批量, 单张还能出
                 let nm = if get("name").is_empty() { member.1.clone() } else { get("name") };
                 let standard = !bought && pla_ui::drawing::looks_standard(&nm, &get("pn"));
@@ -4788,12 +4802,13 @@ impl PlaApp {
             }
             let info = |k: &str| infos.get(k).cloned().unwrap_or_default();
             let stem = self.doc_key.rsplit(['/', '\\']).next().unwrap_or("").to_string();
-            let all = pla_ui::drawing::asm_lines(&v["lines"], &info, None);
+            let pur = &self.draw_sheets.purchased;
+            let all = pla_ui::drawing::asm_lines(&v["lines"], &info, None, pur);
             if !all.is_empty() {
                 asms.push((pla_ui::drawing::asm_key(None), stem.clone(), all));
             }
-            for g in pla_ui::drawing::asm_groups(&v["lines"]) {
-                let ls = pla_ui::drawing::asm_lines(&v["lines"], &info, Some(&g));
+            for g in pla_ui::drawing::asm_groups(&v["lines"], pur) {
+                let ls = pla_ui::drawing::asm_lines(&v["lines"], &info, Some(&g), pur);
                 asms.push((pla_ui::drawing::asm_key(Some(&g)), g, ls));
             }
         }
@@ -4828,6 +4843,39 @@ impl PlaApp {
                 }
             }
         });
+        // ---- 外购组件: 名字不像导入文件的组(如 "heidhan encoder")人来勾 → 装配图合成一行, 组里零件不出零件图 ----
+        let groups: Vec<String> = match &self.bom_result {
+            Some(Ok(v)) => pla_ui::drawing::all_groups(&v["lines"]),
+            _ => Vec::new(),
+        };
+        if !groups.is_empty() {
+            let mut pur = self.draw_sheets.purchased.clone();
+            egui::CollapsingHeader::new(t!("外购组件(已勾 {})", "Purchased groups ({} ticked)", pur.len())).id_salt("draw-purchased").show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(tr(
+                        "名字是 .step / .igs 等文件名的组自动算外购; 别的组(电机、编码器…)在这里勾: 装配图明细合成一行, 组里零件不出零件图",
+                        "Groups named like .step / .igs files count as purchased automatically; tick other groups (motors, encoders…) here: one parts-list line, no part drawings for their parts",
+                    ))
+                    .size(11.0)
+                    .color(COL_MUTED),
+                );
+                egui::ScrollArea::vertical().id_salt("draw-purchased-list").max_height(120.0).show(ui, |ui| {
+                    for g in &groups {
+                        let mut on = pur.contains(g);
+                        if ui.checkbox(&mut on, g).changed() {
+                            pur.retain(|x| x != g);
+                            if on {
+                                pur.push(g.clone());
+                            }
+                        }
+                    }
+                });
+            });
+            if pur != self.draw_sheets.purchased {
+                self.draw_sheets.purchased = pur;
+                self.draw_save();
+            }
+        }
         let mut pick: Option<usize> = None;
         egui::ScrollArea::vertical().id_salt("draw-list").max_height(150.0).show(ui, |ui| {
             for (i, it) in items.iter().enumerate() {
@@ -4977,6 +5025,59 @@ impl PlaApp {
                 ui.checkbox(&mut s.section, tr("剖视 A-A", "Section A-A"));
             }
         });
+        // ---- 装配剖视: 剖哪个视图 + 剖切面过哪里 ----
+        if pla_ui::drawing::is_asm(&key) {
+            let cands: Vec<pla_ui::drawing::FitCand> = self.draw_report.as_ref().filter(|(k, _)| *k == key).map(|(_, r)| r.fit_candidates.clone()).unwrap_or_default();
+            let sec_info = self.draw_report.as_ref().filter(|(k, _)| *k == key).and_then(|(_, r)| r.section.clone());
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut s.section, tr("剖视 A-A(全剖)", "Section A-A (full)")).on_hover_text(tr(
+                    "剖切面垂直视线、留后半; 标准件 / 实心轴 / 外购件被剖到按不剖画; 相邻零件剖面线方向或间距不同",
+                    "Cutting plane perpendicular to the view, back half kept; standard parts / solid shafts / purchased parts are drawn uncut; adjacent parts get different hatching",
+                ));
+                ui.add_enabled_ui(s.section, |ui| {
+                    let cur_v = s.section_view.clone().unwrap_or_else(|| "Front".into());
+                    let vname = |v: &str| if v == "Left" { tr("左视", "Left view") } else { tr("主视", "Front view") };
+                    let mut pick_v = cur_v.clone();
+                    egui::ComboBox::from_id_salt("draw-sec-view").selected_text(vname(&cur_v)).width(70.0).show_ui(ui, |ui| {
+                        for v in ["Front", "Left"] {
+                            ui.selectable_value(&mut pick_v, v.to_string(), vname(v));
+                        }
+                    });
+                    if pick_v != cur_v {
+                        s.section_view = if pick_v == "Front" { None } else { Some(pick_v) };
+                    }
+                    ui.label(egui::RichText::new(tr("过", "through")).color(COL_MUTED));
+                    let label_of = |id: &Option<String>| -> String {
+                        match id.as_deref() {
+                            None => tr("自动(最大配合的轴线)", "auto (axis of the largest fit)").to_string(),
+                            Some("@center") => tr("中心", "center").to_string(),
+                            Some(f) => cands.iter().find(|c| c.id == f).map(|c| format!("Ø{} {} ↔ {}", pla_ui::drawing::fmt_d(c.d), c.hole, c.shaft)).unwrap_or_else(|| f.to_string()),
+                        }
+                    };
+                    let mut pick_f = s.section_fit.clone();
+                    egui::ComboBox::from_id_salt("draw-sec-fit").selected_text(label_of(&s.section_fit)).width(200.0).show_ui(ui, |ui| {
+                        ui.selectable_value(&mut pick_f, None, label_of(&None));
+                        ui.selectable_value(&mut pick_f, Some("@center".to_string()), label_of(&Some("@center".into())));
+                        for c in &cands {
+                            ui.selectable_value(&mut pick_f, Some(c.id.clone()), label_of(&Some(c.id.clone())));
+                        }
+                    });
+                    s.section_fit = pick_f;
+                });
+            });
+            if let Some(si) = sec_info {
+                ui.label(
+                    egui::RichText::new(t!(
+                        "上次: 剖 {} 个零件, {} 个按不剖画",
+                        "Last run: {} part(s) cut, {} drawn uncut",
+                        si["cut"].as_u64().unwrap_or(0),
+                        si["uncut"].as_u64().unwrap_or(0)
+                    ))
+                    .size(11.0)
+                    .color(COL_MUTED),
+                );
+            }
+        }
         if pla_ui::drawing::is_asm(&key) {
             ui.label(
                 egui::RichText::new(tr(
@@ -5071,12 +5172,173 @@ impl PlaApp {
                 });
             }
         }
+        let (pl_rows, bal_rep, tech_used, tech_def) = self
+            .draw_report
+            .as_ref()
+            .filter(|(k, _)| *k == key)
+            .map(|(_, r)| (r.parts_list.clone(), r.balloons.clone(), r.tech.clone(), r.tech_default.clone()))
+            .unwrap_or_default();
+        // ---- 装配图: 明细 / 序号人改(点预览上的序号圈也能选中) ----
+        let bal_sel = self.draw_buf.get("balsel").cloned().unwrap_or_default();
+        if pla_ui::drawing::is_asm(&key) && !pl_rows.is_empty() {
+            let bom_lines: Vec<pla_ui::drawing::AsmLine> = self.draw_asm.get(&key).cloned().unwrap_or_default();
+            egui::CollapsingHeader::new(t!("明细 / 序号 {}(点预览上的序号也能选中)", "Parts list / balloons {} (or click a balloon on the preview)", pl_rows.len()))
+                .id_salt("draw-pl")
+                .default_open(!bal_sel.is_empty())
+                .show(ui, |ui| {
+                    egui::ScrollArea::vertical().id_salt("draw-pl-scroll").max_height(260.0).show(ui, |ui| {
+                        egui::Grid::new("draw-pl-grid").num_columns(7).spacing([6.0, 2.0]).show(ui, |ui| {
+                            for h in [tr("序号", "No."), tr("名称", "Name"), tr("数量", "Qty"), tr("备注", "Note"), tr("序号", "Balloon"), tr("位置", "Side"), tr("视图", "View")] {
+                                ui.label(egui::RichText::new(h).size(11.0).color(COL_MUTED));
+                            }
+                            ui.end_row();
+                            for row in &pl_rows {
+                                let Some(k) = row.key.clone() else { continue };
+                                let bl = bom_lines.iter().find(|l| l.key == k);
+                                let picked = bal_sel == k;
+                                if ui.selectable_label(picked, egui::RichText::new(row.no.to_string()).strong()).clicked() {
+                                    self.draw_buf.insert("balsel".into(), if picked { String::new() } else { k.clone() });
+                                }
+                                for (col, w, bom_v) in [
+                                    ("name", 150.0, bl.map(|l| l.name.clone()).unwrap_or_default()),
+                                    ("qty", 36.0, bl.map(|l| l.qty.to_string()).unwrap_or_default()),
+                                    ("note", 80.0, bl.map(|l| l.note.clone()).unwrap_or_default()),
+                                ] {
+                                    let cur = s.parts_list.get(&k).and_then(|m| m.get(col)).cloned().unwrap_or_default();
+                                    let buf = self.draw_buf.entry(format!("pl|{k}|{col}")).or_insert_with(|| cur.clone());
+                                    let te = ui.add(egui::TextEdit::singleline(buf).hint_text(bom_v.clone()).desired_width(w).text_color(COL_ACCENT));
+                                    if te.lost_focus() {
+                                        let v = buf.trim().to_string();
+                                        let m = s.parts_list.entry(k.clone()).or_default();
+                                        if v.is_empty() || v == bom_v {
+                                            m.remove(col);
+                                        } else {
+                                            m.insert(col.to_string(), v);
+                                        }
+                                        if m.is_empty() {
+                                            s.parts_list.remove(&k);
+                                        }
+                                    } else if !te.has_focus() {
+                                        *buf = cur;
+                                    }
+                                }
+                                let mut e = s.balloons.get(&k).cloned().unwrap_or_default();
+                                let mut show = !e.hide;
+                                ui.checkbox(&mut show, "").on_hover_text(tr("不勾 = 不标序号(明细表里仍有)", "Unticked = no balloon (still in the parts list)"));
+                                e.hide = !show;
+                                let side_name = |x: &Option<String>| match x.as_deref() {
+                                    Some("left") => tr("左列", "left"),
+                                    Some("top") => tr("上排", "top"),
+                                    _ => tr("自动", "auto"),
+                                };
+                                egui::ComboBox::from_id_salt(("bal-side", k.as_str())).selected_text(side_name(&e.side)).width(56.0).show_ui(ui, |ui| {
+                                    for o in [None, Some("left".to_string()), Some("top".to_string())] {
+                                        let lab = side_name(&o);
+                                        ui.selectable_value(&mut e.side, o, lab);
+                                    }
+                                });
+                                let view_name = |x: &Option<String>| match x.as_deref() {
+                                    Some("Front") => tr("主视", "front"),
+                                    Some("Left") => tr("左视", "left"),
+                                    Some("Top") => tr("俯视", "top"),
+                                    _ => tr("自动", "auto"),
+                                };
+                                let shown_in = bal_rep.iter().find(|b| b.key.as_deref() == Some(k.as_str())).map(|b| b.view.clone()).unwrap_or_default();
+                                egui::ComboBox::from_id_salt(("bal-view", k.as_str())).selected_text(view_name(&e.view)).width(56.0).show_ui(ui, |ui| {
+                                    for o in [None, Some("Front".to_string()), Some("Left".to_string()), Some("Top".to_string())] {
+                                        let lab = view_name(&o);
+                                        ui.selectable_value(&mut e.view, o, lab);
+                                    }
+                                })
+                                .response
+                                .on_hover_text(t!("上次标在: {}", "Last placed in: {}", view_name(&Some(shown_in))));
+                                if e.is_default() {
+                                    s.balloons.remove(&k);
+                                } else {
+                                    s.balloons.insert(k.clone(), e);
+                                }
+                                ui.end_row();
+                            }
+                        });
+                    });
+                    ui.label(
+                        egui::RichText::new(tr(
+                            "序号按位置顺时针重新编号, 明细表跟着排; 改名称 / 数量只改这张图(BOM 不变); 改完点「出图」",
+                            "Balloons are renumbered clockwise by position and the parts list follows; name / qty edits apply to this drawing only (not the BOM); click Draw to apply",
+                        ))
+                        .size(11.0)
+                        .color(COL_MUTED),
+                    );
+                });
+        }
+        // ---- 技术要求(零件图 / 装配图): 默认 = 规范 + 按配合自动加的条目; 改了存本图, 可设为自己的默认 ----
+        let mut tech_pref: Option<Option<Vec<String>>> = None;
+        if !tech_used.is_empty() || s.tech.is_some() {
+            egui::CollapsingHeader::new(if s.tech.is_some() { tr("技术要求(已改)", "Technical requirements (edited)") } else { tr("技术要求", "Technical requirements") })
+                .id_salt("draw-tech")
+                .show(ui, |ui| {
+                    let cur = s.tech.clone().unwrap_or_else(|| tech_used.clone());
+                    let cur_text = pla_ui::drawing::tech_text(&cur);
+                    let buf = self.draw_buf.entry("tech".into()).or_insert_with(|| cur_text.clone());
+                    let te = ui.add(egui::TextEdit::multiline(buf).desired_rows(6).desired_width(f32::INFINITY));
+                    if te.lost_focus() {
+                        let l = pla_ui::drawing::tech_lines(buf);
+                        if l.is_empty() || l == tech_def {
+                            s.tech = None;
+                        } else if l != cur {
+                            s.tech = Some(l);
+                        }
+                    } else if !te.has_focus() {
+                        *buf = cur_text;
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.add_enabled(s.tech.is_some(), egui::Button::new(tr("恢复默认", "Reset")).small()).clicked() {
+                            s.tech = None;
+                            self.draw_buf.remove("tech");
+                        }
+                        if ui
+                            .small_button(tr("设为我的默认", "Make my default"))
+                            .on_hover_text(if pla_ui::drawing::is_asm(&key) { tr("以后所有装配图都用这段(配合条目不再自动加)", "Used for every assembly drawing from now on (fit lines are no longer added automatically)") } else { tr("以后所有零件图都用这段(配合面粗糙度不再自动加)", "Used for every part drawing from now on (fit roughness is no longer added automatically)") })
+                            .clicked()
+                        {
+                            tech_pref = Some(Some(pla_ui::drawing::tech_lines(&pla_ui::drawing::tech_text(&cur))));
+                        }
+                        if ui.small_button(tr("清除我的默认", "Clear my default")).clicked() {
+                            tech_pref = Some(None);
+                        }
+                    });
+                    ui.label(egui::RichText::new(tr("一行一条; 默认会按配合加条目(装配图: 压装 / 压入 / 灵活; 零件图: 配合面粗糙度)", "One line per item; by default lines are added from the fits (assembly: press / push fit / free running; part: fit-surface roughness)")).size(11.0).color(COL_MUTED));
+                });
+        }
+        if let Some(t) = tech_pref {
+            let t_is_set = t.is_some();
+            let mut p = self.prefs_get().clone();
+            if pla_ui::drawing::is_asm(&key) {
+                p.tech_asm = t;
+            } else {
+                p.tech_part = t;
+            }
+            if t_is_set {
+                s.tech = None; // 本图跟着默认走
+                self.draw_buf.remove("tech");
+            }
+            self.prefs_set(p);
+        }
+        let pref_title = self.prefs_get().title.clone();
+        let mut title_pref = false;
         // ---- 标题栏 + 螺纹规则 + 密度 ----
         egui::CollapsingHeader::new(tr("标题栏 / 螺纹 / 重量", "Title block / threads / weight")).id_salt("draw-title").show(ui, |ui| {
+            if ui
+                .small_button(tr("设计 / 审核 / 项目 / 表处 / 硬度 / 版本 设为默认", "Make designer / reviewer / project / finish / hardness / version my default"))
+                .on_hover_text(tr("以后每张新图的这些栏自动填(本图填了的优先)", "These fields are filled in on every drawing (this drawing's own values win)"))
+                .clicked()
+            {
+                title_pref = true;
+            }
             egui::Grid::new("draw-title-grid").num_columns(2).spacing([8.0, 3.0]).show(ui, |ui| {
                 for (id, zh, en) in DRAW_TITLE_FIELDS {
                     ui.label(egui::RichText::new(tr(zh, en)).color(COL_MUTED));
-                    let from_bom = bom_title.get(*id).cloned().unwrap_or_default();
+                    let from_bom = bom_title.get(*id).or_else(|| pref_title.get(*id)).cloned().unwrap_or_default();
                     let cur = s.title.get(*id).cloned().unwrap_or_default();
                     let buf = self.draw_buf.entry(format!("t|{id}")).or_insert_with(|| cur.clone());
                     let te = ui.add(egui::TextEdit::singleline(buf).hint_text(from_bom.clone()).desired_width(200.0).text_color(COL_ACCENT));
@@ -5124,6 +5386,20 @@ impl PlaApp {
                 ui.end_row();
             });
         });
+        if title_pref {
+            let mut p = self.prefs_get().clone();
+            for f in pla_ui::drawing::PREF_TITLE_FIELDS {
+                match s.title.get(*f).map(|v| v.trim().to_string()).filter(|v| !v.is_empty()) {
+                    Some(v) => {
+                        p.title.insert(f.to_string(), v);
+                    }
+                    None => {
+                        p.title.remove(*f);
+                    }
+                }
+            }
+            self.prefs_set(p);
+        }
         // ---- 尺寸: 列表 / 点预览选中 → 不标 / 关键尺寸 * / 改文字(重出后生效) ----
         let placed: Vec<pla_ui::drawing::Placed> = self.draw_report.as_ref().filter(|(k, _)| *k == key).map(|(_, r)| r.placed.clone()).unwrap_or_default();
         let sel_dim = self.draw_buf.get("dimsel").cloned().unwrap_or_default();
@@ -5176,6 +5452,7 @@ impl PlaApp {
                 });
         }
         if s != orig {
+            s.edits += 1; // D6 指标: 人修正的次数
             self.draw_sheets.upsert(s.clone());
             self.draw_save();
         }
@@ -5198,9 +5475,19 @@ impl PlaApp {
                 if let Some(pos) = r.interact_pointer_pos() {
                     let fx = ((pos.x - r.rect.left()) / r.rect.width()) as f64;
                     let fy = ((pos.y - r.rect.top()) / r.rect.height()) as f64;
-                    let hit = pla_ui::drawing::nearest_dim(&placed, paper, fx, fy).map(|p| p.name.clone()).unwrap_or_default();
-                    self.draw_buf.insert("dimsel".into(), hit);
+                    if let Some(b) = pla_ui::drawing::nearest_balloon(&bal_rep, paper, fx, fy) {
+                        self.draw_buf.insert("balsel".into(), b.key.clone().unwrap_or_default());
+                    } else {
+                        let hit = pla_ui::drawing::nearest_dim(&placed, paper, fx, fy).map(|p| p.name.clone()).unwrap_or_default();
+                        self.draw_buf.insert("dimsel".into(), hit);
+                        self.draw_buf.insert("balsel".into(), String::new());
+                    }
                 }
+            }
+            // 选中的序号: 圈出来
+            if let Some(b) = bal_rep.iter().find(|b| !bal_sel.is_empty() && b.key.as_deref() == Some(bal_sel.as_str())) {
+                let c = egui::pos2(r.rect.left() + (b.at[0] / paper[0]) as f32 * r.rect.width(), r.rect.top() + (1.0 - b.at[1] / paper[1]) as f32 * r.rect.height());
+                ui.painter().circle_stroke(c, 12.0, egui::Stroke::new(2.0_f32, COL_ACCENT));
             }
             // 选中的尺寸: 在预览上圈出来
             if let Some(p) = placed.iter().find(|p| !sel_dim.is_empty() && p.name == sel_dim) {

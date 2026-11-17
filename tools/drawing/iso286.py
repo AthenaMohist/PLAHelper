@@ -148,7 +148,104 @@ def split_fit(fit):
     return a.strip(), b.strip()
 
 
+def fit_kind(d, fit):
+    """配合性质: "clearance"(间隙)/ "transition"(过渡)/ "interference"(过盈); 返回 (性质, 最小间隙, 最大间隙) 毫米(负 = 过盈)。"""
+    h, s = split_fit(fit)
+    ES, EI = limits(d, h)
+    es, ei = limits(d, s)
+    cmin, cmax = round(EI - es, 4), round(ES - ei, 4)
+    kind = "clearance" if cmin >= 0 else ("interference" if cmax <= 0 else "transition")
+    return kind, cmin, cmax
+
+
+def grade_of(code):
+    m = CODE.match(code or "")
+    return int(m.group(2)) if m else None
+
+
+def ra_for(code):
+    """配合面粗糙度经验值: IT5–6 → Ra0.8, IT7 → Ra1.6, IT8–9 → Ra3.2(GB/T 1031 推荐的常用对应)。"""
+    g = grade_of(code)
+    if g is None:
+        return None
+    return "0.8" if g <= 6 else ("1.6" if g == 7 else "3.2")
+
+
+def asm_tech(fits, dia="⌀"):
+    """装配图技术要求里按配合加的条目(fits = [(d, "H7/g6"), …], 同性质合并成一条)。"""
+    by = {"interference": [], "transition": [], "clearance": []}
+    for d, code in fits:
+        try:
+            k, _, _ = fit_kind(d, code)
+        except ValueError:
+            continue
+        txt = "%s%s %s" % (dia, ("%.2f" % d).rstrip("0").rstrip("."), code)
+        if txt not in by[k]:
+            by[k].append(txt)
+    out = []
+    if by["interference"]:
+        out.append("过盈配合 %s 压装或热装（孔件加热80~120℃），不得锤击；" % "、".join(by["interference"]))
+    if by["transition"]:
+        out.append("过渡配合 %s 用压具或铜棒均匀压入，不得硬敲；" % "、".join(by["transition"]))
+    if by["clearance"]:
+        out.append("间隙配合 %s 装配后转动/滑动灵活，无卡滞；" % "、".join(by["clearance"]))
+    return out
+
+
+def text_w(s):
+    """文字宽度(字高为单位): 汉字 1, 其余约 0.55。"""
+    return sum(1.0 if ord(ch) > 0x2E80 else 0.55 for ch in s)
+
+
+def wrap(lines, max_w):
+    """技术要求框放不下的行折成续行(续行不编号, 缩进两格)。"""
+    out = []
+    for l in lines:
+        cur = ""
+        for ch in l:
+            if text_w(cur + ch) > max_w and cur:
+                out.append(cur)
+                cur = "  "
+            cur += ch
+        out.append(cur)
+    return out
+
+
+def part_tech(fits, dia="⌀"):
+    """零件图技术要求里按公差加的条目(fits = [(d, "H7"), …]): 配合面粗糙度。"""
+    by = {}
+    for d, code in fits:
+        ra = ra_for(code)
+        if ra:
+            t = "%s%s%s" % (dia, ("%.2f" % d).rstrip("0").rstrip("."), code)
+            if t not in by.setdefault(ra, []):
+                by[ra].append(t)
+    if not by:
+        return []
+    # 一条写完(技术要求框只有 12 行)
+    return ["配合面粗糙度 %s；" % "，".join("%s Ra%s" % ("、".join(v), ra) for ra, v in sorted(by.items()))]
+
+
+def numbered(lines, extra):
+    """默认技术要求(“1.xxx” 编号, 续行不编号)后面接着编号加 extra。"""
+    n = 0
+    for l in lines:
+        m = re.match(r"^\s*(\d+)\s*[.、．]", l)
+        if m:
+            n = max(n, int(m.group(1)))
+    out = list(lines)
+    for e in extra:
+        n += 1
+        out.append("%d.%s" % (n, e))
+    return out
+
+
 if __name__ == "__main__":
+    assert fit_kind(10, "H7/g6")[0] == "clearance" and fit_kind(20, "H7/k6")[0] == "transition" and fit_kind(25, "H7/p6")[0] == "interference"
+    assert fit_kind(100, "H7/h6") == ("clearance", 0.0, 0.057)
+    assert numbered(["1.a；", "续", "2.b"], ["c"]) == ["1.a；", "续", "2.b", "3.c"]
+    assert wrap(["一二三四五"], 3.2) == ["一二三", "  四五"]
+    assert part_tech([(20, "k6"), (100, "H7")]) == ["配合面粗糙度 ⌀20k6 Ra0.8，⌀100H7 Ra1.6；"], part_tech([(20, "k6"), (100, "H7")])
     # 标准表里的已知值(µm → mm)
     cases = [
         (10, "H7", (0.015, 0.0)), (10, "g6", (-0.005, -0.014)), (25, "p6", (0.035, 0.022)), (25, "H7", (0.021, 0.0)),
