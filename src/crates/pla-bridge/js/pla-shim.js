@@ -1408,23 +1408,34 @@
     return loop();
   }
 
+  // 事务记在页面级 __PLA_PAGE__ 上(跨垫片实例存续): 实测 2026-11-17, begin 之后垫片热替换(版本变了)→ 记录丢了, rollback 报 no transaction。
   def('hist.begin', 'hist.write', function () {
-    state.tx = markNow();
-    return { depth: state.tx.depth };
+    pageState().tx = markNow();
+    return { depth: pageState().tx.depth };
   });
 
   def('hist.commit', 'hist.write', function () {
-    var had = !!state.tx;
-    var d = had ? undoStack().length - state.tx.depth : 0;
-    state.tx = null;
+    var p = pageState(), had = !!p.tx;
+    var d = had ? undoStack().length - p.tx.depth : 0;
+    p.tx = null;
     return { committed: had, steps: d };
   });
 
   // 回滚当前事务(hist.begin 之后的全部步骤, 含期间用户自己的操作); 结束事务。
   def('hist.rollback', 'hist.write', function () {
-    if (!state.tx) throw new Error('no transaction (call hist.begin first)');
-    var mark = state.tx;
-    return rollbackTo(mark).then(function (n) { state.tx = null; return { undone: n, depth: undoStack().length }; });
+    var p = pageState();
+    if (!p.tx) throw new Error('no transaction (call hist.begin first)');
+    var mark = p.tx;
+    return rollbackTo(mark).then(function (n) { p.tx = null; return { undone: n, depth: undoStack().length }; });
+  }, { async: true });
+
+  // 撤销最近 steps 步(同 Ctrl+Z, 逐步确认)。
+  def('hist.undo', 'hist.write', function (a) {
+    var steps = Math.floor(Number((a || {}).steps || 1));
+    var s = undoStack();
+    if (!(steps >= 1) || steps > s.length) throw new Error('steps must be 1..' + s.length);
+    var mark = { depth: s.length - steps, base: Array.from(s).slice(0, s.length - steps) };
+    return rollbackTo(mark).then(function (n) { return { undone: n, depth: undoStack().length }; });
   }, { async: true });
 
   // 工厂挂载状态(只读): 供 Rust 判断要不要让代理拍快照、自检显示。
@@ -1917,17 +1928,27 @@
       c.orbit.radius = R; c.orbit.radiusEnd = R;
       c.orbit.zoom = zoom; c.orbit.zoomEnd = zoom;
       API['cam.set'].fn(c);
-      // 先空渲一帧: 刚切到正交后的第一帧有时还是旧相机(实测 2026-11-17: 同参数第一次截到整个场景, 第二次才对准)
-      API['cam.thumbnail'].fn({ maxWidth: 16 });
+      // shot: false = 只摆相机、不截(调用方隔一个任务再 cam.thumbnail, 然后 cam.viewRestore)。
+      // 实测 2026-11-17(窗口可见时): 同一个同步调用里 set 完立刻渲染, 画面还是旧相机; 隔开一次调用再截就对了。
+      if (a.shot === false) {
+        return { view: name, target: center.map(function (x) { return sig7(x / k); }), zoom: sig7(zoom), prev: c0, toggled: toggled };
+      }
       shot = API['cam.thumbnail'].fn({ maxWidth: a.maxWidth || 960 });
     } finally {
-      if (!a.keep) {
+      if (!a.keep && a.shot !== false) {
         API['cam.set'].fn(c0);
         if (toggled) invokeOn('vp.togglePerspective', [], V);
       }
     }
     return { view: name, data: shot.data, width: shot.width, height: shot.height,
              target: center.map(function (x) { return sig7(x / k); }), zoom: sig7(zoom), restored: !a.keep };
+  });
+  // cam.view {shot: false} 之后还原: 相机 + 投影模式(切过正交才切回)。
+  def('cam.viewRestore', 'cam.write', function (a) {
+    a = a || {};
+    if (a.prev) API['cam.set'].fn(a.prev);
+    if (a.toggled) invokeOn('vp.togglePerspective', [], viewport());
+    return { restored: true };
   });
 
   // =====================================================================

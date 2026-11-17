@@ -90,8 +90,8 @@ bool: union | subtract | intersect with targets [solid refs]. Give a step id: \"
             "points": {"type": "array", "items": {"type": "object"}}, "stack": {"type": "array", "items": {"type": "string"}}, "units": {"type": "string"}},
           "required": ["face", "d"]}},
         {"name": "model_transaction", "annotations": {"destructiveHint": true},
-         "description": "Group several model_exec / model_hole calls so they can be undone together. action=begin (remember the undo depth) → work → commit (keep) or rollback (undo everything since begin, including anything the user did in between; refused if the undo stack below begin was changed). action=state = undo / redo depth.",
-         "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["begin", "commit", "rollback", "state"]}}, "required": ["action"]}}
+         "description": "Group several model_exec / model_hole calls so they can be undone together. action=begin (remember the undo depth) → work → commit (keep) or rollback (undo everything since begin, including anything the user did in between; refused if the undo stack below begin was changed). action=undo with steps = undo the last N steps (like Ctrl+Z). action=state = undo / redo depth. The transaction survives shim updates (kept on the page).",
+         "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["begin", "commit", "rollback", "undo", "state"]}, "steps": {"type": "integer", "description": "for undo: how many steps (default 1)"}}, "required": ["action"]}}
     ])
 }
 
@@ -177,6 +177,7 @@ fn call_model_tool(name: &str, a: &Value) -> Option<Value> {
             "begin" => call(api::HIST_BEGIN, Value::Null),
             "commit" => call(api::HIST_COMMIT, Value::Null),
             "rollback" => call(api::HIST_ROLLBACK, Value::Null),
+            "undo" => call(api::HIST_UNDO, json!({"steps": a["steps"].as_u64().unwrap_or(1)})),
             "state" => call(api::HIST_STATE, Value::Null),
             x => err(format!("unknown action {x}")),
         },

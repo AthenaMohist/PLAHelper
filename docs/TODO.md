@@ -668,8 +668,9 @@
 - [~] **A6 MCP 服务**（2026-11-17，pla-mcp，know-how/mcp-tools.md）：model_state（hist + 选择 + geo.query）/ model_snaps / model_measure /
       model_view（图片）/ model_exec（cmd.exec，默认 atomic）/ model_hole（hole.make）/ model_transaction（hist.begin/commit/rollback/state），
       直接经 CDP 连 Plasticity（pla-ui 在跑就用它吸附的窗口），不需要 pla-ui。只读工具真机验证过（encoder calibrator bkp）；
-      顺手修了 cam.view 第一帧旧相机（先空渲一帧）。**待做**：在 model1 副本上跑一遍改模型路径（P1 验收：一句话建 L 形支架 → 查面 → 量孔距 →
-      截图；失败回滚），要 Plasticity 窗口可见、用户不在操作。
+      ✅ **P1 验收通过**（2026-11-17，model1，know-how/mcp-tools.md「P1 验收」）：建 L 形支架 → 查面 → 打两孔 → 量孔距 18.000 → 截图 →
+      失败步整次撤回 → 事务回滚，model1 回到原样。过程中修了：截图分三步（摆相机 / 隔开截 / 还原，原来窗口可见时截到旧相机）、
+      事务记录挪到页面级（垫片热替换不再丢）、新增 hist.undo {steps}（model_transaction action=undo）。
 
 **P2 规格层**（验收: 同一份规格改一个参数后重放, 几何与 checks 全部吻合）
 - [ ] **A7 规格 JSON schema**：参数表、基准、特征序列（语义 id）、checks、intent；从图纸开始先出"参数表 + 疑点"。

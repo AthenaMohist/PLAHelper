@@ -93,11 +93,15 @@ pub mod api {
     pub const HIST_BEGIN: &str = "hist.begin";
     pub const HIST_ROLLBACK: &str = "hist.rollback";
     pub const HIST_COMMIT: &str = "hist.commit";
+    /// 撤销最近 N 步(同 Ctrl+Z, 逐步确认; 窗口不可见拒绝)。
+    pub const HIST_UNDO: &str = "hist.undo";
     /// A2: 吸附点(测量 / 自由移动命令的那批点)与测量(距离 / 角度 / 面积体积质心)。
     pub const GEO_SNAPS: &str = "geo.snaps";
     pub const GEO_MEASURE: &str = "geo.measure";
     /// A5: 指定视角截图(对准物体, 截完还原视角)。
     pub const CAM_VIEW: &str = "cam.view";
+    /// A5: cam.view {shot: false} 之后还原相机 + 投影(截图分三步: 摆相机 → 隔一次调用截 → 还原)。
+    pub const CAM_VIEW_RESTORE: &str = "cam.viewRestore";
     /// N3: 面的可改尺寸(平面厚度 / 圆柱半径 + 偏移系数)。
     pub const DIM_FACE: &str = "dim.face";
     /// N3: 面高亮(叠加网格, 不动选择; 空列表 = 清除)。
@@ -131,7 +135,7 @@ pub mod api {
         CORE_PROBE, CORE_HEALTH, CORE_APIS, SEL_SNAPSHOT, HIST_STATE, CAM_GET, CAM_SET, CMD_DISPATCH,
         CMD_PING, ERR_LAST, TREE_LIST, SEL_CANCEL_COMMAND, SEL_CLEAR, SEL_APPLY, CAM_NAVIGATE, CAM_RENDER, CAM_THUMBNAIL, CAM_VP_RECT,
         CAM_SET_ORBIT_STEP, CAM_ROLL, KEYMAP_SET_BINDINGS, VP_SAVE, VP_RESTORE, MAT_SAVE, MAT_RESTORE, CMD_EXEC, CMD_FACTORIES,
-        GEO_QUERY, HIST_BEGIN, HIST_ROLLBACK, HIST_COMMIT, GEO_SNAPS, GEO_MEASURE, CAM_VIEW, DIM_FACE, VIEW_HIGHLIGHT, DIM_DISTANCE, DIM_SIGNATURE, GEO_RESOLVE,
+        GEO_QUERY, HIST_BEGIN, HIST_ROLLBACK, HIST_COMMIT, HIST_UNDO, GEO_SNAPS, GEO_MEASURE, CAM_VIEW, CAM_VIEW_RESTORE, DIM_FACE, VIEW_HIGHLIGHT, DIM_DISTANCE, DIM_SIGNATURE, GEO_RESOLVE,
         DIM_RECORD, DIM_MEASURE, DIM_FACES, UI_RCLICK, HOLE_MAKE, CFG_SAVE, CFG_RESTORE, BOM_SCAN, FILE_EXPORT_STEP, FILE_EXPORT_RESTORE,
     ];
 }

@@ -64,11 +64,34 @@ pub async fn export_step_once(cdp_port: u16, hwnd: isize, path: &str, ids: &[Str
 }
 
 /// A5 CLI 用: 指定视角截图 → (PNG 字节, 回包去掉 data 后的其余字段)。
+/// 分三步(实测 2026-11-17, 窗口可见时): 摆相机(cam.view shot:false)→ 隔几帧再单独截(cam.thumbnail)→ 还原(cam.viewRestore)。
+/// 同一个同步调用里摆完立刻截, 画面还是旧相机。还原一定做(截图失败也还原)。
 pub async fn view_png_once(cdp_port: u16, hwnd: isize, args: &Value) -> anyhow::Result<(Vec<u8>, Value)> {
-    let mut v = call_once(cdp_port, hwnd, api::CAM_VIEW, args).await?;
-    let b64 = v["data"].as_str().ok_or_else(|| anyhow::anyhow!("cam.view: no image data"))?.to_string();
+    let mut ws = tokio::time::timeout(Duration::from_secs(8), connect_page(cdp_port, hwnd))
+        .await
+        .map_err(|_| anyhow::anyhow!("connect timeout (8s)"))??;
+    let mut mid: u64 = 100;
+    eval_roundtrip(&mut ws, &mut mid, &shim::install_expr()).await?;
+    let mut a = args.clone();
+    a["shot"] = json!(false);
+    let raw = eval_roundtrip(&mut ws, &mut mid, &shim::call_expr(api::CAM_VIEW, &a)).await?;
+    let mut v = shim::parse_reply(&raw)?;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let width = args.get("maxWidth").cloned().unwrap_or(json!(960));
+    let shot = match eval_roundtrip(&mut ws, &mut mid, &shim::call_expr(api::CAM_THUMBNAIL, &json!({ "maxWidth": width }))).await {
+        Ok(raw) => shim::parse_reply(&raw).map_err(|e| anyhow::anyhow!(e)),
+        Err(e) => Err(e),
+    };
+    let restore = json!({ "prev": v["prev"].clone(), "toggled": v["toggled"].clone() });
+    let restored = eval_roundtrip(&mut ws, &mut mid, &shim::call_expr(api::CAM_VIEW_RESTORE, &restore)).await.is_ok();
+    let shot = shot?;
+    let b64 = shot["data"].as_str().ok_or_else(|| anyhow::anyhow!("cam.thumbnail: no image data"))?.to_string();
     if let Some(o) = v.as_object_mut() {
-        o.remove("data");
+        o.remove("prev");
+        o.remove("toggled");
+        o.insert("width".into(), shot["width"].clone());
+        o.insert("height".into(), shot["height"].clone());
+        o.insert("restored".into(), json!(restored));
     }
     Ok((crate::cdp::base64_decode(&b64)?, v))
 }
