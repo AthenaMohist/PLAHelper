@@ -76,12 +76,16 @@ pub async fn view_png_once(cdp_port: u16, hwnd: isize, args: &Value) -> anyhow::
     a["shot"] = json!(false);
     let raw = eval_roundtrip(&mut ws, &mut mid, &shim::call_expr(api::CAM_VIEW, &a)).await?;
     let mut v = shim::parse_reply(&raw)?;
-    tokio::time::sleep(Duration::from_millis(150)).await;
     let width = args.get("maxWidth").cloned().unwrap_or(json!(960));
-    let shot = match eval_roundtrip(&mut ws, &mut mid, &shim::call_expr(api::CAM_THUMBNAIL, &json!({ "maxWidth": width }))).await {
-        Ok(raw) => shim::parse_reply(&raw).map_err(|e| anyhow::anyhow!(e)),
-        Err(e) => Err(e),
-    };
+    // 截两次取第二张: 垫片刚注入 / 刚切正交后的头一张偶尔还是旧画面(实测 2026-11-18, 同参数第二次总是对的)
+    let mut shot = Err(anyhow::anyhow!("no capture"));
+    for _ in 0..2 {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        shot = match eval_roundtrip(&mut ws, &mut mid, &shim::call_expr(api::CAM_THUMBNAIL, &json!({ "maxWidth": width }))).await {
+            Ok(raw) => shim::parse_reply(&raw).map_err(|e| anyhow::anyhow!(e)),
+            Err(e) => Err(e),
+        };
+    }
     let restore = json!({ "prev": v["prev"].clone(), "toggled": v["toggled"].clone() });
     let restored = eval_roundtrip(&mut ws, &mut mid, &shim::call_expr(api::CAM_VIEW_RESTORE, &restore)).await.is_ok();
     let shot = shot?;

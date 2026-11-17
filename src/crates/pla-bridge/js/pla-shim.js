@@ -3545,8 +3545,18 @@
         var ext = Math.abs(b[1][i] - b[0][i]), ai = Math.abs(a[i]);
         if (ai > 1e-6) h = sig7(Math.max(0, (ext - 2 * g.radius * Math.sqrt(Math.max(0, 1 - ai * ai))) / ai));
       }
-      rev.push({ t: isCyl ? 'cyl' : 'cone', r: g.radius, h: h, tc: sig7(tc), inner: g.normal ? vdot(g.normal, rad) < 0 : false, axis: a, o: o,
-                 area: isCyl && h ? 2 * Math.PI * g.radius * h : 0 });
+      // 锥面的 radius 是参考半径(实测 2026-11-17: 沉头锥报的是小端 = 杆半径)→ 另给 rmax = 最大半径:
+      // 取与轴最垂直的世界轴方向上的包围盒宽 / (2√(1 − a_i²))(轴与世界轴对齐时精确)
+      var rmax;
+      if (isCone && g.bbox) {
+        var bb = g.bbox, j0 = [0, 1, 2].sort(function (p, q) { return Math.abs(a[p]) - Math.abs(a[q]); })[0];
+        var s0 = Math.sqrt(Math.max(0, 1 - a[j0] * a[j0]));
+        if (s0 > 1e-6) rmax = sig7(Math.abs(bb[1][j0] - bb[0][j0]) / (2 * s0));
+      }
+      var entry = { t: isCyl ? 'cyl' : 'cone', r: g.radius, h: h, tc: sig7(tc), inner: g.normal ? vdot(g.normal, rad) < 0 : false, axis: a, o: o,
+                    area: isCyl && h ? 2 * Math.PI * g.radius * h : 0 };
+      if (rmax !== undefined) entry.rmax = rmax;
+      rev.push(entry);
     });
     var out = { faces: es.length, planes: planes, len: null, rev: rev };
     if (!rev.length) return out;

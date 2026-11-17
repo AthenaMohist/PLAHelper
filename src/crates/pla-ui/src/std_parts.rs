@@ -32,6 +32,8 @@ struct Rev {
     r: f64,
     h: f64,
     inner: bool,
+    /// 锥面的最大半径(垫片 rmax; 锥的 r 是参考半径, 沉头锥报的是小端)。没有 = r。
+    rmax: f64,
     axis: [f64; 3],
     o: [f64; 3],
 }
@@ -67,9 +69,10 @@ fn m_of_washer(inner: f64) -> Option<f64> {
     M_SERIES.iter().copied().filter(|m| inner >= *m - 0.05 && inner <= m * 1.12 + 0.2).min_by(|a, b| (inner - a).abs().total_cmp(&(inner - b).abs()))
 }
 
-/// 螺钉长度: 离标准长度 ≤ 0.6 mm 取标准值, 否则取 0.5 的整倍数。
-fn std_len(l: f64) -> f64 {
-    SCREW_LEN.iter().copied().find(|s| (l - s).abs() <= 0.6).unwrap_or((l * 2.0).round() / 2.0)
+/// 螺钉长度: 离标准长度 ≤ max(0.6, 0.1 d) 取标准值(端部倒角 / 头部倒圆随规格变大), 否则取 0.5 的整倍数。
+fn std_len(l: f64, d: f64) -> f64 {
+    let tol = 0.6_f64.max(0.1 * d) + 1e-6;
+    SCREW_LEN.iter().copied().filter(|s| (l - s).abs() <= tol).min_by(|a, b| (l - a).abs().total_cmp(&(l - b).abs())).unwrap_or((l * 2.0).round() / 2.0)
 }
 
 fn spec(kind: &'static str, d: f64, l: f64, od: Option<f64>) -> StdSpec {
@@ -112,6 +115,7 @@ pub fn classify(shape: &Value) -> Option<StdSpec> {
                 r: r["r"].as_f64()?,
                 h: r["h"].as_f64().unwrap_or(0.0),
                 inner: r["inner"].as_bool().unwrap_or(false),
+                rmax: r["rmax"].as_f64().or(r["r"].as_f64())?,
                 axis: v3(&r["axis"])?,
                 o: v3(&r["o"])?,
             })
@@ -169,20 +173,20 @@ pub fn classify(shape: &Value) -> Option<StdSpec> {
         let dk = 2.0 * hd.r;
         // 没有内六角孔的台阶轴(实测 XYZ60 台阶销)不是螺钉
         if socket && dk >= 1.3 * m && dk <= 2.1 * m {
-            return Some(spec("screw-cap", m, std_len(len - hd.h), None));
+            return Some(spec("screw-cap", m, std_len(len - hd.h, m), None));
         }
         return None;
     }
-    if let Some(_c) = cones.iter().find(|c| c.r > shank.r * 1.3) {
+    if let Some(_c) = cones.iter().find(|c| !c.inner && c.rmax > shank.r * 1.3) {
         let m = m_of(2.0 * shank.r)?;
-        return Some(spec("screw-csk", m, std_len(len), None));
+        return Some(spec("screw-csk", m, std_len(len, m), None));
     }
     if all_same {
         if planes >= 6 {
             // 六角平面 + 只有一种外圆: 杆比总长短得多 = 六角头螺栓; 否则 = 内六角紧定螺钉
             let m = m_of(2.0 * shank.r)?;
             // 螺栓公称长度 = 头下到末端 ≈ 杆长(末端倒角 < 0.6 mm 由 std_len 吸收)
-            return Some(if shank.h < 0.85 * len { spec("screw-hex", m, std_len(shank.h), None) } else { spec("screw-set", m, std_len(len), None) });
+            return Some(if shank.h < 0.85 * len { spec("screw-hex", m, std_len(shank.h, m), None) } else { spec("screw-set", m, std_len(len, m), None) });
         }
         if planes <= 3 {
             return Some(spec("pin", (2.0 * shank.r * 100.0).round() / 100.0, (len * 100.0).round() / 100.0, None));
@@ -208,7 +212,7 @@ mod tests {
                 .unwrap()
                 .iter()
                 .zip(l["o"].as_array().unwrap())
-                .map(|(r, o)| json!({"t": r[0], "r": r[1], "h": r[2], "inner": r[3] == "in", "axis": l["axis"], "o": o}))
+                .map(|(r, o)| json!({"t": r[0], "r": r[1], "h": r[2], "inner": r[3] == "in", "rmax": r.get(5).cloned().filter(|x| !x.is_null()).unwrap_or(r[1].clone()), "axis": l["axis"], "o": o}))
                 .collect();
             let s = classify(&json!({"len": l["len"], "planes": l["planes"], "rev": rev}));
             println!("{} x{} → {}", l["name"], l["qty"], s.map(|s| s.key).unwrap_or("-".into()));
@@ -252,5 +256,11 @@ mod tests {
         // 实测误判排除: 磁环(内 r12.4 外 r17.1 厚 0.62)不是垫圈; 无内六角的台阶销(r3 h5.5 + r5 h3.5, 3 个平面)不是螺钉
         assert!(classify(&json!({"len": 0.62, "planes": 2, "rev": [cyl(12.4, 0.62, true), cyl(17.1, 0.62, false)]})).is_none());
         assert!(classify(&json!({"len": 10.0, "planes": 3, "rev": [cyl(3.0, 5.5, false), cyl(5.0, 3.5, false)]})).is_none());
+        // 实测(A10 宏, model1 2026-11-17): 沉头锥的 r 报小端(= 杆半径 2.5), 最大半径要看 rmax; 六角头杆长 19.4(20 − 端部倒角 0.6)仍认 20
+        let csk = json!({"t": "cone", "r": 2.5, "rmax": 5.6, "inner": false, "axis": [0, 0, 1], "o": [10, 5, 0]});
+        assert_eq!(classify(&json!({"len": 16.0, "planes": 9, "rev": [cone(2.02), cyl(2.5, 12.42, false), csk]})).unwrap().key, "screw-csk M5x16");
+        assert_eq!(classify(&json!({"len": 24.0, "planes": 9, "rev": [cone(2.4), cyl(3.0, 19.4, false)]})).unwrap().key, "screw-hex M6x20");
+        // M20 杯头: 头部倒圆 1.6 → 杆 + 倒圆仍在容差 max(0.6, 2) 内
+        assert_eq!(classify(&json!({"len": 60.0, "planes": 10, "rev": [cyl(10.0, 38.5, false), cyl(15.0, 18.4, false)]})).unwrap().key, "screw-cap M20x40");
     }
 }
