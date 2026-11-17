@@ -1719,27 +1719,38 @@ const callAsync = async (name, args) => JSON.parse(await run(`window.__PLA__.cal
   await ta('A3 hist.begin / rollback / commit: 跨多次调用的事务; begin 以下的撤销栈被动过 → 拒绝回滚', async () => {
     const ed = ed3;
     const n0 = ed.geo.items.length, u0 = ed.history._undoStack.length;
-    assert.deepStrictEqual(call('hist.begin').v, { depth: u0 });
+    assert.deepStrictEqual(call('hist.begin').v, { depth: u0, level: 1 });
     await callAsync('cmd.exec', { ops: [{ op: 'box', p1: [700, 0, 0], p2: [701, 1, 0], height: 1 }] });
     await callAsync('cmd.exec', { ops: [{ op: 'box', p1: [710, 0, 0], p2: [711, 1, 0], height: 1 }] });
     assert.strictEqual(ed.geo.items.length, n0 + 2);
     const r = await callAsync('hist.rollback');
     assert.strictEqual(r.ok, true, JSON.stringify(r));
-    assert.deepStrictEqual(r.v, { undone: 2, depth: u0 });
+    assert.deepStrictEqual(r.v, { undone: 2, depth: u0, level: 0 });
     assert.strictEqual(ed.geo.items.length, n0);
     assert.ok(/no transaction/.test((await callAsync('hist.rollback')).err), '回滚后事务结束');
     // commit
     call('hist.begin');
     await callAsync('cmd.exec', { ops: [{ op: 'box', p1: [720, 0, 0], p2: [721, 1, 0], height: 1 }] });
-    assert.deepStrictEqual(call('hist.commit').v, { committed: true, steps: 1 });
+    assert.deepStrictEqual(call('hist.commit').v, { committed: true, steps: 1, level: 0 });
     assert.ok(/no transaction/.test((await callAsync('hist.rollback')).err));
-    // 用户在事务期间撤到 begin 之前 → 拒绝, 不乱撤
+    // 嵌套(2026-11-18): 内层回滚只撤内层的步骤, 外层还能接着回滚
+    const n1 = ed.geo.items.length;
+    call('hist.begin');
+    await callAsync('cmd.exec', { ops: [{ op: 'box', p1: [750, 0, 0], p2: [751, 1, 0], height: 1 }] });
+    assert.strictEqual(call('hist.begin').v.level, 2);
+    await callAsync('cmd.exec', { ops: [{ op: 'box', p1: [760, 0, 0], p2: [761, 1, 0], height: 1 }] });
+    assert.deepStrictEqual((await callAsync('hist.rollback')).v.undone, 1, '内层');
+    assert.strictEqual(ed.geo.items.length, n1 + 1);
+    assert.deepStrictEqual((await callAsync('hist.rollback')).v, { undone: 1, depth: ed.history._undoStack.length, level: 0 }, '外层');
+    assert.strictEqual(ed.geo.items.length, n1);
+    // 用户在事务期间撤到 begin 之前 → 拒绝, 不乱撤(这一层留着, 收尾时 commit 掉)
     call('hist.begin');
     ed._undo(); ed._undo();
     const u1 = ed.history._undoStack.length;
     const bad = await callAsync('hist.rollback');
     assert.ok(/below the transaction start/.test(bad.err), bad.err);
     assert.strictEqual(ed.history._undoStack.length, u1, '一步都没撤');
+    call('hist.commit');
     // 栈深度够、但 begin 以下的某项被换掉(撤了再做了别的)→ 同样拒绝
     call('hist.begin');
     ed._undo();

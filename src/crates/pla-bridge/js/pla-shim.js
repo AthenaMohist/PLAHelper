@@ -1560,24 +1560,30 @@
   }
 
   // 事务记在页面级 __PLA_PAGE__ 上(跨垫片实例存续): 实测 2026-11-17, begin 之后垫片热替换(版本变了)→ 记录丢了, rollback 报 no transaction。
+  // 事务可嵌套(栈): begin 压栈, commit / rollback 弹最里层 —— 外层(例如还没收尾的测试事务)不受影响(2026-11-18)。
+  function txStack() {
+    var p = pageState();
+    if (!p.txs) { p.txs = p.tx ? [p.tx] : []; p.tx = null; }
+    return p.txs;
+  }
+
   def('hist.begin', 'hist.write', function () {
-    pageState().tx = markNow();
-    return { depth: pageState().tx.depth };
+    var s = txStack(), m = markNow();
+    s.push(m);
+    return { depth: m.depth, level: s.length };
   });
 
   def('hist.commit', 'hist.write', function () {
-    var p = pageState(), had = !!p.tx;
-    var d = had ? undoStack().length - p.tx.depth : 0;
-    p.tx = null;
-    return { committed: had, steps: d };
+    var s = txStack(), m = s.pop();
+    return { committed: !!m, steps: m ? undoStack().length - m.depth : 0, level: s.length };
   });
 
-  // 回滚当前事务(hist.begin 之后的全部步骤, 含期间用户自己的操作); 结束事务。
+  // 回滚最里层事务(它 begin 之后的全部步骤, 含期间用户自己的操作); 结束这一层。
   def('hist.rollback', 'hist.write', function () {
-    var p = pageState();
-    if (!p.tx) throw new Error('no transaction (call hist.begin first)');
-    var mark = p.tx;
-    return rollbackTo(mark).then(function (n) { p.tx = null; return { undone: n, depth: undoStack().length }; });
+    var s = txStack();
+    if (!s.length) throw new Error('no transaction (call hist.begin first)');
+    var mark = s[s.length - 1];
+    return rollbackTo(mark).then(function (n) { s.pop(); return { undone: n, depth: undoStack().length, level: s.length }; });
   }, { async: true });
 
   // 撤销最近 steps 步(同 Ctrl+Z, 逐步确认)。

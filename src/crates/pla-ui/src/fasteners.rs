@@ -97,7 +97,8 @@ fn row<T: Copy>(table: &[T], d: f64, key: impl Fn(&T) -> f64, what: &str) -> Res
     })
 }
 
-fn pitch(d: f64) -> f64 {
+/// 粗牙螺距(没有就按 0.15 d)。
+pub fn pitch(d: f64) -> f64 {
     PITCH.iter().find(|p| (p.0 - d).abs() < 1e-9).map(|p| p.1).unwrap_or(0.15 * d)
 }
 

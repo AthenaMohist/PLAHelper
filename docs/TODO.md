@@ -16,6 +16,18 @@
 
 ---
 
+## T — 待测（用户 2026-11-18 记录：两组测试挂起，开发先往前走）
+
+- [ ] **T1 出图流水线全面测评**：在真实项目上把整条链跑一遍并打分 ——
+      BOM 扫描 → 零件库链接 / 标准件识别 → 批量出图（零件图 + 装配图）→ 逐张核对（视图选择、尺寸完整 / 重复 / 位置、孔标注、螺纹、剖视、公差、技术要求、标题栏）
+      → 修正（逐个尺寸编辑 / 补尺寸 / 出图助手一句话改多张）→ 上传图纸锁定 → 改模型后增量更新 → 外发包（分供应商 BOM + 文件）→ 版本 / ECN。
+      产出：问题清单（按严重程度）+ 每张图的可用度评分；已知待看：标准件单张出图标注差（螺钉图上莫名的「60」、内六角十字）。
+      需要：用户指定项目文档；全程不改模型（除了"改模型后增量更新"那一步，在副本上做）。
+- [ ] **T2 MCP 效果测试**：在 Claude Code 里只用 pla-mcp 工具完成真实任务，评估工具是否够用、好不好用 ——
+      出图类（list_parts / get_drawing / apply_drawing_changes / draw：一句话改多张、改完重出、对照预览图核对）；
+      建模类（model_state / measure / view / exec / hole / part / transaction：按描述建零件、装配位置放标准件、失败回滚）。
+      产出：任务成功率、轮数、出错类型、缺的工具 / 参数 / 说明。需要：Plasticity 窗口可见（建模类），model1 或副本。
+
 ## Q — 快速见效
 
 - [x] **Q1 方向键步进旋转**（R14 完成，CDP 实测 + 用户手按确认 2026-11-13）
@@ -677,8 +689,16 @@
       事务记录挪到页面级（垫片热替换不再丢）、新增 hist.undo {steps}（model_transaction action=undo）。
 
 **P2 规格层**（验收: 同一份规格改一个参数后重放, 几何与 checks 全部吻合）
-- [ ] **A7 规格 JSON schema**：参数表、基准、特征序列（语义 id）、checks、intent；从图纸开始先出"参数表 + 疑点"。
-- [ ] **A8 编译器**：规格 → 步骤，逐步执行、解析语义引用（`face(base.top)`、`edge(a.top, b.inner)`）、失败回滚并报特征。
+- [~] **A7 规格 JSON schema**：参数表、基准、特征序列（语义 id）、checks、intent；从图纸开始先出"参数表 + 疑点"。
+- [~] **A8 编译器**：规格 → 步骤，逐步执行、解析语义引用（`face(base.top)`、`edge(a.top, b.inner)`）、失败回滚并报特征。
+      2026-11-18（`pla_ui::spec` + pla-mcp `model_build`）：参数可写表达式（`w - 2*t`）和标准引用（`M3.clearance` GB/T 5277 / `M4.tap` / `M4.d`）；
+      特征 box / cylinder / revolve / prism / part（A10 宏）/ hole（on 面引用 + at / positions / pattern 网格）/ fillet / chamfer；
+      bool + into = 并进某个先前特征的体；语义引用 `face(特征.top/bottom/left/right/front/back)` 在**该特征自己的范围**里找当前几何的面
+      （合并后 face(base.top) 仍是底板顶面，不是立板顶面），`edge(face(..), face(..))` = 两面交线上的边；checks = bbox / count / volume。
+      逐特征执行：每步前按需查几何、执行后记体 → 实体 id；任何特征或验收失败 → 整次回滚并报是哪个。存 `<文档>/.pla/models/<doc>/specs/`
+      （spec / map（体、实体 id、撤销区间）/ log.jsonl）；replace = 上次这份规格的产物还在撤销栈顶就先撤掉再建（= 改参数重放）。
+      事务改成可嵌套（栈）：外层没收尾的事务不受影响。单元测试 3 项（表达式 / 合并后面引用 / 圆角边 / 孔阵列 / 验收）+ 契约测试（嵌套事务）。
+      **待做**：model1 真机跑 L 形支架规格 + 改参数 replace 重放（P2 验收；窗口要可见），归进 T2。
 - [~] **A9 映射表**（地基已由 N3d 建立：`dim.signature` / `geo.resolve` + `.pla/models/<doc_key>/`）：`.pla/models/<doc_key>/{spec.json, map.json, log.jsonl}`；语义名 → 解析规则 + 几何签名 + 最近编号缓存；
       重放。调研 `store.version2stable` 能否给稳定 id。N3 尺寸驱动是它的第一个用户。
 - [~] **A10 特征宏** 5–10 个：带孔安装板、L 形支架、凸台加筋、沉头孔、抽壳外壳、螺丝柱（选题待用户定零件类别）。

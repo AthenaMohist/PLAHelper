@@ -99,6 +99,20 @@ bool: union | subtract | intersect with targets [solid refs]. Give a step id: \"
             "steps": {"type": "array", "items": {"type": "array", "items": {"type": "number"}}}, "chamfer": {"type": "number"},
             "at": {"type": "array", "items": {"type": "number"}}, "axis": {"type": "array", "items": {"type": "number"}}},
           "required": ["kind"]}},
+        {"name": "model_build", "annotations": {"destructiveHint": true},
+         "description": "CHANGES THE USER'S MODEL. Build a part from a design spec (A7/A8): params (numbers or expressions like \"w - 2*t\"; standard refs M3.clearance / M4.tap / M4.d) + features in order + checks. Everything runs in one transaction: any failing feature or check rolls the whole build back and reports which one.\n\
+features (every one needs a unique id; numbers may be expressions):\n\
+- box {size [x,y,z], at [x,y,z] (min corner)}\n\
+- cylinder {d | r, h, at (base centre), axis?=[0,0,1]}\n\
+- revolve / prism - same fields as model_exec\n\
+- part {kind, size, length, at, axis} - a GB standard part (see model_part), separate solid\n\
+- hole {on: \"face(<feature>.<side>)\", d, depth? (omit = through), kind? simple|counterbore|countersink, cbD, cbDepth, cskD, and at [x,y,z] | positions [[x,y,z],…] | pattern {start, grid [nu,nv], pitch [pu,pv]} (u/v = the hole tool's in-plane axes: for a +Z face u = +X, v = +Y)}\n\
+- fillet / chamfer {edges: [\"edge(face(a.top), face(b.right))\", …], r}\n\
+box / cylinder / revolve / prism take bool union|subtract|intersect with into: <earlier feature id> (they join that feature's body).\n\
+Semantic refs: face(<feature>.<side>), side = top/bottom/left/right/front/back (±Z/±X/±Y), resolved after each step against the live geometry within that feature's own extent - so face(base.top) stays the base's top even after an upright is merged on.\n\
+checks: {bbox [[min],[max]], of?, tol?=0.05} · {count {\"Cylinder\": 3}, of?} · {volume {min?, max?}, of?}.\n\
+The spec, a map (bodies, solid ids, undo range) and a log are saved under the document's .pla/models/<doc>/specs/. replace: true first undoes this spec's previous build (only if nothing else was done since).",
+         "inputSchema": {"type": "object", "properties": {"spec": {"type": "object"}, "replace": {"type": "boolean"}}, "required": ["spec"]}},
         {"name": "model_transaction", "annotations": {"destructiveHint": true},
          "description": "Group several model_exec / model_hole calls so they can be undone together. action=begin (remember the undo depth) → work → commit (keep) or rollback (undo everything since begin, including anything the user did in between; refused if the undo stack below begin was changed). action=undo with steps = undo the last N steps (like Ctrl+Z). action=state = undo / redo depth. The transaction survives shim updates (kept on the page).",
          "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["begin", "commit", "rollback", "undo", "state"]}, "steps": {"type": "integer", "description": "for undo: how many steps (default 1)"}}, "required": ["action"]}}
@@ -206,6 +220,10 @@ fn call_model_tool(name: &str, a: &Value) -> Option<Value> {
                 Err(e) => cdp_err(e),
             }
         }
+        "model_build" => match build_spec(h, a) {
+            Ok(v) => json_text(&v),
+            Err(e) => err(e),
+        },
         "model_hole" => call(api::HOLE_MAKE, pick(a, &["face", "type", "d", "depth", "cbD", "cbDepth", "cskD", "tapD", "at", "offset", "points", "stack", "units"])),
         "model_transaction" => match a["action"].as_str().unwrap_or("") {
             "begin" => call(api::HIST_BEGIN, Value::Null),
@@ -415,6 +433,154 @@ fn call_tool(name: &str, a: &Value) -> Value {
         },
         _ => err(format!("unknown tool {name}")),
     }
+}
+
+// ---------------------------------------------------------------- A7 / A8: 按规格建模(逐特征执行 + 语义引用 + 验收 + 回滚 + 存档)
+
+fn shim(h: isize, name: &str, args: Value) -> Result<Value, String> {
+    let v = rt().block_on(pla_bridge::query::call_once(CDP_PORT, h, name, &args)).map_err(|e| format!("{e:#}"))?;
+    if let Some(e) = v.get("err") {
+        return Err(e.to_string());
+    }
+    Ok(v)
+}
+
+fn specs_dir(doc_key: &str) -> std::path::PathBuf {
+    pla_ui::dims::STORE.dir(doc_key).join("specs")
+}
+
+fn build_spec(h: isize, a: &Value) -> Result<Value, String> {
+    use pla_bridge::shim::api;
+    use pla_ui::spec::{self, Action, Params, State};
+    let sp: spec::Spec = serde_json::from_value(a["spec"].clone()).map_err(|e| format!("bad spec: {e}"))?;
+    if sp.name.trim().is_empty() || sp.features.is_empty() {
+        return Err("spec needs a name and at least one feature".into());
+    }
+    let safe: String = sp.name.chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
+    let doc = bridge::read_state().ok().map(|s| s.doc_key);
+    let dir = doc.as_deref().map(specs_dir);
+    let units = sp.units.clone();
+    let with_units = |mut v: Value| {
+        if let Some(u) = &units {
+            v["units"] = json!(u);
+        }
+        v
+    };
+    // replace: 上一次按这份规格建的东西还在撤销栈顶 → 先撤掉
+    if a["replace"].as_bool() == Some(true) {
+        let map: Option<Value> = dir.as_ref().and_then(|d| std::fs::read_to_string(d.join(format!("{safe}.map.json"))).ok()).and_then(|t| serde_json::from_str(&t).ok());
+        if let Some(m) = map {
+            let (s0, s1) = (m["undo_start"].as_u64().unwrap_or(0), m["undo_end"].as_u64().unwrap_or(0));
+            let now = shim(h, api::HIST_STATE, Value::Null)?["undo"].as_u64().unwrap_or(0);
+            if now != s1 {
+                return Err(format!("replace: the previous build of {} ended at undo depth {s1}, now {now} - something else happened since; undo it yourself or build without replace", sp.name));
+            }
+            if s1 > s0 {
+                shim(h, api::HIST_UNDO, json!({"steps": s1 - s0}))?;
+            }
+        }
+    }
+    let start = shim(h, api::HIST_BEGIN, Value::Null)?["depth"].as_u64().unwrap_or(0);
+    let p = Params::new(&sp.params);
+    let mut st = State::default();
+    let mut log: Vec<Value> = Vec::new();
+    let query = |st: &State, detail: &str| -> Result<Value, String> {
+        let of: Vec<i64> = st.bodies.values().copied().collect();
+        if of.is_empty() {
+            return Ok(json!({}));
+        }
+        shim(h, api::GEO_QUERY, with_units(json!({"detail": detail, "of": of})))
+    };
+    let fail = |msg: String| -> Result<Value, String> {
+        let rb = shim(h, api::HIST_ROLLBACK, Value::Null).map(|v| format!("rolled back {} step(s)", v["undone"])).unwrap_or_else(|e| format!("ROLLBACK FAILED: {e}"));
+        Err(format!("{msg} — {rb}"))
+    };
+    let mut last_body = String::new();
+    for f in &sp.features {
+        let fid = f["id"].as_str().unwrap_or("?").to_string();
+        let ty = f["type"].as_str().unwrap_or("");
+        let geo = if matches!(ty, "fillet" | "chamfer") {
+            match query(&st, "all") {
+                Ok(g) => g,
+                Err(e) => return fail(format!("{fid}: query failed: {e}")),
+            }
+        } else {
+            json!({})
+        };
+        let c = match spec::compile(f, &p, &st, &geo) {
+            Ok(c) => c,
+            Err(e) => return fail(e),
+        };
+        st.features.insert(fid.clone(), (c.body.clone(), c.bbox));
+        for act in c.actions {
+            match act {
+                Action::Exec { ops, body } => {
+                    let script = with_units(json!({"ops": ops}));
+                    let v = match rt().block_on(pla_bridge::exec::run_once(CDP_PORT, h, &script)) {
+                        Ok(v) => v,
+                        Err(e) => return fail(format!("{fid}: {e:#}")),
+                    };
+                    if !v["failed"].is_null() {
+                        return fail(format!("{fid}: {}", v["failed"]["err"]));
+                    }
+                    let solid = v["results"].as_array().and_then(|r| r.last()).and_then(|r| r["items"].as_array()).and_then(|i| i.last()).and_then(|i| i["id"].as_i64());
+                    match solid {
+                        Some(s) => {
+                            st.bodies.insert(body.clone(), s);
+                        }
+                        None => return fail(format!("{fid}: the step produced no solid")),
+                    }
+                    log.push(json!({"feature": fid, "ops": ops, "solid": solid}));
+                    last_body = body;
+                }
+                Action::Hole { face, mut args } => {
+                    let geo = match query(&st, "faces") {
+                        Ok(g) => g,
+                        Err(e) => return fail(format!("{fid}: query failed: {e}")),
+                    };
+                    let (face_id, body) = match spec::resolve_face(&face, &st, &geo) {
+                        Ok(x) => x,
+                        Err(e) => return fail(format!("{fid}: {e}")),
+                    };
+                    args["face"] = json!(face_id);
+                    let v = match shim(h, api::HOLE_MAKE, with_units(args.clone())) {
+                        Ok(v) => v,
+                        Err(e) => return fail(format!("{fid}: hole failed: {e}")),
+                    };
+                    if let Some(new) = v["solids"].as_object().and_then(|m| m.values().last()).and_then(|x| x.as_i64()) {
+                        st.bodies.insert(body.clone(), new);
+                    }
+                    log.push(json!({"feature": fid, "hole": args}));
+                    last_body = body;
+                }
+            }
+        }
+    }
+    // 验收
+    let geo = match query(&st, "faces") {
+        Ok(g) => g,
+        Err(e) => return fail(format!("checks: query failed: {e}")),
+    };
+    let mass = |solid: i64| -> Option<f64> { shim(h, api::GEO_MEASURE, with_units(json!({"op": "mass", "of": [solid]}))).ok().and_then(|v| v["solids"][0]["volume"].as_f64()) };
+    let fails = spec::check(&sp.checks, &p, &st, &geo, &mass, &last_body);
+    if !fails.is_empty() {
+        return fail(format!("checks failed: {}", fails.join("; ")));
+    }
+    shim(h, api::HIST_COMMIT, Value::Null)?;
+    let end = shim(h, api::HIST_STATE, Value::Null)?["undo"].as_u64().unwrap_or(0);
+    let map = json!({"name": sp.name, "bodies": st.bodies, "features": st.features, "undo_start": start, "undo_end": end, "date": pla_ui::parts_lib::today()});
+    let mut saved = Value::Null;
+    if let Some(d) = &dir {
+        let _ = std::fs::create_dir_all(d);
+        let w = |n: &str, v: &Value| std::fs::write(d.join(n), serde_json::to_vec_pretty(v).unwrap_or_default());
+        let ok = w(&format!("{safe}.spec.json"), &serde_json::to_value(&sp).unwrap_or_default()).is_ok() && w(&format!("{safe}.map.json"), &map).is_ok();
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(d.join(format!("{safe}.log.jsonl"))) {
+            use std::io::Write;
+            let _ = writeln!(f, "{}", json!({"date": pla_ui::parts_lib::today(), "steps": log, "map": map}));
+        }
+        saved = json!(if ok { d.display().to_string() } else { "save failed".into() });
+    }
+    Ok(json!({"built": sp.name, "bodies": st.bodies, "steps": end.saturating_sub(start), "checks": format!("{} passed", sp.checks.len()), "saved": saved}))
 }
 
 fn report_mtime(dir: &std::path::Path, sh: &drawing::Sheets, key: &str) -> Option<std::time::SystemTime> {
