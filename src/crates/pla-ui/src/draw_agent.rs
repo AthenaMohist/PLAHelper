@@ -19,6 +19,9 @@ pub struct Patch {
     /// 一句话说明(给用户看)。
     #[serde(default)]
     pub summary: String,
+    /// 一句话改多张图: 目标零件(名称 / 料号; ["all"] = 全部自制件); 空 = 只改当前这张。
+    #[serde(default)]
+    pub parts: Vec<String>,
     /// 主视朝向: flip(上下翻转)/ rotate(转 90°)/ back(看背面)/ auto(恢复自动)。
     #[serde(default)]
     pub orient: Option<String>,
@@ -181,6 +184,7 @@ pub fn tools() -> Value {
                 "type": "object",
                 "properties": {
                     "summary": {"type": "string", "description": "One short sentence for the user, in their language"},
+                    "parts": {"type": "array", "items": {"type": "string"}, "description": "To change several sheets at once: the target parts by name or part number from [All parts], or [\"all\"] for every made (not bought) part. Omit to change only the current sheet; when set, include the current part too if it should change. Dimension names differ between sheets - for other sheets prefer settings that don't name dimensions (title, tech, density, threads, section)."},
                     "orient": {"type": "string", "enum": ["flip", "rotate", "back", "auto"], "description": "Front view orientation: flip = upside down, rotate = 90°, back = view from the opposite side, auto = automatic"},
                     "section": {"type": "boolean", "description": "Automatic section view A-A on/off"},
                     "ordinate": {"description": "Hole groups that get coordinate (position) dimensions: array of group ids, or the string \"all\" for every group in the front view", "anyOf": [{"type": "array", "items": {"type": "string"}}, {"type": "string", "enum": ["all"]}]},
@@ -223,8 +227,9 @@ What it cannot do: move individual dimensions or views to coordinates, add new d
 Plasticity with the + button), change the model. If asked for that, say briefly what the user can do instead.\n\n\
 Each user turn carries the current settings, the last compile report (placed dimensions with names and values, hole groups, warnings) and \
 usually an image of the current sheet. Refer to dimensions by the names in the report. If a request is ambiguous (which hole? which face?), \
-ask one short question instead of guessing. When the user states a general preference that should hold for future drawings, also offer \
-remember_rule. Answer in the user's language, briefly; no long explanations of drafting theory unless asked.",
+ask one short question instead of guessing. When the user asks for the same change on several sheets (\"all aluminium parts\", \"these three \
+plates\"), propose one patch with `parts` listing them from [All parts]. When the user states a general preference that should hold for future \
+drawings, also offer remember_rule. Answer in the user's language, briefly; no long explanations of drafting theory unless asked.",
     );
     if !rules.is_empty() {
         s.push_str("\n\nThe user's standing drawing rules (apply them unless the user says otherwise):\n");
@@ -239,6 +244,11 @@ remember_rule. Answer in the user's language, briefly; no long explanations of d
 
 /// 本轮的上下文(当前方案 + 报告摘要), 放在用户消息里。
 pub fn context(s: &Sheet, rep: Option<&Report>, bom_title: &BTreeMap<String, String>, uploaded_locked: bool) -> String {
+    context_with(s, rep, bom_title, uploaded_locked, &[])
+}
+
+/// 同 `context`, 再附上整个 BOM 的零件清单(一句话改多张图时模型按名字 / 料号点名)。
+pub fn context_with(s: &Sheet, rep: Option<&Report>, bom_title: &BTreeMap<String, String>, uploaded_locked: bool, all: &[crate::mcp_bridge::PartInfo]) -> String {
     let sheet = json!({
         "front": s.front, "up": s.up, "section": s.section, "ordinate": s.ordinate, "threads": s.threads, "density": s.density,
         "hidden": s.dims_hide, "key": s.dims_key, "dim_text": s.dims_text, "dim_tol": s.dims_tol, "tech": s.tech, "title": s.title,
@@ -261,7 +271,34 @@ pub fn context(s: &Sheet, rep: Option<&Report>, bom_title: &BTreeMap<String, Str
     if uploaded_locked {
         out.push_str("\n[Note] This part is locked to a drawing the user uploaded; patches only take effect after they unlock it.");
     }
+    if !all.is_empty() {
+        out.push_str("\n[All parts] ");
+        out.push_str(
+            &all.iter()
+                .map(|p| format!("{}{}{}{}", if p.pn.is_empty() { String::new() } else { format!("{} ", p.pn) }, p.name, if p.material.is_empty() { String::new() } else { format!(" ({})", p.material) }, if p.bought { " [bought]" } else { "" }))
+                .collect::<Vec<_>>()
+                .join("; "),
+        );
+    }
     out
+}
+
+/// 补丁的目标零件 key: parts 空 = 当前这张; "all" = 全部自制件; 否则按名称 / 料号找(找不到报错)。
+pub fn targets(p: &Patch, current: &str, all: &[crate::mcp_bridge::PartInfo]) -> Result<Vec<String>, String> {
+    if p.parts.is_empty() {
+        return Ok(vec![current.to_string()]);
+    }
+    if p.parts.iter().any(|x| x.eq_ignore_ascii_case("all")) {
+        return Ok(all.iter().filter(|x| !x.bought).map(|x| x.key.clone()).collect());
+    }
+    let mut out: Vec<String> = Vec::new();
+    for q in &p.parts {
+        let k = crate::mcp_bridge::resolve(all, q)?.key.clone();
+        if !out.contains(&k) {
+            out.push(k);
+        }
+    }
+    Ok(out)
 }
 
 /// 等用户决定的提议。
@@ -477,6 +514,23 @@ mod tests {
         assert_eq!(s, before);
         // 没出过图(没有报告)不能改朝向
         assert!(apply(&mut s.clone(), &serde_json::from_value(json!({"orient": "rotate"})).unwrap(), None).is_err());
+    }
+
+    #[test]
+    fn multi_sheet_targets() {
+        use crate::mcp_bridge::PartInfo;
+        let all = vec![
+            PartInfo { key: "a".into(), pn: "904002001".into(), name: "Base".into(), material: "6061".into(), ..Default::default() },
+            PartInfo { key: "b".into(), name: "Cover".into(), ..Default::default() },
+            PartInfo { key: "s".into(), name: "M4 screw".into(), bought: true, ..Default::default() },
+        ];
+        let p = |v: Value| serde_json::from_value::<Patch>(v).unwrap();
+        assert_eq!(targets(&p(json!({"summary": ""})), "a", &all).unwrap(), vec!["a"]);
+        assert_eq!(targets(&p(json!({"parts": ["all"]})), "a", &all).unwrap(), vec!["a", "b"], "all = 自制件");
+        assert_eq!(targets(&p(json!({"parts": ["904002001", "cover", "Base"]})), "a", &all).unwrap(), vec!["a", "b"]);
+        assert!(targets(&p(json!({"parts": ["nope"]})), "a", &all).is_err());
+        let c = context_with(&Sheet::new("a", "B", "", ""), None, &BTreeMap::new(), false, &all);
+        assert!(c.contains("[All parts] 904002001 Base (6061); Cover; M4 screw [bought]"), "{c}");
     }
 
     #[test]

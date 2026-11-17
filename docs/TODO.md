@@ -590,6 +590,8 @@
             应用过的记 <base>.agent.jsonl（D6 案例样本）。官方接口默认带 fallbacks "default"（拒绝时服务端换模型）。
             实测：直连官方接口回 403 "Request not allowed"（按地区拒绝）；走代理正常（假 key → 401）。代理：设置里填 / 环境变量 HTTPS_PROXY /
             Windows 系统代理（依次），"none" = 直连；本机两条自动路径都验证过（Clash 127.0.0.1:7897）。
+            ✅ 2026-11-17 一句话改多张图：补丁带 parts（名称 / 料号；["all"] = 全部自制件），上下文附整个 BOM 的零件清单；
+            预览逐张打到副本上（各自报告），有一张不认 → 退回模型改；应用时没图的零件先建图，锁定的跳过，「应用并出图」多张走出图队列。
             没做：对话持久化、不能挪尺寸位置（编译器没有位置参数）。
             ✅ 2026-11-17 MCP 形态（R3(b)）：pla-mcp.exe（stdio JSON-RPC；仓库根 .mcp.json 已登记，Claude Code 在本项目里直接可用；
             别处用 `claude mcp add plahelper -- <repo>\src\target\release\pla-mcp.exe`）。工具：status / list_parts / get_drawing（设置 + 报告 + 预览图）/

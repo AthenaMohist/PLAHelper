@@ -5480,17 +5480,45 @@ impl PlaApp {
     fn agent_send(&mut self, key: &str, text: &str, bom_title: &std::collections::BTreeMap<String, String>) {
         let Some(s) = self.draw_sheets.get(key).cloned() else { return };
         let rep = self.draw_report.as_ref().filter(|(k, _)| k == key && self.draw_up_view.is_none()).map(|(_, r)| r.clone());
-        let ctx = pla_ui::draw_agent::context(&s, rep.as_ref(), bom_title, s.locked());
+        let all: Vec<pla_ui::mcp_bridge::PartInfo> = self.bom_parts().into_iter().map(|p| p.2).collect();
+        let ctx = pla_ui::draw_agent::context_with(&s, rep.as_ref(), bom_title, s.locked(), &all);
         let img = self.draw_png.clone();
         self.agent_chat.push_user(text, &ctx, img.as_ref().map(|(u, b)| (u.as_str(), &b[..])));
         let history = self.agent_chat.history.clone();
         let rules = self.prefs_get().agent_rules.clone();
         let cfg = self.llm_cfg.clone();
+        let others: std::collections::HashMap<String, pla_ui::drawing::Sheet> = self.draw_sheets.sheets.iter().map(|x| (x.key.clone(), x.clone())).collect();
+        let dir = pla_ui::drawing::dir(&self.doc_key);
+        let cur = key.to_string();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let preview = |p: &pla_ui::draw_agent::Patch| {
-                let mut c = s.clone();
-                pla_ui::draw_agent::apply(&mut c, p, rep.as_ref())
+            // 预览: 当前这张用内存里的报告; 改多张时逐张打到副本上(各自的报告从磁盘读), 有一张不认 → 整个补丁退回给模型改
+            let preview = |p: &pla_ui::draw_agent::Patch| -> Result<Vec<String>, String> {
+                let ts = pla_ui::draw_agent::targets(p, &cur, &all)?;
+                if ts.len() == 1 && ts[0] == cur {
+                    let mut c = s.clone();
+                    return pla_ui::draw_agent::apply(&mut c, p, rep.as_ref());
+                }
+                let mut lines = Vec::new();
+                let mut errors = Vec::new();
+                for t in &ts {
+                    let label = all.iter().find(|x| &x.key == t).map(|x| format!("{} {}", x.pn, x.name).trim().to_string()).unwrap_or_else(|| t.clone());
+                    let mut sh = others.get(t).cloned().unwrap_or_else(|| pla_ui::drawing::Sheet::new(t, &label, "", ""));
+                    if sh.locked() {
+                        lines.push(t!("[{label}] 跳过(以上传图纸为准)", "[{label}] skipped (follows an uploaded drawing)"));
+                        continue;
+                    }
+                    let r = if *t == cur { rep.clone() } else { pla_ui::drawing::load_report(&dir, &sh) };
+                    match pla_ui::draw_agent::apply(&mut sh, p, r.as_ref()) {
+                        Ok(ch) => lines.push(format!("[{label}] {}", ch.join("; "))),
+                        Err(e) => errors.push(format!("{label}: {e}")),
+                    }
+                }
+                if errors.is_empty() {
+                    Ok(lines)
+                } else {
+                    Err(errors.join(" | "))
+                }
             };
             let _ = tx.send(pla_ui::draw_agent::run_turn(&cfg, &rules, &history, &preview));
         });
@@ -5509,29 +5537,55 @@ impl PlaApp {
         let request = self.agent_chat.lines.iter().rev().find_map(|l| if let Line::User(t) = l { Some(t.clone()) } else { None }).unwrap_or_default();
         match prop {
             Proposal::Patch(p) => {
-                let Some(mut s) = self.draw_sheets.get(key).cloned() else { return };
-                let rep = self.draw_report.as_ref().filter(|(k, _)| k == key && self.draw_up_view.is_none()).map(|(_, r)| r.clone());
-                match pla_ui::draw_agent::apply(&mut s, &p, rep.as_ref()) {
-                    Ok(changes) => {
-                        s.edits += 1;
-                        pla_ui::draw_agent::log_applied(&pla_ui::drawing::dir(&self.doc_key), &s, &request, &p, &changes);
-                        self.draw_sheets.upsert(s.clone());
-                        self.draw_save();
-                        self.draw_buf.clear();
-                        let note = if draw { "The drawing is being recompiled; the next message will carry the new image." } else { "" };
-                        self.agent_chat.decide(id, true, note);
-                        if draw {
-                            let mut title = bom_title.clone();
-                            title.extend(s.title.clone());
-                            self.draw_start(key, false, title);
-                        } else {
-                            self.set_notice((false, tr("已应用, 点「出图」生效", "Applied; click Draw to see it").to_string()));
-                        }
-                    }
+                let parts = self.bom_parts();
+                let all: Vec<pla_ui::mcp_bridge::PartInfo> = parts.iter().map(|x| x.2.clone()).collect();
+                let ts = match pla_ui::draw_agent::targets(&p, key, &all) {
+                    Ok(t) => t,
                     Err(e) => {
                         self.agent_chat.decide(id, false, &format!("Applying failed: {e}"));
                         self.set_notice((true, t!("应用失败: {e}", "Applying failed: {e}")));
+                        return;
                     }
+                };
+                let dir = pla_ui::drawing::dir(&self.doc_key);
+                let mut done: Vec<String> = Vec::new();
+                let mut failed: Vec<String> = Vec::new();
+                for t in &ts {
+                    if let Some(x) = parts.iter().find(|x| &x.2.key == t) {
+                        self.draw_ensure(t, &x.0, &x.1);
+                    }
+                    let Some(mut s) = self.draw_sheets.get(t).cloned() else { continue };
+                    if s.locked() {
+                        continue;
+                    }
+                    let rep = if t == key { self.draw_report.as_ref().filter(|(k, _)| k == key && self.draw_up_view.is_none()).map(|(_, r)| r.clone()) } else { pla_ui::drawing::load_report(&dir, &s) };
+                    match pla_ui::draw_agent::apply(&mut s, &p, rep.as_ref()) {
+                        Ok(changes) => {
+                            s.edits += 1;
+                            pla_ui::draw_agent::log_applied(&dir, &s, &request, &p, &changes);
+                            self.draw_sheets.upsert(s);
+                            done.push(t.clone());
+                        }
+                        Err(e) => failed.push(format!("{}: {e}", s.base)),
+                    }
+                }
+                self.draw_save();
+                self.draw_buf.clear();
+                self.draw_load(key);
+                let note = if !failed.is_empty() { format!("Failed on: {}", failed.join("; ")) } else if draw { "The drawings are being recompiled; the next message will carry the new image.".into() } else { String::new() };
+                self.agent_chat.decide(id, !done.is_empty(), &note);
+                if !failed.is_empty() {
+                    self.set_notice((true, t!("{} 张没改成: {}", "{} sheet(s) not changed: {}", failed.len(), failed.join("; "))));
+                } else if draw {
+                    if done.len() == 1 && done[0] == key {
+                        let mut title = bom_title.clone();
+                        title.extend(self.draw_sheets.get(key).map(|s| s.title.clone()).unwrap_or_default());
+                        self.draw_start(key, false, title);
+                    } else {
+                        self.mcp_queue_draw(&done, false, &parts);
+                    }
+                } else {
+                    self.set_notice((false, t!("已应用到 {} 张图, 点「出图」生效", "Applied to {} drawing(s); click Draw to see it", done.len())));
                 }
             }
             Proposal::Rule(r) => {
