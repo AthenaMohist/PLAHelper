@@ -209,6 +209,8 @@ struct PlaApp {
     draw_report: Option<(String, pla_ui::drawing::Report)>,
     draw_png: Option<(String, egui::load::Bytes)>,
     draw_buf: std::collections::HashMap<String, String>,
+    /// 补尺寸: 等 dim.signature 回包的图 key(在 Plasticity 里选的面 → 这张图的 dims_add)。
+    draw_sig_pending: Option<String>,
     /// 批量出图: 待出的 (零件 key, 重新导出 STEP?, 标题栏); 本批 (总数, 失败的图名)。
     draw_queue: std::collections::VecDeque<(String, bool, std::collections::BTreeMap<String, String>)>,
     draw_batch: Option<(usize, Vec<String>)>,
@@ -2542,6 +2544,7 @@ impl PlaApp {
             draw_report: None,
             draw_png: None,
             draw_buf: Default::default(),
+            draw_sig_pending: None,
             draw_queue: Default::default(),
             draw_batch: None,
             draw_batch_keys: Vec::new(),
@@ -2841,6 +2844,26 @@ impl PlaApp {
                         }
                     }
                     self.dim_info = Some(result);
+                }
+                // 出图补尺寸: 选中面的签名 → 这张图的 dims_add
+                pla_bridge::cdp::CdpEvent::CallResult { name, result } if name == pla_bridge::shim::api::DIM_SIGNATURE && self.draw_sig_pending.is_some() => {
+                    let key = self.draw_sig_pending.take().unwrap_or_default();
+                    match result {
+                        Ok(v) => {
+                            let sigs = v["faces"].as_array().cloned().unwrap_or_default();
+                            if let Some(e) = sigs.iter().find_map(|s| s["err"].as_str().map(String::from)) {
+                                self.set_notice((true, t!("补尺寸失败: {e}", "Add dimension failed: {e}")));
+                            } else if let Some(mut s) = self.draw_sheets.sheets.iter().find(|s| s.key == key).cloned() {
+                                let name = pla_ui::drawing::next_added_name(&s);
+                                s.dims_add.push(pla_ui::drawing::AddedDim { name: name.clone(), faces: sigs });
+                                s.edits += 1;
+                                self.draw_sheets.upsert(s);
+                                self.draw_save();
+                                self.set_notice((false, t!("已补尺寸 {name}, 点「出图」生效", "Added dimension {name}; click Draw to apply")));
+                            }
+                        }
+                        Err(e) => self.set_notice((true, t!("补尺寸失败: {e}", "Add dimension failed: {e}"))),
+                    }
                 }
                 // N3d: 面签名回包(记录 / 改后刷新之外的签名请求不会发)
                 pla_bridge::cdp::CdpEvent::CallResult { name, result } if name == pla_bridge::shim::api::DIM_SIGNATURE => {
@@ -5429,19 +5452,31 @@ impl PlaApp {
                                 }
                             }
                             if picked {
-                                let cur = s.dims_text.get(&p.name).cloned().unwrap_or_default();
-                                let buf = self.draw_buf.entry(format!("dimtext|{}", p.name)).or_insert_with(|| cur.clone());
-                                let te = ui.add(egui::TextEdit::singleline(buf).hint_text(tr("改文字(空 = 自动)", "Text (empty = automatic)")).desired_width(160.0));
-                                if te.lost_focus() {
-                                    let v = buf.trim().to_string();
-                                    if v.is_empty() {
-                                        s.dims_text.remove(&p.name);
-                                    } else {
-                                        s.dims_text.insert(p.name.clone(), v);
+                                ui.horizontal(|ui| {
+                                    for (map_tol, hint, w) in [
+                                        (false, tr("改文字(空 = 自动)", "Text (empty = automatic)"), 150.0),
+                                        (true, tr("公差: h7 / ±0.05 / +0.1/-0.05", "Tolerance: h7 / ±0.05 / +0.1/-0.05"), 150.0),
+                                    ] {
+                                        let map = if map_tol { &mut s.dims_tol } else { &mut s.dims_text };
+                                        let cur = map.get(&p.name).cloned().unwrap_or_default();
+                                        let bk = format!("dim{}|{}", if map_tol { "tol" } else { "text" }, p.name);
+                                        let buf = self.draw_buf.entry(bk).or_insert_with(|| cur.clone());
+                                        let te = ui.add(egui::TextEdit::singleline(buf).hint_text(hint).desired_width(w));
+                                        if te.lost_focus() {
+                                            let v = buf.trim().to_string();
+                                            if v.is_empty() {
+                                                map.remove(&p.name);
+                                            } else {
+                                                map.insert(p.name.clone(), v);
+                                            }
+                                        } else if !te.has_focus() {
+                                            *buf = cur;
+                                        }
                                     }
-                                } else if !te.has_focus() {
-                                    *buf = cur;
-                                }
+                                    if p.name.starts_with('U') && s.dims_add.iter().any(|a| a.name == p.name) && ui.small_button(tr("删除", "Delete")).clicked() {
+                                        s.dims_add.retain(|a| a.name != p.name);
+                                    }
+                                });
                             } else {
                                 ui.label("");
                             }
@@ -5450,6 +5485,39 @@ impl PlaApp {
                     });
                     ui.label(egui::RichText::new(tr("改完点「出图」生效; 孔位坐标值由上面的孔组勾选控制", "Click Draw to apply; hole position values are controlled by the hole groups above")).size(11.0).color(COL_MUTED));
                 });
+        }
+        // ---- 补尺寸: 在 Plasticity 里选 1 ~ 2 个面 → 签名存进这张图 ----
+        {
+            let faces: Vec<String> = self.live_sel.iter().filter(|it| it.kind == "face").map(|it| it.id.clone()).collect();
+            let failed: Vec<(String, String)> = self
+                .draw_report
+                .as_ref()
+                .filter(|(k, _)| *k == key)
+                .map(|(_, r)| r.added_failed.iter().map(|f| (f.name.clone(), f.error.clone().unwrap_or_default())).collect())
+                .unwrap_or_default();
+            ui.horizontal_wrapped(|ui| {
+                let ok = (1..=2).contains(&faces.len()) && self.draw_sig_pending.is_none();
+                let b = ui
+                    .add_enabled(ok, egui::Button::new(t!("＋ 补尺寸(已选 {} 个面)", "+ Add dimension ({} faces selected)", faces.len())))
+                    .on_hover_text(tr(
+                        "在 Plasticity 里选: 1 个圆柱面 = 直径; 1 个平面 = 厚度; 2 个平行的面(平面 / 圆柱轴线)= 距离",
+                        "Select in Plasticity: 1 cylinder = diameter; 1 plane = thickness; 2 parallel faces (planes / cylinder axes) = distance",
+                    ))
+                    .on_disabled_hover_text(tr("先在 Plasticity 里选 1 ~ 2 个面", "Select 1–2 faces in Plasticity first"));
+                if b.clicked() {
+                    self.cdp.send(pla_bridge::cdp::CdpCmd::Call {
+                        name: pla_bridge::shim::api::DIM_SIGNATURE,
+                        args: serde_json::json!({ "faces": faces, "units": "millimeter" }),
+                    });
+                    self.draw_sig_pending = Some(key.clone());
+                }
+                if !s.dims_add.is_empty() {
+                    ui.label(egui::RichText::new(t!("已补 {}: {}", "Added {}: {}", s.dims_add.len(), s.dims_add.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(" "))).size(11.0).color(COL_MUTED));
+                }
+            });
+            for (n, e) in failed {
+                ui.label(egui::RichText::new(t!("{n} 没标出: {e}", "{n} not drawn: {e}")).size(11.0).color(COL_RED));
+            }
         }
         if s != orig {
             s.edits += 1; // D6 指标: 人修正的次数

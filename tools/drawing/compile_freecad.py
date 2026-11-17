@@ -697,6 +697,19 @@ DIM_EDIT = spec.get("dims") or {}
 DIM_HIDE = set(DIM_EDIT.get("hide") or [])
 DIM_TEXT = dict(DIM_EDIT.get("text") or {})
 DIM_KEY = set(DIM_EDIT.get("key") or [])
+# tol: {"LenW": "h7" | "±0.05" | "+0.1/-0.05"}  公差(ISO 代号按 GB/T 1800 查偏差; 其它原样跟在数字后)
+DIM_TOL = {k: str(v).strip() for k, v in (DIM_EDIT.get("tol") or {}).items() if str(v).strip()}
+
+
+def tol_suffix(value, tol):
+    """公差文字: "h7" → " h7(0/-0.03)"; "±0.05" → "±0.05"; "+0.1/-0.05" → " +0.1/-0.05"。代号查不到(超范围)→ 原样。"""
+    if iso286.CODE.match(tol):
+        try:
+            return " " + iso286.tol_text(value, tol)
+        except Exception as e:
+            rep["warnings"].append("tolerance %s on %s: %s" % (tol, fmt(value), e))
+            return " " + tol
+    return tol if tol.startswith("±") else " " + tol
 
 
 def add_dim(view, typ, refs, name, page_xy, text=None, fmt_spec=None, value=None):
@@ -710,6 +723,11 @@ def add_dim(view, typ, refs, name, page_xy, text=None, fmt_spec=None, value=None
     if name in DIM_TEXT and str(DIM_TEXT[name]).strip():
         text = str(DIM_TEXT[name]).strip()
         info["custom"] = True
+    elif name in DIM_TOL and value is not None:
+        pre = {"Diameter": DIMS["diameter"], "Radius": "R"}.get(typ, "")
+        base = text if text is not None else pre + fmt(value)
+        text = base + tol_suffix(value, DIM_TOL[name])
+        info["tol"] = DIM_TOL[name]
     if name in DIM_KEY:
         info["key"] = True
         if text is not None:
@@ -1284,6 +1302,258 @@ def draw_thread_sides(taps, ex, ey):
             drawn += 1
     rep["thread_sides"] = {"drawn": drawn}
 
+
+# ---------------------------------------------------------------- 补尺寸(面板里从 Plasticity 选的面)
+# dims.add = [{"name": "U1", "faces": [签名…]}]; 签名 = Plasticity 面的 center(面上一点)/ normal / surface / radius / axis。
+#   1 个圆柱面 → 直径; 1 个平面 → 到对面平行平面的厚度; 2 个面(平面 / 圆柱轴线, 互相平行)→ 距离。
+# 自己画进页面 SVG(尺寸线 / 尺寸界线 / 箭头 / 数字), 不走 TechDraw 引用(省消隐重算, 也不依赖边编号)。
+_VSIGN = {}
+
+
+def view_signs(vname):
+    """模型(VAX 轴, 相对包围盒中心)→ 页面的正负。主视 = (+, +); 其它视图: 先用模型顶点对上视图边端点得 模型 → 边 的正负,
+    再乘主视的 边 → 页面 正负(与 draw_threads 同一个约定)。"""
+    if vname in _VSIGN:
+        return _VSIGN[vname]
+
+    def m2e(vn):
+        bw_, bh_, _ = VAX[vn]
+        ev = {(round(p.Point.x, 1), round(p.Point.y, 1)) for _, ed in edges_of(views[vn]) for p in ed.Vertexes}
+        mv = [((p.Point - bb.Center).dot(bw_), (p.Point - bb.Center).dot(bh_)) for p in shape.Vertexes[:600]]
+        sc = {(sx, sy): sum((round(sx * x, 1), round(sy * y, 1)) in ev for x, y in mv) for sx in (1, -1) for sy in (1, -1)}
+        return max(sc, key=sc.get)
+
+    if "Front" not in _VSIGN:
+        _VSIGN["_fe"] = m2e("Front")  # 主视 模型 → 边; 主视 模型 → 页面 = (+, +) ⇒ 边 → 页面 = 同号
+        _VSIGN["Front"] = (1, 1)
+    if vname != "Front":
+        fe, s = _VSIGN["_fe"], m2e(vname)
+        _VSIGN[vname] = (fe[0] * s[0], fe[1] * s[1])
+    return _VSIGN[vname]
+
+
+def to_page(vname, p):
+    bw_, bh_, _ = VAX[vname]
+    sx, sy = view_signs(vname)
+    cx, cy = vcenter(views[vname])
+    return cx + sx * (p - bb.Center).dot(bw_) * scale, cy + sy * (p - bb.Center).dot(bh_) * scale
+
+
+def match_face(sig):
+    """签名 → 零件上的面: 面上那一点到面的距离最小、且该点法向与签名法向平行(反向也算: STEP 面朝向可能反)。"""
+    c = V(*sig["center"])
+    n = V(*sig["normal"]).normalize() if sig.get("normal") else None
+    best, bd = None, 1e9
+    for f in shape.Faces:
+        try:
+            d, _, info = f.distToShape(Part.Vertex(c))
+        except Exception:
+            continue
+        if d > bd or d > 0.05:
+            continue
+        if n is not None:
+            try:
+                uv = f.Surface.parameter(c)
+                fn = f.normalAt(uv[0], uv[1])
+                if abs(abs(fn.dot(n)) - 1) > 1e-3:
+                    continue
+            except Exception:
+                pass
+        best, bd = f, d
+    return best
+
+
+def feature_of(f):
+    """面 → ("plane", 点, 法向) / ("axis", 轴上一点, 轴向, 半径); 其它曲面 None。"""
+    cy = geomutil.cylinder_of(f)
+    if cy is not None:
+        return ("axis", V(cy["c"]), V(cy["ax"]).normalize(), cy["r"])
+    if isinstance(f.Surface, Part.Plane):
+        uv = f.Surface.parameter(f.CenterOfMass)
+        return ("plane", f.CenterOfMass, f.normalAt(uv[0], uv[1]).normalize())
+    return None
+
+
+def opposite_plane(f, ft):
+    """厚度: 与 f 平行、法向相反、沿 -法向 最近、且投影有重叠的平面。"""
+    _, p0, n = ft
+    best, bd = None, 1e9
+    for g in shape.Faces:
+        if g.isSame(f) or not isinstance(g.Surface, Part.Plane):
+            continue
+        gt = feature_of(g)
+        if gt is None or abs(gt[2].dot(n) + 1) > 1e-3:
+            continue
+        d = (p0 - gt[1]).dot(n)
+        if 1e-4 < d < bd:
+            best, bd = g, d
+    return best
+
+
+def add_measure(item):
+    """一条补尺寸 → (方向 d, 点 A, 点 B, 值, 前缀, 涉及的面) 或 抛出原因。"""
+    sigs = item.get("faces") or []
+    fs = [match_face(s) for s in sigs]
+    if not fs or any(f is None for f in fs):
+        raise ValueError("face not found in the exported part")
+    fts = [feature_of(f) for f in fs]
+    if any(t is None for t in fts):
+        raise ValueError("only planes and cylinders can be dimensioned")
+    if len(fs) == 1:
+        t = fts[0]
+        if t[0] == "axis":
+            ax, r = t[2], t[3]
+            d = ax.cross(V(1, 0, 0)) if abs(ax.x) < 0.9 else ax.cross(V(0, 1, 0))
+            return ("dia", t, d.normalize(), t[1] - d.normalize() * r, t[1] + d.normalize() * r, 2 * r, DIMS["diameter"], fs)
+        g = opposite_plane(fs[0], t)
+        if g is None:
+            raise ValueError("no opposite parallel face for a thickness")
+        fts.append(feature_of(g))
+        fs.append(g)
+    a, b = fts[0], fts[1]
+    if a[0] == "plane":
+        d = a[2]
+    elif b[0] == "plane":
+        d = b[2]
+    else:  # 两根轴线: 中心距
+        if abs(abs(a[2].dot(b[2])) - 1) > 1e-3:
+            raise ValueError("axes are not parallel")
+        b = (b[0], b[1] - a[2] * (b[1] - a[1]).dot(a[2]), b[2], b[3])  # 第二根轴上取与第一点同高的点
+        w = b[1] - a[1]
+        d = w - a[2] * w.dot(a[2])
+        if d.Length < 0.01:
+            raise ValueError("coaxial: distance is 0")
+        d.normalize()
+    for t in (a, b):
+        if t[0] == "plane" and abs(abs(t[2].dot(d)) - 1) > 1e-3:
+            raise ValueError("faces are not parallel")
+        if t[0] == "axis" and abs(t[2].dot(d)) > 1e-3:
+            raise ValueError("axis is not parallel to the face")
+    A, B = a[1], b[1]
+    val = abs((B - A).dot(d))
+    if val < 0.01:
+        raise ValueError("distance is 0")
+    return ("lin", a, d, A, A + d * (B - A).dot(d), val, "", fs)  # B 换成 b 上正对 A 的点: 尺寸线 ∥ d
+
+
+def draw_added_dim(item):
+    name = str(item.get("name") or "U")
+    info = {"name": name, "type": "Added", "view": None, "text": None, "at": [0, 0]}
+    try:
+        kind, t0, d, A, B, val, pre, fs = add_measure(item)
+    except Exception as e:
+        info["error"] = str(e)
+        rep["added_failed"].append(info)
+        rep["warnings"].append("added dim %s: %s" % (name, e))
+        return
+    info["value"] = round(val, 4)
+    # 视图: d 在视图平面里(⟂ 视线); 圆柱还要求轴线也在视图平面里(侧面看成两条线), 优先主视
+    if kind == "dia":
+        cand = [vn for vn in ("Front", "Top", "Left") if abs(t0[2].dot(VAX[vn][2])) < 1e-3]
+    else:
+        cand = [vn for vn in ("Front", "Top", "Left") if abs(d.dot(VAX[vn][2])) < 1e-3]
+    if not cand:
+        info["error"] = "no view shows this distance"
+        rep["added_failed"].append(info)
+        return
+    vn = cand[0]
+    info["view"] = vn
+    if kind == "dia":  # 直径在视图平面里、垂直轴线量
+        d = t0[2].cross(VAX[vn][2]).normalize()
+        A, B = t0[1] - d * t0[3], t0[1] + d * t0[3]
+    pa, pb = to_page(vn, A), to_page(vn, B)
+    ux, uy = pb[0] - pa[0], pb[1] - pa[1]
+    L = math.hypot(ux, uy)
+    if L < 1e-6:
+        info["error"] = "zero length on paper"
+        rep["added_failed"].append(info)
+        return
+    ux, uy = ux / L, uy / L
+    wx, wy = -uy, ux  # 尺寸线的偏移方向(两侧都试)
+    # 面的投影在 w 方向上的范围(尺寸界线从这里起)
+    pts = [to_page(vn, p.Point) for f in fs for p in f.Vertexes] or [pa, pb]
+    if kind == "dia":
+        pts += [pa, pb]
+    txt = str(DIM_TEXT.get(name) or "").strip() or pre + fmt(val)
+    if name not in DIM_TEXT and name in DIM_TOL:
+        txt += tol_suffix(val, DIM_TOL[name])
+        info["tol"] = DIM_TOL[name]
+    if name in DIM_KEY:
+        txt = DIMS["key_mark"] + txt
+        info["key"] = True
+    if name in DIM_HIDE:
+        info["hidden"] = True
+        info["at"] = [round((pa[0] + pb[0]) / 2, 1), round((pa[1] + pb[1]) / 2, 1)]
+        rep["placed"].append(info)
+        return
+    r = R[vn]
+    fsz = std["fonts"]["dim"]
+    for ring in range(10):
+        for sgn in (1, -1):
+            ww = (wx * sgn, wy * sgn)
+            ext_w = max((p[0] - pa[0]) * ww[0] + (p[1] - pa[1]) * ww[1] for p in pts)
+            # 视图矩形在 w 上的外沿, 尺寸线放到它外面
+            corners = [(r[0], r[1]), (r[0], r[3]), (r[2], r[1]), (r[2], r[3])]
+            out_w = max((c[0] - pa[0]) * ww[0] + (c[1] - pa[1]) * ww[1] for c in corners)
+            off = max(ext_w, out_w) + G + ring * STEP
+            m = ((pa[0] + pb[0]) / 2 + ww[0] * off, (pa[1] + pb[1]) / 2 + ww[1] * off)
+            vertical = abs(ux) < 0.5
+            # GB: 数字在水平尺寸线上方、竖直尺寸线左侧(不论尺寸放在视图哪一边)
+            tc = (m[0] - fsz * 0.9, m[1]) if vertical else (m[0], m[1] + fsz * 0.9)
+            tr_ = text_rect(tc[0], tc[1], txt)
+            if vertical:
+                hw_, hh_ = (tr_[2] - tr_[0]) / 2, (tr_[3] - tr_[1]) / 2
+                tr_ = (tc[0] - hh_, tc[1] - hw_, tc[0] + hh_, tc[1] + hw_)
+            if placer.free(tr_):
+                placer.take(tr_)
+                svg_linear_dim(pa, pb, pts, ww, off, (ux, uy), txt, tc, vertical)
+                info["at"] = [round(tc[0], 1), round(tc[1], 1)]
+                info["shown"] = txt
+                rep["placed"].append(info)
+                return
+    info["error"] = "no free place on the sheet"
+    rep["added_failed"].append(info)
+
+
+def svg_linear_dim(pa, pb, pts, ww, off, u, txt, tc, vertical):
+    """页面坐标(y 向上)的线性尺寸 → PAGE_SVG: 两条尺寸界线 + 尺寸线 + 两个实心箭头 + 数字(竖直尺寸字头朝左)。"""
+    lw = std["lines"]["thin"]
+    fam = std["fonts"]["latin"]
+    fsz = std["fonts"]["dim"]
+    ar, aw = 3.0, 0.5  # 箭头长 / 半宽(页面毫米)
+
+    def s(p):
+        return p[0], H - p[1]
+
+    def line(p, q_):
+        a, b = s(p), s(q_)
+        PAGE_SVG.append('<path d="M %.3f %.3f L %.3f %.3f" style="fill:none;stroke:#000;stroke-width:%g"/>' % (a[0], a[1], b[0], b[1], lw))
+
+    ends = []
+    for p in (pa, pb):
+        base = max((q_[0] - p[0]) * ww[0] + (q_[1] - p[1]) * ww[1] for q_ in pts)  # 面投影最外点(相对 p)
+        foot = (p[0] + ww[0] * (base + 1.0), p[1] + ww[1] * (base + 1.0))
+        mid_ = ((pa[0] + pb[0]) / 2, (pa[1] + pb[1]) / 2)
+        # 尺寸线上的点: p 沿 w 推到 off(off 相对中点, 换算到 p)
+        k = off - ((p[0] - mid_[0]) * ww[0] + (p[1] - mid_[1]) * ww[1])
+        e = (p[0] + ww[0] * k, p[1] + ww[1] * k)
+        line(foot, (e[0] + ww[0] * 2.0, e[1] + ww[1] * 2.0))
+        ends.append(e)
+    line(ends[0], ends[1])
+    for e, sg in ((ends[0], 1), (ends[1], -1)):
+        tip = s(e)
+        b1 = s((e[0] + u[0] * ar * sg + ww[0] * aw, e[1] + u[1] * ar * sg + ww[1] * aw))
+        b2 = s((e[0] + u[0] * ar * sg - ww[0] * aw, e[1] + u[1] * ar * sg - ww[1] * aw))
+        PAGE_SVG.append('<path d="M %.3f %.3f L %.3f %.3f L %.3f %.3f Z" style="fill:#000;stroke:none"/>' % (tip[0], tip[1], b1[0], b1[1], b2[0], b2[1]))
+    x, y = s(tc)
+    rot = ' transform="rotate(-90 %.3f %.3f)"' % (x, y) if vertical else ""
+    PAGE_SVG.append('<text x="%.3f" y="%.3f" style="font-family:%s;font-size:%gpx;text-anchor:middle;dominant-baseline:central;fill:#000"%s>%s</text>'
+                    % (x, y, fam, fsz, rot, txt))
+
+
+rep["added_failed"] = []
+for it_ in DIM_EDIT.get("add") or []:
+    draw_added_dim(it_)
 
 draw_threads()
 flush_page_svg()

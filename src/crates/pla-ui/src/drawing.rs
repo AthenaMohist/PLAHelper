@@ -74,6 +74,12 @@ pub struct Sheet {
     pub dims_key: Vec<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub dims_text: BTreeMap<String, String>,
+    /// 尺寸公差(按尺寸名): "h7" / "±0.05" / "+0.1/-0.05"。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub dims_tol: BTreeMap<String, String>,
+    /// 补加的尺寸(在 Plasticity 里选面后加): 名字 U1… + 面签名(dim.signature)。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dims_add: Vec<AddedDim>,
     /// 技术要求(人改过的全文, 一行一条); None = 规范默认 + 按配合自动加的条目。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tech: Option<Vec<String>>,
@@ -91,6 +97,18 @@ pub struct Sheet {
     /// D6 指标: 这张图被人修正过几次(设置每变一次 +1)。
     #[serde(default)]
     pub edits: u32,
+}
+
+/// 一条补加的尺寸: 1 个圆柱面 = 直径, 1 个平面 = 厚度, 2 个面 = 距离(编译器按面签名在 STEP 里找面)。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct AddedDim {
+    pub name: String,
+    pub faces: Vec<Value>,
+}
+
+/// 下一个补尺寸的名字(U1, U2 … 跳过已用的)。
+pub fn next_added_name(s: &Sheet) -> String {
+    (1..).map(|i| format!("U{i}")).find(|n| !s.dims_add.iter().any(|a| &a.name == n)).unwrap_or_default()
 }
 
 /// 装配图一个序号的人改项。
@@ -134,6 +152,8 @@ impl Sheet {
             dims_hide: Vec::new(),
             dims_key: Vec::new(),
             dims_text: BTreeMap::new(),
+            dims_tol: BTreeMap::new(),
+            dims_add: Vec::new(),
             tech: None,
             section_view: None,
             section_fit: None,
@@ -241,8 +261,9 @@ pub fn spec(s: &Sheet, dir: &Path, dims_file: Option<&Path>) -> Value {
         v["dims_file"] = json!(p.display().to_string());
     }
     let text: BTreeMap<&String, &String> = s.dims_text.iter().filter(|(_, t)| !t.trim().is_empty()).collect();
-    if !s.dims_hide.is_empty() || !s.dims_key.is_empty() || !text.is_empty() {
-        v["dims"] = json!({ "hide": s.dims_hide, "key": s.dims_key, "text": text });
+    let tol: BTreeMap<&String, &String> = s.dims_tol.iter().filter(|(_, t)| !t.trim().is_empty()).collect();
+    if !s.dims_hide.is_empty() || !s.dims_key.is_empty() || !text.is_empty() || !tol.is_empty() || !s.dims_add.is_empty() {
+        v["dims"] = json!({ "hide": s.dims_hide, "key": s.dims_key, "text": text, "tol": tol, "add": s.dims_add });
     }
     put_tech(&mut v, s);
     v
@@ -281,6 +302,13 @@ pub struct Placed {
     pub at: [f64; 2],
     #[serde(default)]
     pub hidden: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AddedFail {
+    pub name: String,
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 impl Placed {
@@ -739,6 +767,9 @@ pub struct Report {
     /// 放了的尺寸(含被隐藏的)+ 纸张大小 mm: 预览上点选尺寸用。
     #[serde(default)]
     pub placed: Vec<Placed>,
+    /// 补尺寸里没标出来的(名字 + 原因)。
+    #[serde(default)]
+    pub added_failed: Vec<AddedFail>,
     #[serde(default)]
     pub paper_mm: Option<[f64; 2]>,
     #[serde(default)]
@@ -971,6 +1002,18 @@ mod tests {
         assert_eq!(v["dims"]["hide"], json!(["LenD"]));
         assert_eq!(v["dims"]["text"], json!({"H2": "M6 通孔"}), "blank overrides are dropped");
         assert!(spec(&Sheet::new("k", "p", "id", "E"), Path::new("x"), None).get("dims").is_none());
+        // 公差 + 补尺寸(名字跳过已用的)
+        let mut t = Sheet::new("k", "p", "id", "E");
+        t.dims_tol.insert("LenW".into(), "h7".into());
+        t.dims_tol.insert("LenH".into(), "  ".into());
+        assert_eq!(next_added_name(&t), "U1");
+        t.dims_add.push(AddedDim { name: "U2".into(), faces: vec![json!({"center": [0, 0, 0]})] });
+        assert_eq!(next_added_name(&t), "U1");
+        t.dims_add.push(AddedDim { name: "U1".into(), faces: vec![] });
+        assert_eq!(next_added_name(&t), "U3");
+        let v = spec(&t, Path::new("x"), None);
+        assert_eq!(v["dims"]["tol"], json!({"LenW": "h7"}));
+        assert_eq!(v["dims"]["add"][0]["name"], "U2");
         let r: Report = serde_json::from_str(
             r#"{"placed":[{"name":"LenW","type":"DistanceX","view":"V","text":null,"at":[100,250],"value":80.0},
                           {"name":"H1","text":"2 x ⌀6.6","at":[60,190],"shown":"*2 x ⌀6.6"}],"paper_mm":[420,297]}"#,
