@@ -23,6 +23,7 @@ pub mod sel_labels;
 pub mod selection;
 pub mod snapshot;
 pub mod state_store;
+pub mod std_parts;
 pub mod titlebar_probe;
 pub mod vpstate;
 pub mod wincap;

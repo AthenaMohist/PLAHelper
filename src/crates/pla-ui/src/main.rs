@@ -4139,6 +4139,13 @@ impl PlaApp {
         if !row.manual {
             en.keys.push(row.key.clone());
         }
+        if let Some(sp) = &row.spec {
+            en.spec = sp.key.clone();
+            // 型号空着就用认出的规格
+            if en.fields.get("model").is_none_or(|m| m.trim().is_empty()) {
+                en.fields.insert("model".into(), sp.text());
+            }
+        }
         self.lib.upsert(en);
         self.lib_save();
         self.bom_edits.links.insert(row.key.clone(), pn.clone());
@@ -6005,11 +6012,14 @@ impl PlaApp {
                                             (None, Some(_)) => egui::RichText::new("库?").color(COL_ACCENT),
                                             _ => egui::RichText::new("库").color(COL_MUTED),
                                         };
-                                        let tip = match (&r.link, &r.suggest) {
+                                        let mut tip = match (&r.link, &r.suggest) {
                                             (Some(pn), _) => t!("已链接零件库 {pn}", "Linked to library {pn}"),
                                             (None, Some(pn)) => t!("零件库里可能是 {pn}", "Library suggests {pn}"),
                                             _ => tr("零件库: 存入 / 链接", "Parts library: save / link").to_string(),
                                         };
+                                        if let Some(sp) = &r.spec {
+                                            tip = t!("{tip}\n识别为标准件: {}", "{tip}\nRecognized standard part: {}", sp.text());
+                                        }
                                         let b = ui.small_button(label).on_hover_text(tip);
                                         let pid = ui.id().with(("bom-lib-menu", &r.key));
                                         if b.clicked() {
@@ -6017,6 +6027,10 @@ impl PlaApp {
                                         }
                                         egui::popup::popup_below_widget(ui, pid, &b, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
                                             ui.set_min_width(240.0);
+                                            if let Some(sp) = &r.spec {
+                                                ui.label(egui::RichText::new(t!("识别: {}", "Recognized: {}", sp.text())).color(COL_MUTED))
+                                                    .on_hover_text(tr("按几何识别的标准件规格; 同规格的库条目会被建议链接(名字不同也认, 长度不同则算新物料)", "Standard part recognized from geometry; library entries with the same spec are suggested (any name; a different length is a new item)"));
+                                            }
                                             match &r.link {
                                                 Some(pn) => {
                                                     ui.label(egui::RichText::new(t!("已链接 {pn}", "Linked {pn}")).strong());

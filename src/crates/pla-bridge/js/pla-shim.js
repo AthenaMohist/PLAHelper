@@ -327,7 +327,7 @@
     viewMargin: 1.15,
     // 判定两平面"平行"的角度容差(度): 平行时 measure 额外给法向距离(壁厚); 平面的曲面类名
     parallelTolDeg: 0.1,
-    planeSurface: 'Plane',
+    planeSurface: 'Plane', cylinderSurface: 'Cylinder', coneSurface: 'Cone',
     // ---- N3: 面高亮的样式(角色 → 颜色 / 不透明度); 透过实体可见(depthTest 关), 画在最上层 ----
     // 颜色来自配置(Rust shim::HIGHLIGHT_*; 面板色块用同一份), 这里只定不透明度
     highlightStyles: {
@@ -387,7 +387,8 @@
     translationFields: { vector: 'move', matrix: 'matrix' },
     // ---- B1/B2 BOM: 指纹比较的相对容差(网格近似, 旋转后的复制件有 Float32 噪声); 手性阈值(相对 面积 × 尺度³);
     //      组: 根组 id 与组对象的 id 字段(ed.groups.getParent(nodeKey) → Groups_Group{id…}, 根 = 0) ----
-    bom: { relTol: 2e-3, chiralEps: 1e-3, groupId: 'id', rootGroupId: 0 },
+    // shapeMaxFaces: 面数不超过它的零件才做回转面摘要(标准件识别; 复杂件不算, 省时间)
+    bom: { relTol: 2e-3, chiralEps: 1e-3, groupId: 'id', rootGroupId: 0, shapeMaxFaces: 80 },
     // D 导出 STEP(实测 26.2.3, 2026-11-16): 站内对话框元素名、格式按钮文字、解析面转 NURBS 复选框名; OK / Cancel 在
     // 对话框外层容器里(往上找同时含两者的祖先, 最多 boxClimb 层); 选择里要记 / 还原的集合。
     exportStep: { dialogTag: 'export-step-58-dialog', formats: ['AP203', 'AP214', 'AP242'], defaultFormat: 'AP214',
@@ -2431,7 +2432,7 @@
           var w = [at[0] - s.axisOrigin[0], at[1] - s.axisOrigin[1], at[2] - s.axisOrigin[2]], al = vdot(w, s.axis);
           return Math.hypot(w[0] - al * s.axis[0], w[1] - al * s.axis[1], w[2] - al * s.axis[2]);
         };
-        var cylOf = function (s, rr) { return sigsOf(s).filter(function (g) { return typeof g.radius === 'number' && g.axis && g.axisOrigin && g.surface !== 'Cone' && Math.abs(g.radius - rr) < tol && Math.abs(Math.abs(vdot(g.axis, n)) - 1) < 1e-4 && distToAxis(g) < tol; })[0]; };
+        var cylOf = function (s, rr) { return sigsOf(s).filter(function (g) { return typeof g.radius === 'number' && g.axis && g.axisOrigin && g.surface !== NAMES.coneSurface && Math.abs(g.radius - rr) < tol && Math.abs(Math.abs(vdot(g.axis, n)) - 1) < 1e-4 && distToAxis(g) < tol; })[0]; };
         // 朝外(= +n)的平面, 中心在孔口下方 hh 处(入口 / 孔底 / 沉头台阶), 取离孔轴最近的
         var floorAt = function (s, hh) { return sigsOf(s).filter(function (g) { return g.surface === NAMES.planeSurface && g.normal && vdot(g.normal, n) > 0.9999 && Math.abs(vdot([at[0] - g.center[0], at[1] - g.center[1], at[2] - g.center[2]], n) - hh) < tol; }).sort(function (p, q) { return Math.hypot(p.center[0] - at[0], p.center[1] - at[1], p.center[2] - at[2]) - Math.hypot(q.center[0] - at[0], q.center[1] - at[1], q.center[2] - at[2]); })[0]; };
         var fc = { entry: floorAt(A, 0), wall: cylOf(A, d / 2) };
@@ -2441,7 +2442,7 @@
           if (!through) { fc.tapEntry = floorAt(last, h.t0); fc.bottom = floorAt(last, h.t0 + depth); }
         }
         if (type === 'counterbore') { fc.cbWall = cylOf(A, cbD / 2); fc.cbFloor = floorAt(A, cbDepth); }
-        if (type === 'countersink') fc.csk = sigsOf(A).filter(function (g) { return g.surface === 'Cone' && g.axis && g.axisOrigin && distToAxis(g) < tol; })[0];
+        if (type === 'countersink') fc.csk = sigsOf(A).filter(function (g) { return g.surface === NAMES.coneSurface && g.axis && g.axisOrigin && distToAxis(g) < tol; })[0];
         h.faces = fc;
         h.at = at.map(sig7);
         if (h.t0 !== undefined) h.t0 = sig7(h.t0);
@@ -3349,6 +3350,48 @@
     return { volume: s5(vol / (k * k * k)), area: s5(area / (k * k)), moments: moments.map(s5), faces: counts, chiral: chiral };
   }
 
+  // 标准件识别用的回转面摘要(文档单位; 面数 > shapeMaxFaces → null)。分类在 Rust(std_parts.rs)。
+  // → { faces, planes, len(沿主轴的总长, 由显示网格顶点投影), rev: [{ t: 'cyl'|'cone', r, h(圆柱轴向长), tc(面中点在轴上的位置), inner, axis, o }] }
+  // 主轴 = 面积最大的回转面的轴; 圆柱轴向长按包围盒反算(整圆柱精确: ext_i = h·|a_i| + 2r·√(1 − a_i²))。
+  function revShape(view, k) {
+    var es = groupEntries(view, 'face', k);
+    if (es.length > NAMES.bom.shapeMaxFaces) return null;
+    var id = itemIdOf(view), planes = 0, rev = [];
+    es.forEach(function (e) {
+      var g = faceSig(e, id, k);
+      if (g.surface === NAMES.planeSurface) { planes++; return; }
+      var isCyl = g.surface === NAMES.cylinderSurface, isCone = g.surface === NAMES.coneSurface;
+      if ((!isCyl && !isCone) || typeof g.radius !== 'number' || !g.axis || !g.axisOrigin || !g.center) return;
+      var a = g.axis, o = g.axisOrigin, c = g.center;
+      var w = [c[0] - o[0], c[1] - o[1], c[2] - o[2]], tc = vdot(w, a);
+      var rad = [w[0] - tc * a[0], w[1] - tc * a[1], w[2] - tc * a[2]];
+      var h = null;
+      if (isCyl && g.bbox) {
+        var b = g.bbox, i = [0, 1, 2].sort(function (p, q) { return Math.abs(a[q]) - Math.abs(a[p]); })[0];
+        var ext = Math.abs(b[1][i] - b[0][i]), ai = Math.abs(a[i]);
+        if (ai > 1e-6) h = sig7(Math.max(0, (ext - 2 * g.radius * Math.sqrt(Math.max(0, 1 - ai * ai))) / ai));
+      }
+      rev.push({ t: isCyl ? 'cyl' : 'cone', r: g.radius, h: h, tc: sig7(tc), inner: g.normal ? vdot(g.normal, rad) < 0 : false, axis: a, o: o,
+                 area: isCyl && h ? 2 * Math.PI * g.radius * h : 0 });
+    });
+    var out = { faces: es.length, planes: planes, len: null, rev: rev };
+    if (!rev.length) return out;
+    var main = rev.slice().sort(function (p, q) { return q.area - p.area; })[0];
+    // 总长: 显示网格全部顶点在主轴上的投影范围
+    try {
+      var fg = view[NAMES.shellGroups.face], mesh = fg && fg[NAMES.faceMesh], pos = mesh.geometry.attributes.position.array, me = mesh.matrixWorld && mesh.matrixWorld.elements;
+      var lo = Infinity, hi = -Infinity;
+      for (var j = 0; j + 2 < pos.length; j += 3) {
+        var p = xfPoint(me, pos[j], pos[j + 1], pos[j + 2]), t = (p[0] * main.axis[0] + p[1] * main.axis[1] + p[2] * main.axis[2]) / k;
+        if (t < lo) lo = t;
+        if (t > hi) hi = t;
+      }
+      if (hi > lo) out.len = sig7(hi - lo);
+    } catch (x) {}
+    rev.forEach(function (r) { delete r.area; });
+    return out;
+  }
+
   // 两个指纹是不是同一种零件(手性另判)
   function samePrint(a, b) {
     var T = NAMES.bom.relTol;
@@ -3394,7 +3437,7 @@
     var parts = [], skipped = [];
     pool.forEach(function (v) {
       var key = invokeOn('nodes.item2key', [v]), sid = st[NAMES.node2id].get(key), nm = nameOf(v);
-      try { parts.push({ id: sid, name: nm, path: groupPath(key), fp: partPrint(v, k), material: matName[sid] || null }); }
+      try { parts.push({ id: sid, name: nm, path: groupPath(key), fp: partPrint(v, k), material: matName[sid] || null, view: v }); }
       catch (e) { skipped.push({ id: sid, name: nm, err: errMsg(e) }); }
     });
     // 归并: 指纹相同且手性相同(或有一方分不清) → 同一行; 指纹相同手性相反 → 镜像件单列
@@ -3418,7 +3461,8 @@
                name: common(names), names: names.filter(function (x, i) { return names.indexOf(x) === i; }), qty: l.members.length,
                members: l.members.map(function (p) { return { id: p.id, name: p.name, path: p.path }; }),
                path: common(paths) || '', material: common(l.members.map(function (p) { return p.material || ''; })) || null,
-               volume: l.fp.volume, area: l.fp.area, faces: l.fp.faces, chiral: l.fp.chiral, mirrorOf: l.mirrorOf };
+               volume: l.fp.volume, area: l.fp.area, faces: l.fp.faces, chiral: l.fp.chiral, mirrorOf: l.mirrorOf,
+               shape: (function () { try { return revShape(l.members[0].view, k); } catch (x) { return null; } })() };
     });
     // mirrorOf 指向排序前的下标 → 换成名字, 再按 组路径 → 名字 排
     out.forEach(function (l) { if (l.mirrorOf !== undefined) l.mirrorOf = out[l.mirrorOf].name; });

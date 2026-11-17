@@ -50,6 +50,9 @@ pub struct Entry {
     pub aliases: Vec<String>,
     #[serde(default)]
     pub keys: Vec<String>,
+    /// 标准件规格 key(std_parts: "screw-cap M4x12" …): 指纹不同的同规格件(asset pack / 自己画的)也能建议到这条。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub spec: String,
     #[serde(default)]
     pub notes: String,
     /// 改号前用过的料号(旧表 / 旧 BOM 还写着它们; 搜索、导入、链接都认)。
@@ -362,10 +365,14 @@ impl Library {
         self.next_pn_for("", category)
     }
 
-    /// 建议链接: 零件 key 精确命中 > 名字等于别名 / 采购名 > 名字互相包含。返回料号。
-    pub fn suggest(&self, name: &str, key: &str) -> Option<String> {
+    /// 建议链接: 零件 key 精确命中 > 标准件规格相同 > 名字等于别名 / 采购名 > 名字互相包含。返回料号。
+    /// 规格认出来了但库里没有同规格 → 不再按名字猜(名字像、规格不同 = 不同物料, 如改了长度的螺钉)。
+    pub fn suggest(&self, name: &str, key: &str, spec: Option<&str>) -> Option<String> {
         if let Some(e) = self.entries.iter().find(|e| e.keys.iter().any(|k| k == key)) {
             return Some(e.pn.clone());
+        }
+        if let Some(sp) = spec.filter(|s| !s.is_empty()) {
+            return self.entries.iter().find(|e| e.spec == sp).map(|e| e.pn.clone());
         }
         let n = name.trim().to_lowercase();
         if n.is_empty() {
@@ -456,10 +463,14 @@ mod tests {
         assert_eq!(lib.next_pn("009"), "904009002");
         assert_eq!(lib.next_pn("001"), "904001001");
         // 建议: key > 别名 > 包含
-        assert_eq!(lib.suggest("whatever", "k-screw").as_deref(), Some("904009001"));
-        assert_eq!(lib.suggest("杯内六M4x14", "x").as_deref(), Some("904009001"));
-        assert_eq!(lib.suggest("杯内六M4x14 copy", "x").as_deref(), Some("904009001"));
-        assert_eq!(lib.suggest("Base side", "x"), None);
+        assert_eq!(lib.suggest("whatever", "k-screw", None).as_deref(), Some("904009001"));
+        assert_eq!(lib.suggest("杯内六M4x14", "x", None).as_deref(), Some("904009001"));
+        assert_eq!(lib.suggest("杯内六M4x14 copy", "x", None).as_deref(), Some("904009001"));
+        assert_eq!(lib.suggest("Base side", "x", None), None);
+        // 规格层: 指纹不同、名字也不同, 规格相同 → 建议; 规格不同(改了长度)→ 不按名字瞎猜
+        lib.find_mut("904009001").unwrap().spec = "screw-cap M4x14".into();
+        assert_eq!(lib.suggest("Bolt (1)", "y", Some("screw-cap M4x14")).as_deref(), Some("904009001"));
+        assert_eq!(lib.suggest("杯内六M4x14", "y", Some("screw-cap M4x20")), None);
         // 带进 BOM: 首选供应商的单价
         let f = lib.find("904009001").unwrap().bom_fields();
         assert_eq!((f["pn"].as_str(), f["unit_price"].as_str(), f["pcs_unit"].as_str()), ("904009001", "6.1", "50"));

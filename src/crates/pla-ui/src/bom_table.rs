@@ -18,7 +18,7 @@ use crate::formula;
 pub struct Col {
     pub id: String,
     pub header: String,
-    /// 模型数据: name / qty / material / volume / group / remark; "field" = 可编辑字段; 省略且有 formula = 公式列。
+    /// 模型数据: name / qty / material / volume / group / remark / spec(认出的标准件规格); "field" = 可编辑字段; 省略且有 formula = 公式列。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
     /// 公式, 如 `ROUNDUP({total_qty}*{redundancy}/{pcs_unit},0)`。
@@ -211,6 +211,8 @@ pub struct Row {
     /// B4: 已链接的料号 / 没链接时零件库给的建议料号。
     pub link: Option<String>,
     pub suggest: Option<String>,
+    /// 认出来的标准件规格(std_parts; 手动行 / 认不出 = None)。
+    pub spec: Option<crate::std_parts::StdSpec>,
 }
 
 /// 格式化数字: 去掉多余的 0(12.0 → 12, 42.70 → 42.7)。
@@ -267,12 +269,12 @@ fn model_value(src: &str, line: &Value, remark: &str) -> String {
 pub fn build(scan: &Value, t: &Template, e: &Edits, lib: &crate::parts_lib::Library) -> (Vec<Row>, Vec<String>) {
     let mut rows = Vec::new();
     let field_default = |c: &Col| e.defaults.get(&c.id).cloned().or_else(|| c.default.clone()).unwrap_or_default();
-    let fill = |base: &dyn Fn(&Col) -> String, over: Option<&BTreeMap<String, String>>, key: String, manual: bool, name_hint: &str| -> Row {
+    let fill = |base: &dyn Fn(&Col) -> String, over: Option<&BTreeMap<String, String>>, key: String, manual: bool, name_hint: &str, spec: Option<crate::std_parts::StdSpec>| -> Row {
         // 链接写的可能是改号前的旧料号 → 认到现条目, 显示现料号
         let linked = e.links.get(&key).and_then(|pn| lib.find_any(pn));
         let link = linked.map(|en| en.pn.clone());
         let libf = linked.map(|en| en.bom_fields()).unwrap_or_default();
-        let suggest = if link.is_none() { lib.suggest(name_hint, &key) } else { None };
+        let suggest = if link.is_none() { lib.suggest(name_hint, &key, spec.as_ref().map(|s| s.key.as_str())) } else { None };
         let mut vals: BTreeMap<String, String> = BTreeMap::new();
         let mut overridden = vec![false; t.columns.len()];
         let mut from_lib = vec![false; t.columns.len()];
@@ -297,7 +299,7 @@ pub fn build(scan: &Value, t: &Template, e: &Edits, lib: &crate::parts_lib::Libr
                 vals.insert(c.id.clone(), v);
             }
         }
-        Row { key, cells: t.columns.iter().map(|c| vals.get(&c.id).cloned().unwrap_or_default()).collect(), overridden, from_lib, manual, link, suggest }
+        Row { key, cells: t.columns.iter().map(|c| vals.get(&c.id).cloned().unwrap_or_default()).collect(), overridden, from_lib, manual, link, suggest, spec }
     };
     for line in scan["lines"].as_array().into_iter().flatten() {
         let key = line["key"].as_str().unwrap_or("").to_string();
@@ -305,11 +307,14 @@ pub fn build(scan: &Value, t: &Template, e: &Edits, lib: &crate::parts_lib::Libr
             continue;
         }
         let remark = crate::bom::remark(line);
+        let spec = crate::std_parts::classify(&line["shape"]);
+        let spec_text = spec.as_ref().map(|s| s.text()).unwrap_or_default();
         let base = |c: &Col| match c.source.as_deref() {
             Some("field") | None => field_default(c),
+            Some("spec") => spec_text.clone(),
             Some(src) => model_value(src, line, &remark),
         };
-        rows.push(fill(&base, e.parts.get(&key), key.clone(), false, line["name"].as_str().unwrap_or("")));
+        rows.push(fill(&base, e.parts.get(&key), key.clone(), false, line["name"].as_str().unwrap_or(""), spec));
     }
     for m in &e.manual {
         let base = |c: &Col| match c.source.as_deref() {
@@ -318,7 +323,7 @@ pub fn build(scan: &Value, t: &Template, e: &Edits, lib: &crate::parts_lib::Libr
             _ => String::new(),
         };
         let hint = m.fields.get("name").cloned().unwrap_or_default();
-        rows.push(fill(&base, Some(&m.fields), format!("manual:{}", m.id), true, &hint));
+        rows.push(fill(&base, Some(&m.fields), format!("manual:{}", m.id), true, &hint, None));
     }
     let totals = t
         .columns
