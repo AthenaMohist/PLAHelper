@@ -161,7 +161,6 @@
     // 正在执行的命令(lastCommand 在上一条被取消后可能还指着旧的)
     'exec.activeCmd':          ['exec', 'active.command'],
     'fac.place':               ['fac', 'PlaceFactory'],
-    'fac.boolean':             ['fac', 'BooleanFactory'],
     // ---- N3e: 本体测量(Measure Distance 的同一工厂; 名字在 nodes 表里, 不在测量记录上 —— 实测 2026-11-15) ----
     'ed.measurements':         ['ed', 'measurements'],
     'meas.snapshot':           ['meas', 'snapshot'],
@@ -415,14 +414,13 @@
     // {id, pivot, packId, packRevision, packAbsolutePath, contentHash} → ImportWithPlacementCommand 导入并挂资产引用, 然后等放置
     // (promises: CancellablePromise, finish() = 按当前状态确定)→ PlaceFactory 从 pivot 挪到 destination / destinationOrientation(资产 +Z 对着面外法向)。
     // pack 内容: assets.load(pack.filePath) → {id, revision, assets: [{id, name, path(文件夹), pivot, bbox(米), contentHash, thumbnail}]}。
-    // 用户的螺丝 pack: 每个资产 = 螺钉 + 负体(名字含 Neg), 负体用来从零件里减出孔。
+    // 孔径一律按 pla-ui 的国标目录(用户 2026-11-18: pack 里不再放负体)。
     assetDnd: {
       mime: 'plasticity/asset', importCmd: 'ImportWithPlacementCommand', promises: 'promises', finish: 'finish',
-      dest: 'destination', destQ: 'destinationOrientation', baseNormal: [0, 0, 1], cutterPattern: 'Neg',
+      dest: 'destination', destQ: 'destinationOrientation', baseNormal: [0, 0, 1],
       pack: { id: 'id', revision: 'revision', path: 'filePath', assets: 'assets' },
       asset: { id: 'id', name: 'name', folder: 'path', pivot: 'pivot', bbox: 'bbox', hash: 'contentHash' },
-      startWaitMs: 3000, placeWaitMs: 6000, moveSettleMs: 150,
-      bool: { targets: 'targets', tools: 'tools', op: 'operationType' }
+      startWaitMs: 3000, placeWaitMs: 6000, moveSettleMs: 150
     },
     sketchFields: {
       polygon: { center: 'center', point: 'point', orientation: 'orientation', sides: 'vertexCount', radius: 'radius', baseNormal: [0, 0, 1] },
@@ -2516,7 +2514,7 @@
 
   // =====================================================================
   // N5: 资产(asset pack)。asset.list = 已登记的 pack 与里面的资产; asset.place = 走 Plasticity 自己的拖放导入
-  // (同手工拖, 带资产引用), 放置时把目标点 / 朝向换成给定的, 可选把负体从目标零件里减掉。know-how/asset-place.md。
+  // (同手工拖, 带资产引用), 放置时把目标点 / 朝向换成给定的。know-how/asset-place.md。
   // =====================================================================
   function packList() {
     var D = NAMES.assetDnd;
@@ -2550,8 +2548,8 @@
   }, { async: true });
 
   // args = { asset: 名字(不分大小写)或资产 id, pack?: 路径或其中一段, at: [x,y,z](pivot 落点, 文档单位), normal?: [x,y,z](资产 +Z 指向, 默认 +Z = 面外法向),
-  //          rotate?: 度(绕 normal), cut?: 目标实体 id(把资产里的负体从它减掉), cutter?: 负体名字片段(默认 'Neg'), units? }
-  // → { asset, items: [{kind, id, name, bbox}], cut?: {target, tools, result}, undoSteps }
+  //          rotate?: 度(绕 normal), units? }
+  // → { asset, items: [{kind, id, name, bbox}], undoSteps }
   def('asset.place', 'asset.place', function (a) {
     a = a || {};
     var D = NAMES.assetDnd, U = unitOf(a), k = U.k;
@@ -2627,29 +2625,7 @@
     }).then(function () {
       var made = fresh();
       report.items = made.map(function (v) { return describeMade(v, k); });
-      if (a.cut === undefined || a.cut === null) return report;
-      var pat = String(a.cutter || D.cutterPattern).toLowerCase();
-      var tools = made.filter(function (v) { return String(nameOf(v) || '').toLowerCase().indexOf(pat) >= 0; });
-      if (!tools.length) throw new Error('no cutter body (name containing "' + pat + '") in asset ' + report.asset);
-      var target = viewOf('solid', a.cut);
-      if (!target) throw new Error('cut target solid not found: ' + a.cut);
-      var Bool = need('fac.boolean'), B = D.bool;
-      var Cls = factoryCommandClass();
-      var cmd = new Cls(editor(), function (c) {
-        var f = new Bool(c.editor);
-        f[NAMES.facResource](c);
-        f[B.targets] = [target];
-        f[B.tools] = tools;
-        f[B.op] = NAMES.boolOps.subtract;
-        return f[NAMES.facCommit]();
-      });
-      return runCommand(cmd, NAMES.cmdTimeoutMs).then(function (how) {
-        if (cmd.plaErr || how !== 'ended') throw new Error('cut failed: ' + (cmd.plaErr || how));
-        var res = cmd.plaResult === null || cmd.plaResult === undefined ? [] : (Array.isArray(cmd.plaResult) ? cmd.plaResult : [cmd.plaResult]);
-        report.cut = { target: a.cut, tools: tools.map(function (v) { return itemIdOf(v); }), result: res.map(function (v) { return describeMade(v, k); }) };
-        report.items = fresh().map(function (v) { return describeMade(v, k); });
-        return report;
-      });
+      return report;
     }).then(function (rep) {
       rep.undoSteps = undoStack().length - mark.depth;
       return rep;
@@ -2719,10 +2695,18 @@
     pts = pts.map(function (p) { var o = vdot([p[0] - c[0], p[1] - c[1], p[2] - c[2]], n); return [p[0] - n[0] * o, p[1] - n[1] * o, p[2] - n[2] * o]; });
     // 实体: 入口(面所在) + 组合孔的其余实体(按顺序, 最后一个 = 螺纹 / 底孔)
     var A = itemIdOf(viewOf('solid', /^(\d+)/.exec(String(a.face))[1]));
-    // dry: 只算孔位(给"用 asset 负体开孔"用), 不打孔
-    if (a.dry) return { dry: true, holes: pts.map(function (p) { return { at: p.map(sig7) }; }), normal: n.map(sig7), solid: A, units: U.unit };
     var stack = (Array.isArray(a.stack) ? a.stack : []).map(String).filter(function (s) { return s !== String(A); });
     stack.forEach(function (s) { if (!viewOf('solid', s)) throw new Error('solid not found: ' + s); });
+    // dry: 只算孔位 + 第一个孔位上各实体沿孔轴的入口 / 出口深度(包围盒投影; 打孔面板算螺丝长度用), 不打孔
+    if (a.dry) {
+      var ax0 = n.map(function (x) { return -x; }), p0 = pts[0];
+      var layers = [A].concat(stack).map(function (s) {
+        var b = bboxOf(viewOf('solid', s), k), lo = Infinity, hi = -Infinity;
+        for (var i = 0; i < 8; i++) { var q = [(i & 1 ? b[1] : b[0])[0], (i & 2 ? b[1] : b[0])[1], (i & 4 ? b[1] : b[0])[2]]; var t = vdot([q[0] - p0[0], q[1] - p0[1], q[2] - p0[2]], ax0); lo = Math.min(lo, t); hi = Math.max(hi, t); }
+        return { solid: s, t0: sig7(Math.max(0, lo)), t1: sig7(hi) };
+      });
+      return { dry: true, holes: pts.map(function (p) { return { at: p.map(sig7) }; }), normal: n.map(sig7), solid: A, layers: layers, units: U.unit };
+    }
     var last = stack.length ? stack[stack.length - 1] : null, mids = stack.slice(0, -1);
     var tapD = last ? num(a.tapD, 'tapD') : null;
     var boxes = [A].concat(stack).map(function (s) { return bboxOf(viewOf('solid', s), k); });

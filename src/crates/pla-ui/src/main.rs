@@ -402,12 +402,19 @@ struct PlaApp {
     /// N5 打孔面板「放螺丝」(用户 2026-11-18: 优先用 Plasticity 里已加载的螺丝 asset pack): pack 里的资产名、是否读过、
     /// 选的资产(None = 不放)、方式(0 打孔后放螺丝 / 1 用 pack 负体开孔)、等打孔回包后要放的(资产, 方式)、
     /// 逐个放的队列(asset.place 参数)与计数(成功, 失败, 首个错误)。
-    screw_assets: Vec<String>,
+    /// N5 放螺丝: Plasticity 里登记的 asset pack 资产(认现成件用)
+    screw_assets: Vec<pla_ui::screw_kit::Asset>,
     screw_listed: bool,
-    screw_pick: Option<String>,
-    screw_mode: u8,
-    screw_after: Option<(String, u8)>,
-    screw_queue: std::collections::VecDeque<serde_json::Value>,
+    /// 标准 / 规格 / 长度 / 垫圈 / 螺母(std 为空 = 不放)
+    screw_choice: pla_ui::screw_kit::Choice,
+    /// 孔位上各实体的入口 / 出口深度(hole.make dry): (选择 key, 回包); 等回包时 screw_dry_pending
+    screw_layers: (String, Option<serde_json::Value>),
+    screw_dry_pending: bool,
+    /// 打完孔后要放的件(每个孔位一套)
+    screw_after: Option<Vec<pla_ui::screw_kit::Item>>,
+    /// 逐个执行: (垫片 api, 参数) —— asset.place(pack 里有)或 cmd.exec(宏建)
+    screw_queue: std::collections::VecDeque<(&'static str, serde_json::Value)>,
+    screw_running: bool,
     screw_count: (usize, usize, Option<String>),
     /// P4: 进行中的组联动。
     link_run: Option<LinkRun>,
@@ -2741,10 +2748,12 @@ impl PlaApp {
             hole_preset_rename: None,
             screw_assets: Vec::new(),
             screw_listed: false,
-            screw_pick: None,
-            screw_mode: 0,
+            screw_choice: Default::default(),
+            screw_layers: (String::new(), None),
+            screw_dry_pending: false,
             screw_after: None,
             screw_queue: std::collections::VecDeque::new(),
+            screw_running: false,
             screw_count: (0, 0, None),
             attach_prompt: None,
             link_run: None,
@@ -3163,30 +3172,22 @@ impl PlaApp {
                     Err(e) => self.set_notice((true, t!("应用配置失败: {e}", "Applying the configuration failed: {e}"))),
                 },
                 // P3 打孔回包 → 「记录」里生成孔特征 H00n + 自动子尺寸(半径 / 深度 / 沉头半径 / 沉头深度)
+                // N5: 只算孔位 / 层深的 dry 回包(打孔面板算螺丝长度用)
+                pla_bridge::cdp::CdpEvent::CallResult { name, result } if name == pla_bridge::shim::api::HOLE_MAKE && self.screw_dry_pending => {
+                    self.screw_dry_pending = false;
+                    match result {
+                        Ok(v) => self.screw_layers.1 = Some(v),
+                        Err(e) => pla_ui::diag::log(&format!("hole.make dry failed: {e}")),
+                    }
+                }
                 pla_bridge::cdp::CdpEvent::CallResult { name, result } if name == pla_bridge::shim::api::HOLE_MAKE => {
                     self.dim_busy = false;
                     self.dim_face = None;
                     self.dim_info = None;
-                    // N5: 打完孔(或只算了孔位)→ 排队放螺丝
-                    let after = self.screw_after.take();
-                    if let (Some((asset, mode)), Ok(v)) = (&after, &result) {
-                        let cut = if *mode == 1 { v["solid"].clone() } else { serde_json::Value::Null };
-                        for h in v["holes"].as_array().cloned().unwrap_or_default() {
-                            let mut a = serde_json::json!({"asset": asset, "at": h["at"], "normal": v["normal"], "units": v["units"]});
-                            if !cut.is_null() {
-                                a["cut"] = cut.clone();
-                            }
-                            self.screw_queue.push_back(a);
-                        }
+                    // N5: 打完孔 → 每个孔位排一套(垫圈 / 螺钉 / 螺母)
+                    if let (Some(items), Ok(v)) = (self.screw_after.take(), &result) {
                         self.screw_count = (0, 0, None);
-                        if v["dry"].as_bool() == Some(true) {
-                            self.screw_pump();
-                            continue;
-                        }
-                    }
-                    if let (Some((_, 1)), Err(e)) = (&after, &result) {
-                        self.set_notice((true, t!("算孔位失败: {e}", "Working out positions failed: {e}")));
-                        continue;
+                        self.screw_enqueue(v, &items);
                     }
                     let spec = self.hole_pending.take().unwrap_or_default();
                     match result {
@@ -3248,12 +3249,32 @@ impl PlaApp {
                 // N5 资产: pack 清单 → 打孔面板的螺丝下拉; 放一个 → 接着放下一个
                 pla_bridge::cdp::CdpEvent::CallResult { name, result } if name == pla_bridge::shim::api::ASSET_LIST => match result {
                     Ok(v) => {
-                        self.screw_assets = v["packs"].as_array().into_iter().flatten().flat_map(|p| p["assets"].as_array().cloned().unwrap_or_default()).filter_map(|a| a["name"].as_str().map(String::from)).collect();
-                        self.screw_assets.dedup();
+                        self.screw_assets = v["packs"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .flat_map(|p| {
+                                let pack = p["path"].as_str().unwrap_or("").to_string();
+                                p["assets"].as_array().cloned().unwrap_or_default().into_iter().map(move |a| pla_ui::screw_kit::Asset {
+                                    pack: pack.clone(),
+                                    id: a["id"].as_str().unwrap_or("").into(),
+                                    name: a["name"].as_str().unwrap_or("").into(),
+                                    folder: a["folder"].as_str().unwrap_or("").into(),
+                                    size: a["size"].as_array().map(|s| s.iter().filter_map(|x| x.as_f64()).collect()).unwrap_or_default(),
+                                })
+                            })
+                            .collect();
                     }
                     Err(e) => pla_ui::diag::log(&format!("asset.list failed: {e}")),
                 },
-                pla_bridge::cdp::CdpEvent::CallResult { name, result } if name == pla_bridge::shim::api::ASSET_PLACE => {
+                pla_bridge::cdp::CdpEvent::CallResult { name, result }
+                    if self.screw_running && (name == pla_bridge::shim::api::ASSET_PLACE || name == pla_bridge::shim::api::CMD_EXEC) =>
+                {
+                    // cmd.exec 的失败在回包里(failed)
+                    let result = result.and_then(|v| match v.get("failed") {
+                        Some(f) if !f.is_null() => Err(format!("{} {}", f["op"].as_str().unwrap_or(""), f["err"].as_str().unwrap_or(""))),
+                        _ => Ok(v),
+                    });
                     match result {
                         Ok(_) => self.screw_count.0 += 1,
                         Err(e) => {
@@ -7602,6 +7623,21 @@ impl PlaApp {
                 rz_info_card(ui, tr("在选中的平面上打孔", "Hole in the selected plane"), &sub);
             }
         }
+        // ---- N5 紧固件: 第一行标准, 第二行规格(长度 / 垫圈 / 螺母); 孔参数在下面 ----
+        let ctx = self.screw_ctx(plane.as_ref(), combo);
+        if let (Some(v), Some(face)) = (plane.as_ref(), faces.first()) {
+            // 孔位上各实体的层深(组合孔的夹紧厚度; 单件读不到厚度时兜底)
+            let key = format!("{face}|{stack:?}|{points:?}");
+            if !self.screw_choice.std.is_empty() && self.screw_layers.0 != key && !self.dim_busy && !self.screw_dry_pending {
+                self.screw_layers = (key, None);
+                self.screw_dry_pending = true;
+                self.cdp.send(pla_bridge::cdp::CdpCmd::Call {
+                    name: pla_bridge::shim::api::HOLE_MAKE,
+                    args: serde_json::json!({ "face": face, "type": "simple", "d": 1, "units": v["units"], "points": points, "stack": stack, "dry": true }),
+                });
+            }
+        }
+        let screw_plan = self.screw_ui(ui, &ctx);
         // ---- 规格方案(JSON 文件; 下拉切换 · 改名 · 新建 · 编辑) ----
         rz_label(ui, tr("规格方案", "Size table"));
         ui.horizontal(|ui| {
@@ -7741,55 +7777,6 @@ impl PlaApp {
         if self.hole_vals != before && self.hole_std.and_then(|i| self.hole_sizes.get(i)).is_some_and(|s| std_hole_vals(s, self.hole_usage) != self.hole_vals) {
             self.hole_std = None;
         }
-        // ---- N5 放螺丝(Plasticity 里已加载的 asset pack 优先) ----
-        if !self.screw_listed {
-            self.screw_listed = true;
-            self.cdp.send(pla_bridge::cdp::CdpCmd::Call { name: pla_bridge::shim::api::ASSET_LIST, args: serde_json::json!({}) });
-        }
-        // 规格变了 → pack 里有同名的就默认选上(M4 孔 → M4 螺丝)
-        let std_name = self.hole_std.and_then(|i| self.hole_sizes.get(i)).map(|s| s.size.clone());
-        rz_label(ui, tr("放螺丝(asset pack)", "Screw (asset pack)"));
-        ui.horizontal(|ui| {
-            let cur = self.screw_pick.clone().unwrap_or_else(|| tr("不放", "None").to_string());
-            egui::ComboBox::from_id_salt("screw-pick").width(90.0).selected_text(cur).show_ui(ui, |ui| {
-                if ui.selectable_label(self.screw_pick.is_none(), tr("不放", "None")).clicked() {
-                    self.screw_pick = None;
-                }
-                for n in &self.screw_assets {
-                    if ui.selectable_label(self.screw_pick.as_deref() == Some(n.as_str()), n).clicked() {
-                        self.screw_pick = Some(n.clone());
-                    }
-                }
-            });
-            if let Some(s) = std_name.as_ref().filter(|s| self.screw_assets.contains(s)) {
-                if self.screw_pick.as_ref() != Some(s) && ui.small_button(t!("用 {s}", "Use {s}")).on_hover_text(tr("选和孔规格同名的螺丝", "Pick the screw named like the hole size")).clicked() {
-                    self.screw_pick = Some(s.clone());
-                }
-            }
-            if ui.small_button(tr("刷新", "Refresh")).on_hover_text(tr("重新读 Plasticity 里登记的 asset pack", "Re-read the asset packs registered in Plasticity")).clicked() {
-                self.cdp.send(pla_bridge::cdp::CdpCmd::Call { name: pla_bridge::shim::api::ASSET_LIST, args: serde_json::json!({}) });
-            }
-        });
-        if self.screw_assets.is_empty() {
-            ui.label(egui::RichText::new(tr("(Plasticity 里没有登记 asset pack, 或还没读到)", "(No asset pack registered in Plasticity, or not read yet)")).size(11.0).color(COL_MUTED));
-        }
-        if self.screw_pick.is_some() {
-            let labels = vec![tr("打孔后放螺丝", "Drill, then place").to_string(), tr("用 pack 负体开孔", "Cut with the pack's cutter").to_string()];
-            let mut s = self.screw_mode as usize;
-            if rz_segmented(ui, "screw-mode", &labels, &mut s) {
-                self.screw_mode = s as u8;
-            }
-            ui.label(
-                egui::RichText::new(if self.screw_mode == 1 {
-                    tr("孔由螺丝资产里的负体减出(上面的孔参数不用); 孔位同上: 面中点或选中的草图点", "The hole comes from the asset's cutter body (hole settings above unused); positions as above: face midpoint or selected sketch points")
-                } else {
-                    tr("先按上面的参数打孔, 再把螺丝放进每个孔(螺丝头朝面外)", "Drill with the settings above, then drop the screw into each hole (head outward)")
-                })
-                .size(11.0)
-                .color(COL_MUTED),
-            );
-        }
-        let cut_mode = self.screw_pick.is_some() && self.screw_mode == 1;
         // ---- 校验 + 底部 ----
         let num = |s: &str| s.trim().parse::<f64>().ok();
         let d = num(&self.hole_vals[0]).filter(|x| *x > 0.0);
@@ -7802,7 +7789,8 @@ impl PlaApp {
             && (self.hole_through || depth.is_some())
             && (!combo || tapd.is_some())
             && match ty { "counterbore" => cbd.is_some() && cbh.is_some(), "countersink" => cskd.is_some(), _ => true };
-        let can = plane.is_some() && (valid || cut_mode) && !self.dim_busy && self.screw_queue.is_empty();
+        let screw_ready = screw_plan.as_ref().is_none_or(|p| p.length.is_some());
+        let can = plane.is_some() && valid && screw_ready && !self.dim_busy && self.screw_queue.is_empty() && !self.screw_running;
         let esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
         let (cancel, ok) = rz_footer(ui, can, self.dim_busy);
         if cancel || esc {
@@ -7814,22 +7802,8 @@ impl PlaApp {
         if !(go && can && self.require_feature(Feature::DimFace)) {
             return;
         }
-        // 用 pack 负体开孔: 只要孔位(hole.make dry), 回包后逐个放螺丝 + 减负体
-        if cut_mode {
-            let Some(v) = plane else { return };
-            let asset = self.screw_pick.clone().unwrap_or_default();
-            self.cdp.send(pla_bridge::cdp::CdpCmd::Call {
-                name: pla_bridge::shim::api::HOLE_MAKE,
-                args: serde_json::json!({ "face": faces[0], "type": "simple", "d": 1, "units": v["units"], "points": points, "dry": true }),
-            });
-            self.screw_after = Some((asset, 1));
-            self.hole_pending = None;
-            self.dim_busy = true;
-            self.set_notice((false, tr("正在算孔位…", "Working out the positions…").into()));
-            return;
-        }
         let (Some(v), Some(d)) = (plane, d) else { return };
-        self.screw_after = self.screw_pick.clone().map(|a| (a, 0));
+        self.screw_after = screw_plan.map(|p| p.items);
         let mut args = serde_json::json!({ "face": faces[0], "type": ty, "d": d, "units": v["units"], "points": points });
         if !self.hole_through {
             args["depth"] = serde_json::json!(depth);
@@ -7857,23 +7831,289 @@ impl PlaApp {
         self.set_notice((false, tr("正在打孔…", "Making the hole(s)…").into()));
     }
 
-    /// N5: 放下一个螺丝(asset.place 一次一个, 回包后再放下一个); 放完报结果。
+    /// N5: 当前打孔表单 → 算螺丝长度用的孔情况。厚度: 单件 = 「操作」读到的面厚(dim.face), 读不到 / 组合孔 = hole.make dry 的层深。
+    fn screw_ctx(&self, plane: Option<&serde_json::Value>, combo: bool) -> pla_ui::screw_kit::HoleCtx {
+        let num = |s: &str| s.trim().parse::<f64>().ok().filter(|x| *x > 0.0);
+        let layers: Vec<(f64, f64)> = self
+            .screw_layers
+            .1
+            .as_ref()
+            .and_then(|v| v["layers"].as_array().cloned())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|l| Some((l["t0"].as_f64()?, l["t1"].as_f64()?)))
+            .collect();
+        let face_t = plane.filter(|v| v["kind"] == "thickness").and_then(|v| v["value"].as_f64());
+        let ty = HOLE_TYPES[self.hole_type as usize];
+        pla_ui::screw_kit::HoleCtx {
+            tap: !combo && self.hole_usage == 1,
+            through: self.hole_through,
+            combo,
+            t_entry: face_t.or_else(|| layers.first().map(|l| l.1 - l.0)),
+            t0_last: if combo { layers.last().map(|l| l.0) } else { None },
+            t_last: if combo { layers.last().map(|l| l.1 - l.0) } else { None },
+            depth: if self.hole_through { None } else { num(&self.hole_vals[1]) },
+            cb_depth: if ty == "counterbore" { num(&self.hole_vals[3]).unwrap_or(0.0) } else { 0.0 },
+        }
+    }
+
+    /// N5: 换螺丝标准 → 规格沿用(新标准没有就取最接近的), 孔跟着变: 沉头 → 锥形沉孔(直径 = 头径), 紧定 → 螺纹底孔。
+    fn screw_set_std(&mut self, id: String) {
+        use pla_ui::fasteners as fs;
+        let was_csk = fs::screw_std(&self.screw_choice.std).is_some_and(|s| s.head == fs::Head::Csk);
+        self.screw_choice.std = id;
+        self.screw_choice.length = None;
+        let Some(st) = fs::screw_std(&self.screw_choice.std) else { return };
+        if st.row(self.screw_choice.d).is_none() {
+            let want = if self.screw_choice.d > 0.0 { self.screw_choice.d } else { 4.0 };
+            self.screw_choice.d = st.rows.iter().map(|r| r.d).min_by(|a, b| (a - want).abs().total_cmp(&(b - want).abs())).unwrap_or(4.0);
+        }
+        let ty = |name: &str| HOLE_TYPES.iter().position(|t| *t == name).unwrap_or(0) as u8;
+        if st.head == fs::Head::Csk {
+            self.hole_type = ty("countersink");
+        } else if was_csk && HOLE_TYPES[self.hole_type as usize] == "countersink" {
+            self.hole_type = ty("simple");
+        }
+        if st.head == fs::Head::Set {
+            self.hole_usage = 1;
+        }
+        self.screw_sync_hole();
+    }
+
+    /// N5: 螺丝规格 → 孔规格(方案里同名的 M 规格)+ 沉头孔径 = 头径。
+    fn screw_sync_hole(&mut self) {
+        use pla_ui::fasteners as fs;
+        let d = self.screw_choice.d;
+        let name = format!("M{d}");
+        if let Some(i) = self.hole_sizes.iter().position(|s| s.size.trim().eq_ignore_ascii_case(&name)) {
+            self.hole_std = Some(i);
+            self.hole_vals = std_hole_vals(&self.hole_sizes[i], self.hole_usage);
+        }
+        if let Some(r) = fs::screw_std(&self.screw_choice.std).filter(|s| s.head == fs::Head::Csk).and_then(|s| s.row(d)) {
+            self.hole_vals[4] = format!("{}", r.dk);
+        }
+    }
+
+    /// N5「放螺丝」两行: 标准 / 规格(长度、头下垫圈、螺母)+ 说明。返回本帧的计划(不放 = None)。
+    fn screw_ui(&mut self, ui: &mut egui::Ui, ctx: &pla_ui::screw_kit::HoleCtx) -> Option<pla_ui::screw_kit::Plan> {
+        use pla_ui::fasteners as fs;
+        use pla_ui::screw_kit as sk;
+        let en = pla_bridge::i18n::is_en();
+        if !self.screw_listed {
+            self.screw_listed = true;
+            self.cdp.send(pla_bridge::cdp::CdpCmd::Call { name: pla_bridge::shim::api::ASSET_LIST, args: serde_json::json!({}) });
+        }
+        // ---- 第一行: 标准 ----
+        rz_label(ui, tr("紧固件(标准)", "Fastener (standard)"));
+        let mut pick: Option<String> = None;
+        ui.horizontal(|ui| {
+            let cur = fs::screw_std(&self.screw_choice.std).map_or(tr("不放螺丝", "No screw").to_string(), |s| format!("{} {}", s.code, if en { s.en } else { s.zh }));
+            egui::ComboBox::from_id_salt("screw-std").width(240.0).selected_text(cur).show_ui(ui, |ui| {
+                if ui.selectable_label(self.screw_choice.std.is_empty(), tr("不放螺丝", "No screw")).clicked() {
+                    pick = Some(String::new());
+                }
+                for s in fs::SCREWS {
+                    if ui.selectable_label(self.screw_choice.std == s.id, format!("{} {}", s.code, if en { s.en } else { s.zh })).clicked() {
+                        pick = Some(s.id.to_string());
+                    }
+                }
+            });
+            if ui.small_button(tr("刷新", "Refresh")).on_hover_text(tr("重新读 Plasticity 里登记的 asset pack(有现成件就用它)", "Re-read the asset packs registered in Plasticity (ready-made parts are used first)")).clicked() {
+                self.cdp.send(pla_bridge::cdp::CdpCmd::Call { name: pla_bridge::shim::api::ASSET_LIST, args: serde_json::json!({}) });
+            }
+        });
+        if let Some(id) = pick {
+            self.screw_set_std(id);
+        }
+        let st = fs::screw_std(&self.screw_choice.std)?;
+        let d = self.screw_choice.d;
+        let plan = sk::plan(&self.screw_choice, ctx);
+        // ---- 第二行: 规格 + 长度 ----
+        rz_label(ui, tr("规格 / 长度", "Size / length"));
+        let mut new_d: Option<f64> = None;
+        let mut new_l: Option<Option<f64>> = None;
+        let in_pack = sk::pack_lengths(&self.screw_assets, st.id, d);
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_id_salt("screw-d").width(70.0).selected_text(format!("M{d}")).show_ui(ui, |ui| {
+                for r in st.rows {
+                    if ui.selectable_label(r.d == d, format!("M{}", r.d)).clicked() {
+                        new_d = Some(r.d);
+                    }
+                }
+            });
+            ui.label("×");
+            let lab = |l: f64| if in_pack.contains(&l) { format!("{l} ★") } else { format!("{l}") };
+            let cur = match self.screw_choice.length {
+                Some(l) => lab(l),
+                None => plan.auto.map_or(tr("自动(无)", "Auto (none)").to_string(), |a| t!("自动 {}", "Auto {}", lab(a))),
+            };
+            egui::ComboBox::from_id_salt("screw-l").width(110.0).selected_text(cur).show_ui(ui, |ui| {
+                if ui.selectable_label(self.screw_choice.length.is_none(), tr("自动", "Auto")).clicked() {
+                    new_l = Some(None);
+                }
+                for l in &plan.lengths {
+                    if ui.selectable_label(self.screw_choice.length == Some(*l), lab(*l)).clicked() {
+                        new_l = Some(Some(*l));
+                    }
+                }
+            });
+            if !in_pack.is_empty() {
+                ui.label(egui::RichText::new(tr("★ = pack 里有", "★ = in a pack")).size(11.0).color(COL_MUTED));
+            }
+        });
+        if let Some(nd) = new_d {
+            self.screw_choice.d = nd;
+            self.screw_choice.length = None;
+            self.screw_sync_hole();
+        }
+        if let Some(l) = new_l {
+            self.screw_choice.length = l;
+        }
+        // ---- 头下垫圈 / 弹垫 ----
+        if plan.washers_ok {
+            ui.horizontal(|ui| {
+                ui.label(tr("头下", "Under head"));
+                let name = |w: &fs::WasherStd| format!("{} {}", w.code, if en { w.en } else { w.zh });
+                let cur = self.screw_choice.washer.as_deref().and_then(fs::washer_std).map_or(tr("无垫圈", "No washer").to_string(), name);
+                egui::ComboBox::from_id_salt("screw-w").width(150.0).selected_text(cur).show_ui(ui, |ui| {
+                    if ui.selectable_label(self.screw_choice.washer.is_none(), tr("无垫圈", "No washer")).clicked() {
+                        self.screw_choice.washer = None;
+                    }
+                    for w in fs::WASHERS.iter().filter(|w| !w.spring && w.row(d).is_some()) {
+                        if ui.selectable_label(self.screw_choice.washer.as_deref() == Some(w.id), name(w)).clicked() {
+                            self.screw_choice.washer = Some(w.id.into());
+                        }
+                    }
+                });
+                ui.checkbox(&mut self.screw_choice.spring, tr("弹垫", "Spring washer"));
+            });
+        }
+        // ---- 螺母(只有过孔通孔才能配) ----
+        match &plan.nut_why {
+            Some(why) => {
+                ui.label(egui::RichText::new(t!("螺母: {why}", "Nut: {why}")).size(11.0).color(COL_MUTED));
+            }
+            None => {
+                ui.horizontal(|ui| {
+                    ui.label(tr("螺母", "Nut"));
+                    let name = |n: &fs::NutStd| format!("{} {}", n.code, if en { n.en } else { n.zh });
+                    let cur = self.screw_choice.nut.as_deref().and_then(fs::nut_std).map_or(tr("不配", "None").to_string(), name);
+                    egui::ComboBox::from_id_salt("screw-n").width(150.0).selected_text(cur).show_ui(ui, |ui| {
+                        if ui.selectable_label(self.screw_choice.nut.is_none(), tr("不配", "None")).clicked() {
+                            self.screw_choice.nut = None;
+                        }
+                        for n in fs::NUTS.iter().filter(|n| n.row(d).is_some()) {
+                            if ui.selectable_label(self.screw_choice.nut.as_deref() == Some(n.id), name(n)).clicked() {
+                                self.screw_choice.nut = Some(n.id.into());
+                            }
+                        }
+                    });
+                    if self.screw_choice.nut.is_some() {
+                        ui.checkbox(&mut self.screw_choice.nut_washer, tr("平垫", "Washer"));
+                        let nylon = self.screw_choice.nut.as_deref().and_then(fs::nut_std).is_some_and(|n| n.nylon);
+                        ui.add_enabled(!nylon, egui::Checkbox::new(&mut self.screw_choice.nut_spring, tr("弹垫", "Spring")));
+                    }
+                });
+            }
+        }
+        // ---- 说明: 长度怎么来的 / 每件从哪来(pack 现成件 / 宏建) ----
+        let small = |ui: &mut egui::Ui, s: &str, col: egui::Color32| {
+            ui.label(egui::RichText::new(s).size(11.0).color(col));
+        };
+        if let Some(l) = plan.length {
+            let range = match (plan.need, plan.max) {
+                (Some(n), Some(m)) => t!("(需要 ≥ {n}, ≤ {m})", " (needs ≥ {n}, ≤ {m})"),
+                (Some(n), None) => t!("(需要 ≥ {n})", " (needs ≥ {n})"),
+                (None, Some(m)) => t!("(≤ {m})", " (≤ {m})"),
+                _ => String::new(),
+            };
+            small(ui, &t!("{} M{d}×{l}{range}", "{} M{d}×{l}{range}", st.code), COL_MUTED);
+        }
+        for s in &plan.info {
+            small(ui, s, COL_MUTED);
+        }
+        for s in &plan.warn {
+            small(ui, s, COL_RED);
+        }
+        if !plan.items.is_empty() && plan.length.is_some() {
+            let src: Vec<String> = plan
+                .items
+                .iter()
+                .map(|it| {
+                    let what = match it.kind {
+                        sk::Kind::Screw => tr("螺钉", "screw"),
+                        sk::Kind::Washer => tr("垫圈", "washer"),
+                        sk::Kind::Nut => tr("螺母", "nut"),
+                    };
+                    let from = if sk::find(&self.screw_assets, it).is_some() { tr("pack", "pack") } else { tr("建模", "built") };
+                    format!("{what} {from}")
+                })
+                .collect();
+            small(ui, &t!("每个孔: {}", "Per hole: {}", src.join(" · ")), COL_MUTED);
+        }
+        Some(plan)
+    }
+
+    /// N5: 打完孔 → 每个孔位按计划排队: pack 里有现成件 = asset.place, 没有 = 按国标宏建(cmd.exec)。
+    fn screw_enqueue(&mut self, v: &serde_json::Value, items: &[pla_ui::screw_kit::Item]) {
+        use pla_ui::screw_kit::Kind;
+        let n: Vec<f64> = v["normal"].as_array().map(|a| a.iter().filter_map(|x| x.as_f64()).collect()).unwrap_or_default();
+        if n.len() != 3 {
+            return;
+        }
+        let units = v["units"].clone();
+        for h in v["holes"].as_array().cloned().unwrap_or_default() {
+            let at: Vec<f64> = h["at"].as_array().map(|a| a.iter().filter_map(|x| x.as_f64()).collect()).unwrap_or_default();
+            if at.len() != 3 {
+                continue;
+            }
+            for it in items {
+                // 深度 z 沿孔轴(= −n)
+                let pt: Vec<f64> = (0..3).map(|i| ((at[i] - n[i] * it.z) * 1000.0).round() / 1000.0).collect();
+                let out: Vec<f64> = n.iter().map(|x| if it.up { *x } else { -*x }).collect();
+                if let Some(a) = pla_ui::screw_kit::find(&self.screw_assets, it) {
+                    self.screw_queue.push_back((
+                        pla_bridge::shim::api::ASSET_PLACE,
+                        serde_json::json!({ "asset": a.id, "pack": a.pack, "at": pt, "normal": out, "units": units }),
+                    ));
+                    continue;
+                }
+                let (kind, axis) = match it.kind {
+                    Kind::Screw => ("screw", n.iter().map(|x| -x).collect::<Vec<f64>>()),
+                    Kind::Washer => ("washer", out.clone()),
+                    Kind::Nut => ("nut", out.clone()),
+                };
+                let req = serde_json::json!({ "kind": kind, "std": it.std, "size": it.d, "length": it.length, "at": pt, "axis": axis });
+                match serde_json::from_value::<pla_ui::fasteners::PartReq>(req).map_err(|e| e.to_string()).and_then(|q| pla_ui::fasteners::expand(&q)) {
+                    Ok(x) => self.screw_queue.push_back((pla_bridge::shim::api::CMD_EXEC, serde_json::json!({ "atomic": true, "ops": x.ops, "units": units }))),
+                    Err(e) => {
+                        self.screw_count.1 += 1;
+                        self.screw_count.2.get_or_insert(e);
+                    }
+                }
+            }
+        }
+    }
+
+    /// N5: 放下一件(一次一个, 回包后再放下一个); 放完报结果。
     fn screw_pump(&mut self) {
-        if let Some(args) = self.screw_queue.pop_front() {
+        if let Some((api, args)) = self.screw_queue.pop_front() {
             self.dim_busy = true;
+            self.screw_running = true;
             let left = self.screw_queue.len();
-            self.cdp.send(pla_bridge::cdp::CdpCmd::Call { name: pla_bridge::shim::api::ASSET_PLACE, args });
-            self.set_notice((false, t!("正在放螺丝…(还有 {left} 个)", "Placing screws… ({left} more)")));
+            self.cdp.send(pla_bridge::cdp::CdpCmd::Call { name: api, args });
+            self.set_notice((false, t!("正在放紧固件…(还有 {left} 件)", "Placing fasteners… ({left} more)")));
             return;
         }
         self.dim_busy = false;
+        self.screw_running = false;
         let (ok, bad, err) = std::mem::take(&mut self.screw_count);
         if ok + bad == 0 {
             return;
         }
         match err {
-            None => self.set_notice((false, t!("已放 {ok} 个螺丝", "Placed {ok} screw(s)"))),
-            Some(e) => self.set_notice((true, t!("放了 {ok} 个, 失败 {bad} 个: {e}", "Placed {ok}, {bad} failed: {e}"))),
+            None => self.set_notice((false, t!("已放 {ok} 件紧固件", "Placed {ok} fastener part(s)"))),
+            Some(e) => self.set_notice((true, t!("放了 {ok} 件, 失败 {bad} 件: {e}", "Placed {ok}, {bad} failed: {e}"))),
         }
     }
 

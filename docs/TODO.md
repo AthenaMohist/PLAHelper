@@ -420,10 +420,18 @@
 - [ ] **N4 打孔工具**：把 SW 异型孔向导体验搬进 Plasticity。
       规格库（螺纹底孔 / 自攻孔按材料 / 螺套 / 热熔螺母 / 沉头 / 过孔，可录入 + 上传模型）→
       选面/点 → 自动放负体、定长度、布尔、放螺丝实例。一期可先自动化现有 asset 负体流程。
-- [~] **N5 asset 放置**（用户 2026-11-18：螺丝等常用件优先用 Plasticity 的 asset pack，放螺丝做进打孔面板；know-how/asset-place.md）：
-      垫片 `asset.list` / `asset.place`（走 Plasticity 自己的拖放导入 = 带资产引用，放置时换成指定点 / 朝向，可选把负体从零件减掉）、
-      `hole.make {dry}` 只算孔位；打孔面板「放螺丝」：pack 资产下拉（同名一键选）+ 打孔后放螺丝 / 用 pack 负体开孔；pla-mcp `model_assets` / `model_asset_place`。
-      model1 实测：M4 / M3 放置 + 负体开孔（⌀4.3 / ⌀4 / ⌀3.3 三段孔）。**待做**：打孔面板「放螺丝」在屏幕上点测（用户）。
+- [~] **N5 asset 放置 + 打孔面板放紧固件**（用户 2026-11-18：螺丝等常用件优先用 Plasticity 的 asset pack，放螺丝做进打孔面板；know-how/asset-place.md）：
+      垫片 `asset.list` / `asset.place`（走 Plasticity 自己的拖放导入 = 带资产引用，放置时换成指定点 / 朝向）、`hole.make {dry}`（孔位 + 各实体层深）；
+      pla-mcp `model_assets` / `model_asset_place`。**负体相关全部去掉**（用户：孔径以国标 JSON / 目录为准，pack 只放螺丝本体，用户另出一份新 pack）。
+      国标目录 `fasteners.rs`：螺钉 14 种（GB/T 70.1/70.2/70.3、5783/5782、818/819.1、65/67/68、77/78/79/80）、垫圈 4 种（97.1/848/96.1/93 弹垫）、
+      螺母 3 种（6170/6172.1/889.1）、长度系列与各规格长度范围；`model_part` 支持 `kind: screw + std`。`screw_kit.rs`：兼容规则 + 长度 + 摆放 + 认 pack 现成件。
+      打孔面板：第一行标准 → 第二行规格 × 长度（自动 / 手选，★ = pack 里有）+ 头下垫圈 / 弹垫 + 螺母（只有过孔通孔可配；盲孔 / 螺纹孔 / 组合孔不配）→ 孔参数；
+      长度 = 夹紧厚（面厚 / 组合孔层深，扣沉孔深）+ 垫圈 + 螺母 + 2P 或旋合 1.5d（盲孔不超过孔深 − 2P）；沉头 → 锥形沉孔、紧定 → 螺纹底孔。
+      每件：pack 里认到就 asset.place，没有就按宏建（十字槽 / 一字槽暂不建）。**待做**：屏幕点测（用户）；每件一个撤销步（以后可合成一步）。
+- [ ] **N5b 建库进 asset pack + 随软件分发**（用户 2026-11-18）：按需 / 有空时按规格书把某系列建出来（规范姿态、pivot = 支承面、+Z = 杆→头，
+      命名 `GB/T 70.1 M4×12`、文件夹 = 标准），存进 asset pack；pack 随 PLAhelper 安装，给一个按钮一键加入用户的 Plasticity。
+      已知（只读探查）：Plasticity 做 pack = 把组标成资产（`ToggleAssetCommand` / `nodes.setAsset`）再 `ExportAssetPackCommand` 导出（存盘对话框可用
+      export.rs 的主进程应答）；登记 pack = `editor.assets.add / remove`（参数待实测）。**待做**：在单独的库文档里实测 标资产 → 导出 → 登记。
 - [ ] **N5 常用件库**：常用件白名单入库（STEP + 缩略图 + 规格字段，SQLite 索引），PLAhelper 搜索面板一键放入当前文档；
       常用度按本人插入次数统计；商家具体型号用到时下载归档。
 - [ ] **N6 AI 建模**：已细化为 **A 自动建模 pipeline**（见下节）。build123d → STEP → 导入 作为退路保留。

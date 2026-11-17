@@ -8,8 +8,8 @@
   `load(filePath)`(参数是**路径字符串**; 传对象报 path must be string)→ 读 pack 文件:
   `{schemaVersion, id, revision, exportedAt, unit, bufferViews[], assets[]}`, 每个资产
   `{id: 'node:…', type, subtype: 'group', name, path: [文件夹], thumbnail(dataURL), bbox(米), pivot: {position, orientation}, contentHash}`。只读, 不进撤销栈。
-- 用户的螺丝 pack: 12 个(M1.4 … M20, 文件夹「杯头内六角」), 每个资产 = 螺钉(如 `杯内六M4x10`)+ **负体**(`杯内六M4Neg`, 减出孔:
-  M4 = ⌀4.3 过孔段 + ⌀4 段 + ⌀3.3 底孔段)。
+- 用户的螺丝 pack(旧版): 12 个(M1.4 … M20, 文件夹「杯头内六角」), 每个资产 = 螺钉(如 `杯内六M4x10`)+ 负体(`杯内六M4Neg`)。
+  负体是没有 helper 时记孔径的折中; 用户 2026-11-18 决定**去掉负体**, pack 只放螺丝本体(另出新 pack), 孔径以国标目录为准, helper 里负体相关操作已删。
 
 ## 手工拖进视口发生了什么(透明记录器实测)
 
@@ -27,19 +27,32 @@
 等**新的** `ImportWithPlacementCommand`(看 `executor.active.command`; `lastCommand` 在上一条被取消后还指着旧的)→
 合成一次 `pointermove`(拾取器没有当前点时 `finish()` 什么也不做)→ 临时给 `PlaceFactory.prototype` 挂一个 commit, 把
 destination / destinationOrientation 换成要的(`setFromUnitVectors(+Z, normal)` + 绕 normal 转 rotate°)→ 对命令的 promises 逐个 `finish()` →
-撤销栈 +1 = 放好 → 删掉临时 commit。可选 `cut`: 自建命令里 `BooleanFactory`(setter `targets` / `tools`, `operationType` 默认 subtract)把负体从目标减掉。
-失败: 取消命令(导入的东西随之消失)+ 撤回到放之前。
+撤销栈 +1 = 放好 → 删掉临时 commit。失败: 取消命令(导入的东西随之消失)+ 撤回到放之前。
+(曾有可选 `cut` 用 `BooleanFactory`(setter `targets` / `tools`, `operationType` 默认 subtract)把负体减掉, 2026-11-18 随负体一起删了。)
 
 坑:
 - **命令对象是 thenable**(有 `then`): 拿它去 resolve 自己的 Promise, 链会等命令结束 —— 命令在等我们放置 = 死锁。包一层 `{cmd}`。
 - 窗口不可见时拒绝(拖放 / 拾取器要可见窗口)。
 - pla-ui 与 pla-app / pla-mcp 的垫片版本要一致(pla-ui 会把页面里的垫片换回它自己的版本, 正在跑的调用会被打断)。
 
-实测: M4 放到 (300, 50, 20) + 减进 40×40×20 的方块 → 0.98 s, 2 个撤销步; 方块上出现 ⌀4.3 / ⌀4 / ⌀3.3 三段孔, 螺钉头在面上方。
-`hole.make {dry: true}` 只返回孔位(面中点 + offset / 草图点), 给"用负体开孔"用。
+实测: M4 放到 (300, 50, 20), 0.98 s, 螺钉头在面上方(pivot = 支承面, +Z = 杆 → 头)。
+`hole.make {dry: true}` 不打孔, 只返回孔位 + 第一个孔位上各实体沿孔轴的入口 / 出口深度 `layers: [{solid, t0, t1}]`(包围盒投影), 打孔面板算螺丝长度用。
 
 ## 用在哪
 
-- 打孔面板(「操作」→ 打孔)新增「放螺丝(asset pack)」: 选 pack 里的资产(和孔规格同名的一键选), 方式 = 打孔后放螺丝 / 用 pack 负体开孔
-  (孔位同打孔: 面中点或选中的草图点; 螺丝 +Z = 面外法向)。
-- pla-mcp: `model_assets`(列表)、`model_asset_place`(放 + 可选减负体)。
+- 打孔面板(「操作」→ 打孔), 用户 2026-11-18 定的顺序: 第一行选标准(国标螺钉 14 种, `fasteners::SCREWS`), 第二行规格 × 长度 +
+  头下垫圈 / 弹垫 + 螺母, 再往下是原来的孔参数。规则在 `screw_kit.rs`(有单测):
+  - 螺母只有**过孔 + 通孔 + 单件**才能配(盲孔 / 螺纹底孔 / 组合孔 / 紧定螺钉都不配); 尼龙锁紧螺母不加弹垫; 沉头 / 紧定不加头下垫圈。
+  - 长度: 夹紧厚(单件 = 「操作」读到的面厚, 组合孔 = 最后一件的入口深度; 圆柱沉孔扣掉沉孔深)+ 头下垫圈 / 弹垫厚, 然后
+    配螺母: + 螺母侧垫圈 + 螺母厚 + 2P, 取 ≥ 它的最短标准长度; 拧进螺纹: + 旋合 min(1.5d, 可用螺纹)(盲孔可用 = 孔深 − 2P, 不超过), 旋合 < d 报警;
+    过孔通孔不配螺母 = 当作穿过去拧进没建模的件(+1.5d); 盲过孔 = 不顶底。手选长度超出范围报警。
+  - 选沉头 → 孔类型自动切锥形沉孔、沉头径 = 头径; 选紧定 → 用途切螺纹底孔; 规格 → 孔规格跟着选同名 M 规格。
+  - 每件(垫圈 / 螺钉 / 螺母)先在 pack 里认现成件(标准俗称在名字或文件夹里 + M 规格 + 螺钉长度: 名字里的 ×l, 没有就用包围盒最长边 − 头高推),
+    认到就 `asset.place`, 没有就按国标宏建(`cmd.exec`); 长度下拉里 ★ = pack 里有。
+- pla-mcp: `model_assets`(列表)、`model_asset_place`(放)、`model_part`(`kind: screw` + `std` = 目录 id)。
+
+## 建库 / 分发(N5b, 待实测)
+
+只读探查(2026-11-18): `editor.assets` 只有 `getAssetPacks / load / add / remove`(源码被隐藏, 只能看行为); 命令里有 `ToggleAssetCommand`(把组标成资产)、
+`ExportAssetPackCommand`(导出 pack)、`ReloadAssetCommand`; `nodes` 上有 `setAsset / isAsset / findAllAssets / setAssetReference / getAssetReference`。
+打算: 在单独的库文档里按规范姿态建件 → 成组命名 → 标成资产 → 导出(存盘对话框用 export.rs 的主进程一次性应答)→ `assets.add` 登记。
