@@ -590,7 +590,12 @@
             应用过的记 <base>.agent.jsonl（D6 案例样本）。官方接口默认带 fallbacks "default"（拒绝时服务端换模型）。
             实测：直连官方接口回 403 "Request not allowed"（按地区拒绝）；走代理正常（假 key → 401）。代理：设置里填 / 环境变量 HTTPS_PROXY /
             Windows 系统代理（依次），"none" = 直连；本机两条自动路径都验证过（Clash 127.0.0.1:7897）。
-            没做：MCP 形态（R3(b)）、对话持久化、不能挪尺寸位置（编译器没有位置参数）。
+            没做：对话持久化、不能挪尺寸位置（编译器没有位置参数）。
+            ✅ 2026-11-17 MCP 形态（R3(b)）：pla-mcp.exe（stdio JSON-RPC；仓库根 .mcp.json 已登记，Claude Code 在本项目里直接可用；
+            别处用 `claude mcp add plahelper -- <repo>\src\target\release\pla-mcp.exe`）。工具：status / list_parts / get_drawing（设置 + 报告 + 预览图）/
+            apply_drawing_changes（一次改多张）/ draw（含 "undrawn"，可等完成）/ list_rules / remember_rule / show_part。
+            读直接读文件；改 / 出图经文件队列交给正在跑的 pla-ui（<exe 目录>/mcp/：state.json 心跳 + req / resp），零件清单空时让 pla-ui 扫一次 BOM（只读）。
+            实测（encoder calibrator bkp）：status / list_parts（自动扫出 66 个零件）/ get_drawing（Extruded.005 设置 + 报告 + 预览 PNG）/ 找不到零件报错。apply / draw 没在真文档上跑。
       - [~] D6 偏好层（2026-11-17 先做硬规则）：全局 `<数据目录>/drawing-prefs.json`：标题栏默认字段（设计 / 审核 / 项目 / 表处 / 硬度 / 版本，
             「设为默认」按钮）+ 零件图 / 装配图技术要求（「设为我的默认」）；出图时 偏好 < BOM < 本图。指标：Sheet.edits = 人修正次数（设置每变一次 +1）。
             没做：软指导给 agent、案例层（等 D5）。

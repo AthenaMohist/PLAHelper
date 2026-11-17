@@ -14,6 +14,7 @@ pub mod hotkey;
 pub mod identity;
 pub mod llm;
 pub mod matstate;
+pub mod mcp_bridge;
 pub mod notes;
 pub mod notes_table;
 pub mod notes_ui;

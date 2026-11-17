@@ -228,6 +228,10 @@ struct PlaApp {
     rel_del_confirm: bool,
     rel_job: Option<std::sync::mpsc::Receiver<Result<std::path::PathBuf, String>>>,
     rel_last: Option<std::path::PathBuf>,
+    /// MCP 桥: 上次处理 / 上次写的状态(没变就不写, 5 s 心跳)。
+    mcp_checked: Option<Instant>,
+    mcp_last: String,
+    mcp_written: Option<Instant>,
     /// D5: 出图助手对话(当前选中的图)、输入框、后台一轮。
     agent_chat: pla_ui::draw_agent::Chat,
     agent_input: String,
@@ -2595,6 +2599,9 @@ impl PlaApp {
             rel_del_confirm: false,
             rel_job: None,
             rel_last: None,
+            mcp_checked: None,
+            mcp_last: String::new(),
+            mcp_written: None,
             agent_chat: Default::default(),
             agent_input: String::new(),
             agent_job: None,
@@ -4962,6 +4969,196 @@ impl PlaApp {
                 ),
             ));
         }
+    }
+
+    // ---------------------------------------------------------------- MCP 桥(pla-mcp)
+    /// BOM 行 → 每个零件: 标题栏字段(pn / name / material / finish / qty)、第一个实例、给 MCP 的摘要。
+    fn bom_parts(&self) -> Vec<(std::collections::BTreeMap<String, String>, (String, String), pla_ui::mcp_bridge::PartInfo)> {
+        let Some(Ok(v)) = &self.bom_result else { return Vec::new() };
+        let (rows, _) = pla_ui::bom_table::build(v, &self.bom_tpl, &self.bom_edits, &self.lib);
+        let cols = &self.bom_tpl.columns;
+        let mut out = Vec::new();
+        for r in rows.iter().filter(|r| !r.manual) {
+            let get = |id: &str| cols.iter().position(|c| c.id == id).map(|i| r.cells[i].trim().to_string()).unwrap_or_default();
+            let line = v["lines"].as_array().into_iter().flatten().find(|l| l["key"].as_str() == Some(r.key.as_str()));
+            let m = line.and_then(|l| l["members"].as_array()).and_then(|a| a.first());
+            let member = m.map(|m| (m["id"].as_str().unwrap_or("").to_string(), m["name"].as_str().unwrap_or("").to_string())).unwrap_or_default();
+            let qty = line.and_then(|l| l["qty"].as_u64()).unwrap_or(1);
+            let mut title = std::collections::BTreeMap::new();
+            for id in ["pn", "name", "material", "finish"] {
+                let x = get(id);
+                if !x.is_empty() {
+                    title.insert(id.to_string(), x);
+                }
+            }
+            title.insert("qty".into(), qty.to_string());
+            let name = if get("name").is_empty() { member.1.clone() } else { get("name") };
+            let bought = line.is_some_and(|l| pla_ui::drawing::member_bought(&l["members"], &self.draw_sheets.purchased)) || pla_ui::drawing::looks_standard(&name, &get("pn"));
+            let info = pla_ui::mcp_bridge::PartInfo {
+                key: r.key.clone(),
+                pn: get("pn"),
+                name,
+                qty,
+                material: get("material"),
+                supplier: pla_ui::release::process_of(&self.bom_edits, &r.key).to_string(),
+                bought,
+            };
+            out.push((title, member, info));
+        }
+        out
+    }
+
+    fn mcp_tick(&mut self) {
+        if self.mcp_checked.is_some_and(|t| t.elapsed() < Duration::from_millis(300)) {
+            return;
+        }
+        self.mcp_checked = Some(Instant::now());
+        self.bom_template_tick();
+        let parts = self.bom_parts();
+        let mut st = pla_ui::mcp_bridge::State {
+            doc_key: self.doc_key.clone(),
+            drawings_dir: pla_ui::drawing::dir(&self.doc_key).display().to_string(),
+            parts: parts.iter().map(|p| p.2.clone()).collect(),
+            selected: self.draw_sel.clone(),
+            drawing: self.draw_job.as_ref().map(|j| j.key.clone()),
+            queued: self.draw_queue.len(),
+            ts: 0,
+        };
+        let ser = serde_json::to_string(&st).unwrap_or_default();
+        if ser != self.mcp_last || self.mcp_written.map_or(true, |t| t.elapsed() > Duration::from_secs(5)) {
+            st.ts = pla_ui::mcp_bridge::now();
+            if pla_ui::mcp_bridge::write_state(&st).is_ok() {
+                self.mcp_last = ser;
+                self.mcp_written = Some(Instant::now());
+            }
+        }
+        for (id, req) in pla_ui::mcp_bridge::take_requests() {
+            let resp = self.mcp_handle(&req, &parts);
+            pla_ui::mcp_bridge::respond(&id, &resp);
+        }
+    }
+
+    /// 处理一个 pla-mcp 请求: apply(改设置, 可多张)/ draw(排队出图)/ rule / show。
+    fn mcp_handle(&mut self, req: &serde_json::Value, parts: &[(std::collections::BTreeMap<String, String>, (String, String), pla_ui::mcp_bridge::PartInfo)]) -> serde_json::Value {
+        use serde_json::json;
+        let find = |k: &str| parts.iter().find(|p| p.2.key == k);
+        let keys: Vec<String> = req["keys"].as_array().into_iter().flatten().filter_map(|k| k.as_str().map(String::from)).collect();
+        match req["op"].as_str().unwrap_or("") {
+            "apply" => {
+                let patch: pla_ui::draw_agent::Patch = match serde_json::from_value(req["patch"].clone()) {
+                    Ok(p) => p,
+                    Err(e) => return json!({"ok": false, "error": e.to_string()}),
+                };
+                let dir = pla_ui::drawing::dir(&self.doc_key);
+                let mut results = Vec::new();
+                let mut redraw = Vec::new();
+                for k in &keys {
+                    if let Some(p) = find(k) {
+                        self.draw_ensure(k, &p.0, &p.1);
+                    }
+                    let Some(mut s) = self.draw_sheets.get(k).cloned() else {
+                        results.push(json!({"part": k, "error": "no such part"}));
+                        continue;
+                    };
+                    if s.locked() {
+                        results.push(json!({"part": s.base, "skipped": "locked to an uploaded drawing"}));
+                        continue;
+                    }
+                    let rep = pla_ui::drawing::load_report(&dir, &s);
+                    match pla_ui::draw_agent::apply(&mut s, &patch, rep.as_ref()) {
+                        Ok(changes) => {
+                            s.edits += 1;
+                            pla_ui::draw_agent::log_applied(&dir, &s, &format!("MCP: {}", patch.summary), &patch, &changes);
+                            results.push(json!({"part": s.base, "changes": changes}));
+                            self.draw_sheets.upsert(s);
+                            redraw.push(k.clone());
+                        }
+                        Err(e) => results.push(json!({"part": s.base, "error": e})),
+                    }
+                }
+                self.draw_save();
+                if let Some(k) = self.draw_sel.clone() {
+                    self.draw_buf.clear();
+                    self.draw_load(&k);
+                }
+                if !redraw.is_empty() {
+                    self.set_notice((false, t!("外部助手改了 {} 张图的设置", "An external assistant changed {} drawing(s)", redraw.len())));
+                }
+                if req["redraw"].as_bool().unwrap_or(false) {
+                    self.mcp_queue_draw(&redraw, false, parts);
+                }
+                json!({"ok": true, "results": results})
+            }
+            "draw" => {
+                let skipped = self.mcp_queue_draw(&keys, req["export"].as_bool().unwrap_or(false), parts);
+                json!({"ok": true, "skipped": skipped})
+            }
+            // 还没扫过 BOM(零件清单空): 按当前范围扫一次(只读)
+            "scan" => {
+                if !self.bom_busy {
+                    let s = self.bom_scope.clone();
+                    self.bom_scan(s);
+                }
+                json!({"ok": true})
+            }
+            "rule" => {
+                let r = req["rule"].as_str().unwrap_or("").trim().to_string();
+                if r.is_empty() {
+                    return json!({"ok": false, "error": "empty rule"});
+                }
+                let mut p = self.prefs_get().clone();
+                if !p.agent_rules.contains(&r) {
+                    p.agent_rules.push(r);
+                }
+                self.prefs_set(p);
+                json!({"ok": true})
+            }
+            "show" => {
+                let k = req["key"].as_str().unwrap_or("").to_string();
+                let Some(p) = find(&k) else { return json!({"ok": false, "error": "no such part"}) };
+                self.draw_ensure(&k, &p.0, &p.1);
+                self.show_snapshots = false;
+                self.close_cfg_group();
+                self.show_bom = true;
+                self.bom_tab = 2;
+                self.draw_sel = Some(k.clone());
+                self.draw_buf.clear();
+                self.draw_up_page = 0;
+                self.draw_load(&k);
+                json!({"ok": true})
+            }
+            op => json!({"ok": false, "error": format!("unknown op {op}")}),
+        }
+    }
+
+    /// 排队出图(同批量出图的队列); 锁定的跳过。返回跳过的图名。
+    fn mcp_queue_draw(&mut self, keys: &[String], export: bool, parts: &[(std::collections::BTreeMap<String, String>, (String, String), pla_ui::mcp_bridge::PartInfo)]) -> Vec<String> {
+        let mut skipped = Vec::new();
+        let mut n = 0;
+        for k in keys {
+            let Some(p) = parts.iter().find(|p| p.2.key == *k) else {
+                skipped.push(format!("{k} (not in the current BOM scope)"));
+                continue;
+            };
+            self.draw_ensure(k, &p.0, &p.1);
+            let Some(s) = self.draw_sheets.get(k) else { continue };
+            if s.locked() {
+                skipped.push(format!("{} (locked)", s.base));
+                continue;
+            }
+            if self.draw_queue.iter().any(|q| &q.0 == k) || self.draw_job.as_ref().is_some_and(|j| &j.key == k) {
+                continue;
+            }
+            let mut title = p.0.clone();
+            title.extend(s.title.clone());
+            self.draw_queue.push_back((k.clone(), export, title));
+            n += 1;
+        }
+        if n > 0 && self.draw_batch.is_none() {
+            self.draw_batch = Some((n, Vec::new()));
+            self.draw_batch_keys = Vec::new();
+        }
+        skipped
     }
 
     // ---------------------------------------------------------------- 外发包
@@ -11568,6 +11765,9 @@ impl eframe::App for PlaApp {
         }
         // D1 出图任务在后台跑, 窗口关了也要收结果
         self.draw_tick();
+        // MCP 桥: 心跳 / 状态 + 处理 pla-mcp 的请求(窗口不动也每 2 s 醒一次)
+        self.mcp_tick();
+        ctx.request_repaint_after(Duration::from_secs(2));
         if self.draw_job.is_some() || self.draw_book.is_some() {
             ctx.request_repaint_after(Duration::from_millis(500));
         }

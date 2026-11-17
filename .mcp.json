@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "plahelper": {
+      "command": "src/target/release/pla-mcp.exe",
+      "args": []
+    }
+  }
+}

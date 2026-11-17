@@ -7,6 +7,11 @@ edition.workspace = true
 name = "pla-ui"
 path = "src/main.rs"
 
+# MCP 服务器(stdio): Claude Code 等外部 agent 通过它看 / 改 / 出图(经正在跑的 pla-ui)。
+[[bin]]
+name = "pla-mcp"
+path = "src/bin/pla_mcp.rs"
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
