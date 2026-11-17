@@ -91,6 +91,14 @@ bool: union | subtract | intersect with targets [solid refs]. Give a step id: \"
             "at": {"type": "array", "items": {"type": "number"}}, "offset": {"type": "array", "items": {"type": "number"}},
             "points": {"type": "array", "items": {"type": "object"}}, "stack": {"type": "array", "items": {"type": "string"}}, "units": {"type": "string"}},
           "required": ["face", "d"]}},
+        {"name": "model_part", "annotations": {"destructiveHint": true},
+         "description": format!("CHANGES THE USER'S MODEL. Build a GB standard part in one atomic call (A10 macros; threads not modelled). kind: screw-cap (GB/T 70.1 socket head cap) / screw-csk (GB/T 70.3 countersunk socket, length includes head) / screw-hex (GB/T 5783 hex bolt) / screw-set (GB/T 77 socket set screw, flat point) / nut (GB/T 6170) / washer (GB/T 97.1) / pin (GB/T 119.2 dowel, size = diameter) / shaft (steps [[diameter, length], …], chamfer). Placement: at + axis. Screws: at = centre of the head's bearing face (countersunk: of the head top), axis = from head toward the tip (into the hole). Set screw: at = socket end. Nut / washer / pin / shaft: at = one end face centre, axis = thickness / length direction. Returns the steps' results and the spec key PLAhelper's BOM recognizer will report. Sizes: {}", pla_ui::fasteners::sizes()),
+         "inputSchema": {"type": "object", "properties": {
+            "kind": {"type": "string", "enum": ["screw-cap", "screw-csk", "screw-hex", "screw-set", "nut", "washer", "pin", "shaft"]},
+            "size": {"description": "\"M4\" (or 4); pin = diameter"}, "length": {"type": "number"},
+            "steps": {"type": "array", "items": {"type": "array", "items": {"type": "number"}}}, "chamfer": {"type": "number"},
+            "at": {"type": "array", "items": {"type": "number"}}, "axis": {"type": "array", "items": {"type": "number"}}},
+          "required": ["kind"]}},
         {"name": "model_transaction", "annotations": {"destructiveHint": true},
          "description": "Group several model_exec / model_hole calls so they can be undone together. action=begin (remember the undo depth) → work → commit (keep) or rollback (undo everything since begin, including anything the user did in between; refused if the undo stack below begin was changed). action=undo with steps = undo the last N steps (like Ctrl+Z). action=state = undo / redo depth. The transaction survives shim updates (kept on the page).",
          "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["begin", "commit", "rollback", "undo", "state"]}, "steps": {"type": "integer", "description": "for undo: how many steps (default 1)"}}, "required": ["action"]}}
@@ -166,6 +174,30 @@ fn call_model_tool(name: &str, a: &Value) -> Option<Value> {
                     let (ok, msg) = pla_bridge::exec::summary(&v);
                     let mut r = json_text(&v);
                     r["content"].as_array_mut().map(|c| c.insert(0, json!({"type": "text", "text": msg})));
+                    if !ok {
+                        r["isError"] = json!(true);
+                    }
+                    r
+                }
+                Err(e) => cdp_err(e),
+            }
+        }
+        "model_part" => {
+            let q: pla_ui::fasteners::PartReq = match serde_json::from_value(a.clone()) {
+                Ok(q) => q,
+                Err(e) => return Some(err(format!("bad arguments: {e}"))),
+            };
+            let x = match pla_ui::fasteners::expand(&q) {
+                Ok(x) => x,
+                Err(e) => return Some(err(e)),
+            };
+            let script = json!({"ops": x.ops, "atomic": true});
+            match rt().block_on(pla_bridge::exec::run_once(CDP_PORT, h, &script)) {
+                Ok(v) => {
+                    let (ok, msg) = pla_bridge::exec::summary(&v);
+                    let part = v["results"].as_array().and_then(|r| r.last()).map(|r| r["items"].clone()).unwrap_or(Value::Null);
+                    let mut r = json_text(&json!({"part": part, "spec": x.spec, "standard": x.text, "steps": v}));
+                    r["content"].as_array_mut().map(|c| c.insert(0, json!({"type": "text", "text": format!("{} — {msg}", x.text)})));
                     if !ok {
                         r["isError"] = json!(true);
                     }

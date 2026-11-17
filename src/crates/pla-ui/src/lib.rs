@@ -7,6 +7,7 @@ pub mod diag;
 pub mod dims;
 pub mod draw_agent;
 pub mod drawing;
+pub mod fasteners;
 pub mod features;
 pub mod formula;
 pub mod hole_presets;
