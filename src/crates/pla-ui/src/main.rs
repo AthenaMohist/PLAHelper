@@ -211,6 +211,10 @@ struct PlaApp {
     draw_buf: std::collections::HashMap<String, String>,
     /// 补尺寸: 等 dim.signature 回包的图 key(在 Plasticity 里选的面 → 这张图的 dims_add)。
     draw_sig_pending: Option<String>,
+    /// BOM 表: 列宽(按列 id)/ 冻结前几列; 改了等松开鼠标再存(prefs "bom_cols")。
+    bom_col_w: std::collections::HashMap<String, f32>,
+    bom_freeze: usize,
+    bom_cols_dirty: bool,
     /// 批量出图: 待出的 (零件 key, 重新导出 STEP?, 标题栏); 本批 (总数, 失败的图名)。
     draw_queue: std::collections::VecDeque<(String, bool, std::collections::BTreeMap<String, String>)>,
     draw_batch: Option<(usize, Vec<String>)>,
@@ -2545,6 +2549,11 @@ impl PlaApp {
             draw_png: None,
             draw_buf: Default::default(),
             draw_sig_pending: None,
+            bom_col_w: pla_ui::prefs::load_value(BOM_COLS_KEY)
+                .and_then(|v| serde_json::from_value(v["w"].clone()).ok())
+                .unwrap_or_default(),
+            bom_freeze: pla_ui::prefs::load_value(BOM_COLS_KEY).and_then(|v| v["freeze"].as_u64()).unwrap_or(0) as usize,
+            bom_cols_dirty: false,
             draw_queue: Default::default(),
             draw_batch: None,
             draw_batch_keys: Vec::new(),
@@ -4011,6 +4020,14 @@ impl PlaApp {
         self.cdp.send(pla_bridge::cdp::CdpCmd::Call { name: pla_bridge::shim::api::BOM_SCAN, args });
         self.bom_busy = true;
         self.bom_pending_scope = Some(scope);
+    }
+
+    /// BOM 表列宽 / 冻结列数 → prefs(全局, 跨文档)。
+    fn bom_cols_save(&mut self) {
+        let v = serde_json::json!({ "w": self.bom_col_w, "freeze": self.bom_freeze });
+        if let Err(e) = pla_ui::prefs::save_value(BOM_COLS_KEY, v) {
+            self.set_notice((true, t!("列宽保存失败: {e}", "Saving column widths failed: {e}")));
+        }
     }
 
     /// B3: 本文档的编辑按需载入; 模板列表 / 当前模板每秒查一次修改时间, 改了重读(读错保留上一次能用的)。
@@ -5581,7 +5598,7 @@ impl PlaApp {
             FloatSpec {
                 id: "panel-bom",
                 prefs_key: BOM_RECT_KEY,
-                title: tr("BOM", "BOM"),
+                title: tr("生产", "Manufacture"),
                 subtitle: String::new(),
                 close_tip: tr("关闭", "Close"),
                 default_rect: default,
@@ -5597,7 +5614,7 @@ impl PlaApp {
                 // ---- 标签: 清单 / 零件库(B4) ----
                 self.lib_tick();
                 {
-                    let labels = vec![tr("清单", "List").to_string(), t!("零件库 {}", "Parts library {}", self.lib.entries.len()), tr("出图", "Drawings").to_string()];
+                    let labels = vec![tr("BOM", "BOM").to_string(), t!("零件库 {}", "Parts library {}", self.lib.entries.len()), tr("出图", "Drawings").to_string()];
                     let mut s = self.bom_tab as usize;
                     if rz_tabs(ui, &labels, &mut s, None) {
                         self.bom_tab = s as u8;
@@ -5740,6 +5757,18 @@ impl PlaApp {
                                 self.bom_edits.excluded.clear();
                                 edits_changed = true;
                             }
+                            ui.add_space(12.0);
+                            ui.label(egui::RichText::new(tr("冻结前", "Freeze first")).color(COL_MUTED));
+                            let mut nf = self.bom_freeze.min(cols.len());
+                            if ui.add(egui::DragValue::new(&mut nf).range(0..=cols.len())).on_hover_text(tr("左边这几列不随横向滚动", "These columns stay put when scrolling sideways")).changed() {
+                                self.bom_freeze = nf;
+                                self.bom_cols_dirty = true;
+                            }
+                            ui.label(egui::RichText::new(tr("列", "columns")).color(COL_MUTED));
+                            if !self.bom_col_w.is_empty() && ui.small_button(tr("重置列宽", "Reset widths")).on_hover_text(tr("拖表头右边缘可改列宽", "Drag a header's right edge to resize")).clicked() {
+                                self.bom_col_w.clear();
+                                self.bom_cols_dirty = true;
+                            }
                         });
                         if let Some(sk) = v["skipped"].as_array().filter(|a| !a.is_empty()) {
                             let names: Vec<&str> = sk.iter().filter_map(|x| x["name"].as_str()).collect();
@@ -5758,42 +5787,94 @@ impl PlaApp {
                         let mut cell_edits: Vec<(String, String, String)> = Vec::new();
                         let mut remove_row: Option<String> = None;
                         let buf_map = &mut self.bom_cell_buf;
+                        // 列宽(表头右缘拖动; 按列 id 记住)+ 冻结前 N 列(左边一块不随横向滚动)
+                        let nf = self.bom_freeze.min(cols.len());
+                        let mut ws: Vec<f32> = cols
+                            .iter()
+                            .map(|c| {
+                                let d = if c.source.as_deref() == Some("name") || c.id == "model" || c.id == "usage" { 140.0 } else { 64.0 };
+                                *self.bom_col_w.get(&c.id).unwrap_or(&d)
+                            })
+                            .collect();
+                        let ws0 = ws.clone();
+                        const RH: f32 = 20.0;
+                        let mut cell = |ui: &mut egui::Ui, r: &pla_ui::bom_table::Row, j: usize, w: f32| {
+                            let c = &cols[j];
+                            let val = &r.cells[j];
+                            if c.formula.is_some() {
+                                fixed_label(ui, w, egui::RichText::new(val).color(egui::Color32::WHITE));
+                                return;
+                            }
+                            let key = format!("{}|{}", r.key, c.id);
+                            let buf = buf_map.entry(key).or_insert_with(|| val.clone());
+                            // 橙 = 本文档手工覆盖; 蓝 = 来自零件库
+                            let col = if r.overridden[j] { COL_ACCENT } else if r.from_lib[j] { rgb_hex(pla_bridge::shim::HIGHLIGHT_CANDIDATE) } else { egui::Color32::WHITE };
+                            let te = ui.add_sized([w, RH], egui::TextEdit::singleline(buf).text_color(col));
+                            if c.source.as_deref() == Some("name") {
+                                if let Some(m) = members_of.get(&r.key) {
+                                    te.clone().on_hover_text(m.as_str());
+                                }
+                            }
+                            if te.lost_focus() {
+                                if *buf != *val {
+                                    cell_edits.push((r.key.clone(), c.id.clone(), buf.trim().to_string()));
+                                }
+                            } else if !te.has_focus() {
+                                *buf = val.clone();
+                            }
+                        };
+                        let head = |ui: &mut egui::Ui, j: usize, w: &mut f32| {
+                            let c = &cols[j];
+                            let h = egui::RichText::new(&c.header).size(11.5).color(if c.formula.is_some() { COL_ACCENT } else { COL_MUTED });
+                            col_head(ui, ("bom-col", &c.id), h, c.formula.as_deref(), w);
+                        };
+                        let totals_cell = |ui: &mut egui::Ui, j: usize, w: f32| {
+                            if cols[j].sum {
+                                fixed_label(ui, w, egui::RichText::new(&totals[j]).strong().color(COL_ACCENT));
+                            } else if cols.get(j + 1).is_some_and(|n| n.sum) {
+                                fixed_label(ui, w, egui::RichText::new(tr("合计", "total")).color(COL_MUTED));
+                            } else {
+                                fixed_label(ui, w, egui::RichText::new(""));
+                            }
+                        };
+                        let has_sum = cols.iter().any(|c| c.sum);
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
+                        // 冻结块: 序号 + 前 nf 列
+                        egui::Grid::new("bom-grid-frozen").striped(true).min_row_height(RH + 2.0).spacing([8.0, 3.0]).show(ui, |ui| {
+                            fixed_label(ui, 22.0, egui::RichText::new("#").color(COL_MUTED).size(11.5));
+                            for j in 0..nf {
+                                head(ui, j, &mut ws[j]);
+                            }
+                            ui.end_row();
+                            for (i, r) in rows.iter().enumerate() {
+                                fixed_label(ui, 22.0, if r.manual { egui::RichText::new(format!("{}*", i + 1)).color(COL_MUTED) } else { egui::RichText::new(format!("{}", i + 1)) })
+                                    .on_hover_text(if r.manual { tr("手动行(模型里没有)", "Manual row (not in the model)") } else { "" });
+                                for j in 0..nf {
+                                    cell(ui, r, j, ws[j]);
+                                }
+                                ui.end_row();
+                            }
+                            if has_sum {
+                                fixed_label(ui, 22.0, egui::RichText::new(""));
+                                for j in 0..nf {
+                                    totals_cell(ui, j, ws[j]);
+                                }
+                                ui.end_row();
+                            }
+                        });
+                        if nf > 0 {
+                            ui.separator();
+                        }
                         egui::ScrollArea::horizontal().id_salt("bom-h").show(ui, |ui| {
-                            egui::Grid::new("bom-grid").striped(true).num_columns(cols.len() + 2).spacing([8.0, 3.0]).show(ui, |ui| {
-                                ui.label(egui::RichText::new("#").color(COL_MUTED).size(11.5));
-                                for c in &cols {
-                                    let h = egui::RichText::new(&c.header).size(11.5);
-                                    ui.label(if c.formula.is_some() { h.color(COL_ACCENT) } else { h.color(COL_MUTED) }).on_hover_text(c.formula.clone().unwrap_or_default());
+                            egui::Grid::new("bom-grid").striped(true).min_row_height(RH + 2.0).spacing([8.0, 3.0]).show(ui, |ui| {
+                                for j in nf..cols.len() {
+                                    head(ui, j, &mut ws[j]);
                                 }
                                 ui.label("");
                                 ui.end_row();
                                 for (i, r) in rows.iter().enumerate() {
-                                    ui.label(if r.manual { egui::RichText::new(format!("{}*", i + 1)).color(COL_MUTED) } else { egui::RichText::new(format!("{}", i + 1)) })
-                                        .on_hover_text(if r.manual { tr("手动行(模型里没有)", "Manual row (not in the model)") } else { "" });
-                                    for (j, c) in cols.iter().enumerate() {
-                                        let val = &r.cells[j];
-                                        if c.formula.is_some() {
-                                            ui.label(egui::RichText::new(val).color(egui::Color32::WHITE));
-                                            continue;
-                                        }
-                                        let w = if c.source.as_deref() == Some("name") || c.id == "model" || c.id == "usage" { 140.0 } else { 64.0 };
-                                        let key = format!("{}|{}", r.key, c.id);
-                                        let buf = buf_map.entry(key).or_insert_with(|| val.clone());
-                                        // 橙 = 本文档手工覆盖; 蓝 = 来自零件库
-                                        let col = if r.overridden[j] { COL_ACCENT } else if r.from_lib[j] { rgb_hex(pla_bridge::shim::HIGHLIGHT_CANDIDATE) } else { egui::Color32::WHITE };
-                                        let te = ui.add(egui::TextEdit::singleline(buf).desired_width(w).text_color(col));
-                                        if c.source.as_deref() == Some("name") {
-                                            if let Some(m) = members_of.get(&r.key) {
-                                                te.clone().on_hover_text(m.as_str());
-                                            }
-                                        }
-                                        if te.lost_focus() {
-                                            if *buf != *val {
-                                                cell_edits.push((r.key.clone(), c.id.clone(), buf.trim().to_string()));
-                                            }
-                                        } else if !te.has_focus() {
-                                            *buf = val.clone();
-                                        }
+                                    for j in nf..cols.len() {
+                                        cell(ui, r, j, ws[j]);
                                     }
                                     ui.horizontal(|ui| {
                                         // B4 "库"菜单: 链接 / 建议 / 存入零件库 / 取消链接 / 编辑条目
@@ -5858,22 +5939,26 @@ impl PlaApp {
                                     ui.end_row();
                                 }
                                 // 合计行
-                                if cols.iter().any(|c| c.sum) {
-                                    ui.label("");
-                                    for (j, c) in cols.iter().enumerate() {
-                                        if c.sum {
-                                            ui.label(egui::RichText::new(&totals[j]).strong().color(COL_ACCENT));
-                                        } else if cols.get(j + 1).is_some_and(|n| n.sum) {
-                                            ui.label(egui::RichText::new(tr("合计", "total")).color(COL_MUTED));
-                                        } else {
-                                            ui.label("");
-                                        }
+                                if has_sum {
+                                    for j in nf..cols.len() {
+                                        totals_cell(ui, j, ws[j]);
                                     }
                                     ui.label("");
                                     ui.end_row();
                                 }
                             });
                         });
+                        });
+                        if ws != ws0 {
+                            for (c, w) in cols.iter().zip(&ws) {
+                                self.bom_col_w.insert(c.id.clone(), *w);
+                            }
+                            self.bom_cols_dirty = true;
+                        }
+                        if self.bom_cols_dirty && !ui.input(|i| i.pointer.any_down()) {
+                            self.bom_cols_dirty = false;
+                            self.bom_cols_save();
+                        }
                         for a in lib_acts {
                             match a {
                                 LibAct::Link(rk, pn) => {
@@ -8324,6 +8409,35 @@ struct DimApplied {
 const NOTES_RECT_KEY: &str = "notes_rect";
 const DIM_RECT_KEY: &str = "dim_rect";
 const BOM_RECT_KEY: &str = "bom_rect";
+const BOM_COLS_KEY: &str = "bom_cols";
+
+/// 固定宽度、左对齐、超长截断的标签(表格里各行对齐用)。
+fn fixed_label(ui: &mut egui::Ui, w: f32, text: egui::RichText) -> egui::Response {
+    ui.allocate_ui_with_layout(egui::vec2(w, 20.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+        ui.set_width(w);
+        ui.add(egui::Label::new(text).truncate())
+    })
+    .inner
+}
+
+/// 可拖宽的表头: 固定宽度 w 的标题, 右缘 ±4 px 可拖(30 ~ 600)。
+fn col_head(ui: &mut egui::Ui, id: impl std::hash::Hash, text: egui::RichText, hover: Option<&str>, w: &mut f32) {
+    let r = fixed_label(ui, *w, text);
+    let cell = r.rect;
+    if let Some(h) = hover {
+        r.on_hover_text(h);
+    }
+    let x = cell.right() + 4.0; // 列间距(8)的中线
+    let handle = egui::Rect::from_min_max(egui::pos2(x - 4.0, cell.top()), egui::pos2(x + 4.0, cell.bottom()));
+    let resp = ui.interact(handle, ui.id().with(id), egui::Sense::drag());
+    if resp.hovered() || resp.dragged() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+        ui.painter().vline(x, handle.y_range(), egui::Stroke::new(1.0_f32, COL_MUTED));
+    }
+    if resp.dragged() {
+        *w = (*w + resp.drag_delta().x).clamp(30.0, 600.0);
+    }
+}
 
 /// 独立浮窗(笔记 / 尺寸)的状态: 位置记忆 + 自管拖动/调大小会话。
 #[derive(Default)]

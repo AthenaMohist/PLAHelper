@@ -58,7 +58,7 @@ impl Action {
             Action::ToggleVpState => tr("视口状态面板", "Viewport state panel"),
             Action::ToggleMatState => tr("材质状态面板", "Material state panel"),
             Action::ToggleConfig => tr("配置面板(方案)", "Configurations panel"),
-            Action::ToggleBom => tr("BOM(物料清单)", "BOM (bill of materials)"),
+            Action::ToggleBom => tr("生产(BOM / 零件库 / 出图)", "Manufacture (BOM / library / drawings)"),
             Action::ToggleNotes => tr("笔记(记录 + 计算)", "Notes (notes + calculator)"),
         }
     }

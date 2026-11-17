@@ -133,7 +133,7 @@ impl Feature {
             Feature::DimFace => tr("参数化(改尺寸 / 记录)", "Parametric (resize / records)"),
             Feature::CfgSave => tr("保存配置", "Save configuration"),
             Feature::CfgApply => tr("应用配置", "Apply configuration"),
-            Feature::Bom => tr("BOM(物料清单)", "BOM (bill of materials)"),
+            Feature::Bom => tr("生产(BOM / 零件库 / 出图)", "Manufacture (BOM / library / drawings)"),
         }
     }
 
