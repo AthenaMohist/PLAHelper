@@ -228,6 +228,10 @@ struct PlaApp {
     rel_del_confirm: bool,
     rel_job: Option<std::sync::mpsc::Receiver<Result<std::path::PathBuf, String>>>,
     rel_last: Option<std::path::PathBuf>,
+    /// 外发时选: true = 同一批补发(更新上一次), false = 新的外发。
+    rel_amend: bool,
+    /// 已记版本、等受影响的图重出(变更表要带上 ECN)完再写包: (版本, ECN, 等哪些图)。
+    rel_wait: Option<(String, Option<pla_ui::release::Ecn>, Vec<String>)>,
     /// MCP 桥: 上次处理 / 上次写的状态(没变就不写, 5 s 心跳)。
     mcp_checked: Option<Instant>,
     mcp_last: String,
@@ -2599,6 +2603,8 @@ impl PlaApp {
             rel_del_confirm: false,
             rel_job: None,
             rel_last: None,
+            rel_amend: false,
+            rel_wait: None,
             mcp_checked: None,
             mcp_last: String::new(),
             mcp_written: None,
@@ -4817,6 +4823,15 @@ impl PlaApp {
         // D6: 偏好(标题栏默认字段、技术要求)垫在底下, BOM / 本图覆盖
         let (title, mut run) = self.prefs_get().apply(&s, &title);
         run.title = title;
+        // 变更表: 外发过的 ECN 里涉及这个零件的最近两条(模板字段 rev1_* 在下、rev2_* 在上)
+        let hist = pla_ui::release::History::load(&pla_ui::release::STORE.dir(&self.doc_key));
+        for (i, (no, desc, by, date)) in hist.rev_rows(key).into_iter().enumerate() {
+            let r = i + 1;
+            run.title.insert(format!("rev{r}_ecn"), no);
+            run.title.insert(format!("rev{r}_desc"), desc);
+            run.title.insert(format!("rev{r}_by"), by);
+            run.title.insert(format!("rev{r}_date"), date);
+        }
         let spec = if pla_ui::drawing::is_asm(key) {
             pla_ui::drawing::asm_spec(&run, &dir, self.draw_asm.get(key).map(|v| v.as_slice()).unwrap_or(&[]))
         } else {
@@ -4932,11 +4947,20 @@ impl PlaApp {
         }
         let mut edits = if self.bom_edits_doc == self.doc_key { self.bom_edits.clone() } else { pla_ui::bom_table::load_edits(&self.doc_key) };
         let (mut nb, mut nd) = (0, 0);
+        let rroot = pla_ui::release::STORE.dir(&self.doc_key);
+        let mut hist = pla_ui::release::History::load(&rroot);
+        let mut hist_changed = false;
         for (old, new) in &renames {
             nb += usize::from(edits.rename_key(old, new));
             nd += usize::from(sheets.rename_key(&dir, old, new));
+            hist_changed |= hist.rename_key(old, new);
             if self.draw_sel.as_deref() == Some(old.as_str()) {
                 self.draw_sel = Some(new.clone());
+            }
+        }
+        if hist_changed {
+            if let Err(e) = hist.save(&rroot) {
+                self.set_notice((true, t!("版本记录保存失败: {e}", "Saving the version history failed: {e}")));
             }
         }
         if nb > 0 {
@@ -5162,9 +5186,92 @@ impl PlaApp {
     }
 
     // ---------------------------------------------------------------- 外发包
-    /// 生产窗口「外发」标签: 供应商(要哪些文件 / BOM 列)→ 零件归哪家 → 每家的加工 BOM(自有列可填)→ 生成外发包。
-    fn rel_ui(&mut self, ui: &mut egui::Ui) {
-        use pla_ui::release::{self as rel, Supplier, BUY, FILE_KINDS, PROCESS_COL};
+    /// 各家的包内容(按当前 BOM / 填写 / 图)。
+    fn rel_packs(&self, rows: &[pla_ui::bom_table::Row], totals: &[String], sheets: &pla_ui::drawing::Sheets) -> (Vec<pla_ui::release::Pack>, String) {
+        use pla_ui::release as rel;
+        let ddir = pla_ui::drawing::dir(&self.doc_key);
+        let mut packs = Vec::new();
+        for s in &self.suppliers.list {
+            let (h, t, keys) = rel::supplier_table(s, &self.bom_tpl, rows, &self.bom_edits);
+            if t.is_empty() {
+                continue;
+            }
+            let mut files = Vec::new();
+            let mut missing = Vec::new();
+            for (k, row) in keys.iter().zip(&t) {
+                let (f, m) = rel::part_files(&ddir, sheets.get(k), &s.files);
+                files.extend(f);
+                if !m.is_empty() {
+                    missing.push((row.get(2).cloned().unwrap_or_default(), m));
+                }
+            }
+            packs.push(rel::Pack { supplier: s.clone(), csv: rel::table_csv(&h, &t), files, missing });
+        }
+        (packs, pla_ui::bom_table::to_csv(&self.bom_tpl, rows, totals))
+    }
+
+    /// 当前全部零件的快照(外发时存, 之后跟它比出变更)。
+    fn rel_snapshot(&self) -> std::collections::BTreeMap<String, pla_ui::release::PartSnap> {
+        let ids = pla_ui::identity::load(&self.doc_key);
+        let sheets = if self.draw_doc == self.doc_key { self.draw_sheets.clone() } else { pla_ui::drawing::load_in(&pla_ui::drawing::dir(&self.doc_key)) };
+        self.bom_parts()
+            .into_iter()
+            .map(|(_, member, p)| {
+                let sh = sheets.get(&p.key);
+                let snap = pla_ui::release::PartSnap {
+                    pn: p.pn,
+                    name: p.name,
+                    qty: p.qty,
+                    material: p.material,
+                    supplier: p.supplier,
+                    ids: ids.get(&p.key).cloned().unwrap_or_else(|| if member.0.is_empty() { vec![] } else { vec![member.0.clone()] }),
+                    sheet: sh.map(pla_ui::release::sheet_hash).unwrap_or_default(),
+                    upload: sh.and_then(|s| s.uploaded.as_ref()).map(|u| format!("{} {}", u.file, u.date)).unwrap_or_default(),
+                };
+                (p.key, snap)
+            })
+            .collect()
+    }
+
+    /// 点了「生成外发包」: 记版本(新外发冻结 ECN / 同一批补发重算)→ ECN 涉及的已出图零件重出(变更表带 ECN)→ 出完写包(rel_tick)。
+    fn rel_start(&mut self) {
+        use pla_ui::release as rel;
+        let root = rel::STORE.dir(&self.doc_key);
+        let mut hist = rel::History::load(&root);
+        if hist.open_by.trim().is_empty() {
+            hist.open_by = self.prefs_get().title.get("designer").cloned().unwrap_or_default();
+        }
+        let (ver, no) = hist.record(self.rel_snapshot(), &pla_ui::parts_lib::today(), self.rel_amend && hist.last().is_some());
+        if let Err(e) = hist.save(&root) {
+            self.set_notice((true, t!("版本记录保存失败: {e}", "Saving the version history failed: {e}")));
+            return;
+        }
+        let ecn = no.as_ref().and_then(|n| hist.ecns.iter().find(|e| &e.no == n).cloned());
+        // 变更表要显示 ECN: 涉及的零件里出过图(没锁定)的重出; 没出过的本来就缺, 不在这里出
+        let keys: Vec<String> = ecn
+            .as_ref()
+            .map(|e| {
+                e.items
+                    .iter()
+                    .filter(|i| !i.kinds.iter().any(|k| k == "removed"))
+                    .filter(|i| self.draw_sheets.get(&i.key).is_some_and(|s| !s.locked() && (!s.compiled.is_empty() || s.model_changed)))
+                    .map(|i| i.key.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !keys.is_empty() {
+            let parts = self.bom_parts();
+            self.mcp_queue_draw(&keys, false, &parts);
+        }
+        self.set_notice((false, match &no {
+            Some(n) => t!("{ver}: {n} 已记录, 先重出 {} 张图", "{ver}: {n} recorded, redrawing {} sheet(s) first", keys.len()),
+            None => t!("{ver} 已记录", "{ver} recorded"),
+        }));
+        self.rel_wait = Some((ver, ecn, keys));
+    }
+
+    /// 外发包后台: 等 ECN 涉及的图出完 → 写包; 收写包结果。窗口关了也照跑。
+    fn rel_tick(&mut self) {
         if let Some(r) = self.rel_job.as_ref().and_then(|rx| rx.try_recv().ok()) {
             self.rel_job = None;
             match r {
@@ -5175,6 +5282,31 @@ impl PlaApp {
                 Err(e) => self.set_notice((true, t!("生成外发包失败: {e}", "Writing the release package failed: {e}"))),
             }
         }
+        let Some((_, _, keys)) = &self.rel_wait else { return };
+        let pending = keys.iter().any(|k| self.draw_queue.iter().any(|q| &q.0 == k) || self.draw_job.as_ref().is_some_and(|j| &j.key == k));
+        if pending {
+            return;
+        }
+        let Some((ver, ecn, _)) = self.rel_wait.take() else { return };
+        let Some(Ok(scan)) = self.bom_result.clone() else {
+            self.set_notice((true, tr("BOM 没了(换了文档?), 外发包没写", "The BOM is gone (document switched?); the package was not written").to_string()));
+            return;
+        };
+        let (rows, totals) = pla_ui::bom_table::build(&scan, &self.bom_tpl, &self.bom_edits, &self.lib);
+        let sheets = if self.draw_doc == self.doc_key { self.draw_sheets.clone() } else { pla_ui::drawing::load_in(&pla_ui::drawing::dir(&self.doc_key)) };
+        let (packs, total) = self.rel_packs(&rows, &totals, &sheets);
+        let root = pla_ui::release::STORE.dir(&self.doc_key);
+        let date = pla_ui::parts_lib::today();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(pla_ui::release::write(&root, &ver, &date, &total, &packs, ecn.as_ref()));
+        });
+        self.rel_job = Some(rx);
+    }
+
+    /// 生产窗口「外发」标签: 供应商(要哪些文件 / BOM 列)→ 零件归哪家 → 每家的加工 BOM(自有列可填)→ 生成外发包。
+    fn rel_ui(&mut self, ui: &mut egui::Ui) {
+        use pla_ui::release::{self as rel, Supplier, BUY, FILE_KINDS, PROCESS_COL};
         let Some(Ok(scan)) = self.bom_result.clone() else {
             ui.label(egui::RichText::new(tr("先扫描 BOM(外发按当前 BOM 范围出)", "Scan the BOM first (the release follows the current BOM scope)")).color(COL_MUTED));
             if ui.add_enabled(!self.bom_busy, egui::Button::new(tr("扫描", "Scan"))).clicked() {
@@ -5365,26 +5497,56 @@ impl PlaApp {
                 });
             });
         }
-        // ---- 生成 ----
+        // ---- 版本 / 变更(上次外发之后的全部改动 = 一条进行中的变更) ----
         let root = pla_ui::release::STORE.dir(&self.doc_key);
-        let ver = rel::next_version(&root);
-        let mut packs: Vec<rel::Pack> = Vec::new();
-        for s in &self.suppliers.list {
-            let (h, t, keys) = rel::supplier_table(s, &self.bom_tpl, &rows, &self.bom_edits);
-            if t.is_empty() {
-                continue;
+        let mut hist = rel::History::load(&root);
+        let open_items = hist.last().map(|l| rel::diff(&l.parts, &self.rel_snapshot())).unwrap_or_default();
+        let mut hist_dirty = false;
+        ui.separator();
+        match hist.last() {
+            None => {
+                ui.label(egui::RichText::new(tr("还没外发过: 第一次外发是 R1, 不产生 ECN; 之后的改动都会记成变更", "Never released: the first release is R1 with no ECN; later changes are tracked")).color(COL_MUTED));
             }
-            let mut files = Vec::new();
-            let mut missing = Vec::new();
-            for (k, row) in keys.iter().zip(&t) {
-                let (f, m) = rel::part_files(&ddir, sheets.get(k), &s.files);
-                files.extend(f);
-                if !m.is_empty() {
-                    missing.push((row.get(2).cloned().unwrap_or_default(), m));
+            Some(l) => {
+                let (lv, ld) = (l.ver.clone(), l.date.clone());
+                ui.label(egui::RichText::new(t!("上次外发 {lv}({ld}); 之后的改动 {} 项(都算在下一条 ECN 里)", "Last release {lv} ({ld}); {} change(s) since (all go into the next ECN)", open_items.len())).strong());
+                if !open_items.is_empty() {
+                    egui::CollapsingHeader::new(tr("进行中的变更", "Pending changes")).id_salt("rel-open").default_open(true).show(ui, |ui| {
+                        for it in &open_items {
+                            ui.label(egui::RichText::new(format!("· {}: {}", it.label, it.desc)).size(11.0));
+                        }
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(tr("变更原因", "Reason")).color(COL_MUTED));
+                            hist_dirty |= ui.add(egui::TextEdit::singleline(&mut hist.open_note).desired_width(260.0)).lost_focus();
+                            ui.label(egui::RichText::new(tr("责任人", "By")).color(COL_MUTED));
+                            hist_dirty |= ui.add(egui::TextEdit::singleline(&mut hist.open_by).desired_width(80.0)).lost_focus();
+                        });
+                    });
+                }
+                if !hist.ecns.is_empty() {
+                    egui::CollapsingHeader::new(t!("已发出的 ECN({})", "Issued ECNs ({})", hist.ecns.len())).id_salt("rel-ecns").show(ui, |ui| {
+                        for e in hist.ecns.iter().rev() {
+                            ui.label(egui::RichText::new(format!("{} · {} · {} · {} 项{}", e.no, e.ver, e.date, e.items.len(), if e.note.is_empty() { String::new() } else { format!(" · {}", e.note) })).size(11.0));
+                        }
+                    });
                 }
             }
-            packs_preview.push((s.name.clone(), t.len(), missing.len()));
-            packs.push(rel::Pack { supplier: s.clone(), csv: rel::table_csv(&h, &t), files, missing });
+        }
+        if hist_dirty {
+            if let Err(e) = hist.save(&root) {
+                self.set_notice((true, e));
+            }
+        }
+        let has_last = hist.last().is_some();
+        let new_ver = hist.next_ver();
+        let last_ver = hist.last().map(|l| l.ver.clone()).unwrap_or_default();
+        if !has_last {
+            self.rel_amend = false;
+        }
+        // ---- 生成 ----
+        let (packs, _) = self.rel_packs(&rows, &totals, &sheets);
+        for p in &packs {
+            packs_preview.push((p.supplier.name.clone(), p.csv.lines().count().saturating_sub(1), p.missing.len()));
         }
         ui.separator();
         ui.horizontal_wrapped(|ui| {
@@ -5402,21 +5564,27 @@ impl PlaApp {
                 }
             });
         }
+        if has_last {
+            ui.horizontal(|ui| {
+                ui.radio_value(&mut self.rel_amend, false, t!("新的外发 {new_ver}(改动冻结成一条 ECN)", "New release {new_ver} (changes become one ECN)"));
+                ui.radio_value(&mut self.rel_amend, true, t!("同一批补发(仍是 {last_ver}, 不新增 ECN)", "Same batch, resend (still {last_ver}, no new ECN)"))
+                    .on_hover_text(tr("外发前又改了东西、其实还没真正发出去: 改动并进上一次", "You changed things before actually sending: fold them into the last release"));
+            });
+        }
         ui.horizontal(|ui| {
-            let can = self.rel_job.is_none() && !packs.is_empty();
-            let tip = if missing_all.is_empty() { tr("总BOM + 每家的 BOM 和文件 + 每家一个 zip + 版本记录", "Main BOM + each supplier's BOM and files + one zip per supplier + a version record") } else { tr("有缺的文件也能生成, 缺的记在 manifest.json 里", "Can be written with files missing; they are listed in manifest.json") };
+            let busy = self.rel_job.is_some() || self.rel_wait.is_some();
+            let can = !busy && !packs.is_empty();
+            let ver = if self.rel_amend { last_ver.clone() } else { new_ver.clone() };
+            let tip = if missing_all.is_empty() { tr("总BOM + 每家的 BOM 和文件 + 每家一个 zip + 版本记录; 有 ECN 的图先重出(变更表带上 ECN)", "Main BOM + each supplier's BOM and files + zips + version record; drawings with an ECN are redrawn first so their change table shows it") } else { tr("有缺的文件也能生成, 缺的记在 manifest.json 里", "Can be written with files missing; they are listed in manifest.json") };
             if ui.add_enabled(can, egui::Button::new(t!("生成外发包 {ver}", "Write release {ver}"))).on_hover_text(tip).clicked() {
-                let total = pla_ui::bom_table::to_csv(&self.bom_tpl, &rows, &totals);
-                let date = pla_ui::parts_lib::today();
-                let (tx, rx) = std::sync::mpsc::channel();
-                let (root2, ver2) = (root.clone(), ver.clone());
-                std::thread::spawn(move || {
-                    let _ = tx.send(rel::write(&root2, &ver2, &date, &total, &packs));
-                });
-                self.rel_job = Some(rx);
+                self.rel_start();
             }
-            if self.rel_job.is_some() {
+            if let Some((v, _, keys)) = &self.rel_wait {
+                ui.label(egui::RichText::new(t!("{v}: 等 {} 张图重出(变更表带 ECN)…", "{v}: redrawing {} sheet(s) for the change table…", keys.len())).color(COL_ACCENT));
+            } else if self.rel_job.is_some() {
                 ui.label(egui::RichText::new(tr("生成中…", "Writing…")).color(COL_ACCENT));
+            }
+            if busy {
                 ui.ctx().request_repaint_after(std::time::Duration::from_millis(300));
             }
             if ui.button(tr("打开外发文件夹", "Open release folder")).clicked() {
@@ -11821,6 +11989,7 @@ impl eframe::App for PlaApp {
         self.draw_tick();
         // MCP 桥: 心跳 / 状态 + 处理 pla-mcp 的请求(窗口不动也每 2 s 醒一次)
         self.mcp_tick();
+        self.rel_tick();
         ctx.request_repaint_after(Duration::from_secs(2));
         if self.draw_job.is_some() || self.draw_book.is_some() {
             ctx.request_repaint_after(Duration::from_millis(500));

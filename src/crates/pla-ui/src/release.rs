@@ -186,10 +186,16 @@ fn safe(s: &str) -> String {
 }
 
 /// 写外发包(阻塞, 放后台线程): 文件夹 + 每家 zip + manifest。返回包目录。
-pub fn write(root: &Path, version: &str, date: &str, total_csv: &str, packs: &[Pack]) -> Result<PathBuf, String> {
+pub fn write(root: &Path, version: &str, date: &str, total_csv: &str, packs: &[Pack], ecn: Option<&Ecn>) -> Result<PathBuf, String> {
     let out = root.join(format!("{date}-{version}"));
     std::fs::create_dir_all(&out).map_err(|e| format!("{}: {e}", out.display()))?;
     std::fs::write(out.join("总BOM.csv"), total_csv).map_err(|e| e.to_string())?;
+    if let Some(e) = ecn {
+        let rows: Vec<Vec<String>> = e.items.iter().enumerate().map(|(i, it)| vec![(i + 1).to_string(), it.label.clone(), it.desc.clone()]).collect();
+        let mut csv = table_csv(&["#".into(), "零件".into(), "变更内容".into()], &rows);
+        csv.push_str(&format!("\r\n{},{},{}\r\n", e.no, if e.note.is_empty() { "-" } else { &e.note }, e.date));
+        std::fs::write(out.join(format!("{}.csv", e.no)), csv).map_err(|e| e.to_string())?;
+    }
     let mut manifest = Vec::new();
     for p in packs {
         let name = safe(&p.supplier.name);
@@ -202,7 +208,7 @@ pub fn write(root: &Path, version: &str, date: &str, total_csv: &str, packs: &[P
         zip_dir(&d, &out.join(format!("{name}.zip")))?;
         manifest.push(json!({"supplier": p.supplier.name, "files": p.files.iter().map(|f| &f.1).collect::<Vec<_>>(), "missing": p.missing}));
     }
-    let m = json!({"version": version, "date": date, "suppliers": manifest});
+    let m = json!({"version": version, "date": date, "ecn": ecn, "suppliers": manifest});
     std::fs::write(out.join("manifest.json"), serde_json::to_vec_pretty(&m).unwrap_or_default()).map_err(|e| e.to_string())?;
     Ok(out)
 }
@@ -230,10 +236,311 @@ fn zip_dir(dir: &Path, zip: &Path) -> Result<(), String> {
     }
 }
 
+// ---------------------------------------------------------------- 版本 / ECN(用户 2026-11-17)
+//
+// 外发一次 = 锁定这次之前的全部改动(存一份零件快照)。之后的改动不单独记: 当前状态 vs 上次外发的快照 = 一条"进行中的变更",
+// 期间改多少次都在这一条里。下次外发时选:
+// - 新的外发(R<n+1>): 这条变更冻结成 ECN-<m>, 写进受影响零件图的变更表;
+// - 同一批补发(仍是 R<n>): 不新增 ECN, R<n> 的快照(和它带的那条 ECN)按现状重算。
+// 本地改动(没外发过)不产生 ECN。零件按 key 对应, key 变了(模型改了)按实体 id 对应(同 identity)。
+
+/// 一个零件在某次外发时的状态。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct PartSnap {
+    #[serde(default)]
+    pub pn: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub qty: u64,
+    #[serde(default)]
+    pub material: String,
+    #[serde(default)]
+    pub supplier: String,
+    /// 实例 id(模型改了 key 会变, 靠它认出是同一个零件)。
+    #[serde(default)]
+    pub ids: Vec<String>,
+    /// 出图设置的指纹(人改过朝向 / 公差 / 技术要求 … 就变)。
+    #[serde(default)]
+    pub sheet: String,
+    /// 上传图纸(文件名 + 日期)。
+    #[serde(default)]
+    pub upload: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Release {
+    pub ver: String,
+    pub date: String,
+    /// 零件 key → 快照。
+    #[serde(default)]
+    pub parts: std::collections::BTreeMap<String, PartSnap>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct EcnItem {
+    /// 零件 key(模型改了跟着改名, 见 History::rename_key)。
+    pub key: String,
+    #[serde(default)]
+    pub label: String,
+    /// added / removed / model / qty / material / pn / name / supplier / drawing / upload
+    pub kinds: Vec<String>,
+    pub desc: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Ecn {
+    pub no: String,
+    /// 随哪次外发发出。
+    pub ver: String,
+    pub date: String,
+    #[serde(default)]
+    pub by: String,
+    /// 变更原因(人填)。
+    #[serde(default)]
+    pub note: String,
+    #[serde(default)]
+    pub items: Vec<EcnItem>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct History {
+    #[serde(default)]
+    pub releases: Vec<Release>,
+    #[serde(default)]
+    pub ecns: Vec<Ecn>,
+    /// 进行中那条变更的原因 / 责任人(外发时进 ECN)。
+    #[serde(default)]
+    pub open_note: String,
+    #[serde(default)]
+    pub open_by: String,
+}
+
+pub fn history_path(root: &Path) -> PathBuf {
+    root.join("history.json")
+}
+
+impl History {
+    pub fn load(root: &Path) -> History {
+        std::fs::read_to_string(history_path(root)).ok().and_then(|s| serde_json::from_str(s.trim_start_matches('\u{feff}')).ok()).unwrap_or_default()
+    }
+    pub fn save(&self, root: &Path) -> Result<(), String> {
+        std::fs::create_dir_all(root).map_err(|e| e.to_string())?;
+        std::fs::write(history_path(root), serde_json::to_vec_pretty(self).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+    }
+    pub fn last(&self) -> Option<&Release> {
+        self.releases.last()
+    }
+    /// 下一个新外发的版本号。
+    pub fn next_ver(&self) -> String {
+        format!("R{}", self.releases.len() + 1)
+    }
+    fn next_ecn_no(&self) -> String {
+        format!("ECN-{:03}", self.ecns.len() + 1)
+    }
+    /// 模型改了(key 变了): 快照 / ECN 里的 key 跟着改。
+    pub fn rename_key(&mut self, old: &str, new: &str) -> bool {
+        let mut changed = false;
+        for r in &mut self.releases {
+            if let Some(p) = r.parts.remove(old) {
+                r.parts.insert(new.into(), p);
+                changed = true;
+            }
+        }
+        for e in &mut self.ecns {
+            for it in e.items.iter_mut().filter(|i| i.key == old) {
+                it.key = new.into();
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// 外发: amend = 同一批补发(改最后一次), 否则新外发(有上次 → 冻结一条 ECN)。返回版本号和新 / 重算的 ECN 号。
+    pub fn record(&mut self, now: std::collections::BTreeMap<String, PartSnap>, date: &str, amend: bool) -> (String, Option<String>) {
+        if amend && !self.releases.is_empty() {
+            let i = self.releases.len() - 1;
+            let ver = self.releases[i].ver.clone();
+            // 这次外发带的那条 ECN 按现状重算(对比的是再上一次)
+            if i > 0 {
+                let items = diff(&self.releases[i - 1].parts, &now);
+                if let Some(e) = self.ecns.iter_mut().find(|e| e.ver == ver) {
+                    e.items = items;
+                    e.date = date.into();
+                    if !self.open_note.trim().is_empty() {
+                        e.note = self.open_note.trim().to_string();
+                    }
+                }
+            }
+            self.releases[i].parts = now;
+            self.releases[i].date = date.into();
+            let no = self.ecns.iter().find(|e| e.ver == ver).map(|e| e.no.clone());
+            self.open_note.clear();
+            return (ver, no);
+        }
+        let ver = self.next_ver();
+        let mut no = None;
+        if let Some(last) = self.releases.last() {
+            let items = diff(&last.parts, &now);
+            if !items.is_empty() {
+                let n = self.next_ecn_no();
+                self.ecns.push(Ecn { no: n.clone(), ver: ver.clone(), date: date.into(), by: self.open_by.clone(), note: self.open_note.trim().to_string(), items });
+                no = Some(n);
+            }
+        }
+        self.releases.push(Release { ver: ver.clone(), date: date.into(), parts: now });
+        self.open_note.clear();
+        (ver, no)
+    }
+
+    /// 某个零件图上的变更表(最近两条, 旧的在第 1 行): (ECN 号, 内容, 责任人, 日期)。
+    pub fn rev_rows(&self, key: &str) -> Vec<(String, String, String, String)> {
+        let mut rows: Vec<(String, String, String, String)> = self
+            .ecns
+            .iter()
+            .filter_map(|e| {
+                let it = e.items.iter().find(|i| i.key == key && !i.kinds.iter().any(|k| k == "removed"))?;
+                let desc = if e.note.is_empty() { it.desc.clone() } else { format!("{}; {}", it.desc, e.note) };
+                Some((e.no.clone(), desc, e.by.clone(), e.date.clone()))
+            })
+            .collect();
+        if rows.len() > 2 {
+            rows.drain(..rows.len() - 2);
+        }
+        rows
+    }
+}
+
+/// 两次状态的差: 按 key 对应; key 不同但实例 id 重合 = 同一零件改了模型。
+pub fn diff(old: &std::collections::BTreeMap<String, PartSnap>, now: &std::collections::BTreeMap<String, PartSnap>) -> Vec<EcnItem> {
+    let mut items = Vec::new();
+    let mut matched_old: std::collections::BTreeSet<&String> = std::collections::BTreeSet::new();
+    let label = |p: &PartSnap| format!("{} {}", p.pn, p.name).trim().to_string();
+    for (k, n) in now {
+        let o = old.get_key_value(k).or_else(|| old.iter().find(|(ok, op)| !now.contains_key(*ok) && op.ids.iter().any(|i| n.ids.contains(i))));
+        let Some((ok, o)) = o else {
+            items.push(EcnItem { key: k.clone(), label: label(n), kinds: vec!["added".into()], desc: format!("新增 ×{}", n.qty) });
+            continue;
+        };
+        matched_old.insert(ok);
+        let mut kinds = Vec::new();
+        let mut desc = Vec::new();
+        if ok != k {
+            kinds.push("model".to_string());
+            desc.push("模型修改".to_string());
+        }
+        let mut cmp = |kind: &str, what: &str, a: &str, b: &str| {
+            if a != b {
+                kinds.push(kind.to_string());
+                desc.push(format!("{what} {} → {}", if a.is_empty() { "-" } else { a }, if b.is_empty() { "-" } else { b }));
+            }
+        };
+        cmp("qty", "数量", &o.qty.to_string(), &n.qty.to_string());
+        cmp("material", "材料", &o.material, &n.material);
+        cmp("pn", "料号", &o.pn, &n.pn);
+        cmp("name", "名称", &o.name, &n.name);
+        cmp("supplier", "加工方", &o.supplier, &n.supplier);
+        if o.upload != n.upload {
+            kinds.push("upload".into());
+            desc.push("图纸更换".into());
+        } else if o.sheet != n.sheet && !kinds.iter().any(|k| k == "model") {
+            kinds.push("drawing".into());
+            desc.push("图纸标注修改".into());
+        }
+        if !kinds.is_empty() {
+            items.push(EcnItem { key: k.clone(), label: label(n), kinds, desc: desc.join("; ") });
+        }
+    }
+    for (k, o) in old {
+        if !matched_old.contains(k) {
+            items.push(EcnItem { key: k.clone(), label: label(o), kinds: vec!["removed".into()], desc: "删除".into() });
+        }
+    }
+    items
+}
+
+/// 出图设置的指纹: 去掉时间 / 计数 / 实例这些不算"图改了"的字段。
+pub fn sheet_hash(s: &Sheet) -> String {
+    let mut c = s.clone();
+    c.compiled.clear();
+    c.exported.clear();
+    c.edits = 0;
+    c.model_changed = false;
+    c.member.clear();
+    c.model_name.clear();
+    c.volume = None;
+    c.area = None;
+    c.uploaded = None;
+    let txt = serde_json::to_string(&c).unwrap_or_default();
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in txt.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::drawing::Uploaded;
+
+    fn snap(pn: &str, qty: u64, ids: &[&str]) -> PartSnap {
+        PartSnap { pn: pn.into(), name: pn.into(), qty, ids: ids.iter().map(|s| s.to_string()).collect(), ..Default::default() }
+    }
+
+    #[test]
+    fn ecn_new_release_vs_same_batch() {
+        use std::collections::BTreeMap;
+        let mut h = History::default();
+        let r1: BTreeMap<String, PartSnap> = [("a".to_string(), snap("A", 2, &["e1"])), ("b".to_string(), snap("B", 1, &["e2"]))].into();
+        // 第一次外发: 没有 ECN
+        assert_eq!(h.record(r1.clone(), "2026-11-17", false), ("R1".into(), None));
+        // 之后改了几次: a 改了模型(key 变、实体同)+ 数量, b 删了, c 新增 → 都在一条里
+        let mut now: BTreeMap<String, PartSnap> = [("a2".to_string(), snap("A", 4, &["e1"])), ("c".to_string(), snap("C", 1, &["e3"]))].into();
+        let items = diff(&h.last().unwrap().parts, &now);
+        assert_eq!(items.len(), 3);
+        let a = items.iter().find(|i| i.key == "a2").unwrap();
+        assert_eq!(a.kinds, vec!["model", "qty"]);
+        assert_eq!(a.desc, "模型修改; 数量 2 → 4");
+        assert!(items.iter().any(|i| i.key == "b" && i.kinds == vec!["removed"]));
+        assert!(items.iter().any(|i| i.key == "c" && i.kinds == vec!["added"]));
+        // 同一批补发(还是 R1): 不新增 ECN, R1 的快照更新
+        h.open_note = "客户改需求".into();
+        assert_eq!(h.record(now.clone(), "2026-11-18", true), ("R1".into(), None));
+        assert!(h.ecns.is_empty() && h.releases.len() == 1 && h.last().unwrap().parts.contains_key("a2"));
+        // 再改材料 → 新外发 R2 → ECN-001(只含 R1 之后的改动)
+        now.get_mut("a2").unwrap().material = "6061".into();
+        h.open_note = "改材料".into();
+        h.open_by = "frg".into();
+        let (v, no) = h.record(now.clone(), "2026-11-19", false);
+        assert_eq!((v.as_str(), no.as_deref()), ("R2", Some("ECN-001")));
+        assert_eq!(h.ecns[0].items.len(), 1);
+        assert_eq!(h.ecns[0].items[0].desc, "材料 - → 6061");
+        assert_eq!(h.rev_rows("a2"), vec![("ECN-001".to_string(), "材料 - → 6061; 改材料".to_string(), "frg".to_string(), "2026-11-19".to_string())]);
+        // R2 发出去之前又改了数量, 还是同一批 → ECN-001 重算(对比 R1)
+        now.get_mut("a2").unwrap().qty = 6;
+        assert_eq!(h.record(now.clone(), "2026-11-20", true), ("R2".into(), Some("ECN-001".into())));
+        assert_eq!(h.ecns.len(), 1);
+        assert_eq!(h.ecns[0].items[0].desc, "数量 4 → 6; 材料 - → 6061");
+        // 模型改名跟着走; 变更表最多两行
+        assert!(h.rename_key("a2", "a3"));
+        assert_eq!(h.rev_rows("a3").len(), 1);
+        now = [("a3".to_string(), snap("A", 7, &["e1"])), ("c".to_string(), snap("C", 1, &["e3"]))].into();
+        h.record(now.clone(), "d", false);
+        now.get_mut("a3").unwrap().qty = 8;
+        h.record(now, "d", false);
+        let rows = h.rev_rows("a3");
+        assert_eq!(rows.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(), vec!["ECN-002", "ECN-003"]);
+        // 图纸指纹: 时间 / 计数不算改动, 公差算
+        let mut s = Sheet::new("k", "P", "m", "n");
+        let h0 = sheet_hash(&s);
+        s.compiled = "x".into();
+        s.edits = 5;
+        assert_eq!(sheet_hash(&s), h0);
+        s.dims_tol.insert("D".into(), "h7".into());
+        assert_ne!(sheet_hash(&s), h0);
+    }
 
     #[test]
     fn supplier_tables_files_and_package() {
@@ -283,7 +590,9 @@ mod tests {
         let root = d.join("rel");
         assert_eq!(next_version(&root), "R1");
         let pack = Pack { supplier: sups.get("cnc").unwrap().clone(), csv: table_csv(&h, &t), files: f, missing: vec![("Base".into(), miss)] };
-        let out = write(&root, "R1", "2026-11-17", "total", &[pack]).unwrap();
+        let e = Ecn { no: "ECN-001".into(), ver: "R1".into(), date: "2026-11-17".into(), items: vec![EcnItem { key: "a".into(), label: "Base".into(), kinds: vec!["qty".into()], desc: "数量 1 → 2".into() }], ..Default::default() };
+        let out = write(&root, "R1", "2026-11-17", "total", &[pack], Some(&e)).unwrap();
+        assert!(std::fs::read_to_string(out.join("ECN-001.csv")).unwrap().contains("数量 1 → 2"));
         assert!(out.join("总BOM.csv").exists() && out.join("CNC").join("CNC-BOM.csv").exists() && out.join("CNC").join("904002001.pdf").exists());
         assert!(out.join("CNC.zip").exists() && out.join("manifest.json").exists());
         assert_eq!(next_version(&root), "R2");
