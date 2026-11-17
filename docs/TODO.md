@@ -661,7 +661,10 @@
 - [x] **A3 事务回滚**（2026-11-15，know-how/command-dispatch.md「A3」）：`hist.begin / rollback / commit`（能力 `hist.write`），
       撤销 = body 上派发 `edit:undo`（同 Ctrl+Z，异步，轮询确认）；begin 以下撤销栈被动过则拒绝；窗口不可见拒绝；
       `cmd.exec {atomic}` 失败整串撤回（CLI `--atomic`）。契约测试 2 项；真机：失败脚本撤回 2 步 270 ms、事务撤回 2 步 102 ms，前后一致。
-- [ ] **A4 配方补齐**（即 N2 扩配方）：cylinder、sketch+extrude、hole、chamfer、shell、offsetFace、pattern —— 每项先在副本实测。
+- [~] **A4 配方补齐**（即 N2 扩配方）：cylinder、sketch+extrude、hole、chamfer、shell、offsetFace、pattern —— 每项先在副本实测。
+      2026-11-17：cylinder / chamfer / offsetFace / hole 早已有；新增 **revolve**（[r, z] 轮廓旋转体：螺钉 / 轴 / 台阶 / 锥 / 退刀槽）与
+      **prism**（正多边形柱：内六角孔 / 六角头 / 螺母），model1 上逐项实测出字段（know-how/command-dispatch.md「A4」），契约测试通过。
+      待做：配方经 pla-mcp 在 model1 上整体跑一遍（窗口要可见）；螺纹外观；shell / pattern。
 - [x] **A5 视图工具**（2026-11-15，know-how/geometry-query.md「A5」）：垫片 `cam.view`（临时切正交 → 视角朝向 + 包围盒投影算缩放
       对准物体 → 截图 → 还原相机与投影；七个视角）+ CLI `pla-app cdp-view`；契约测试 1 项；真机前 / 等轴 / 顶三张居中清晰、相机完全还原。
       坑：轨道控制器 `focalOffset` 要清零，否则放大后画面被推离物体。

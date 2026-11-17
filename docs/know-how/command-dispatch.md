@@ -134,6 +134,25 @@
   `Vertex.GetPoint()` 给坐标; 选择里在 `curveVertexIds`(Set)。闭合曲线(圆)没有端点(vertices.length = 0)。
 - 组合孔: 每步只减一个实体(一个圆柱可以很长, 只要 targets 只有那个实体就只挖它), 引用链 `$sN` 跟踪各实体的最新产物。
 
+## A4 草图 → 拉伸 / 旋转(2026-11-17 model1 实测; 用户选题: 先做螺丝, 另加轴类与其它标准件)
+
+- **草图曲线**: `CenterPolygonFactory`(实例字段 `center` / `point` / `orientation`, setter `vertexCount` / `radius` = 外接圆半径;
+  `circumscribedOrInscribed` 默认 'inscribed' 但 radius 实测就是顶点半径)、`CenterCircleFactory`(center / point / orientation)、
+  `CurveFactory`(**`push(Vector3)`** 加点; 直接塞 `points` 数组报 `manhattanDistanceTo`; `type` **0 = 折线**, 默认 1 是过点样条 ——
+  闭合样条会鼓出去(2 × 10 的"矩形"区域实际 7.6 宽), 拿它旋转就跨轴报 `PK_ERROR_impossible_spin`; `closed = true`)。commit 返回 `Wire`。
+- **区域**: 闭合平面曲线提交后**同一命令里**就多出一个 `SketchIsland`(视图 `regions` = RegionGroup: `versionIds` 形如 `94r2669675` + `bboxes`);
+  `lookupTopologyItemById(区域 id)` → `{view: Region, model: Face}`。
+- **拉伸** `ExtrudeFactory`: `regions = [Region 视图]`, `distance1`(米), 方向 = 实例字段 `direction`(原地 set)。区域法向不跟多边形 `orientation`
+  走(法向设 −Z 仍往 +Z 拉)→ 一律显式设 `direction`; `distance1` 取负也能反向。直接给 `curves` 得到的是 `Sheet`(面), 不是实体。
+- **旋转** `RevolveFactory`: `regions`, 实例字段 `origin` / `axis`(原地 set, 初始全 0)、setter `degrees`; 轴要在轮廓平面里(轴 ⟂ 平面 → impossible_spin)、
+  轮廓不能跨轴; 贴轴的边可以。M4×12 杯头示意(杆 r2 × 12 + 头 r3.5 × 4)→ 5 面(3 平面 + 2 圆柱)。
+- **删辅助曲线**: `editor.geo.removeItem(wire)`(GeometryDatabase; `editor.db` 上没有删除), 在同一命令里删 = 同一个撤销步。
+  岛(SketchIsland)当帧还在, 命令结束后是否随之消失待真机确认。
+- 两个工厂都继承 BooleanBodyFactory: `targets` + `operationType`(同 box)。
+- 配方(垫片 `NAMES.recipes`, 自定义构建 `customBuild`): `revolve {origin, axis, profile: [[r, z]…], degrees?}`、
+  `prism {center, normal?, sides, radius | flats, height, rotate?}`; 一步 = 画辅助曲线 → 取新区域(提交前后区域 id 求差, 离预期中心最近)→
+  拉伸 / 旋转(+ 布尔)→ 删辅助曲线。契约测试 A4 一项(M4 杯头 + 内六角 subtract)。
+
 ## 加一个新操作
 
 1. 副本上读工厂原型链的 setter 名(本文 4.), 用 lab 脚本试出参数取值与 commit 返回值;

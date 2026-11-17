@@ -148,6 +148,12 @@
     'fac.refillet':            ['fac', 'RefilletFaceFactory'],
     'fac.moveFaces':           ['fac', 'MultiMoveFaceFactory'],
     'fac.cylinder':            ['fac', 'CylinderFactory'],
+    // ---- A4: 草图曲线 → 区域 → 拉伸 / 旋转(实测 2026-11-17, know-how/command-dispatch.md「A4」) ----
+    'fac.centerPolygon':       ['fac', 'CenterPolygonFactory'],
+    'fac.curve':               ['fac', 'CurveFactory'],
+    'fac.extrude':             ['fac', 'ExtrudeFactory'],
+    'fac.revolve':             ['fac', 'RevolveFactory'],
+    'geo.removeItem':          ['geo', 'removeItem'],
     // ---- N3e: 本体测量(Measure Distance 的同一工厂; 名字在 nodes 表里, 不在测量记录上 —— 实测 2026-11-15) ----
     'ed.measurements':         ['ed', 'measurements'],
     'meas.snapshot':           ['meas', 'snapshot'],
@@ -376,7 +382,16 @@
                   params: { center: ['center', 'vecset'], axis: ['orientation', 'axisQuat'], radius: ['radius', 'length'], height: ['height', 'length'] } },
       // N4: 倒角(= 圆角工厂距离取负; 孔口倒角 = 锥形沉头)
       chamfer: { fac: 'fac.multiFillet', required: ['edges', 'distance'],
-                 params: { edges: ['edges', 'edges'], distance: ['distance', 'negLength'] } }
+                 params: { edges: ['edges', 'edges'], distance: ['distance', 'negLength'] } },
+      // A4: 正多边形柱(内六角孔 / 六角头 / 螺母): 中心 + 法向(拉伸方向, 默认 +Z)+ 边数 + 外接圆半径 radius 或对边距 flats + 高度(负 = 反向);
+      // rotate = 绕法向转多少度(默认一个顶点朝 u 轴)。一步 = 画多边形 → 拉伸(+ 布尔)→ 删辅助曲线, 一个撤销步。
+      prism: { custom: 'prism', fac: 'fac.extrude', also: ['fac.centerPolygon'], bool: true, required: ['center', 'sides', 'height'],
+               params: { center: [null, 'point'], normal: [null, 'axisQuat'], sides: [null, 'number'], radius: [null, 'length'], flats: [null, 'length'],
+                         height: [null, 'length'], rotate: [null, 'angle'] } },
+      // A4: 旋转体(螺钉 / 轴 / 台阶 / 锥): profile = [[r, z], …] —— r = 离轴距离(≥ 0), z = 沿 axis 的位置, 相对 origin(文档单位);
+      // 自动闭合; 贴轴的边就是轴线上的线段。degrees 默认 360。
+      revolve: { custom: 'revolve', fac: 'fac.revolve', also: ['fac.curve'], bool: true, required: ['origin', 'axis', 'profile'],
+                 params: { origin: [null, 'point'], axis: [null, 'axisQuat'], profile: [null, 'profile'], degrees: [null, 'number'] } }
     },
     // N4b 打孔位置: 选择里可当孔位的类型(曲线端点 / 整条曲线); Wire 视图上的端点组(ids + Points 几何)与线段组
     holePointKinds: { vertex: 'curveVertex', curve: 'curve' },
@@ -385,6 +400,15 @@
     cylinderFields: { center: 'center', point: 'point', radius: 'radius', baseAxis: [0, 0, 1] },
     // translation 类型参数写到工厂的哪两个字段(Vector3.set + Matrix4.makeTranslation)
     translationFields: { vector: 'move', matrix: 'matrix' },
+    // A4: 多边形 / 折线 / 拉伸 / 旋转工厂的字段(实测 2026-11-17)。折线 type 0(默认 1 是过点样条, 闭合时会鼓出去);
+    // 点用 push(Vector3); 闭合曲线提交后同一命令里就有新的 SketchIsland(区域 id 形如 '94r2669675', lookupTopologyItemById → Region 视图)。
+    // 拉伸: regions + direction(单位向量, 原地 set)+ distance1(米); 旋转: regions + origin / axis(原地 set)+ degrees setter(轴要在轮廓平面里、轮廓不能跨轴)。
+    sketchFields: {
+      polygon: { center: 'center', point: 'point', orientation: 'orientation', sides: 'vertexCount', radius: 'radius', baseNormal: [0, 0, 1] },
+      curve: { type: 'type', polyline: 0, push: 'push', closed: 'closed' },
+      sweep: { regions: 'regions', direction: 'direction', distance: 'distance1', origin: 'origin', axis: 'axis', degrees: 'degrees' },
+      islandCtor: 'SketchIsland', islandRegions: 'regions'
+    },
     // ---- B1/B2 BOM: 指纹比较的相对容差(网格近似, 旋转后的复制件有 Float32 噪声); 手性阈值(相对 面积 × 尺度³);
     //      组: 根组 id 与组对象的 id 字段(ed.groups.getParent(nodeKey) → Groups_Group{id…}, 根 = 0) ----
     // shapeMaxFaces: 面数不超过它的零件才做回转面摘要(标准件识别; 复杂件不算, 省时间)
@@ -1302,9 +1326,139 @@
     throw new Error('recipe: unknown param type ' + type);
   }
 
+  // ---- A4: 草图类配方(多边形柱 / 旋转体): 画辅助曲线 → 取它生成的区域 → 拉伸 / 旋转(+ 布尔)→ 删辅助曲线 ----
+  function perpOf(ax) {
+    var pp = Math.abs(ax[0]) < 0.9 ? [1, 0, 0] : [0, 1, 0];
+    var dp = vdot(pp, ax);
+    return vnorm([pp[0] - dp * ax[0], pp[1] - dp * ax[1], pp[2] - dp * ax[2]]);
+  }
+  // 全部草图区域: [{id, center(米)}](与 versionIds 同序的 bboxes, 每项 6 个数)
+  function allRegions() {
+    var SF = NAMES.sketchFields, out = [];
+    Array.from(need('geo.items') || []).forEach(function (it) {
+      var v = it && it[NAMES.lookupViewKey];
+      if (!v || !v.constructor || v.constructor.name !== SF.islandCtor) return;
+      var g = v[SF.islandRegions], ids = g && g[NAMES.groupVersionIds], bx = g && g[NAMES.groupBboxes];
+      if (!ids || !bx) return;
+      Array.from(ids).forEach(function (id, i) {
+        var o = i * 6;
+        out.push({ id: String(id), center: [(bx[o] + bx[o + 3]) / 2, (bx[o + 1] + bx[o + 4]) / 2, (bx[o + 2] + bx[o + 5]) / 2] });
+      });
+    });
+    return out;
+  }
+  // 提交辅助曲线后新出现的区域里, 中心离 expect 最近的那个(没有新区域 = 曲线并进了已有的草图 → 全部区域里找)
+  function pickNewRegion(before, expect, k) {
+    var all = allRegions();
+    var fresh = all.filter(function (r) { return before.indexOf(r.id) < 0; });
+    var pool = fresh.length ? fresh : all;
+    var best = null, bd = Infinity;
+    pool.forEach(function (r) { var d = Math.hypot(r.center[0] - expect[0], r.center[1] - expect[1], r.center[2] - expect[2]); if (d < bd) { bd = d; best = r; } });
+    if (!best) throw new Error('the sketch curve made no closed region');
+    if (!fresh.length && bd > NAMES.pickTolerance * k) throw new Error('no new region near the sketch (nearest ' + Math.round(bd / k * 1000) / 1000 + ')');
+    var t = invokeOn('geo.lookupTopo', [best.id]);
+    var view = t && t[NAMES.lookupViewKey];
+    if (!view) throw new Error('region ' + best.id + ' could not be looked up');
+    return view;
+  }
+  function customBuild(o, rc, ctx) {
+    var k = ctx.k, V = ctx.V3, SF = NAMES.sketchFields;
+    var num = function (x) { return Number(x); };
+    var bools = [];
+    if (o.bool !== undefined) {
+      var targets = o.targets !== undefined ? convertParam('solids', o.targets, ctx) : [];
+      if (!targets.length) throw new Error('bool needs targets');
+      bools = [[NAMES.boolSetters.targets, targets], [NAMES.boolSetters.op, NAMES.boolOps[o.bool]]];
+    }
+    var finish = function (cmd, f, wire) {
+      bools.forEach(function (s) { f[s[0]] = s[1]; });
+      return Promise.resolve(f[NAMES.facCommit]()).then(function (made) {
+        // 辅助曲线随同一命令删掉(一个撤销步; 删不掉不算失败)
+        return Promise.resolve().then(function () { if (wire) return invokeOn('geo.removeItem', [wire]); }).then(function () { return made; }, function () { return made; });
+      });
+    };
+    if (rc.custom === 'prism') {
+      var n = o.normal !== undefined ? convertParam('axisQuat', o.normal, ctx) : SF.polygon.baseNormal.slice();
+      var c = convertParam('vecset', o.center, ctx);
+      var sides = Math.round(num(o.sides));
+      if (!(sides >= 3 && sides <= 64)) throw new Error('sides must be 3..64');
+      var R;
+      if (o.radius !== undefined) R = convertParam('length', o.radius, ctx);
+      else if (o.flats !== undefined) R = convertParam('length', o.flats, ctx) / (2 * Math.cos(Math.PI / sides));
+      else throw new Error('prism needs radius (circumscribed) or flats (across flats)');
+      if (!(R > 0)) throw new Error('radius / flats must be > 0');
+      var h = convertParam('length', o.height, ctx);
+      if (!h) throw new Error('height must not be 0');
+      var u = perpOf(n), w = vcross(n, u), rot = o.rotate !== undefined ? convertParam('angle', o.rotate, ctx) : 0;
+      var dir = [u[0] * Math.cos(rot) + w[0] * Math.sin(rot), u[1] * Math.cos(rot) + w[1] * Math.sin(rot), u[2] * Math.cos(rot) + w[2] * Math.sin(rot)];
+      var Poly = need('fac.centerPolygon'), Ext = need(rc.fac), P = SF.polygon, S = SF.sweep;
+      return function (cmd) {
+        var before = allRegions().map(function (r) { return r.id; });
+        var p = new Poly(cmd.editor);
+        p[NAMES.facResource](cmd);
+        p[P.center].set(c[0], c[1], c[2]);
+        p[P.orientation].setFromUnitVectors(new V(P.baseNormal[0], P.baseNormal[1], P.baseNormal[2]), new V(n[0], n[1], n[2]));
+        p[P.point].set(c[0] + dir[0] * R, c[1] + dir[1] * R, c[2] + dir[2] * R);
+        p[P.sides] = sides;
+        p[P.radius] = R;
+        return Promise.resolve(p[NAMES.facCommit]()).then(function (wr) {
+          var wire = Array.isArray(wr) ? wr[0] : wr;
+          var region = pickNewRegion(before, c, k);
+          var f = new Ext(cmd.editor);
+          f[NAMES.facResource](cmd);
+          f[S.regions] = [region];
+          var sg = h < 0 ? -1 : 1;
+          f[S.direction].set(n[0] * sg, n[1] * sg, n[2] * sg);
+          f[S.distance] = Math.abs(h);
+          return finish(cmd, f, wire);
+        });
+      };
+    }
+    if (rc.custom === 'revolve') {
+      var ax = convertParam('axisQuat', o.axis, ctx), org = convertParam('vecset', o.origin, ctx);
+      var prof = o.profile;
+      if (!Array.isArray(prof) || prof.length < 3) throw new Error('profile needs at least 3 [r, z] points');
+      var uu = perpOf(ax);
+      var pts = prof.map(function (q, i) {
+        if (!Array.isArray(q) || q.length !== 2) throw new Error('profile point #' + i + ' must be [r, z]');
+        var r = num(q[0]) * k, z = num(q[1]) * k;
+        if (!isFinite(r) || !isFinite(z)) throw new Error('profile point #' + i + ' is not numeric');
+        if (r < -1e-12) throw new Error('profile point #' + i + ': r must be >= 0 (the profile may not cross the axis)');
+        return [org[0] + uu[0] * r + ax[0] * z, org[1] + uu[1] * r + ax[1] * z, org[2] + uu[2] * r + ax[2] * z];
+      });
+      var mn = [Infinity, Infinity, Infinity], mx = [-Infinity, -Infinity, -Infinity];
+      pts.forEach(function (p) { for (var j = 0; j < 3; j++) { mn[j] = Math.min(mn[j], p[j]); mx[j] = Math.max(mx[j], p[j]); } });
+      var mid = [(mn[0] + mx[0]) / 2, (mn[1] + mx[1]) / 2, (mn[2] + mx[2]) / 2];
+      var deg = o.degrees !== undefined ? num(o.degrees) : 360;
+      if (!(deg > 0 && deg <= 360)) throw new Error('degrees must be in (0, 360]');
+      var Crv = need('fac.curve'), Rev = need(rc.fac), C = SF.curve, S2 = SF.sweep;
+      return function (cmd) {
+        var before = allRegions().map(function (r) { return r.id; });
+        var cf = new Crv(cmd.editor);
+        cf[NAMES.facResource](cmd);
+        cf[C.type] = C.polyline;
+        pts.forEach(function (p) { cf[C.push](new V(p[0], p[1], p[2])); });
+        cf[C.closed] = true;
+        return Promise.resolve(cf[NAMES.facCommit]()).then(function (wr) {
+          var wire = Array.isArray(wr) ? wr[0] : wr;
+          var region = pickNewRegion(before, mid, k);
+          var f = new Rev(cmd.editor);
+          f[NAMES.facResource](cmd);
+          f[S2.regions] = [region];
+          f[S2.origin].set(org[0], org[1], org[2]);
+          f[S2.axis].set(ax[0], ax[1], ax[2]);
+          f[S2.degrees] = deg;
+          return finish(cmd, f, wire);
+        });
+      };
+    }
+    throw new Error('recipe: unknown custom builder ' + rc.custom);
+  }
+
   // 一步 → build(cmd) 函数。参数在入队前全部换算好(选择器出错就不产生命令)。
   function buildStep(o, ctx) {
     var rc = NAMES.recipes[o.op];
+    if (rc.custom) return customBuild(o, rc, ctx);
     var Fac = need(rc.fac);
     var sets = [];
     Object.keys(rc.params).forEach(function (p) {
@@ -1366,6 +1520,7 @@
       if (!(o.bool in NAMES.boolOps)) throw new Error(at + 'bool must be one of ' + Object.keys(NAMES.boolOps).join(', '));
     }
     need(rc.fac);
+    (rc.also || []).forEach(function (f) { need(f); });
   }
 
   // =====================================================================
@@ -1442,7 +1597,7 @@
   def('cmd.factories', 'cmd.exec', function () {
     var F = W[CFG.factoriesGlobal];
     var keys = {};
-    Object.keys(NAMES.recipes).forEach(function (op) { keys[NAMES.recipes[op].fac] = true; });
+    Object.keys(NAMES.recipes).forEach(function (op) { keys[NAMES.recipes[op].fac] = true; (NAMES.recipes[op].also || []).forEach(function (f) { keys[f] = true; }); });
     var missing = Object.keys(keys).filter(function (k) { return !resolve(k).ok; });
     return { loaded: !!F, count: F ? Object.keys(F).length : 0, missing: missing, ops: Object.keys(NAMES.recipes) };
   });

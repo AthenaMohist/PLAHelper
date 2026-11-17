@@ -1074,7 +1074,77 @@ const callAsync = async (name, args) => JSON.parse(await run(`window.__PLA__.cal
         return [add(new Solid(t.mn, t.mx))];
       }
     }
-    return { CornerBoxFactory, MultiFilletShellFactory, OffsetFaceFactory, RefilletFaceFactory, MultiMoveFaceFactory, CylinderFactory };
+    // A4 草图(仿实测): 多边形 / 折线提交 = 一条 Wire + 一个 SketchIsland(区域 id '<island>r<n>', 包围盒 = 曲线范围);
+    // 拉伸 = regions + direction + distance1, 旋转 = regions + origin / axis + degrees; 都带布尔; geo.removeItem 删辅助曲线
+    class Wire { constructor() { this.userData = { versionId: nextVid++ }; } }
+    class SketchIsland {
+      constructor(mn, mx) {
+        this.userData = { versionId: nextVid++ };
+        const rid = this.userData.versionId + 'r' + (nextTopo++);
+        this.regions = { versionIds: [rid], bboxes: Float32Array.from([...mn, ...mx]) };
+        ed.geo._topo[rid] = { versionId: rid, kind: 'r', island: this, mn, mx };
+      }
+    }
+    const sketch = (pts) => {
+      const mn = [0, 1, 2].map((k) => Math.min(...pts.map((p) => p[k]))), mx = [0, 1, 2].map((k) => Math.max(...pts.map((p) => p[k])));
+      add(new SketchIsland(mn, mx));
+      return add(new Wire());
+    };
+    ed.geo.removeItem = function (v) { ed.removed = (ed.removed || 0) + 1; remove(v); return Promise.resolve(); };
+    class CenterPolygonFactory extends AbstractFactory {
+      constructor(editor) {
+        super(editor);
+        this.center = vec0(); this.point = vec0();
+        this.orientation = { setFromUnitVectors(a, b) { this.to = [b.x, b.y, b.z]; return this; } };
+      }
+      set vertexCount(v) { this._n = v; } set radius(v) { this._r = v; }
+      async commit() {
+        this.guard();
+        const c = this.center, r = this._r;
+        (ed.polys = ed.polys || []).push({ center: [c.x, c.y, c.z], n: this._n, r, normal: this.orientation.to, pointDist: Math.hypot(this.point.x - c.x, this.point.y - c.y, this.point.z - c.z) });
+        return [sketch([[c.x - r, c.y - r, c.z], [c.x + r, c.y + r, c.z]])];
+      }
+    }
+    class CurveFactory extends AbstractFactory {
+      constructor(editor) { super(editor); this.points = []; this.type = 1; this.closed = false; }
+      push(p) { this.points.push(p); }
+      async commit() {
+        this.guard();
+        ed.lastCurve = { type: this.type, closed: this.closed, pts: this.points.map((p) => [p.x, p.y, p.z]) };
+        return [sketch(ed.lastCurve.pts)];
+      }
+    }
+    class SweepBase extends AbstractFactory {
+      set regions(v) { this._regions = v; } set targets(v) { this._targets = v; } set operationType(v) { this._op = v; }
+      result(mn, mx) {
+        const snap = ed.geo.items.slice();
+        if (this._op === 15902) { const t = this._targets[0]; remove(t); mn = t.mn; mx = t.mx; }
+        ed.history._undoStack.push({ name: 'PlaFactory', snapshot: snap });
+        return [add(new Solid(mn, mx))];
+      }
+    }
+    class ExtrudeFactory extends SweepBase {
+      constructor(editor) { super(editor); this.direction = vec0(); this.distance1 = 0; }
+      async commit() {
+        this.guard();
+        const r = this._regions[0], d = this.direction, h = this.distance1;
+        ed.lastExtrude = { region: r.versionId, dir: [d.x, d.y, d.z], h, op: this._op };
+        const end = [r.mn[0] + d.x * h, r.mn[1] + d.y * h, r.mn[2] + d.z * h];
+        return this.result(r.mn.map((v, k) => Math.min(v, end[k])), r.mx.map((v, k) => Math.max(v, r.mx[k] + [d.x, d.y, d.z][k] * h)));
+      }
+    }
+    class RevolveFactory extends SweepBase {
+      constructor(editor) { super(editor); this.origin = vec0(); this.axis = vec0(); }
+      set degrees(v) { this._deg = v; }
+      async commit() {
+        this.guard();
+        const r = this._regions[0];
+        ed.lastRevolve = { region: r.versionId, origin: [this.origin.x, this.origin.y, this.origin.z], axis: [this.axis.x, this.axis.y, this.axis.z], deg: this._deg, op: this._op };
+        return this.result(r.mn, r.mx);
+      }
+    }
+    return { CornerBoxFactory, MultiFilletShellFactory, OffsetFaceFactory, RefilletFaceFactory, MultiMoveFaceFactory, CylinderFactory,
+             CenterPolygonFactory, CurveFactory, ExtrudeFactory, RevolveFactory };
   }
 
   const L_BRACKET = { ops: [
@@ -1089,8 +1159,8 @@ const callAsync = async (name, args) => JSON.parse(await run(`window.__PLA__.cal
     assert.strictEqual(r.err, 'exc:need-factories');
     const f = call('cmd.factories').v;
     assert.strictEqual(f.loaded, false);
-    assert.deepStrictEqual(f.missing.sort(), ['fac.cornerBox', 'fac.cylinder', 'fac.moveFaces', 'fac.multiFillet', 'fac.offsetFace', 'fac.refillet']);
-    assert.deepStrictEqual(f.ops, ['box', 'fillet', 'offsetFace', 'refillet', 'moveFaces', 'cylinder', 'chamfer']);
+    assert.deepStrictEqual(f.missing.sort(), ['fac.centerPolygon', 'fac.cornerBox', 'fac.curve', 'fac.cylinder', 'fac.extrude', 'fac.moveFaces', 'fac.multiFillet', 'fac.offsetFace', 'fac.refillet', 'fac.revolve']);
+    assert.deepStrictEqual(f.ops, ['box', 'fillet', 'offsetFace', 'refillet', 'moveFaces', 'cylinder', 'chamfer', 'prism', 'revolve']);
   });
 
   await ta('N2 cmd.exec M-A: L 形支架 = 底板 + 立板(合并) + 内角倒圆; 文档单位 mm → 内部米; 每步一个命令一个撤销步', async () => {
@@ -1118,6 +1188,40 @@ const callAsync = async (name, args) => JSON.parse(await run(`window.__PLA__.cal
     assert.strictEqual(typeof v.results[2].items[0].id, 'number', '产物带物体 id(可再引用)');
   });
 
+  await ta('A4 cmd.exec: 旋转体(折线 type 0 闭合, [r, z] → 轴平面里的点)+ 正多边形柱(对边距 → 外接圆半径, 沿法向拉伸, subtract); 一步一个撤销步, 辅助曲线删掉', async () => {
+    const ed = ed3;
+    const u0 = ed.history._undoStack.length, rm0 = ed.removed || 0;
+    const r = await callAsync('cmd.exec', { ops: [
+      { op: 'revolve', id: 'body', origin: [800, 0, 0], axis: [0, 0, 1], profile: [[0, 0], [2, 0], [2, 12], [3.5, 12], [3.5, 16], [0, 16]] },
+      { op: 'prism', center: [800, 0, 16], normal: [0, 0, -1], sides: 6, flats: 3, height: 2.5, bool: 'subtract', targets: ['$body'] },
+    ] });
+    assert.strictEqual(r.ok, true, JSON.stringify(r));
+    assert.strictEqual(r.v.failed, null, JSON.stringify(r.v.failed));
+    const c = ed.lastCurve;
+    assert.strictEqual(c.type, 0, '折线(默认 1 是样条)');
+    assert.strictEqual(c.closed, true);
+    const near = (a, b) => a.every((x, i) => Math.abs(x - b[i]) < 1e-9);
+    assert.ok(near(c.pts[0], [0.8, 0, 0]) && near(c.pts[1], [0.802, 0, 0]) && near(c.pts[3], [0.8035, 0, 0.012]), JSON.stringify(c.pts));
+    assert.deepStrictEqual(ed.lastRevolve.origin, [0.8, 0, 0]);
+    assert.deepStrictEqual(ed.lastRevolve.axis, [0, 0, 1]);
+    assert.strictEqual(ed.lastRevolve.deg, 360);
+    const p = ed.polys[ed.polys.length - 1];
+    assert.strictEqual(p.n, 6);
+    assert.ok(Math.abs(p.r - 0.003 / (2 * Math.cos(Math.PI / 6))) < 1e-12, '对边距 3 → 外接圆半径 √3');
+    assert.ok(Math.abs(p.pointDist - p.r) < 1e-12, '半径点在外接圆上');
+    assert.deepStrictEqual(p.normal, [0, 0, -1]);
+    assert.deepStrictEqual(ed.lastExtrude.dir, [0, 0, -1]);
+    assert.strictEqual(ed.lastExtrude.h, 0.0025);
+    assert.strictEqual(ed.lastExtrude.op, 15902, 'subtract');
+    assert.strictEqual(ed.history._undoStack.length - u0, 2, '两步两个撤销步');
+    assert.strictEqual((ed.removed || 0) - rm0, 2, '两条辅助曲线都删了');
+    // 参数错: 执行前就报, 不产生命令
+    const u1 = ed.history._undoStack.length;
+    assert.ok(/r must be >= 0/.test((await callAsync('cmd.exec', { ops: [{ op: 'revolve', origin: [0, 0, 0], axis: [0, 0, 1], profile: [[0, 0], [-1, 0], [0, 5]] }] })).v.failed.err));
+    assert.ok(/needs radius .* or flats/.test((await callAsync('cmd.exec', { ops: [{ op: 'prism', center: [0, 0, 0], sides: 6, height: 2 }] })).v.failed.err));
+    assert.strictEqual(ed.history._undoStack.length, u1);
+  });
+
   await ta('N2 cmd.exec: 失败如实报且停在失败步; 已完成的保留; 引用已被吃掉的物体、挑不到边、PK 内核报错、参数错', async () => {
     const ed = ed3;
     // 引用被合并吃掉的底板
@@ -1141,7 +1245,7 @@ const callAsync = async (name, args) => JSON.parse(await run(`window.__PLA__.cal
     // 参数错误在执行任何一步之前就报
     const q1 = ed.enqueued;
     const bad = [
-      [{ ops: [{ op: 'sphere' }] }, /unknown op \(known: box, fillet, offsetFace, refillet, moveFaces, cylinder, chamfer\)/],
+      [{ ops: [{ op: 'sphere' }] }, /unknown op \(known: box, fillet, offsetFace, refillet, moveFaces, cylinder, chamfer, prism, revolve\)/],
       [{ ops: [{ op: 'box', p1: [0, 0, 0], p2: [1, 1, 0] }] }, /missing height/],
       [{ ops: [{ op: 'box', p1: [0, 0, 0], p2: [1, 1, 0], height: 1, colour: 'red' }] }, /unknown param colour/],
       [{ ops: [{ op: 'fillet', edges: ['1e1'], distance: 1, bool: 'union' }] }, /bool not supported/],

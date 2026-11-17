@@ -77,6 +77,8 @@ ops (lengths in document units unless units is given; points [x,y,z]):\n\
 - offsetFace {{faces, distance}} (+ = grow outward along the face normal; on a hole wall + makes the hole smaller)\n\
 - refillet {{faces (fillet faces), distance (= radius change)}}\n\
 - moveFaces {{faces, move [dx,dy,dz]}} (move a hole / boss / pocket)\n\
+- revolve {{origin, axis, profile [[r, z], ...], degrees?=360}} (+ bool, targets) - solid of revolution: r = distance from the axis (>= 0, never crossing it), z = position along axis from origin; the profile closes itself; points with r = 0 lie on the axis. Screws, shafts, steps, cones, grooves (subtract).\n\
+- prism {{center, normal?=[0,0,1] (extrude direction), sides, radius (circumscribed) | flats (across flats), height (negative = opposite), rotate? (deg about normal)}} (+ bool, targets) - regular polygon prism: hex socket (subtract, normal pointing into the head), hex head, nut.\n\
 bool: union | subtract | intersect with targets [solid refs]. Give a step id: \"base\" and later steps can use \"$base\" (its result). Edges / faces: topology ids, or {{\"near\": [x,y,z], \"of\": solid ref, \"tol\"?}} = the item whose bbox center is nearest (errors instead of guessing when ambiguous). {refs} After running, verify with model_state / model_measure / model_view."),
          "inputSchema": {"type": "object", "properties": {
             "ops": {"type": "array", "items": {"type": "object"}},
