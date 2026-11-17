@@ -15,6 +15,10 @@ tokio = { workspace = true }
 # egui_extras(image): 快照墙缩略图 — Image::from_bytes 需要安装 extras 的
 # 图片加载器才能解码 PNG(egui 0.29 本体无 png feature, R7-5)。
 egui = "0.29"
+# D5: 调大模型(Claude Messages API, HTTPS)。阻塞客户端, 放后台线程用。
+# TLS 走 native-tls(Windows = schannel, 系统自带): rustls 的 ring 要 C 编译器, 本机 GNU 工具链没有。
+ureq = { version = "2", default-features = false, features = ["json", "native-tls"] }
+native-tls = "0.2"
 egui_extras = { version = "0.29", features = ["image"] }
 eframe = { version = "0.29", default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
 
@@ -42,5 +46,7 @@ windows = { version = "0.52", features = [
     "Win32_System_Registry",
     # Security: windows-0.52 把 RegCreateKeyExW 放在该 feature 之后(SECURITY_ATTRIBUTES 参数)。
     "Win32_Security",
+    # Security_Cryptography: D5 大模型 API key 用 DPAPI(CryptProtectData)加密存盘, 只有本机本用户能解开。
+    "Win32_Security_Cryptography",
     "Win32_Storage_Xps",
 ] }

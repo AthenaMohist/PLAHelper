@@ -216,6 +216,15 @@ struct PlaApp {
     draw_up_job: Option<(String, std::sync::mpsc::Receiver<Result<Option<pla_ui::drawing::Uploaded>, String>>)>,
     /// D8: 解锁要点两次(第一次点了的零件 key)。
     draw_unlock_confirm: Option<String>,
+    /// D5: 大模型配置(设置 → LLM)、key 输入框(从不回显已存的 key)、连接测试。
+    llm_cfg: pla_ui::llm::Config,
+    llm_key_buf: String,
+    llm_test: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
+    llm_test_msg: Option<(bool, String)>,
+    /// D5: 出图助手对话(当前选中的图)、输入框、后台一轮。
+    agent_chat: pla_ui::draw_agent::Chat,
+    agent_input: String,
+    agent_job: Option<(String, std::sync::mpsc::Receiver<Result<pla_ui::draw_agent::TurnOut, String>>)>,
     draw_buf: std::collections::HashMap<String, String>,
     /// 补尺寸: 等 dim.signature 回包的图 key(在 Plasticity 里选的面 → 这张图的 dims_add)。
     draw_sig_pending: Option<String>,
@@ -2569,6 +2578,13 @@ impl PlaApp {
             draw_up_page: 0,
             draw_up_job: None,
             draw_unlock_confirm: None,
+            llm_cfg: pla_ui::llm::Config::load(),
+            llm_key_buf: String::new(),
+            llm_test: None,
+            llm_test_msg: None,
+            agent_chat: Default::default(),
+            agent_input: String::new(),
+            agent_job: None,
             draw_buf: Default::default(),
             draw_sig_pending: None,
             bom_col_w: pla_ui::prefs::load_value(BOM_COLS_KEY)
@@ -4873,6 +4889,116 @@ impl PlaApp {
         self.draw_up_job = Some((key.to_string(), rx));
     }
 
+    // ---------------------------------------------------------------- D5 出图助手
+    /// 收后台一轮的结果(换了零件就丢掉)。
+    fn agent_tick(&mut self) {
+        let got = self.agent_job.as_ref().and_then(|(_, rx)| match rx.try_recv() {
+            Ok(r) => Some(r),
+            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Err(tr("助手线程意外退出", "The assistant thread exited unexpectedly").to_string())),
+        });
+        let Some(r) = got else { return };
+        let key = self.agent_job.take().map(|j| j.0).unwrap_or_default();
+        if key != self.agent_chat.key {
+            return;
+        }
+        match r {
+            Ok(out) => {
+                self.agent_chat.history.extend(out.history_add);
+                self.agent_chat.lines.extend(out.lines);
+                self.agent_chat.open_tools.extend(out.open_tools);
+            }
+            Err(e) => {
+                // 这一轮失败: 撤掉刚加的用户消息(否则下一条会连着两条 user), 话还给输入框
+                if let Some(pla_ui::draw_agent::Line::User(t)) = self.agent_chat.lines.last().cloned() {
+                    self.agent_chat.lines.pop();
+                    if let Some(m) = self.agent_chat.history.pop() {
+                        // 撤回的消息里带着 tool_result → 放回待回列表
+                        for b in m["content"].as_array().into_iter().flatten().filter(|b| b["type"] == "tool_result") {
+                            let id = b["tool_use_id"].as_str().unwrap_or("").to_string();
+                            let c = b["content"].as_str().unwrap_or("").to_string();
+                            self.agent_chat.open_tools.push((id, c));
+                        }
+                    }
+                    self.agent_chat.last_image.clear();
+                    if self.agent_input.trim().is_empty() {
+                        self.agent_input = t;
+                    }
+                }
+                self.agent_chat.lines.push(pla_ui::draw_agent::Line::Error(e));
+            }
+        }
+    }
+
+    /// 发一句话: 带上当前方案 / 报告 / 预览图, 后台跑一轮。
+    fn agent_send(&mut self, key: &str, text: &str, bom_title: &std::collections::BTreeMap<String, String>) {
+        let Some(s) = self.draw_sheets.get(key).cloned() else { return };
+        let rep = self.draw_report.as_ref().filter(|(k, _)| k == key && self.draw_up_view.is_none()).map(|(_, r)| r.clone());
+        let ctx = pla_ui::draw_agent::context(&s, rep.as_ref(), bom_title, s.locked());
+        let img = self.draw_png.clone();
+        self.agent_chat.push_user(text, &ctx, img.as_ref().map(|(u, b)| (u.as_str(), &b[..])));
+        let history = self.agent_chat.history.clone();
+        let rules = self.prefs_get().agent_rules.clone();
+        let cfg = self.llm_cfg.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let preview = |p: &pla_ui::draw_agent::Patch| {
+                let mut c = s.clone();
+                pla_ui::draw_agent::apply(&mut c, p, rep.as_ref())
+            };
+            let _ = tx.send(pla_ui::draw_agent::run_turn(&cfg, &rules, &history, &preview));
+        });
+        self.agent_job = Some((key.to_string(), rx));
+    }
+
+    /// 用户点了「应用」: 补丁打到图上(+1 人修正次数, 记案例)/ 规则存进偏好; 可选接着出图。
+    fn agent_apply(&mut self, key: &str, id: &str, draw: bool, bom_title: &std::collections::BTreeMap<String, String>) {
+        use pla_ui::draw_agent::{Line, Proposal};
+        let Some(prop) = self.agent_chat.lines.iter().find_map(|l| match l {
+            Line::Proposal { id: i, prop, decided: None, .. } if i == id => Some(prop.clone()),
+            _ => None,
+        }) else {
+            return;
+        };
+        let request = self.agent_chat.lines.iter().rev().find_map(|l| if let Line::User(t) = l { Some(t.clone()) } else { None }).unwrap_or_default();
+        match prop {
+            Proposal::Patch(p) => {
+                let Some(mut s) = self.draw_sheets.get(key).cloned() else { return };
+                let rep = self.draw_report.as_ref().filter(|(k, _)| k == key && self.draw_up_view.is_none()).map(|(_, r)| r.clone());
+                match pla_ui::draw_agent::apply(&mut s, &p, rep.as_ref()) {
+                    Ok(changes) => {
+                        s.edits += 1;
+                        pla_ui::draw_agent::log_applied(&pla_ui::drawing::dir(&self.doc_key), &s, &request, &p, &changes);
+                        self.draw_sheets.upsert(s.clone());
+                        self.draw_save();
+                        self.draw_buf.clear();
+                        let note = if draw { "The drawing is being recompiled; the next message will carry the new image." } else { "" };
+                        self.agent_chat.decide(id, true, note);
+                        if draw {
+                            let mut title = bom_title.clone();
+                            title.extend(s.title.clone());
+                            self.draw_start(key, false, title);
+                        } else {
+                            self.set_notice((false, tr("已应用, 点「出图」生效", "Applied; click Draw to see it").to_string()));
+                        }
+                    }
+                    Err(e) => {
+                        self.agent_chat.decide(id, false, &format!("Applying failed: {e}"));
+                        self.set_notice((true, t!("应用失败: {e}", "Applying failed: {e}")));
+                    }
+                }
+            }
+            Proposal::Rule(r) => {
+                let mut p = self.prefs_get().clone();
+                if !p.agent_rules.contains(&r) {
+                    p.agent_rules.push(r);
+                }
+                self.prefs_set(p);
+                self.agent_chat.decide(id, true, "Saved as a standing rule.");
+            }
+        }
+    }
+
     fn open_path(&mut self, p: &std::path::Path) {
         if let Err(e) = std::process::Command::new("cmd").args(["/C", "start", "", &p.display().to_string()]).spawn() {
             self.set_notice((true, t!("打不开 {}: {e}", "Cannot open {}: {e}", p.display())));
@@ -5254,6 +5380,109 @@ impl PlaApp {
         if let Some(p) = open_up {
             self.open_path(&p);
         }
+        // ---- D5: 出图助手(自然语言 → 方案补丁, 用户确认后应用) ----
+        enum AgentAct {
+            Send(String),
+            Apply(String, bool),
+            Reject(String),
+            Clear,
+        }
+        let mut agent_act: Option<AgentAct> = None;
+        if self.agent_chat.key != key {
+            self.agent_chat = pla_ui::draw_agent::Chat::new(&key);
+        }
+        self.agent_tick();
+        let agent_busy = self.agent_job.as_ref().is_some_and(|(k, _)| *k == key);
+        if self.agent_job.is_some() {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(300));
+        }
+        egui::CollapsingHeader::new(tr("出图助手(大模型)", "Drawing assistant (LLM)")).id_salt("draw-agent").default_open(true).show(ui, |ui| {
+            if !self.llm_cfg.has_key() {
+                ui.label(
+                    egui::RichText::new(tr(
+                        "用一句话改图: 「外径标 h7」「孔位只标 4 个安装孔」「主视翻过来」。先在 设置 → LLM 里填你自己的 Anthropic API key。",
+                        "Change the drawing in plain words: \"give the outer diameter h7\", \"only dimension the 4 mounting holes\", \"flip the front view\". First enter your own Anthropic API key in Settings → LLM.",
+                    ))
+                    .size(11.0)
+                    .color(COL_MUTED),
+                );
+                return;
+            }
+            use pla_ui::draw_agent::{Line, Proposal};
+            egui::ScrollArea::vertical().id_salt("draw-agent-log").max_height(220.0).stick_to_bottom(true).show(ui, |ui| {
+                for l in &self.agent_chat.lines {
+                    match l {
+                        Line::User(t) => {
+                            ui.label(egui::RichText::new(format!("» {t}")).color(COL_TEXT));
+                        }
+                        Line::Assistant(t) => {
+                            ui.label(egui::RichText::new(t).color(COL_MUTED));
+                        }
+                        Line::Error(t) => {
+                            ui.label(egui::RichText::new(t).color(COL_RED));
+                        }
+                        Line::Proposal { id, prop, preview, decided } => {
+                            egui::Frame::group(ui.style()).show(ui, |ui| {
+                                let head = match prop {
+                                    Proposal::Patch(p) => t!("提议修改: {}", "Proposed change: {}", p.summary),
+                                    Proposal::Rule(_) => tr("提议记一条长期规则(以后每张图都用):", "Proposed standing rule (used for every future drawing):").to_string(),
+                                };
+                                ui.label(egui::RichText::new(head).strong());
+                                for c in preview {
+                                    ui.label(egui::RichText::new(format!("· {c}")).size(11.0));
+                                }
+                                match decided {
+                                    Some(true) => {
+                                        ui.label(egui::RichText::new(tr("已应用", "Applied")).color(COL_ACCENT));
+                                    }
+                                    Some(false) => {
+                                        ui.label(egui::RichText::new(tr("没采用", "Rejected")).color(COL_MUTED));
+                                    }
+                                    None => {
+                                        ui.horizontal(|ui| {
+                                            if ui.button(tr("应用", "Apply")).clicked() {
+                                                agent_act = Some(AgentAct::Apply(id.clone(), false));
+                                            }
+                                            if matches!(prop, Proposal::Patch(_)) && ui.add_enabled(!locked && job.is_none(), egui::Button::new(tr("应用并出图", "Apply and draw"))).clicked() {
+                                                agent_act = Some(AgentAct::Apply(id.clone(), true));
+                                            }
+                                            if ui.button(tr("不要", "Reject")).clicked() {
+                                                agent_act = Some(AgentAct::Reject(id.clone()));
+                                            }
+                                        });
+                                    }
+                                }
+                            });
+                        }
+                    }
+                }
+                if agent_busy {
+                    ui.label(egui::RichText::new(tr("思考中…", "Thinking…")).color(COL_ACCENT));
+                }
+            });
+            ui.horizontal(|ui| {
+                let te = ui.add(
+                    egui::TextEdit::multiline(&mut self.agent_input)
+                        .desired_rows(2)
+                        .desired_width(ui.available_width() - 90.0)
+                        .hint_text(tr("想怎么改? (Ctrl+Enter 发送)", "What should change? (Ctrl+Enter to send)")),
+                );
+                let ctrl_enter = te.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter) && i.modifiers.ctrl);
+                ui.vertical(|ui| {
+                    let can = !agent_busy && self.agent_job.is_none() && !self.agent_input.trim().is_empty();
+                    if (ui.add_enabled(can, egui::Button::new(tr("发送", "Send"))).clicked() || (ctrl_enter && can)) && can {
+                        agent_act = Some(AgentAct::Send(std::mem::take(&mut self.agent_input).trim().to_string()));
+                    }
+                    if ui.add_enabled(!self.agent_chat.lines.is_empty() && !agent_busy, egui::Button::new(tr("清空", "Clear")).small()).clicked() {
+                        agent_act = Some(AgentAct::Clear);
+                    }
+                });
+            });
+            let rules = self.prefs_get().agent_rules.len();
+            if rules > 0 {
+                ui.label(egui::RichText::new(t!("已记住 {rules} 条长期规则(设置在 drawing-prefs.json)", "{rules} standing rule(s) remembered (in drawing-prefs.json)")).size(11.0).color(COL_MUTED));
+            }
+        });
         // ---- 视图朝向(要先出过一次, 用报告里的实际朝向) ----
         let axes = self.draw_report.as_ref().filter(|(k, _)| *k == key).and_then(|(_, r)| r.axes);
         let mut reorient: Option<(Option<[f64; 3]>, Option<[f64; 3]>)> = None;
@@ -5807,6 +6036,15 @@ impl PlaApp {
             }
             self.draw_up_page = 0;
             self.draw_load(&key);
+        }
+        // D5: 助手动作同样放在设置保存之后
+        if let Some(act) = agent_act {
+            match act {
+                AgentAct::Send(text) => self.agent_send(&key, &text, &bom_title),
+                AgentAct::Clear => self.agent_chat = pla_ui::draw_agent::Chat::new(&key),
+                AgentAct::Reject(id) => self.agent_chat.decide(&id, false, ""),
+                AgentAct::Apply(id, draw) => self.agent_apply(&key, &id, draw, &bom_title),
+            }
         }
         // 预览在旁边的图纸窗口(show_draw_preview): 选了零件就显示, 切换就切换
         let _ = (&bal_rep, &bal_sel, &placed, &sel_dim);
@@ -10557,6 +10795,102 @@ impl eframe::App for PlaApp {
                                 }
                             });
                         });
+                        // ---- D5: 大模型(出图助手): 用户自己的 Anthropic API key ----
+                        settings_card(
+                            ui,
+                            "LLM",
+                            Some((
+                                tr("大模型(出图助手)", "LLM (drawing assistant)"),
+                                vec![
+                                    info_text(tr(
+                                        "用你自己的 Anthropic API key 调 Claude, 按调用量计费, 费用走你的账号。key 用 Windows DPAPI 加密存在本机, 只有当前 Windows 用户能解开。",
+                                        "Calls Claude with your own Anthropic API key, billed per use to your account. The key is stored encrypted with Windows DPAPI; only the current Windows user can decrypt it.",
+                                    )),
+                                    info_text(tr(
+                                        "每次对话会把当前零件的出图设置、尺寸清单和预览图发给 Anthropic。",
+                                        "Each message sends the current part's drawing settings, dimension list and preview image to Anthropic.",
+                                    )),
+                                ],
+                            )),
+                            |ui| {
+                                let has = self.llm_cfg.has_key();
+                                ui.label(
+                                    egui::RichText::new(if has { tr("API key: 已保存(加密)", "API key: saved (encrypted)") } else { tr("API key: 未设置", "API key: not set") })
+                                        .color(if has { COL_ACCENT } else { COL_MUTED }),
+                                );
+                                ui.add(egui::TextEdit::singleline(&mut self.llm_key_buf).password(true).hint_text("sk-ant-…").desired_width(f32::INFINITY));
+                                let mut save = false;
+                                ui.horizontal(|ui| {
+                                    if ui.add_enabled(!self.llm_key_buf.trim().is_empty(), egui::Button::new(tr("保存 key", "Save key"))).clicked() {
+                                        let k = std::mem::take(&mut self.llm_key_buf);
+                                        match self.llm_cfg.set_key(&k) {
+                                            Ok(()) => save = true,
+                                            Err(e) => self.set_notice((true, e)),
+                                        }
+                                    }
+                                    if ui.add_enabled(has, egui::Button::new(tr("清除", "Clear"))).clicked() {
+                                        let _ = self.llm_cfg.set_key("");
+                                        save = true;
+                                    }
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new(tr("模型", "Model")).color(COL_MUTED));
+                                    save |= ui.add(egui::TextEdit::singleline(&mut self.llm_cfg.model).hint_text(pla_ui::llm::DEFAULT_MODEL).desired_width(f32::INFINITY)).lost_focus();
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new(tr("接口", "Endpoint")).color(COL_MUTED))
+                                        .on_hover_text(tr("走代理 / 网关时改; 空 = 官方接口", "Change for a proxy / gateway; empty = official API"));
+                                    save |= ui.add(egui::TextEdit::singleline(&mut self.llm_cfg.base_url).hint_text(pla_ui::llm::DEFAULT_BASE).desired_width(f32::INFINITY)).lost_focus();
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new(tr("思考深度", "Effort")).color(COL_MUTED))
+                                        .on_hover_text(tr("越深越准、越慢越贵; 一般 medium 就够", "Deeper = more accurate, slower and pricier; medium is usually enough"));
+                                    let cur = self.llm_cfg.effort().to_string();
+                                    for e in ["low", "medium", "high"] {
+                                        if ui.selectable_label(cur == e, e).clicked() && cur != e {
+                                            self.llm_cfg.effort = e.into();
+                                            save = true;
+                                        }
+                                    }
+                                });
+                                if save {
+                                    if let Err(e) = self.llm_cfg.save() {
+                                        self.set_notice((true, e));
+                                    }
+                                }
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .add_enabled(has && self.llm_test.is_none(), egui::Button::new(tr("测试连接", "Test connection")))
+                                        .on_hover_text(tr("发一条很短的消息(花费不到一分钱)", "Sends one very short message (costs a fraction of a cent)"))
+                                        .clicked()
+                                    {
+                                        let cfg = self.llm_cfg.clone();
+                                        let (tx, rx) = std::sync::mpsc::channel();
+                                        std::thread::spawn(move || {
+                                            let r = pla_ui::llm::messages(&cfg, serde_json::json!({"max_tokens": 512, "messages": [{"role": "user", "content": "Reply with just: OK"}]}))
+                                                .map(|v| format!("{} · {}", v["model"].as_str().unwrap_or(""), pla_ui::llm::text_of(&v).trim()));
+                                            let _ = tx.send(r);
+                                        });
+                                        self.llm_test = Some(rx);
+                                        self.llm_test_msg = None;
+                                    }
+                                    if let Some(r) = self.llm_test.as_ref().and_then(|rx| rx.try_recv().ok()) {
+                                        self.llm_test = None;
+                                        self.llm_test_msg = Some(match r {
+                                            Ok(t) => (false, t!("连接正常: {t}", "Connected: {t}")),
+                                            Err(e) => (true, e),
+                                        });
+                                    }
+                                    if self.llm_test.is_some() {
+                                        ui.label(egui::RichText::new(tr("测试中…", "Testing…")).color(COL_ACCENT));
+                                        ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+                                    }
+                                });
+                                if let Some((err, m)) = &self.llm_test_msg {
+                                    ui.label(egui::RichText::new(m).size(11.0).color(if *err { COL_RED } else { COL_ACCENT }));
+                                }
+                            },
+                        );
                         // R27: BRIDGE 卡已移到 CDP 能力面板(点工具栏状态点打开)。
                         // ---- F7: Plasticity 默认以 CDP 模式运行(pla-ui 托管代理) ----
                         settings_card(

@@ -954,6 +954,9 @@ pub struct Prefs {
     pub tech_part: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tech_asm: Option<Vec<String>>,
+    /// D5: 用户通过出图助手记下的长期规则(自然语言, 每次对话都带给模型)。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agent_rules: Vec<String>,
 }
 
 /// 标题栏里"每张图都一样"的字段(设为默认时只存这些; 料号 / 名称 / 材料是零件自己的)。
