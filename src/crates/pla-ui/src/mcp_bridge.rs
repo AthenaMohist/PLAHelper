@@ -46,6 +46,9 @@ pub struct State {
     pub drawing: Option<String>,
     #[serde(default)]
     pub queued: usize,
+    /// pla-ui 吸附着的 Plasticity 窗口(建模工具连同一个窗口; 0 = 没有)。
+    #[serde(default)]
+    pub hwnd: isize,
     /// 心跳(unix 秒)。
     #[serde(default)]
     pub ts: u64,

@@ -1917,6 +1917,8 @@
       c.orbit.radius = R; c.orbit.radiusEnd = R;
       c.orbit.zoom = zoom; c.orbit.zoomEnd = zoom;
       API['cam.set'].fn(c);
+      // 先空渲一帧: 刚切到正交后的第一帧有时还是旧相机(实测 2026-11-17: 同参数第一次截到整个场景, 第二次才对准)
+      API['cam.thumbnail'].fn({ maxWidth: 16 });
       shot = API['cam.thumbnail'].fn({ maxWidth: a.maxWidth || 960 });
     } finally {
       if (!a.keep) {

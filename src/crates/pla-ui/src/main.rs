@@ -5046,6 +5046,7 @@ impl PlaApp {
             selected: self.draw_sel.clone(),
             drawing: self.draw_job.as_ref().map(|j| j.key.clone()),
             queued: self.draw_queue.len(),
+            hwnd: self.snap_target.as_ref().map(|t| t.hwnd).unwrap_or(0),
             ts: 0,
         };
         let ser = serde_json::to_string(&st).unwrap_or_default();

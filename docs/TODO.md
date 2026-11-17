@@ -665,8 +665,11 @@
 - [x] **A5 视图工具**（2026-11-15，know-how/geometry-query.md「A5」）：垫片 `cam.view`（临时切正交 → 视角朝向 + 包围盒投影算缩放
       对准物体 → 截图 → 还原相机与投影；七个视角）+ CLI `pla-app cdp-view`；契约测试 1 项；真机前 / 等轴 / 顶三张居中清晰、相机完全还原。
       坑：轨道控制器 `focalOffset` 要清零，否则放大后画面被推离物体。
-- [ ] **A6 MCP 服务**（`pla-app mcp` 子命令或 `pla-mcp` crate，待定）：exec / query / measure / view / undo / model 六个工具，
-      包 pla-bridge 现有代码；附 skill 文档（配方、示例、常见坑）。
+- [~] **A6 MCP 服务**（2026-11-17，pla-mcp，know-how/mcp-tools.md）：model_state（hist + 选择 + geo.query）/ model_snaps / model_measure /
+      model_view（图片）/ model_exec（cmd.exec，默认 atomic）/ model_hole（hole.make）/ model_transaction（hist.begin/commit/rollback/state），
+      直接经 CDP 连 Plasticity（pla-ui 在跑就用它吸附的窗口），不需要 pla-ui。只读工具真机验证过（encoder calibrator bkp）；
+      顺手修了 cam.view 第一帧旧相机（先空渲一帧）。**待做**：在 model1 副本上跑一遍改模型路径（P1 验收：一句话建 L 形支架 → 查面 → 量孔距 →
+      截图；失败回滚），要 Plasticity 窗口可见、用户不在操作。
 
 **P2 规格层**（验收: 同一份规格改一个参数后重放, 几何与 checks 全部吻合）
 - [ ] **A7 规格 JSON schema**：参数表、基准、特征序列（语义 id）、checks、intent；从图纸开始先出"参数表 + 疑点"。
@@ -684,7 +687,8 @@
 - [ ] **A14 窄领域试点**：场景 → 多方案 → 规则 / 指标评分 → 人工选 → 规格 → 建模；依赖 N4 打孔库、N5 常用件库、N7 干涉、N8 COMSOL 出口。
 - [ ] **A15 训练**（数据量到几千条之后）：成功 / 失败轨迹作训练数据，几何断言作奖励。
 
-待用户定：零件类别（A10/A11 选题）；MCP 放 `pla-app mcp` 还是独立 crate。
+用户定（2026-11-17）：A10 / A11 选题 = 带孔安装板、L 形支架、凸台加筋、抽壳外壳、螺丝柱都是候选，**先做螺丝**；另加**轴类零件**和**其余类型标准件**
+（垫圈 / 螺母 / 销 / 轴承等，可复用 std_parts 的规格识别做校验）。MCP = 独立的 pla-mcp（2026-11-17 已建，出图工具在里面，A6 建模工具加进去）。
 
 ## 工程债
 

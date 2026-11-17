@@ -38,6 +38,150 @@ fn tools() -> Value {
         {"name": "remember_rule", "description": "Save a standing drawing rule for all future drawings (only when the user states a general preference).", "inputSchema": {"type": "object", "properties": {"rule": {"type": "string"}}, "required": ["rule"]}},
         {"name": "show_part", "description": "Open the part in PLAhelper's drawing tab so the user sees its sheet.", "inputSchema": part}
     ])
+    .as_array()
+    .cloned()
+    .unwrap_or_default()
+    .into_iter()
+    .chain(model_tools().as_array().cloned().unwrap_or_default())
+    .collect::<Vec<_>>()
+    .into()
+}
+
+// ---------------------------------------------------------------- A6 建模工具(直接经 CDP 连 Plasticity, 不经 pla-ui)
+
+const CDP_PORT: u16 = 9333;
+
+fn model_tools() -> Value {
+    let refs = "Topology ids look like '34f9439' (face) / '34e912' (edge) / '34v12' (vertex) - '34' is the solid's version id, which changes after every edit of that solid, so re-query after changes. Solids can also be given as {\"name\": \"<outliner name>\"}.";
+    let ro = json!({"readOnlyHint": true});
+    json!([
+        {"name": "model_state", "annotations": ro, "description": format!("Read the open Plasticity model: undo depth, current selection, and geometry. detail: solids (default, overview) / faces / edges / all (+ vertices). Filter with of (solid ids or {{name}}), surface (Plane/Cylinder/Cone/Torus/…), curve (Line/Circle/…), normal [x,y,z] with angleTol (deg), near [x,y,z] with tol. Lengths in document units. Start with the overview, then query faces/edges of one solid. {refs}"),
+         "inputSchema": {"type": "object", "properties": {
+            "detail": {"type": "string", "enum": ["solids", "faces", "edges", "all"]},
+            "of": {"type": "array", "items": {}}, "surface": {"type": "string"}, "curve": {"type": "string"},
+            "normal": {"type": "array", "items": {"type": "number"}}, "angleTol": {"type": "number"},
+            "near": {"type": "array", "items": {"type": "number"}}, "tol": {"type": "number"},
+            "units": {"type": "string"}, "limit": {"type": "integer"}}}},
+        {"name": "model_snaps", "annotations": ro, "description": "Snap points Plasticity itself uses (also internal ones): face centers + normals, edge midpoints + tangents, circle centers + axes, points on arcs, vertices, bbox corners. kinds filters (faceCenter|edgeMid|circleCenter|circleQuarter|vertex|bboxCorner); near/tol/of/limit as in model_state.",
+         "inputSchema": {"type": "object", "properties": {"of": {"type": "array", "items": {}}, "kinds": {"type": "array", "items": {"type": "string"}}, "near": {"type": "array", "items": {"type": "number"}}, "tol": {"type": "number"}, "units": {"type": "string"}, "limit": {"type": "integer"}}}},
+        {"name": "model_measure", "annotations": ro, "description": format!("Measure. op=distance: a, b = [x,y,z] | face id | edge id | vertex id → distance, delta, and normalDistance (wall thickness) when both are parallel planes. op=angle: a, b = faces (normals), line edges (directions) or vectors → degrees. op=mass: of (solids) and/or faces → volume, area, centroid (display mesh, curved surfaces ~0.3% low). {refs}"),
+         "inputSchema": {"type": "object", "properties": {"op": {"type": "string", "enum": ["distance", "angle", "mass"]}, "a": {}, "b": {}, "of": {"type": "array", "items": {}}, "faces": {"type": "array", "items": {"type": "string"}}, "units": {"type": "string"}}, "required": ["op"]}},
+        {"name": "model_view", "annotations": ro, "description": "Screenshot the model from a standard view (front/back/left/right/top/bottom/iso), framed on 'of' solids (default: everything). The user's camera is restored afterwards. Use it to check results visually.",
+         "inputSchema": {"type": "object", "properties": {"view": {"type": "string", "enum": ["front", "back", "left", "right", "top", "bottom", "iso"]}, "of": {"type": "array", "items": {}}, "width": {"type": "integer", "description": "max width px (default 960)"}}}},
+        {"name": "model_exec", "annotations": {"destructiveHint": true},
+         "description": format!("CHANGES THE USER'S MODEL - only when the user asked for this modeling work. Runs geometry steps through Plasticity's own factories (each step = one undo step, same as manual work). atomic (default true): if a step fails, every step of this call is undone. Cancels any command the user has in progress; the Plasticity window must be visible.\n\
+ops (lengths in document units unless units is given; points [x,y,z]):\n\
+- box {{p1, p2 (opposite corners of the base), height}} (+ bool, targets)\n\
+- cylinder {{center (base center), axis [x,y,z] (grow direction), radius, height}} (+ bool, targets) - a hole = cylinder with bool 'subtract' and targets [the solid]\n\
+- fillet {{edges, distance}} / chamfer {{edges, distance}} (45°)\n\
+- offsetFace {{faces, distance}} (+ = grow outward along the face normal; on a hole wall + makes the hole smaller)\n\
+- refillet {{faces (fillet faces), distance (= radius change)}}\n\
+- moveFaces {{faces, move [dx,dy,dz]}} (move a hole / boss / pocket)\n\
+bool: union | subtract | intersect with targets [solid refs]. Give a step id: \"base\" and later steps can use \"$base\" (its result). Edges / faces: topology ids, or {{\"near\": [x,y,z], \"of\": solid ref, \"tol\"?}} = the item whose bbox center is nearest (errors instead of guessing when ambiguous). {refs} After running, verify with model_state / model_measure / model_view."),
+         "inputSchema": {"type": "object", "properties": {
+            "ops": {"type": "array", "items": {"type": "object"}},
+            "atomic": {"type": "boolean"}, "units": {"type": "string"}}, "required": ["ops"]}},
+        {"name": "model_hole", "annotations": {"destructiveHint": true},
+         "description": "CHANGES THE USER'S MODEL. Hole wizard in one atomic step: face (plane face id where the hole starts), type simple|counterbore|countersink, d (diameter), depth (omit = through), cbD/cbDepth (counterbore), cskD (countersink, 90°), position: at [x,y,z] or offset [u,v] from the face center (u/v axes are returned), or points (sketch points). stack = further solid ids for a hole through several parts (tapD = diameter in the last one). Returns the created faces per hole.",
+         "inputSchema": {"type": "object", "properties": {
+            "face": {"type": "string"}, "type": {"type": "string", "enum": ["simple", "counterbore", "countersink"]}, "d": {"type": "number"},
+            "depth": {"type": "number"}, "cbD": {"type": "number"}, "cbDepth": {"type": "number"}, "cskD": {"type": "number"}, "tapD": {"type": "number"},
+            "at": {"type": "array", "items": {"type": "number"}}, "offset": {"type": "array", "items": {"type": "number"}},
+            "points": {"type": "array", "items": {"type": "object"}}, "stack": {"type": "array", "items": {"type": "string"}}, "units": {"type": "string"}},
+          "required": ["face", "d"]}},
+        {"name": "model_transaction", "annotations": {"destructiveHint": true},
+         "description": "Group several model_exec / model_hole calls so they can be undone together. action=begin (remember the undo depth) → work → commit (keep) or rollback (undo everything since begin, including anything the user did in between; refused if the undo stack below begin was changed). action=state = undo / redo depth.",
+         "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["begin", "commit", "rollback", "state"]}}, "required": ["action"]}}
+    ])
+}
+
+fn rt() -> &'static tokio::runtime::Runtime {
+    static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RT.get_or_init(|| tokio::runtime::Builder::new_current_thread().enable_all().build().expect("tokio"))
+}
+
+/// 连哪个 Plasticity 窗口: pla-ui 在跑就用它吸附的那个, 否则 0(代理挑唯一的那个)。
+fn hwnd() -> isize {
+    bridge::read_state().map(|s| s.hwnd).unwrap_or(0)
+}
+
+/// 连不上才提示 CDP 模式; 垫片报的参数 / 几何错误原样给。
+fn cdp_err(e: impl std::fmt::Display) -> Value {
+    let m = format!("{e:#}");
+    let conn = ["connect", "timeout", "refused", "json/list", "no page", "no ws url"].iter().any(|k| m.to_lowercase().contains(k));
+    if conn {
+        err(format!("Cannot reach Plasticity over CDP (port {CDP_PORT}): {m}. Is Plasticity running in CDP mode (PLAhelper settings → CDP MODE) with a document open?"))
+    } else {
+        err(m)
+    }
+}
+
+/// 参数对象里只留这些键(不认识的直接丢, 免得原样传进垫片)。
+fn pick(a: &Value, keys: &[&str]) -> Value {
+    let mut m = serde_json::Map::new();
+    for k in keys {
+        if let Some(v) = a.get(*k).filter(|v| !v.is_null()) {
+            m.insert(k.to_string(), v.clone());
+        }
+    }
+    Value::Object(m)
+}
+
+fn call_model_tool(name: &str, a: &Value) -> Option<Value> {
+    use pla_bridge::shim::api;
+    let h = hwnd();
+    let json_text = |v: &Value| text(serde_json::to_string_pretty(v).unwrap_or_default());
+    let call = |api_name: &str, args: Value| match rt().block_on(pla_bridge::query::call_once(CDP_PORT, h, api_name, &args)) {
+        Ok(v) if v.get("err").is_some() => err(v["err"].to_string()),
+        Ok(v) => json_text(&v),
+        Err(e) => cdp_err(e),
+    };
+    Some(match name {
+        "model_state" => {
+            let args = pick(a, &["detail", "of", "surface", "curve", "normal", "angleTol", "near", "tol", "units", "limit"]);
+            match rt().block_on(pla_bridge::query::state_once(CDP_PORT, h, &args)) {
+                Ok(v) => json_text(&v),
+                Err(e) => cdp_err(e),
+            }
+        }
+        "model_snaps" => call(api::GEO_SNAPS, pick(a, &["of", "kinds", "near", "tol", "units", "limit"])),
+        "model_measure" => call(api::GEO_MEASURE, pick(a, &["op", "a", "b", "of", "faces", "units"])),
+        "model_view" => {
+            let mut args = pick(a, &["view", "of"]);
+            if let Some(w) = a["width"].as_u64() {
+                args["maxWidth"] = json!(w);
+            }
+            match rt().block_on(pla_bridge::query::view_png_once(CDP_PORT, h, &args)) {
+                Ok((png, meta)) => json!({"content": [{"type": "image", "data": b64(&png), "mimeType": "image/png"}, {"type": "text", "text": meta.to_string()}]}),
+                Err(e) => cdp_err(e),
+            }
+        }
+        "model_exec" => {
+            let mut script = pick(a, &["ops", "units"]);
+            script["atomic"] = json!(a["atomic"].as_bool().unwrap_or(true));
+            match rt().block_on(pla_bridge::exec::run_once(CDP_PORT, h, &script)) {
+                Ok(v) => {
+                    let (ok, msg) = pla_bridge::exec::summary(&v);
+                    let mut r = json_text(&v);
+                    r["content"].as_array_mut().map(|c| c.insert(0, json!({"type": "text", "text": msg})));
+                    if !ok {
+                        r["isError"] = json!(true);
+                    }
+                    r
+                }
+                Err(e) => cdp_err(e),
+            }
+        }
+        "model_hole" => call(api::HOLE_MAKE, pick(a, &["face", "type", "d", "depth", "cbD", "cbDepth", "cskD", "tapD", "at", "offset", "points", "stack", "units"])),
+        "model_transaction" => match a["action"].as_str().unwrap_or("") {
+            "begin" => call(api::HIST_BEGIN, Value::Null),
+            "commit" => call(api::HIST_COMMIT, Value::Null),
+            "rollback" => call(api::HIST_ROLLBACK, Value::Null),
+            "state" => call(api::HIST_STATE, Value::Null),
+            x => err(format!("unknown action {x}")),
+        },
+        _ => return None,
+    })
 }
 
 fn text(t: impl Into<String>) -> Value {
@@ -97,6 +241,10 @@ fn b64(data: &[u8]) -> String {
 }
 
 fn call_tool(name: &str, a: &Value) -> Value {
+    // 建模工具不需要 pla-ui(直接连 Plasticity)
+    if let Some(r) = call_model_tool(name, a) {
+        return r;
+    }
     let st = match state() {
         Ok(s) => s,
         Err(e) => return err(e),
