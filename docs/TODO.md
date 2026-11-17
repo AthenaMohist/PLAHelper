@@ -664,7 +664,8 @@
 - [~] **A4 配方补齐**（即 N2 扩配方）：cylinder、sketch+extrude、hole、chamfer、shell、offsetFace、pattern —— 每项先在副本实测。
       2026-11-17：cylinder / chamfer / offsetFace / hole 早已有；新增 **revolve**（[r, z] 轮廓旋转体：螺钉 / 轴 / 台阶 / 锥 / 退刀槽）与
       **prism**（正多边形柱：内六角孔 / 六角头 / 螺母），model1 上逐项实测出字段（know-how/command-dispatch.md「A4」），契约测试通过。
-      待做：配方经 pla-mcp 在 model1 上整体跑一遍（窗口要可见）；螺纹外观；shell / pattern。
+      ✅ 经 pla-mcp 在 model1 上建出 M4×12 杯头内六角螺钉（revolve + prism subtract，2 步 0.47 s，对边 3.000 / 深 2.500），回滚后原样。
+      辅助曲线保留（在命令里删会让下一条命令报 missing from stable model）。待做：螺纹外观；shell / pattern；geo.query 环形平面 center 为空。
 - [x] **A5 视图工具**（2026-11-15，know-how/geometry-query.md「A5」）：垫片 `cam.view`（临时切正交 → 视角朝向 + 包围盒投影算缩放
       对准物体 → 截图 → 还原相机与投影；七个视角）+ CLI `pla-app cdp-view`；契约测试 1 项；真机前 / 等轴 / 顶三张居中清晰、相机完全还原。
       坑：轨道控制器 `focalOffset` 要清零，否则放大后画面被推离物体。

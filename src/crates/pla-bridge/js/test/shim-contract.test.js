@@ -1188,7 +1188,7 @@ const callAsync = async (name, args) => JSON.parse(await run(`window.__PLA__.cal
     assert.strictEqual(typeof v.results[2].items[0].id, 'number', '产物带物体 id(可再引用)');
   });
 
-  await ta('A4 cmd.exec: 旋转体(折线 type 0 闭合, [r, z] → 轴平面里的点)+ 正多边形柱(对边距 → 外接圆半径, 沿法向拉伸, subtract); 一步一个撤销步, 辅助曲线删掉', async () => {
+  await ta('A4 cmd.exec: 旋转体(折线 type 0 闭合, [r, z] → 轴平面里的点)+ 正多边形柱(对边距 → 外接圆半径, 沿法向拉伸, subtract); 一步一个撤销步, 辅助曲线保留', async () => {
     const ed = ed3;
     const u0 = ed.history._undoStack.length, rm0 = ed.removed || 0;
     const r = await callAsync('cmd.exec', { ops: [
@@ -1214,7 +1214,7 @@ const callAsync = async (name, args) => JSON.parse(await run(`window.__PLA__.cal
     assert.strictEqual(ed.lastExtrude.h, 0.0025);
     assert.strictEqual(ed.lastExtrude.op, 15902, 'subtract');
     assert.strictEqual(ed.history._undoStack.length - u0, 2, '两步两个撤销步');
-    assert.strictEqual((ed.removed || 0) - rm0, 2, '两条辅助曲线都删了');
+    assert.strictEqual((ed.removed || 0) - rm0, 0, '辅助曲线保留(命令里删会让下一条命令报 missing from stable model)');
     // 参数错: 执行前就报, 不产生命令
     const u1 = ed.history._undoStack.length;
     assert.ok(/r must be >= 0/.test((await callAsync('cmd.exec', { ops: [{ op: 'revolve', origin: [0, 0, 0], axis: [0, 0, 1], profile: [[0, 0], [-1, 0], [0, 5]] }] })).v.failed.err));

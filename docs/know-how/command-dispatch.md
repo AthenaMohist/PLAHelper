@@ -146,12 +146,16 @@
   走(法向设 −Z 仍往 +Z 拉)→ 一律显式设 `direction`; `distance1` 取负也能反向。直接给 `curves` 得到的是 `Sheet`(面), 不是实体。
 - **旋转** `RevolveFactory`: `regions`, 实例字段 `origin` / `axis`(原地 set, 初始全 0)、setter `degrees`; 轴要在轮廓平面里(轴 ⟂ 平面 → impossible_spin)、
   轮廓不能跨轴; 贴轴的边可以。M4×12 杯头示意(杆 r2 × 12 + 头 r3.5 × 4)→ 5 面(3 平面 + 2 圆柱)。
-- **删辅助曲线**: `editor.geo.removeItem(wire)`(GeometryDatabase; `editor.db` 上没有删除), 在同一命令里删 = 同一个撤销步。
-  岛(SketchIsland)当帧还在, 命令结束后是否随之消失待真机确认。
+- **辅助曲线保留**(同手工): `editor.geo.removeItem(wire)` 在命令里能删, 但下一条命令报 "invalid precondition: object N missing from
+  stable model"(实测: 删了 → 下一步 prism 失败; 不删 → 正常)。要清理的话以后走 Plasticity 自己的删除命令。
 - 两个工厂都继承 BooleanBodyFactory: `targets` + `operationType`(同 box)。
 - 配方(垫片 `NAMES.recipes`, 自定义构建 `customBuild`): `revolve {origin, axis, profile: [[r, z]…], degrees?}`、
   `prism {center, normal?, sides, radius | flats, height, rotate?}`; 一步 = 画辅助曲线 → 取新区域(提交前后区域 id 求差, 离预期中心最近)→
-  拉伸 / 旋转(+ 布尔)→ 删辅助曲线。契约测试 A4 一项(M4 杯头 + 内六角 subtract)。
+  拉伸 / 旋转(+ 布尔)。契约测试 A4 一项(M4 杯头 + 内六角 subtract)。
+- **真机验收**(pla-mcp, model1, 2026-11-17): `revolve` 轮廓 [[0,0],[1.6,0],[2,0.4],[2,12],[3.5,12],[3.5,16],[0,16]] + `prism` 六边形对边 3 深 2.5
+  subtract → M4×12 杯头内六角螺钉, 2 步 0.47 s, 13 面(杆圆柱 r2 + 端部 0.4×45° 锥 + 头圆柱 r3.5 + 6 个内六角侧面 + 孔底…);
+  量: 内六角对边 2.99993、深 2.500; 截图正常; 事务回滚 2 步后 model1 原样(26 实体 / 46 曲线 / 5 岛 / 撤销栈 0)。
+  已知: 环形平面(端面带孔)`geo.query` 的 center 为空(面中点落在孔里)。
 
 ## 加一个新操作
 

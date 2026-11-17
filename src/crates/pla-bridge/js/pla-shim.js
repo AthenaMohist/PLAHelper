@@ -153,7 +153,6 @@
     'fac.curve':               ['fac', 'CurveFactory'],
     'fac.extrude':             ['fac', 'ExtrudeFactory'],
     'fac.revolve':             ['fac', 'RevolveFactory'],
-    'geo.removeItem':          ['geo', 'removeItem'],
     // ---- N3e: 本体测量(Measure Distance 的同一工厂; 名字在 nodes 表里, 不在测量记录上 —— 实测 2026-11-15) ----
     'ed.measurements':         ['ed', 'measurements'],
     'meas.snapshot':           ['meas', 'snapshot'],
@@ -384,7 +383,7 @@
       chamfer: { fac: 'fac.multiFillet', required: ['edges', 'distance'],
                  params: { edges: ['edges', 'edges'], distance: ['distance', 'negLength'] } },
       // A4: 正多边形柱(内六角孔 / 六角头 / 螺母): 中心 + 法向(拉伸方向, 默认 +Z)+ 边数 + 外接圆半径 radius 或对边距 flats + 高度(负 = 反向);
-      // rotate = 绕法向转多少度(默认一个顶点朝 u 轴)。一步 = 画多边形 → 拉伸(+ 布尔)→ 删辅助曲线, 一个撤销步。
+      // rotate = 绕法向转多少度(默认一个顶点朝 u 轴)。一步 = 画多边形 → 拉伸(+ 布尔), 一个撤销步; 辅助曲线保留。
       prism: { custom: 'prism', fac: 'fac.extrude', also: ['fac.centerPolygon'], bool: true, required: ['center', 'sides', 'height'],
                params: { center: [null, 'point'], normal: [null, 'axisQuat'], sides: [null, 'number'], radius: [null, 'length'], flats: [null, 'length'],
                          height: [null, 'length'], rotate: [null, 'angle'] } },
@@ -1326,7 +1325,7 @@
     throw new Error('recipe: unknown param type ' + type);
   }
 
-  // ---- A4: 草图类配方(多边形柱 / 旋转体): 画辅助曲线 → 取它生成的区域 → 拉伸 / 旋转(+ 布尔)→ 删辅助曲线 ----
+  // ---- A4: 草图类配方(多边形柱 / 旋转体): 画辅助曲线 → 取它生成的区域 → 拉伸 / 旋转(+ 布尔); 辅助曲线保留 ----
   function perpOf(ax) {
     var pp = Math.abs(ax[0]) < 0.9 ? [1, 0, 0] : [0, 1, 0];
     var dp = vdot(pp, ax);
@@ -1370,12 +1369,11 @@
       if (!targets.length) throw new Error('bool needs targets');
       bools = [[NAMES.boolSetters.targets, targets], [NAMES.boolSetters.op, NAMES.boolOps[o.bool]]];
     }
-    var finish = function (cmd, f, wire) {
+    // 辅助曲线保留(同手工拉伸 / 旋转): 实测 2026-11-17, 在命令里 geo.removeItem 删掉它, 下一条命令报
+    // "invalid precondition: object N missing from stable model"(稳定模型里还挂着它)。
+    var finish = function (cmd, f) {
       bools.forEach(function (s) { f[s[0]] = s[1]; });
-      return Promise.resolve(f[NAMES.facCommit]()).then(function (made) {
-        // 辅助曲线随同一命令删掉(一个撤销步; 删不掉不算失败)
-        return Promise.resolve().then(function () { if (wire) return invokeOn('geo.removeItem', [wire]); }).then(function () { return made; }, function () { return made; });
-      });
+      return f[NAMES.facCommit]();
     };
     if (rc.custom === 'prism') {
       var n = o.normal !== undefined ? convertParam('axisQuat', o.normal, ctx) : SF.polygon.baseNormal.slice();
@@ -1401,8 +1399,7 @@
         p[P.point].set(c[0] + dir[0] * R, c[1] + dir[1] * R, c[2] + dir[2] * R);
         p[P.sides] = sides;
         p[P.radius] = R;
-        return Promise.resolve(p[NAMES.facCommit]()).then(function (wr) {
-          var wire = Array.isArray(wr) ? wr[0] : wr;
+        return Promise.resolve(p[NAMES.facCommit]()).then(function () {
           var region = pickNewRegion(before, c, k);
           var f = new Ext(cmd.editor);
           f[NAMES.facResource](cmd);
@@ -1410,7 +1407,7 @@
           var sg = h < 0 ? -1 : 1;
           f[S.direction].set(n[0] * sg, n[1] * sg, n[2] * sg);
           f[S.distance] = Math.abs(h);
-          return finish(cmd, f, wire);
+          return finish(cmd, f);
         });
       };
     }
@@ -1439,8 +1436,7 @@
         cf[C.type] = C.polyline;
         pts.forEach(function (p) { cf[C.push](new V(p[0], p[1], p[2])); });
         cf[C.closed] = true;
-        return Promise.resolve(cf[NAMES.facCommit]()).then(function (wr) {
-          var wire = Array.isArray(wr) ? wr[0] : wr;
+        return Promise.resolve(cf[NAMES.facCommit]()).then(function () {
           var region = pickNewRegion(before, mid, k);
           var f = new Rev(cmd.editor);
           f[NAMES.facResource](cmd);
@@ -1448,7 +1444,7 @@
           f[S2.origin].set(org[0], org[1], org[2]);
           f[S2.axis].set(ax[0], ax[1], ax[2]);
           f[S2.degrees] = deg;
-          return finish(cmd, f, wire);
+          return finish(cmd, f);
         });
       };
     }
