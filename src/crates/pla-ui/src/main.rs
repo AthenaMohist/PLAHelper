@@ -10843,6 +10843,14 @@ impl eframe::App for PlaApp {
                                     save |= ui.add(egui::TextEdit::singleline(&mut self.llm_cfg.base_url).hint_text(pla_ui::llm::DEFAULT_BASE).desired_width(f32::INFINITY)).lost_focus();
                                 });
                                 ui.horizontal(|ui| {
+                                    let auto = self.llm_cfg.proxy_url().unwrap_or_else(|| tr("直连", "direct").to_string());
+                                    ui.label(egui::RichText::new(tr("代理", "Proxy")).color(COL_MUTED)).on_hover_text(tr(
+                                        "空 = 用环境变量 HTTPS_PROXY 或 Windows 系统代理; 填 none = 直连。官方接口在部分地区直连会被拒(403)",
+                                        "Empty = HTTPS_PROXY env var or the Windows system proxy; none = direct. The official API rejects direct connections from some regions (403)",
+                                    ));
+                                    save |= ui.add(egui::TextEdit::singleline(&mut self.llm_cfg.proxy).hint_text(auto).desired_width(f32::INFINITY)).lost_focus();
+                                });
+                                ui.horizontal(|ui| {
                                     ui.label(egui::RichText::new(tr("思考深度", "Effort")).color(COL_MUTED))
                                         .on_hover_text(tr("越深越准、越慢越贵; 一般 medium 就够", "Deeper = more accurate, slower and pricier; medium is usually enough"));
                                     let cur = self.llm_cfg.effort().to_string();

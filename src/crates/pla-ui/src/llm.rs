@@ -27,6 +27,9 @@ pub struct Config {
     /// effort: low / medium / high; 空 = medium。
     #[serde(default)]
     pub effort: String,
+    /// HTTP 代理(如 http://127.0.0.1:7897); 空 = 环境变量 HTTPS_PROXY / HTTP_PROXY / ALL_PROXY, 再没有就用 Windows 系统代理; "none" = 直连。
+    #[serde(default)]
+    pub proxy: String,
     /// DPAPI 加密后的 key(十六进制)。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub key_enc: String,
@@ -59,6 +62,22 @@ impl Config {
             _ => "medium",
         }
     }
+    /// 实际用的代理(见 `proxy` 字段)。实测 2026-11-17: 本机直连官方接口回 403, 走 Clash(HTTPS_PROXY)正常。
+    pub fn proxy_url(&self) -> Option<String> {
+        let p = self.proxy.trim();
+        if p.eq_ignore_ascii_case("none") {
+            return None;
+        }
+        let pick = if !p.is_empty() {
+            Some(p.to_string())
+        } else {
+            ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy", "HTTP_PROXY", "http_proxy"]
+                .iter()
+                .find_map(|k| std::env::var(k).ok().filter(|v| !v.trim().is_empty()))
+                .or_else(system_proxy)
+        }?;
+        Some(if pick.contains("://") { pick } else { format!("http://{pick}") })
+    }
     pub fn has_key(&self) -> bool {
         !self.key_enc.is_empty()
     }
@@ -78,6 +97,35 @@ impl Config {
         let raw = unhex(&self.key_enc).ok_or("bad key data")?;
         String::from_utf8(unprotect(&raw)?).map_err(|e| e.to_string())
     }
+}
+
+/// Windows 系统代理(Internet 设置里开着的那个; "http=a:1;https=b:2" 取 https 那段)。
+#[cfg(windows)]
+fn system_proxy() -> Option<String> {
+    use std::os::windows::process::CommandExt;
+    let q = |name: &str| -> Option<String> {
+        let out = std::process::Command::new("reg")
+            .args(["query", r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings", "/v", name])
+            .creation_flags(0x0800_0000)
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&out.stdout).to_string();
+        text.lines().find(|l| l.trim_start().starts_with(name)).and_then(|l| l.split_whitespace().nth(2).map(String::from))
+    };
+    if q("ProxyEnable").as_deref() != Some("0x1") {
+        return None;
+    }
+    let s = q("ProxyServer")?;
+    if s.contains('=') {
+        s.split(';').find_map(|p| p.strip_prefix("https=").or_else(|| p.strip_prefix("http="))).map(String::from)
+    } else {
+        Some(s)
+    }
+}
+
+#[cfg(not(windows))]
+fn system_proxy() -> Option<String> {
+    None
 }
 
 fn hex(b: &[u8]) -> String {
@@ -141,7 +189,11 @@ pub fn messages(cfg: &Config, mut body: Value) -> Result<Value, String> {
         body["fallbacks"] = json!("default");
     }
     let tls = native_tls::TlsConnector::new().map_err(|e| e.to_string())?;
-    let agent = ureq::AgentBuilder::new().tls_connector(std::sync::Arc::new(tls)).timeout(std::time::Duration::from_secs(600)).build();
+    let mut ab = ureq::AgentBuilder::new().tls_connector(std::sync::Arc::new(tls)).timeout(std::time::Duration::from_secs(600));
+    if let Some(p) = cfg.proxy_url() {
+        ab = ab.proxy(ureq::Proxy::new(&p).map_err(|e| pla_bridge::t!("代理地址不对 {p}: {e}", "Bad proxy address {p}: {e}"))?);
+    }
+    let agent = ab.build();
     let mut req = agent
         .post(&format!("{}/v1/messages", cfg.base()))
         .set("content-type", "application/json")
@@ -157,10 +209,10 @@ pub fn messages(cfg: &Config, mut body: Value) -> Result<Value, String> {
             let msg = v["error"]["message"].as_str().unwrap_or("").to_string();
             Err(match code {
                 401 => tr("API key 无效(401)", "Invalid API key (401)").to_string(),
-                // 实测(2026-11-17, 本机网络): 假 key 打官方接口回 403 "Request not allowed" 而不是 401 —— 接口按网络 / 地区拒绝
+                // 实测(2026-11-17): 本机直连官方接口回 403 "Request not allowed"(按地区拒绝), 走 Clash 代理正常
                 403 => pla_bridge::t!(
-                    "接口拒绝了请求(403: {msg})。可能是当前网络 / 地区不能直连官方接口: 在 设置 → LLM 的「接口」里填可用的代理 / 网关地址",
-                    "The endpoint refused the request (403: {msg}). This network / region may not reach the official API directly: set a reachable proxy / gateway under Settings → LLM → Endpoint"
+                    "接口拒绝了请求(403: {msg})。多半是当前网络 / 地区不能直连: 在 设置 → LLM 填「代理」(如 http://127.0.0.1:7897)或换「接口」为网关",
+                    "The endpoint refused the request (403: {msg}). This network / region probably can't connect directly: set a Proxy under Settings → LLM (e.g. http://127.0.0.1:7897) or a gateway Endpoint"
                 ),
                 429 => pla_bridge::t!("请求太频繁 / 额度不够(429): {msg}", "Rate limited / out of credit (429): {msg}"),
                 529 | 500..=599 => pla_bridge::t!("服务暂时不可用({code}), 稍后再试", "Service unavailable ({code}), try again later"),
@@ -180,15 +232,16 @@ pub fn text_of(resp: &Value) -> String {
 mod tests {
     use super::*;
 
-    /// 手动(要联网): 假 key 打真接口 → 走通 TLS / 请求头, 服务器回 401 或 403(不花钱)。
+    /// 手动(要联网): 假 key 打真接口 → 走通代理 / TLS / 请求头, 服务器认出 key 无效 = 401(不花钱)。
     #[test]
     #[ignore]
-    fn live_bad_key_is_rejected() {
+    fn live_bad_key_is_401() {
         let mut c = Config::default();
         c.set_key("sk-ant-invalid-test").unwrap();
+        println!("proxy: {:?}", c.proxy_url());
         let e = messages(&c, json!({"max_tokens": 16, "messages": [{"role": "user", "content": "hi"}]})).unwrap_err();
         println!("{e}");
-        assert!(e.contains("401") || e.contains("403"), "{e}");
+        assert!(e.contains("401"), "{e}");
     }
 
     #[test]
