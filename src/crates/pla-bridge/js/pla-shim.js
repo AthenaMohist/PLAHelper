@@ -153,6 +153,15 @@
     'fac.curve':               ['fac', 'CurveFactory'],
     'fac.extrude':             ['fac', 'ExtrudeFactory'],
     'fac.revolve':             ['fac', 'RevolveFactory'],
+    // ---- N5 资产(asset pack)放置(实测 2026-11-18, know-how/asset-place.md) ----
+    'ed.assets':               ['ed', 'assets'],
+    'assets.packs':            ['assets', 'getAssetPacks'],
+    'assets.load':             ['assets', 'load'],
+    'exec.last':               ['exec', 'lastCommand'],
+    // 正在执行的命令(lastCommand 在上一条被取消后可能还指着旧的)
+    'exec.activeCmd':          ['exec', 'active.command'],
+    'fac.place':               ['fac', 'PlaceFactory'],
+    'fac.boolean':             ['fac', 'BooleanFactory'],
     // ---- N3e: 本体测量(Measure Distance 的同一工厂; 名字在 nodes 表里, 不在测量记录上 —— 实测 2026-11-15) ----
     'ed.measurements':         ['ed', 'measurements'],
     'meas.snapshot':           ['meas', 'snapshot'],
@@ -402,6 +411,19 @@
     // A4: 多边形 / 折线 / 拉伸 / 旋转工厂的字段(实测 2026-11-17)。折线 type 0(默认 1 是过点样条, 闭合时会鼓出去);
     // 点用 push(Vector3); 闭合曲线提交后同一命令里就有新的 SketchIsland(区域 id 形如 '94r2669675', lookupTopologyItemById → Region 视图)。
     // 拉伸: regions + direction(单位向量, 原地 set)+ distance1(米); 旋转: regions + origin / axis(原地 set)+ degrees setter(轴要在轮廓平面里、轮廓不能跨轴)。
+    // N5 资产放置(实测 2026-11-18): Assets 面板拖进视口 = 画布上 drop 事件, DataTransfer 'plasticity/asset' = JSON
+    // {id, pivot, packId, packRevision, packAbsolutePath, contentHash} → ImportWithPlacementCommand 导入并挂资产引用, 然后等放置
+    // (promises: CancellablePromise, finish() = 按当前状态确定)→ PlaceFactory 从 pivot 挪到 destination / destinationOrientation(资产 +Z 对着面外法向)。
+    // pack 内容: assets.load(pack.filePath) → {id, revision, assets: [{id, name, path(文件夹), pivot, bbox(米), contentHash, thumbnail}]}。
+    // 用户的螺丝 pack: 每个资产 = 螺钉 + 负体(名字含 Neg), 负体用来从零件里减出孔。
+    assetDnd: {
+      mime: 'plasticity/asset', importCmd: 'ImportWithPlacementCommand', promises: 'promises', finish: 'finish',
+      dest: 'destination', destQ: 'destinationOrientation', baseNormal: [0, 0, 1], cutterPattern: 'Neg',
+      pack: { id: 'id', revision: 'revision', path: 'filePath', assets: 'assets' },
+      asset: { id: 'id', name: 'name', folder: 'path', pivot: 'pivot', bbox: 'bbox', hash: 'contentHash' },
+      startWaitMs: 3000, placeWaitMs: 6000, moveSettleMs: 150,
+      bool: { targets: 'targets', tools: 'tools', op: 'operationType' }
+    },
     sketchFields: {
       polygon: { center: 'center', point: 'point', orientation: 'orientation', sides: 'vertexCount', radius: 'radius', baseNormal: [0, 0, 1] },
       curve: { type: 'type', polyline: 0, push: 'push', closed: 'closed' },
@@ -476,7 +498,7 @@
                                'ed.snapScene', 'snap.canonicals', 'ed.enqueue', 'sig.commandEnded', 'exec.cancel', 'cmd.factoryBaseHolder',
                                'geo.items', 'geo.lookupTopo', 'geo.lookupItem', 'ed.docUnit'] },
     'bool.run':    { todo: 'N4' },
-    'asset.place': { todo: 'N5' }
+    'asset.place': { needs: ['ed.assets', 'assets.packs', 'assets.load', 'ed.executor', 'exec.last', 'geo.items', 'ed.undoStack', 'ed.nodes', 'nodes.item2key', 'nodes.getName'] }
   };
 
   // =====================================================================
@@ -529,6 +551,7 @@
       case 'meas': return get('ed.measurements');
       case 'mats': return get('ed.materialsDb');
       case 'groupsDb': return get('ed.groupsDb');
+      case 'assets': return get('ed.assets');
     }
     return undefined;
   }
@@ -2491,6 +2514,153 @@
     return { u: u.map(sig7), v: v.map(sig7), uName: nameOf(u), vName: nameOf(v) };
   }
 
+  // =====================================================================
+  // N5: 资产(asset pack)。asset.list = 已登记的 pack 与里面的资产; asset.place = 走 Plasticity 自己的拖放导入
+  // (同手工拖, 带资产引用), 放置时把目标点 / 朝向换成给定的, 可选把负体从目标零件里减掉。know-how/asset-place.md。
+  // =====================================================================
+  function packList() {
+    var D = NAMES.assetDnd;
+    return Array.from(invokeOn('assets.packs', []) || []).map(function (p) { return { path: p[D.pack.path] }; });
+  }
+
+  function loadPack(want) {
+    var D = NAMES.assetDnd, packs = packList();
+    if (!packs.length) throw new Error('no asset packs registered in Plasticity (Assets panel)');
+    var low = String(want || '').toLowerCase();
+    var p = want ? packs.find(function (x) { return x.path === want || x.path.toLowerCase().indexOf(low) >= 0; }) : packs[0];
+    if (!p) throw new Error('no pack matches ' + want + ' (have: ' + packs.map(function (x) { return x.path; }).join('; ') + ')');
+    return Promise.resolve(invokeOn('assets.load', [p.path])).then(function (pk) { return { path: p.path, pack: pk }; });
+  }
+
+  def('asset.list', 'asset.place', function (a) {
+    a = a || {};
+    var D = NAMES.assetDnd, k = unitOf(a).k, packs = packList();
+    var wanted = a.pack ? [a.pack] : packs.map(function (p) { return p.path; });
+    return wanted.reduce(function (pr, w) {
+      return pr.then(function (acc) {
+        return loadPack(w).then(function (r) {
+          acc.push({ path: r.path, assets: (r.pack[D.pack.assets] || []).map(function (x) {
+            var bb = x[D.asset.bbox] || [];
+            return { name: x[D.asset.name], id: x[D.asset.id], folder: (x[D.asset.folder] || []).join('/'), size: bb.map(function (v) { return sig7(v / k); }) };
+          }) });
+          return acc;
+        }, function (e) { acc.push({ path: w, err: errMsg(e) }); return acc; });
+      });
+    }, Promise.resolve([])).then(function (list) { return { units: unitOf(a).unit, packs: list }; });
+  }, { async: true });
+
+  // args = { asset: 名字(不分大小写)或资产 id, pack?: 路径或其中一段, at: [x,y,z](pivot 落点, 文档单位), normal?: [x,y,z](资产 +Z 指向, 默认 +Z = 面外法向),
+  //          rotate?: 度(绕 normal), cut?: 目标实体 id(把资产里的负体从它减掉), cutter?: 负体名字片段(默认 'Neg'), units? }
+  // → { asset, items: [{kind, id, name, bbox}], cut?: {target, tools, result}, undoSteps }
+  def('asset.place', 'asset.place', function (a) {
+    a = a || {};
+    var D = NAMES.assetDnd, U = unitOf(a), k = U.k;
+    if (W.document && W.document.visibilityState === 'hidden') throw new Error('asset.place needs a visible Plasticity window (drag-and-drop placement)');
+    if (!Array.isArray(a.at) || a.at.length !== 3) throw new Error('at must be [x,y,z]');
+    var at = a.at.map(function (x) { return Number(x) * k; });
+    var n = vnorm((Array.isArray(a.normal) && a.normal.length === 3 ? a.normal : D.baseNormal).map(Number));
+    var rot = (Number(a.rotate) || 0) * Math.PI / 180;
+    var Place = need('fac.place');
+    var canvas = (viewportElement() || W.document).querySelector('canvas');
+    if (!canvas) throw new Error('viewport canvas not found');
+    var mark = markNow();
+    var before = new Set(Array.from(need('geo.items') || []).map(function (it) { return it[NAMES.lookupViewKey]; }));
+    // 轮询; cond 抛错 → 拒绝(setTimeout 回调里的异常不会传到 Promise, 不接住就永远挂着)
+    var wait = function (cond, ms, what) {
+      return new Promise(function (res, rej) {
+        var t0 = Date.now();
+        (function poll() {
+          var v;
+          try { v = cond(); } catch (e) { return rej(e); }
+          if (v) return res(v);
+          if (Date.now() - t0 > ms) return rej(new Error((what || 'wait') + ' timed out'));
+          setTimeout(poll, 50);
+        })();
+      });
+    };
+    var fresh = function () { return Array.from(need('geo.items') || []).map(function (it) { return it[NAMES.lookupViewKey]; }).filter(function (v) { return v && !before.has(v); }); };
+    var report = { asset: null };
+    var overridden = false;
+    return loadPack(a.pack).then(function (r) {
+      var key = String(a.asset || '').toLowerCase();
+      var asset = (r.pack[D.pack.assets] || []).find(function (x) { return String(x[D.asset.name]).toLowerCase() === key || x[D.asset.id] === a.asset; });
+      if (!asset) throw new Error('asset ' + a.asset + ' not in ' + r.path + ' (have: ' + (r.pack[D.pack.assets] || []).map(function (x) { return x[D.asset.name]; }).join(', ') + ')');
+      report.asset = asset[D.asset.name];
+      var data = JSON.stringify({ id: asset[D.asset.id], pivot: asset[D.asset.pivot], packId: r.pack[D.pack.id], packRevision: r.pack[D.pack.revision], packAbsolutePath: r.path, contentHash: asset[D.asset.hash] });
+      try { invokeOn('exec.cancel'); } catch (e) {}
+      // 要等**新的**导入命令(看正在执行的命令; 上一次没收尾的那条取消后 lastCommand 还指着它)
+      var prev = get('exec.activeCmd');
+      var rc = canvas.getBoundingClientRect(), x = rc.left + rc.width / 2, y = rc.top + rc.height / 2;
+      var dt = new W.DataTransfer();
+      dt.setData(D.mime, data);
+      ['dragenter', 'dragover', 'drop'].forEach(function (t) {
+        canvas.dispatchEvent(new W.DragEvent(t, { bubbles: true, cancelable: true, composed: true, clientX: x, clientY: y, dataTransfer: dt }));
+      });
+      // 命令对象本身是 thenable(有 then): 直接 resolve 它会让链等命令结束 —— 而命令在等我们放置 = 死锁(实测 2026-11-18)→ 包一层
+      return wait(function () {
+        var c = get('exec.activeCmd');
+        return c && c !== prev && c.constructor && c.constructor.name === D.importCmd && (c[D.promises] || []).length ? { cmd: c } : null;
+      }, D.startWaitMs, 'import command');
+    }).then(function (box) {
+      var cmd = box.cmd;
+      // 放置: 只在这一次 commit 里把目标换掉(PlaceFactory 自己没有 commit, 挂一个本实例原型上的再删掉)
+      var P = Place.prototype, base = P[NAMES.facCommit];
+      P[NAMES.facCommit] = function () {
+        var V = this[D.dest].constructor;
+        this[D.dest].set(at[0], at[1], at[2]);
+        var q = this[D.destQ];
+        q.setFromUnitVectors(new V(D.baseNormal[0], D.baseNormal[1], D.baseNormal[2]), new V(n[0], n[1], n[2]));
+        if (rot) { var qr = q.clone().setFromAxisAngle(new V(n[0], n[1], n[2]), rot); q.premultiply(qr); }
+        return base.apply(this, arguments);
+      };
+      overridden = true;
+      // 放置拾取器要先收到一次指针移动才有"当前点", 否则 finish() 什么也不做(实测 2026-11-18)
+      var rc2 = canvas.getBoundingClientRect();
+      canvas.dispatchEvent(new W.PointerEvent('pointermove', { bubbles: true, cancelable: true, composed: true, clientX: rc2.left + rc2.width / 2, clientY: rc2.top + rc2.height / 2, pointerId: 1, pointerType: 'mouse', isPrimary: true }));
+      return new Promise(function (r2) { setTimeout(r2, D.moveSettleMs); }).then(function () {
+        cmd[D.promises].slice().forEach(function (p) { if (typeof p[D.finish] === 'function') { try { p[D.finish](); } catch (e) {} } });
+        return wait(function () { return undoStack().length > mark.depth; }, D.placeWaitMs);
+      }).then(function () {
+        delete P[NAMES.facCommit]; overridden = false;
+        return new Promise(function (r2) { setTimeout(r2, 150); });
+      });
+    }).then(function () {
+      var made = fresh();
+      report.items = made.map(function (v) { return describeMade(v, k); });
+      if (a.cut === undefined || a.cut === null) return report;
+      var pat = String(a.cutter || D.cutterPattern).toLowerCase();
+      var tools = made.filter(function (v) { return String(nameOf(v) || '').toLowerCase().indexOf(pat) >= 0; });
+      if (!tools.length) throw new Error('no cutter body (name containing "' + pat + '") in asset ' + report.asset);
+      var target = viewOf('solid', a.cut);
+      if (!target) throw new Error('cut target solid not found: ' + a.cut);
+      var Bool = need('fac.boolean'), B = D.bool;
+      var Cls = factoryCommandClass();
+      var cmd = new Cls(editor(), function (c) {
+        var f = new Bool(c.editor);
+        f[NAMES.facResource](c);
+        f[B.targets] = [target];
+        f[B.tools] = tools;
+        f[B.op] = NAMES.boolOps.subtract;
+        return f[NAMES.facCommit]();
+      });
+      return runCommand(cmd, NAMES.cmdTimeoutMs).then(function (how) {
+        if (cmd.plaErr || how !== 'ended') throw new Error('cut failed: ' + (cmd.plaErr || how));
+        var res = cmd.plaResult === null || cmd.plaResult === undefined ? [] : (Array.isArray(cmd.plaResult) ? cmd.plaResult : [cmd.plaResult]);
+        report.cut = { target: a.cut, tools: tools.map(function (v) { return itemIdOf(v); }), result: res.map(function (v) { return describeMade(v, k); }) };
+        report.items = fresh().map(function (v) { return describeMade(v, k); });
+        return report;
+      });
+    }).then(function (rep) {
+      rep.undoSteps = undoStack().length - mark.depth;
+      return rep;
+    }, function (e) {
+      if (overridden) { try { delete Place.prototype[NAMES.facCommit]; } catch (x) {} }
+      // 半途失败: 撤到放之前(导入还在等放置时先取消命令)
+      try { invokeOn('exec.cancel'); } catch (x) {}
+      return rollbackTo(mark).then(function () { throw e; }, function () { throw e; });
+    });
+  }, { async: true });
+
   // N4b 打孔位置: 选择里的草图点 → 文档单位坐标(用户 2026-11-15: 用草图端点定孔位, 选几个点打几个孔)。
   // curveVertex = 曲线端点(lookupTopologyItemById → Vertex.GetPoint); curve = 整条曲线: 有端点 → 各端点, 闭合(圆等)→ 包围盒中心(= 圆心)。
   function sketchPoints(refs, k) {
@@ -2549,6 +2719,8 @@
     pts = pts.map(function (p) { var o = vdot([p[0] - c[0], p[1] - c[1], p[2] - c[2]], n); return [p[0] - n[0] * o, p[1] - n[1] * o, p[2] - n[2] * o]; });
     // 实体: 入口(面所在) + 组合孔的其余实体(按顺序, 最后一个 = 螺纹 / 底孔)
     var A = itemIdOf(viewOf('solid', /^(\d+)/.exec(String(a.face))[1]));
+    // dry: 只算孔位(给"用 asset 负体开孔"用), 不打孔
+    if (a.dry) return { dry: true, holes: pts.map(function (p) { return { at: p.map(sig7) }; }), normal: n.map(sig7), solid: A, units: U.unit };
     var stack = (Array.isArray(a.stack) ? a.stack : []).map(String).filter(function (s) { return s !== String(A); });
     stack.forEach(function (s) { if (!viewOf('solid', s)) throw new Error('solid not found: ' + s); });
     var last = stack.length ? stack[stack.length - 1] : null, mids = stack.slice(0, -1);

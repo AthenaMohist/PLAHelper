@@ -91,6 +91,16 @@ bool: union | subtract | intersect with targets [solid refs]. Give a step id: \"
             "at": {"type": "array", "items": {"type": "number"}}, "offset": {"type": "array", "items": {"type": "number"}},
             "points": {"type": "array", "items": {"type": "object"}}, "stack": {"type": "array", "items": {"type": "string"}}, "units": {"type": "string"}},
           "required": ["face", "d"]}},
+        {"name": "model_assets", "annotations": ro, "description": "List the asset packs registered in Plasticity (Assets panel) and their assets: name, folder, size (document units). Prefer the user's own assets (e.g. their screw pack, which includes a cutter body per screw) over building standard parts with model_part.",
+         "inputSchema": {"type": "object", "properties": {"pack": {"type": "string", "description": "path or part of it (default: all)"}}}},
+        {"name": "model_asset_place", "annotations": {"destructiveHint": true},
+         "description": "CHANGES THE USER'S MODEL. Place an asset from a registered pack exactly like dragging it from the Assets panel (keeps the asset reference), at a point with its +Z along `normal`. With cut = a solid id, the asset's cutter body (name containing 'Neg' by default) is subtracted from that solid - the user's screw-plus-hole workflow. Needs the Plasticity window visible. 1–2 undo steps; a failure undoes itself.",
+         "inputSchema": {"type": "object", "properties": {
+            "asset": {"type": "string", "description": "asset name (e.g. M4) or id"}, "pack": {"type": "string"},
+            "at": {"type": "array", "items": {"type": "number"}, "description": "where the asset's pivot goes (document units)"},
+            "normal": {"type": "array", "items": {"type": "number"}, "description": "direction of the asset's +Z (for a screw: the face's outward normal, head outward); default [0,0,1]"},
+            "rotate": {"type": "number", "description": "degrees about normal"}, "cut": {"description": "solid id to subtract the cutter from"}, "cutter": {"type": "string"}},
+          "required": ["asset", "at"]}},
         {"name": "model_part", "annotations": {"destructiveHint": true},
          "description": format!("CHANGES THE USER'S MODEL. Build a GB standard part in one atomic call (A10 macros; threads not modelled). kind: screw-cap (GB/T 70.1 socket head cap) / screw-csk (GB/T 70.3 countersunk socket, length includes head) / screw-hex (GB/T 5783 hex bolt) / screw-set (GB/T 77 socket set screw, flat point) / nut (GB/T 6170) / washer (GB/T 97.1) / pin (GB/T 119.2 dowel, size = diameter) / shaft (steps [[diameter, length], …], chamfer). Placement: at + axis. Screws: at = centre of the head's bearing face (countersunk: of the head top), axis = from head toward the tip (into the hole). Set screw: at = socket end. Nut / washer / pin / shaft: at = one end face centre, axis = thickness / length direction. Returns the steps' results and the spec key PLAhelper's BOM recognizer will report. Sizes: {}", pla_ui::fasteners::sizes()),
          "inputSchema": {"type": "object", "properties": {
@@ -220,6 +230,8 @@ fn call_model_tool(name: &str, a: &Value) -> Option<Value> {
                 Err(e) => cdp_err(e),
             }
         }
+        "model_assets" => call(api::ASSET_LIST, pick(a, &["pack", "units"])),
+        "model_asset_place" => call(api::ASSET_PLACE, pick(a, &["asset", "pack", "at", "normal", "rotate", "cut", "cutter", "units"])),
         "model_build" => match build_spec(h, a) {
             Ok(v) => json_text(&v),
             Err(e) => err(e),

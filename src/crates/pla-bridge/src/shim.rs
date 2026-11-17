@@ -121,6 +121,10 @@ pub mod api {
     pub const UI_RCLICK: &str = "ui.rightClick";
     /// N4: 打孔(简单 / 柱形沉头 / 锥形沉头; 一次原子执行, 回孔的各面签名)。
     pub const HOLE_MAKE: &str = "hole.make";
+    /// N5: 已登记的 asset pack 与里面的资产(名字 / 文件夹 / 尺寸)。
+    pub const ASSET_LIST: &str = "asset.list";
+    /// N5: 按名字放一个资产(走 Plasticity 拖放导入, 带资产引用)到给定点 / 朝向; 可选把负体从目标零件减掉。
+    pub const ASSET_PLACE: &str = "asset.place";
     /// C0: 配置 = 可见性 + 材质指派(抓取 / 恢复; 抓取时附可见实体清单供 BOM)。
     pub const CFG_SAVE: &str = "cfg.save";
     pub const CFG_RESTORE: &str = "cfg.restore";
@@ -136,7 +140,7 @@ pub mod api {
         CMD_PING, ERR_LAST, TREE_LIST, SEL_CANCEL_COMMAND, SEL_CLEAR, SEL_APPLY, CAM_NAVIGATE, CAM_RENDER, CAM_THUMBNAIL, CAM_VP_RECT,
         CAM_SET_ORBIT_STEP, CAM_ROLL, KEYMAP_SET_BINDINGS, VP_SAVE, VP_RESTORE, MAT_SAVE, MAT_RESTORE, CMD_EXEC, CMD_FACTORIES,
         GEO_QUERY, HIST_BEGIN, HIST_ROLLBACK, HIST_COMMIT, HIST_UNDO, GEO_SNAPS, GEO_MEASURE, CAM_VIEW, CAM_VIEW_RESTORE, DIM_FACE, VIEW_HIGHLIGHT, DIM_DISTANCE, DIM_SIGNATURE, GEO_RESOLVE,
-        DIM_RECORD, DIM_MEASURE, DIM_FACES, UI_RCLICK, HOLE_MAKE, CFG_SAVE, CFG_RESTORE, BOM_SCAN, FILE_EXPORT_STEP, FILE_EXPORT_RESTORE,
+        DIM_RECORD, DIM_MEASURE, DIM_FACES, UI_RCLICK, HOLE_MAKE, ASSET_LIST, ASSET_PLACE, CFG_SAVE, CFG_RESTORE, BOM_SCAN, FILE_EXPORT_STEP, FILE_EXPORT_RESTORE,
     ];
 }
 
