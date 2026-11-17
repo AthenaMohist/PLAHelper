@@ -221,6 +221,13 @@ struct PlaApp {
     llm_key_buf: String,
     llm_test: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
     llm_test_msg: Option<(bool, String)>,
+    /// 外发包: 供应商配置、当前选的供应商、加列输入框、删除确认、后台生成、上次生成的目录。
+    suppliers: pla_ui::release::Suppliers,
+    rel_sel: usize,
+    rel_new_col: String,
+    rel_del_confirm: bool,
+    rel_job: Option<std::sync::mpsc::Receiver<Result<std::path::PathBuf, String>>>,
+    rel_last: Option<std::path::PathBuf>,
     /// D5: 出图助手对话(当前选中的图)、输入框、后台一轮。
     agent_chat: pla_ui::draw_agent::Chat,
     agent_input: String,
@@ -2582,6 +2589,12 @@ impl PlaApp {
             llm_key_buf: String::new(),
             llm_test: None,
             llm_test_msg: None,
+            suppliers: pla_ui::release::Suppliers::load(),
+            rel_sel: 0,
+            rel_new_col: String::new(),
+            rel_del_confirm: false,
+            rel_job: None,
+            rel_last: None,
             agent_chat: Default::default(),
             agent_input: String::new(),
             agent_job: None,
@@ -4951,6 +4964,280 @@ impl PlaApp {
         }
     }
 
+    // ---------------------------------------------------------------- 外发包
+    /// 生产窗口「外发」标签: 供应商(要哪些文件 / BOM 列)→ 零件归哪家 → 每家的加工 BOM(自有列可填)→ 生成外发包。
+    fn rel_ui(&mut self, ui: &mut egui::Ui) {
+        use pla_ui::release::{self as rel, Supplier, BUY, FILE_KINDS, PROCESS_COL};
+        if let Some(r) = self.rel_job.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            self.rel_job = None;
+            match r {
+                Ok(p) => {
+                    self.set_notice((false, t!("外发包已生成: {}", "Release package written: {}", p.display())));
+                    self.rel_last = Some(p);
+                }
+                Err(e) => self.set_notice((true, t!("生成外发包失败: {e}", "Writing the release package failed: {e}"))),
+            }
+        }
+        let Some(Ok(scan)) = self.bom_result.clone() else {
+            ui.label(egui::RichText::new(tr("先扫描 BOM(外发按当前 BOM 范围出)", "Scan the BOM first (the release follows the current BOM scope)")).color(COL_MUTED));
+            if ui.add_enabled(!self.bom_busy, egui::Button::new(tr("扫描", "Scan"))).clicked() {
+                let s = self.bom_scope.clone();
+                self.bom_scan(s);
+            }
+            return;
+        };
+        let (rows, totals) = pla_ui::bom_table::build(&scan, &self.bom_tpl, &self.bom_edits, &self.lib);
+        let ddir = pla_ui::drawing::dir(&self.doc_key);
+        let sheets = if self.draw_doc == self.doc_key { self.draw_sheets.clone() } else { pla_ui::drawing::load_in(&ddir) };
+        let col_of = |id: &str| self.bom_tpl.columns.iter().position(|c| c.id == id);
+        let (ci_name, ci_pn, ci_qty) = (col_of("name"), col_of("pn"), col_of("total_qty").or(col_of("per_set")));
+        let cell = |r: &pla_ui::bom_table::Row, i: Option<usize>| i.map(|i| r.cells[i].clone()).unwrap_or_default();
+        let parts: Vec<&pla_ui::bom_table::Row> = rows.iter().filter(|r| !r.manual).collect();
+        let mut sups_dirty = false;
+        let mut edits_dirty = false;
+        if self.rel_sel >= self.suppliers.list.len() {
+            self.rel_sel = 0;
+        }
+        // ---- 供应商 ----
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new(tr("供应商", "Suppliers")).color(COL_MUTED));
+            for (i, s) in self.suppliers.list.iter().enumerate() {
+                let n = parts.iter().filter(|r| rel::process_of(&self.bom_edits, &r.key) == s.id).count();
+                if ui.selectable_label(self.rel_sel == i, format!("{} ({n})", s.name)).clicked() {
+                    self.rel_sel = i;
+                    self.rel_del_confirm = false;
+                }
+            }
+            if ui.small_button(tr("＋ 供应商", "＋ Supplier")).clicked() {
+                let id = self.suppliers.next_id();
+                self.suppliers.list.push(Supplier { id, name: tr("新供应商", "New supplier").into(), files: vec!["pdf".into(), "step".into()], columns: vec!["pn".into(), "name".into(), "total_qty".into()], extra: vec![] });
+                self.rel_sel = self.suppliers.list.len() - 1;
+                sups_dirty = true;
+            }
+        });
+        let master: Vec<(String, String)> = self.bom_tpl.columns.iter().map(|c| (c.id.clone(), c.header.clone())).collect();
+        let mut delete_sup = false;
+        if let Some(sp) = self.suppliers.list.get_mut(self.rel_sel) {
+            egui::CollapsingHeader::new(t!("「{}」的设置: 要哪些文件 / BOM 列", "\"{}\" settings: files / BOM columns", sp.name)).id_salt("rel-sup-set").show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(tr("名称", "Name")).color(COL_MUTED));
+                    sups_dirty |= ui.add(egui::TextEdit::singleline(&mut sp.name).desired_width(160.0)).lost_focus();
+                    ui.label(egui::RichText::new(tr("文件", "Files")).color(COL_MUTED));
+                    for k in FILE_KINDS {
+                        let mut on = sp.files.iter().any(|f| f == k);
+                        if ui.checkbox(&mut on, k.to_uppercase()).changed() {
+                            sp.files.retain(|f| f != k);
+                            if on {
+                                sp.files.push(k.to_string());
+                            }
+                            sups_dirty = true;
+                        }
+                    }
+                });
+                ui.label(egui::RichText::new(tr("主 BOM 的列(勾上的进这家的 BOM):", "Columns from the main BOM (ticked ones go into this supplier's BOM):")).size(11.0).color(COL_MUTED));
+                ui.horizontal_wrapped(|ui| {
+                    for (id, h) in &master {
+                        let mut on = sp.columns.contains(id);
+                        if ui.checkbox(&mut on, h).changed() {
+                            // 保持主表顺序
+                            let mut set: Vec<String> = sp.columns.iter().filter(|c| *c != id).cloned().collect();
+                            if on {
+                                set.push(id.clone());
+                            }
+                            sp.columns = master.iter().filter(|(m, _)| set.contains(m)).map(|(m, _)| m.clone()).collect();
+                            sups_dirty = true;
+                        }
+                    }
+                });
+                ui.label(egui::RichText::new(tr("这家自己的列(值按零件填, 在下面的表里改):", "This supplier's own columns (filled per part in the table below):")).size(11.0).color(COL_MUTED));
+                let mut remove: Option<usize> = None;
+                ui.horizontal_wrapped(|ui| {
+                    for (i, c) in sp.extra.iter_mut().enumerate() {
+                        sups_dirty |= ui.add(egui::TextEdit::singleline(&mut c.header).desired_width(90.0)).lost_focus();
+                        if ui.small_button("✕").clicked() {
+                            remove = Some(i);
+                        }
+                    }
+                    ui.add(egui::TextEdit::singleline(&mut self.rel_new_col).hint_text(tr("新列名", "New column")).desired_width(90.0));
+                    if ui.add_enabled(!self.rel_new_col.trim().is_empty(), egui::Button::new(tr("加列", "Add")).small()).clicked() {
+                        let header = std::mem::take(&mut self.rel_new_col).trim().to_string();
+                        let id = (1..).map(|n| format!("{}_x{n}", sp.id)).find(|id| !sp.extra.iter().any(|c| &c.id == id)).unwrap_or_default();
+                        sp.extra.push(pla_ui::bom_table::Col { id, header, source: Some("field".into()), formula: None, default: None, sum: false });
+                        sups_dirty = true;
+                    }
+                });
+                if let Some(i) = remove {
+                    sp.extra.remove(i);
+                    sups_dirty = true;
+                }
+                let b = egui::Button::new(if self.rel_del_confirm { tr("确认删除这家?", "Confirm delete?") } else { tr("删除这家供应商", "Delete supplier") }).small();
+                if ui.add(b).clicked() {
+                    if self.rel_del_confirm {
+                        delete_sup = true;
+                    }
+                    self.rel_del_confirm = !self.rel_del_confirm;
+                }
+            });
+        }
+        if delete_sup {
+            self.suppliers.list.remove(self.rel_sel);
+            self.rel_sel = 0;
+            self.rel_del_confirm = false;
+            sups_dirty = true;
+        }
+        // ---- 零件归哪家 ----
+        let cur = self.suppliers.list.get(self.rel_sel).cloned();
+        let names: Vec<(String, String)> = std::iter::once((String::new(), tr("(未分配)", "(unassigned)").to_string()))
+            .chain(std::iter::once((BUY.to_string(), tr("外购 / 不发", "Bought / not sent").to_string())))
+            .chain(self.suppliers.list.iter().map(|s| (s.id.clone(), s.name.clone())))
+            .collect();
+        let unassigned = parts.iter().filter(|r| rel::process_of(&self.bom_edits, &r.key).is_empty()).count();
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(t!("零件归哪家({unassigned} 个未分配)", "Who makes each part ({unassigned} unassigned)")).strong());
+            if let Some(c) = &cur {
+                if ui.add_enabled(unassigned > 0, egui::Button::new(t!("未分配的 → {}", "Unassigned → {}", c.name)).small()).clicked() {
+                    for r in &parts {
+                        if rel::process_of(&self.bom_edits, &r.key).is_empty() {
+                            self.bom_edits.set_cell(&r.key, PROCESS_COL, &c.id, "");
+                        }
+                    }
+                    edits_dirty = true;
+                }
+            }
+        });
+        egui::ScrollArea::vertical().id_salt("rel-assign").max_height(200.0).show(ui, |ui| {
+            egui::Grid::new("rel-assign-grid").striped(true).num_columns(5).show(ui, |ui| {
+                for h in [tr("名称", "Name"), tr("料号", "P/N"), tr("数量", "Qty"), tr("归哪家", "Supplier"), tr("图纸", "Drawing")] {
+                    ui.label(egui::RichText::new(h).color(COL_MUTED));
+                }
+                ui.end_row();
+                for r in &parts {
+                    ui.label(cell(r, ci_name));
+                    ui.label(cell(r, ci_pn));
+                    ui.label(cell(r, ci_qty));
+                    let p = rel::process_of(&self.bom_edits, &r.key).to_string();
+                    let shown = names.iter().find(|(id, _)| *id == p).map(|(_, n)| n.clone()).unwrap_or_else(|| p.clone());
+                    egui::ComboBox::from_id_salt(("rel-proc", &r.key)).width(110.0).selected_text(shown).show_ui(ui, |ui| {
+                        for (id, n) in &names {
+                            if ui.selectable_label(*id == p, n).clicked() && *id != p {
+                                self.bom_edits.set_cell(&r.key, PROCESS_COL, id, "");
+                                edits_dirty = true;
+                            }
+                        }
+                    });
+                    let st = match sheets.get(&r.key) {
+                        Some(s) if s.locked() => tr("上传图纸", "uploaded").to_string(),
+                        Some(s) if s.model_changed => tr("模型改过, 待重出", "model changed").to_string(),
+                        Some(s) if !s.compiled.is_empty() => t!("已出 {}", "drawn {}", s.compiled),
+                        _ => tr("没出图", "not drawn").to_string(),
+                    };
+                    ui.label(egui::RichText::new(st).size(11.0).color(COL_MUTED));
+                    ui.end_row();
+                }
+            });
+        });
+        // ---- 当前这家的加工 BOM(自有列可填) ----
+        let mut packs_preview: Vec<(String, usize, usize)> = Vec::new();
+        if let Some(c) = &cur {
+            let (h, t, keys) = rel::supplier_table(c, &self.bom_tpl, &rows, &self.bom_edits);
+            ui.separator();
+            ui.label(egui::RichText::new(t!("「{}」的加工 BOM({} 行)", "\"{}\" BOM ({} rows)", c.name, t.len())).strong());
+            let n_master = 1 + c.columns.iter().filter(|id| self.bom_tpl.columns.iter().any(|m| &m.id == *id)).count();
+            egui::ScrollArea::both().id_salt("rel-sup-bom").max_height(200.0).show(ui, |ui| {
+                egui::Grid::new("rel-sup-grid").striped(true).num_columns(h.len()).show(ui, |ui| {
+                    for x in &h {
+                        ui.label(egui::RichText::new(x).color(COL_MUTED));
+                    }
+                    ui.end_row();
+                    for (ri, row) in t.iter().enumerate() {
+                        for (ci, v) in row.iter().enumerate() {
+                            if ci < n_master {
+                                ui.label(v);
+                            } else {
+                                let col = &c.extra[ci - n_master];
+                                let mut buf = v.clone();
+                                if ui.add(egui::TextEdit::singleline(&mut buf).desired_width(100.0)).changed() {
+                                    self.bom_edits.set_cell(&keys[ri], &col.id, &buf, col.default.as_deref().unwrap_or(""));
+                                    edits_dirty = true;
+                                }
+                            }
+                        }
+                        ui.end_row();
+                    }
+                });
+            });
+        }
+        // ---- 生成 ----
+        let root = pla_ui::release::STORE.dir(&self.doc_key);
+        let ver = rel::next_version(&root);
+        let mut packs: Vec<rel::Pack> = Vec::new();
+        for s in &self.suppliers.list {
+            let (h, t, keys) = rel::supplier_table(s, &self.bom_tpl, &rows, &self.bom_edits);
+            if t.is_empty() {
+                continue;
+            }
+            let mut files = Vec::new();
+            let mut missing = Vec::new();
+            for (k, row) in keys.iter().zip(&t) {
+                let (f, m) = rel::part_files(&ddir, sheets.get(k), &s.files);
+                files.extend(f);
+                if !m.is_empty() {
+                    missing.push((row.get(2).cloned().unwrap_or_default(), m));
+                }
+            }
+            packs_preview.push((s.name.clone(), t.len(), missing.len()));
+            packs.push(rel::Pack { supplier: s.clone(), csv: rel::table_csv(&h, &t), files, missing });
+        }
+        ui.separator();
+        ui.horizontal_wrapped(|ui| {
+            for (n, rows_n, miss) in &packs_preview {
+                let txt = if *miss > 0 { t!("{n}: {rows_n} 件, {miss} 件缺文件", "{n}: {rows_n} parts, {miss} missing files") } else { t!("{n}: {rows_n} 件", "{n}: {rows_n} parts") };
+                ui.label(egui::RichText::new(txt).color(if *miss > 0 { COL_YELLOW } else { COL_MUTED }));
+            }
+        });
+        let missing_all: Vec<String> = packs.iter().flat_map(|p| p.missing.iter().map(move |(n, m)| format!("{} · {n}: {}", p.supplier.name, m.join("/")))).collect();
+        if !missing_all.is_empty() {
+            egui::CollapsingHeader::new(t!("缺的文件({})", "Missing files ({})", missing_all.len())).id_salt("rel-missing").show(ui, |ui| {
+                ui.label(egui::RichText::new(tr("没出图 / 模型改过没重出的零件, 先到「出图」标签出图(「出未出的」会一起出)", "Parts not drawn or changed since: draw them in the Drawings tab first (\"Draw undrawn\" covers both)")).size(11.0).color(COL_MUTED));
+                for m in &missing_all {
+                    ui.label(egui::RichText::new(m).size(11.0));
+                }
+            });
+        }
+        ui.horizontal(|ui| {
+            let can = self.rel_job.is_none() && !packs.is_empty();
+            let tip = if missing_all.is_empty() { tr("总BOM + 每家的 BOM 和文件 + 每家一个 zip + 版本记录", "Main BOM + each supplier's BOM and files + one zip per supplier + a version record") } else { tr("有缺的文件也能生成, 缺的记在 manifest.json 里", "Can be written with files missing; they are listed in manifest.json") };
+            if ui.add_enabled(can, egui::Button::new(t!("生成外发包 {ver}", "Write release {ver}"))).on_hover_text(tip).clicked() {
+                let total = pla_ui::bom_table::to_csv(&self.bom_tpl, &rows, &totals);
+                let date = pla_ui::parts_lib::today();
+                let (tx, rx) = std::sync::mpsc::channel();
+                let (root2, ver2) = (root.clone(), ver.clone());
+                std::thread::spawn(move || {
+                    let _ = tx.send(rel::write(&root2, &ver2, &date, &total, &packs));
+                });
+                self.rel_job = Some(rx);
+            }
+            if self.rel_job.is_some() {
+                ui.label(egui::RichText::new(tr("生成中…", "Writing…")).color(COL_ACCENT));
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(300));
+            }
+            if ui.button(tr("打开外发文件夹", "Open release folder")).clicked() {
+                let p = self.rel_last.clone().unwrap_or(root.clone());
+                let _ = std::fs::create_dir_all(&p);
+                self.open_path(&p);
+            }
+        });
+        if sups_dirty {
+            if let Err(e) = self.suppliers.save() {
+                self.set_notice((true, t!("供应商设置保存失败: {e}", "Saving suppliers failed: {e}")));
+            }
+        }
+        if edits_dirty {
+            self.bom_edits_save();
+        }
+    }
+
     // ---------------------------------------------------------------- D5 出图助手
     /// 收后台一轮的结果(换了零件就丢掉)。
     fn agent_tick(&mut self) {
@@ -6310,7 +6597,12 @@ impl PlaApp {
                 // ---- 标签: 清单 / 零件库(B4) ----
                 self.lib_tick();
                 {
-                    let labels = vec![tr("BOM", "BOM").to_string(), t!("零件库 {}", "Parts library {}", self.lib.entries.len()), tr("出图", "Drawings").to_string()];
+                    let labels = vec![
+                        tr("BOM", "BOM").to_string(),
+                        t!("零件库 {}", "Parts library {}", self.lib.entries.len()),
+                        tr("出图", "Drawings").to_string(),
+                        tr("外发", "Release").to_string(),
+                    ];
                     let mut s = self.bom_tab as usize;
                     if rz_tabs(ui, &labels, &mut s, None) {
                         self.bom_tab = s as u8;
@@ -6324,6 +6616,11 @@ impl PlaApp {
                 if self.bom_tab == 2 {
                     self.bom_template_tick();
                     self.draw_ui(ui);
+                    return;
+                }
+                if self.bom_tab == 3 {
+                    self.bom_template_tick();
+                    self.rel_ui(ui);
                     return;
                 }
                 // ---- 范围 + 操作 ----

@@ -21,6 +21,7 @@ pub mod params;
 pub mod parts_lib;
 pub mod plasticity_config;
 pub mod prefs;
+pub mod release;
 pub mod round_corners;
 pub mod sel_labels;
 pub mod selection;
