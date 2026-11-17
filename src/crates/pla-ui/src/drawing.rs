@@ -97,6 +97,150 @@ pub struct Sheet {
     /// D6 指标: 这张图被人修正过几次(设置每变一次 +1)。
     #[serde(default)]
     pub edits: u32,
+    /// D8: 用户上传的图纸(锁定时以它为准, 不再生成)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uploaded: Option<Uploaded>,
+}
+
+/// D8 第一层: 上传的图纸。文件复制进出图目录(`<base>.uploaded.<ext>`), PDF / 图片转成每页一张 PNG(`<base>.up-N.png`)供预览和合订。
+/// 和同目录的 `<base>.step` 正好是一对"模型 + 人画的图" —— 第二层学习接口的样本。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Uploaded {
+    /// 出图目录里的文件名。
+    pub file: String,
+    /// 原文件名(显示用)。
+    pub orig: String,
+    pub date: String,
+    /// 锁定 = 以上传的为准: 出图 / 批量 / 合订都用它, 不生成新的; 用户授权才解锁。
+    #[serde(default = "yes")]
+    pub locked: bool,
+    /// 预览页: PNG 文件名 + 纸张 mm(DWG / DXF 没有预览 = 空)。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pages: Vec<UpPage>,
+    /// 模型改过(几何指纹变了, 从旧图沿用过来): 图纸可能过期, 等用户确认。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stale: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct UpPage {
+    pub png: String,
+    pub mm: [f64; 2],
+}
+
+/// 能上传的文件类型: pdf / image(png jpg bmp)/ cad(dwg dxf, 只存不预览)。
+pub fn upload_kind(p: &Path) -> Option<&'static str> {
+    match p.extension()?.to_str()?.to_ascii_lowercase().as_str() {
+        "pdf" => Some("pdf"),
+        "png" | "jpg" | "jpeg" | "bmp" | "tif" | "tiff" => Some("image"),
+        "dwg" | "dxf" => Some("cad"),
+        _ => None,
+    }
+}
+
+impl Sheet {
+    /// 锁定中(以上传图纸为准)。
+    pub fn locked(&self) -> bool {
+        self.uploaded.as_ref().is_some_and(|u| u.locked)
+    }
+}
+
+/// 上传一张图纸(阻塞几秒, 放后台线程): 复制进出图目录 → PDF / 图片转预览 PNG。旧的上传文件 / 预览页先删掉。
+pub fn import_upload(dir: &Path, s: &Sheet, src: &Path, tools: Option<&Path>, today: &str) -> Result<Uploaded, String> {
+    let kind = upload_kind(src).ok_or_else(|| pla_bridge::i18n::tr("只支持 PDF / PNG / JPG / DWG / DXF", "Only PDF / PNG / JPG / DWG / DXF are supported").to_string())?;
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    remove_upload_files(dir, s);
+    let ext = src.extension().and_then(|e| e.to_str()).unwrap_or("bin").to_ascii_lowercase();
+    let file = format!("{}.uploaded.{ext}", s.base);
+    std::fs::copy(src, dir.join(&file)).map_err(|e| format!("{}: {e}", src.display()))?;
+    let mut up = Uploaded {
+        file: file.clone(),
+        orig: src.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string(),
+        date: today.to_string(),
+        locked: true,
+        pages: Vec::new(),
+        stale: false,
+    };
+    if kind != "cad" {
+        let tools = tools.ok_or_else(|| pla_bridge::i18n::tr("找不到 tools/drawing(转预览用)", "tools/drawing not found (for the preview)").to_string())?;
+        let prefix = dir.join(format!("{}.up", s.base));
+        let mut cmd = std::process::Command::new("powershell");
+        cmd.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]).arg(tools.join("upload2png.ps1")).arg("-In").arg(dir.join(&file)).arg("-Out").arg(&prefix);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
+        let out = cmd.output().map_err(|e| format!("powershell: {e}"))?;
+        let text = String::from_utf8_lossy(&out.stdout).to_string();
+        let v: Value = text.lines().rev().find_map(|l| serde_json::from_str(l.trim()).ok()).ok_or_else(|| {
+            let err = String::from_utf8_lossy(&out.stderr);
+            pla_bridge::t!("转预览失败: {}", "Preview conversion failed: {}", err.lines().find(|l| !l.trim().is_empty()).unwrap_or(text.trim()))
+        })?;
+        up.pages = parse_pages(&v, &format!("{}.up", s.base));
+    }
+    Ok(up)
+}
+
+/// 选一个图纸文件(Windows 打开文件对话框, 置顶; 阻塞, 放后台线程)。取消 = None。
+pub fn pick_upload_file() -> Option<PathBuf> {
+    let script = "Add-Type -AssemblyName System.Windows.Forms; [Console]::OutputEncoding = [Text.Encoding]::UTF8; \
+        $o = New-Object System.Windows.Forms.Form -Property @{TopMost = $true; ShowInTaskbar = $false}; \
+        $d = New-Object System.Windows.Forms.OpenFileDialog; \
+        $d.Filter = 'Drawings (*.pdf;*.png;*.jpg;*.dwg;*.dxf)|*.pdf;*.png;*.jpg;*.jpeg;*.bmp;*.tif;*.tiff;*.dwg;*.dxf|All files|*.*'; \
+        if ($d.ShowDialog($o) -eq 'OK') { $d.FileName }";
+    let mut cmd = std::process::Command::new("powershell");
+    cmd.args(["-NoProfile", "-STA", "-Command", script]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW(对话框照常弹出)
+    }
+    let out = cmd.output().ok()?;
+    let p = String::from_utf8_lossy(&out.stdout).trim().trim_start_matches('\u{feff}').to_string();
+    (!p.is_empty()).then(|| PathBuf::from(p))
+}
+
+/// upload2png.ps1 的输出 → 预览页(PowerShell 的 ConvertTo-Json 单页时也是数组套数组)。
+fn parse_pages(v: &Value, prefix: &str) -> Vec<UpPage> {
+    v["pages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .filter_map(|(i, p)| Some(UpPage { png: format!("{prefix}-{}.png", i + 1), mm: [p.get(0)?.as_f64()?, p.get(1)?.as_f64()?] }))
+        .collect()
+}
+
+/// 删掉这张图的上传文件和预览页。
+pub fn remove_upload_files(dir: &Path, s: &Sheet) {
+    if let Some(u) = &s.uploaded {
+        let _ = std::fs::remove_file(dir.join(&u.file));
+        for p in &u.pages {
+            let _ = std::fs::remove_file(dir.join(&p.png));
+        }
+    }
+}
+
+/// 合订本的页: 锁定的图 = 上传图纸的每一页("png|宽|高", 见 book.ps1); 否则 = 生成的 SVG。没有可用的页 → 空。
+pub fn book_pages(dir: &Path, s: &Sheet) -> Vec<String> {
+    match &s.uploaded {
+        Some(u) if u.locked => u
+            .pages
+            .iter()
+            .map(|p| (dir.join(&p.png), p.mm))
+            .filter(|(f, _)| f.exists())
+            .map(|(f, mm)| format!("{}|{}|{}", f.display(), mm[0], mm[1]))
+            .collect(),
+        _ => {
+            let svg = file(dir, s, "svg");
+            if svg.exists() {
+                vec![svg.display().to_string()]
+            } else {
+                Vec::new()
+            }
+        }
+    }
 }
 
 /// 一条补加的尺寸: 1 个圆柱面 = 直径, 1 个平面 = 厚度, 2 个面 = 距离(编译器按面签名在 STEP 里找面)。
@@ -160,6 +304,7 @@ impl Sheet {
             balloons: BTreeMap::new(),
             parts_list: BTreeMap::new(),
             edits: 0,
+            uploaded: None,
         }
     }
 }
@@ -894,10 +1039,11 @@ pub fn compile(tools: &Path, spec_file: &Path) -> Result<String, String> {
 }
 
 /// 多张图合成一份 PDF(tools/drawing/book.ps1: 每张 SVG 一页, 纸张按各自报告)。同步执行, 放后台线程里调。
-pub fn book(tools: &Path, out: &Path, svgs: &[PathBuf]) -> Result<String, String> {
+/// `pages` 每项 = SVG 路径, 或上传图纸页 "png|宽mm|高mm"(见 `book_pages`)。
+pub fn book(tools: &Path, out: &Path, pages: &[String]) -> Result<String, String> {
     // 路径清单写文件(文件名里可能有逗号, 不能走 -Svg a,b)
     let list = out.with_extension("list.txt");
-    std::fs::write(&list, svgs.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("\n")).map_err(|e| format!("{}: {e}", list.display()))?;
+    std::fs::write(&list, pages.join("\n")).map_err(|e| format!("{}: {e}", list.display()))?;
     let mut cmd = std::process::Command::new("powershell");
     cmd.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]).arg(tools.join("book.ps1")).arg("-Out").arg(out).arg("-List").arg(&list);
     #[cfg(windows)]
@@ -924,6 +1070,62 @@ pub fn book_file(dir: &Path, doc_key: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uploads_lock_and_book_pages() {
+        let d = std::env::temp_dir().join(format!("pla_up_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let mut s = Sheet::new("k", "904002001", "m1", "Plate");
+        assert!(!s.locked());
+        // 没上传: 合订用生成的 SVG(有才算)
+        assert!(book_pages(&d, &s).is_empty());
+        std::fs::write(file(&d, &s, "svg"), "<svg/>").unwrap();
+        assert_eq!(book_pages(&d, &s), vec![file(&d, &s, "svg").display().to_string()]);
+        // 上传 + 锁定: 合订用上传的页("png|宽|高"), 生成的 SVG 不用
+        let pages = parse_pages(&json!({"pages": [[420.2, 297.0], [297.0, 210.0]]}), "904002001.up");
+        assert_eq!(pages[1].png, "904002001.up-2.png");
+        for p in &pages {
+            std::fs::write(d.join(&p.png), b"png").unwrap();
+        }
+        s.uploaded = Some(Uploaded { file: "904002001.uploaded.pdf".into(), orig: "a.pdf".into(), date: "2026-11-17".into(), locked: true, pages, stale: false });
+        assert!(s.locked());
+        let bp = book_pages(&d, &s);
+        assert_eq!(bp.len(), 2);
+        assert!(bp[0].ends_with("904002001.up-1.png|420.2|297"), "{}", bp[0]);
+        // 解锁: 回到生成的图
+        s.uploaded.as_mut().unwrap().locked = false;
+        assert!(!s.locked());
+        assert_eq!(book_pages(&d, &s).len(), 1);
+        // 存盘往返; 旧 sheets.json(没有 uploaded)照常读; locked 缺省 = true
+        let mut all = Sheets::default();
+        all.upsert(s.clone());
+        save_in(&d, &all).unwrap();
+        assert_eq!(load_in(&d).get("k").unwrap().uploaded, s.uploaded);
+        let u: Uploaded = serde_json::from_value(json!({"file": "x.dwg", "orig": "x.dwg", "date": ""})).unwrap();
+        assert!(u.locked && u.pages.is_empty() && !u.stale);
+        // 删除上传: 文件和预览页都删
+        remove_upload_files(&d, &s);
+        assert!(!d.join("904002001.up-1.png").exists());
+        assert_eq!(upload_kind(Path::new("A.PDF")), Some("pdf"));
+        assert_eq!(upload_kind(Path::new("a.dwg")), Some("cad"));
+        assert_eq!(upload_kind(Path::new("a.step")), None);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 手动: PLA_UPLOAD=<pdf 或图片> → 真跑 upload2png.ps1, 打印页数和纸张。
+    #[test]
+    #[ignore]
+    fn import_real_upload() {
+        let Ok(src) = std::env::var("PLA_UPLOAD") else { return };
+        let d = std::env::temp_dir().join(format!("pla_up_real_{}", std::process::id()));
+        let s = Sheet::new("k", "T1", "", "");
+        let u = import_upload(&d, &s, Path::new(&src), tools_dir().as_deref(), "2026-11-17").unwrap();
+        println!("{u:?}");
+        assert!(d.join(&u.file).exists());
+        assert!(u.pages.iter().all(|p| d.join(&p.png).exists()));
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     #[test]
     fn standard_parts() {

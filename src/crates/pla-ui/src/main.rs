@@ -209,6 +209,13 @@ struct PlaApp {
     draw_job: Option<DrawJob>,
     draw_report: Option<(String, pla_ui::drawing::Report)>,
     draw_png: Option<(String, egui::load::Bytes)>,
+    /// D8: 预览显示的是上传的图纸(第几页, 共几页, 纸张 mm); None = 生成的图。
+    draw_up_view: Option<(usize, usize, [f64; 2])>,
+    draw_up_page: usize,
+    /// D8: 上传线程(选文件 + 复制 + 转预览): 零件 key → 结果(None = 取消了选择)。
+    draw_up_job: Option<(String, std::sync::mpsc::Receiver<Result<Option<pla_ui::drawing::Uploaded>, String>>)>,
+    /// D8: 解锁要点两次(第一次点了的零件 key)。
+    draw_unlock_confirm: Option<String>,
     draw_buf: std::collections::HashMap<String, String>,
     /// 补尺寸: 等 dim.signature 回包的图 key(在 Plasticity 里选的面 → 这张图的 dims_add)。
     draw_sig_pending: Option<String>,
@@ -2558,6 +2565,10 @@ impl PlaApp {
             draw_job: None,
             draw_report: None,
             draw_png: None,
+            draw_up_view: None,
+            draw_up_page: 0,
+            draw_up_job: None,
+            draw_unlock_confirm: None,
             draw_buf: Default::default(),
             draw_sig_pending: None,
             bom_col_w: pla_ui::prefs::load_value(BOM_COLS_KEY)
@@ -3544,6 +3555,9 @@ impl PlaApp {
                 // B1/B2: 独立浮窗(同参数化), 打开时按当前范围扫描一次
                 self.show_bom = !self.show_bom;
                 if self.show_bom {
+                    // 用户 2026-11-17: 生产窗口占地方, 与快照墙 / 配置窗口不共存
+                    self.show_snapshots = false;
+                    self.close_cfg_group();
                     let scope = self.bom_scope.clone();
                     self.bom_scan(scope);
                 } else {
@@ -4570,6 +4584,38 @@ impl PlaApp {
                 }
             }
         }
+        // D8: 上传线程的结果
+        let got = self.draw_up_job.as_ref().and_then(|(_, rx)| match rx.try_recv() {
+            Ok(r) => Some(r),
+            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Err(tr("上传线程意外退出", "The upload thread exited unexpectedly").to_string())),
+        });
+        if let Some(r) = got {
+            let key = self.draw_up_job.take().map(|j| j.0).unwrap_or_default();
+            match r {
+                Ok(None) => {}
+                Ok(Some(up)) => {
+                    if let Some(mut s) = self.draw_sheets.get(&key).cloned() {
+                        let name = up.orig.clone();
+                        let preview = !up.pages.is_empty();
+                        s.uploaded = Some(up);
+                        self.draw_sheets.upsert(s);
+                        self.draw_save();
+                        let msg = if preview {
+                            t!("已上传 {name}: 这张图以上传的为准(已锁定, 不再生成)", "Uploaded {name}: this sheet now follows the upload (locked, no regeneration)")
+                        } else {
+                            t!("已上传 {name}(DWG / DXF 没有预览): 已锁定, 不再生成", "Uploaded {name} (no preview for DWG / DXF): locked, no regeneration")
+                        };
+                        self.set_notice((false, msg));
+                        if self.draw_sel.as_deref() == Some(key.as_str()) {
+                            self.draw_up_page = 0;
+                            self.draw_load(&key);
+                        }
+                    }
+                }
+                Err(e) => self.set_notice((true, t!("上传图纸失败: {e}", "Uploading the drawing failed: {e}"))),
+            }
+        }
         let got = self.draw_book.as_ref().and_then(|rx| match rx.try_recv() {
             Ok(r) => Some(r),
             Err(std::sync::mpsc::TryRecvError::Empty) => None,
@@ -4594,12 +4640,8 @@ impl PlaApp {
         }
         let Some(tools) = pla_ui::drawing::tools_dir() else { return };
         let dir = pla_ui::drawing::dir(&self.doc_key);
-        let svgs: Vec<std::path::PathBuf> = keys
-            .iter()
-            .filter_map(|k| self.draw_sheets.get(k))
-            .map(|s| pla_ui::drawing::file(&dir, s, "svg"))
-            .filter(|p| p.exists())
-            .collect();
+        // D8: 锁定的图用上传图纸的页, 其余用生成的 SVG
+        let svgs: Vec<String> = keys.iter().filter_map(|k| self.draw_sheets.get(k)).flat_map(|s| pla_ui::drawing::book_pages(&dir, s)).collect();
         if svgs.is_empty() {
             self.set_notice((true, tr("还没有出过的图可合订", "No drawings to combine yet").to_string()));
             return;
@@ -4664,6 +4706,11 @@ impl PlaApp {
             return;
         }
         let Some(s) = self.draw_sheets.get(key).cloned() else { return };
+        // D8: 以上传图纸为准的图不生成(用户解锁才行)
+        if s.locked() {
+            self.set_notice((true, t!("{} 以上传的图纸为准(已锁定), 要重新生成先解锁", "{} follows the uploaded drawing (locked); unlock it to regenerate", s.base)));
+            return;
+        }
         if pla_ui::drawing::tools_dir().is_none() || pla_ui::drawing::freecad_bin().is_none() {
             self.set_notice((true, tr("出图需要 tools/drawing 编译器和 FreeCAD 1.1", "Drawing needs the tools/drawing compiler and FreeCAD 1.1").to_string()));
             return;
@@ -4779,14 +4826,51 @@ impl PlaApp {
     fn draw_load(&mut self, key: &str) {
         self.draw_report = None;
         self.draw_png = None;
+        self.draw_up_view = None;
         let Some(s) = self.draw_sheets.get(key).cloned() else { return };
         let dir = pla_ui::drawing::dir(&self.doc_key);
         if let Some(r) = pla_ui::drawing::load_report(&dir, &s) {
             self.draw_report = Some((key.to_string(), r));
         }
-        if let Ok(b) = std::fs::read(pla_ui::drawing::file(&dir, &s, "png")) {
+        let gen = pla_ui::drawing::file(&dir, &s, "png");
+        // D8: 锁定(或还没生成过)→ 预览上传的图纸
+        if let Some(u) = s.uploaded.as_ref().filter(|u| !u.pages.is_empty() && (u.locked || !gen.exists())) {
+            let i = self.draw_up_page.min(u.pages.len() - 1);
+            if let Ok(b) = std::fs::read(dir.join(&u.pages[i].png)) {
+                self.draw_png = Some((png_uri("drawup", &format!("{}-{i}", s.base), &b), b.into()));
+                self.draw_up_view = Some((i, u.pages.len(), u.pages[i].mm));
+                return;
+            }
+        }
+        if let Ok(b) = std::fs::read(gen) {
             self.draw_png = Some((png_uri("draw", &s.base, &b), b.into()));
         }
+    }
+
+    /// D8: 上传图纸(后台线程: 没给文件就弹选择框 → 复制进出图目录 → 转预览 PNG)。
+    fn draw_upload_start(&mut self, key: &str, src: Option<std::path::PathBuf>) {
+        if self.draw_up_job.is_some() {
+            return;
+        }
+        let Some(s) = self.draw_sheets.get(key).cloned() else { return };
+        if let Some(p) = &src {
+            if pla_ui::drawing::upload_kind(p).is_none() {
+                self.set_notice((true, tr("只支持 PDF / PNG / JPG / DWG / DXF", "Only PDF / PNG / JPG / DWG / DXF are supported").into()));
+                return;
+            }
+        }
+        let dir = pla_ui::drawing::dir(&self.doc_key);
+        let tools = pla_ui::drawing::tools_dir();
+        let today = pla_ui::parts_lib::today();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let r = match src.or_else(pla_ui::drawing::pick_upload_file) {
+                None => Ok(None),
+                Some(p) => pla_ui::drawing::import_upload(&dir, &s, &p, tools.as_deref(), &today).map(Some),
+            };
+            let _ = tx.send(r);
+        });
+        self.draw_up_job = Some((key.to_string(), rx));
     }
 
     fn open_path(&mut self, p: &std::path::Path) {
@@ -4875,6 +4959,19 @@ impl PlaApp {
             items.insert(i, Item { key: k.clone(), label, title, member: (String::new(), String::new()), bought: false });
         }
         self.draw_asm = asms.into_iter().map(|(k, _, ls)| (k, ls)).collect();
+        // D8: 模型改过 = 几何指纹变了, 旧图成了"不在当前范围"。同一个实体(member)的旧图上有上传图纸 → 新 key → 旧 key, 提示沿用
+        let carry: std::collections::HashMap<String, String> = items
+            .iter()
+            .filter(|it| !it.member.0.is_empty() && self.draw_sheets.get(&it.key).map_or(true, |s| s.uploaded.is_none()))
+            .filter_map(|it| {
+                self.draw_sheets
+                    .sheets
+                    .iter()
+                    .find(|s| s.uploaded.is_some() && s.member == it.member.0 && !items.iter().any(|i| i.key == s.key))
+                    .map(|s| (it.key.clone(), s.key.clone()))
+            })
+            .collect();
+        let locked_keys: std::collections::HashSet<String> = self.draw_sheets.sheets.iter().filter(|s| s.locked()).map(|s| s.key.clone()).collect();
         for s in &self.draw_sheets.sheets {
             if !items.iter().any(|i| i.key == s.key) {
                 items.push(Item { key: s.key.clone(), label: format!("{}  ({})", s.base, tr("不在当前范围", "not in the current scope")), title: Default::default(), member: (s.member.clone(), s.model_name.clone()), bought: false });
@@ -4929,10 +5026,17 @@ impl PlaApp {
         egui::ScrollArea::vertical().id_salt("draw-list").max_height(150.0).show(ui, |ui| {
             for (i, it) in items.iter().enumerate() {
                 let sheet = self.draw_sheets.get(&it.key);
-                let mark = match sheet {
-                    Some(s) if !s.compiled.is_empty() => t!("  · 已出 {}", "  · drawn {}", s.compiled),
-                    _ => String::new(),
+                let mut mark = match sheet.and_then(|s| s.uploaded.as_ref()) {
+                    Some(u) if u.stale => tr("  · 上传图纸(模型改过, 待确认)", "  · uploaded (model changed, to confirm)").to_string(),
+                    Some(u) if u.locked => tr("  · 上传图纸(锁定)", "  · uploaded (locked)").to_string(),
+                    _ => match sheet {
+                        Some(s) if !s.compiled.is_empty() => t!("  · 已出 {}", "  · drawn {}", s.compiled),
+                        _ => String::new(),
+                    },
                 };
+                if carry.contains_key(&it.key) {
+                    mark.push_str(tr("  · 模型改过, 有旧的上传图纸", "  · model changed, old upload exists"));
+                }
                 let busy = self.draw_job.as_ref().is_some_and(|j| j.key == it.key);
                 let text = egui::RichText::new(format!("{}{}{}", it.label, mark, if busy { "  …" } else { "" }));
                 if ui.selectable_label(self.draw_sel.as_deref() == Some(it.key.as_str()), text).clicked() {
@@ -4943,7 +5047,9 @@ impl PlaApp {
         // ---- 批量: 当前 BOM 范围里的零件(不在范围里的旧图不管) ----
         let mut batch: Option<bool> = None; // Some(包括已出过的?)
         // 批量出哪些: 装配图 + 自制件(外购组件里的零件不出零件图)
-        let drawable = |it: &Item| pla_ui::drawing::is_asm(&it.key) || (!it.member.0.is_empty() && !it.bought);
+        // D8: 以上传图纸为准(锁定)的不出
+        let drawable = |it: &Item| (pla_ui::drawing::is_asm(&it.key) || (!it.member.0.is_empty() && !it.bought)) && !locked_keys.contains(&it.key);
+        let n_locked = items.iter().filter(|it| locked_keys.contains(&it.key)).count();
         ui.horizontal(|ui| {
             if self.draw_batch.is_some() {
                 let (n, f) = self.draw_batch.as_ref().map(|(n, f)| (*n, f.len())).unwrap_or_default();
@@ -4967,8 +5073,12 @@ impl PlaApp {
                 if ui.add_enabled(free && all > 0, egui::Button::new(t!("全部重出 {all} 张", "Redraw all {all}"))).on_hover_text(tr("每张都重新导出 STEP 再出图(模型改过之后用)", "Re-exports every STEP, then draws (use after the model changed)")).clicked() {
                     batch = Some(true);
                 }
+                if n_locked > 0 {
+                    ui.label(egui::RichText::new(t!("{n_locked} 张以上传图纸为准, 不出", "{n_locked} follow uploads, skipped")).size(11.0).color(COL_MUTED))
+                        .on_hover_text(tr("合订本里用上传的图纸; 要重新生成先在该零件里解锁", "The combined PDF uses the uploads; unlock a part to regenerate it"));
+                }
             }
-            let done = items.iter().filter(|it| self.draw_sheets.get(&it.key).is_some_and(|s| !s.compiled.is_empty())).count();
+            let done = items.iter().filter(|it| self.draw_sheets.get(&it.key).is_some_and(|s| s.locked() || !s.compiled.is_empty())).count();
             if self.draw_book.is_some() {
                 ui.label(egui::RichText::new(tr("合订中…", "Combining…")).color(COL_ACCENT));
             } else if ui
@@ -5003,6 +5113,8 @@ impl PlaApp {
             self.draw_ensure(&it.key, &it.title, &it.member);
             self.draw_sel = Some(it.key.clone());
             self.draw_buf.clear();
+            self.draw_up_page = 0;
+            self.draw_unlock_confirm = None;
             let k = it.key.clone();
             self.draw_load(&k);
         }
@@ -5017,13 +5129,17 @@ impl PlaApp {
         let mut go: Option<bool> = None; // Some(重新导出?)
         let job = self.draw_job.as_ref().map(|j| (j.key == key, j.stage, j.t0.elapsed().as_secs()));
         // ---- 操作 + 状态 ----
+        let locked = s.locked();
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new(&s.base).strong());
-            let free = job.is_none();
-            if ui.add_enabled(free, egui::Button::new(tr("出图", "Draw"))).on_hover_text(tr("没有 STEP 时先从 Plasticity 导出; 有了直接按当前设置编译", "Exports a STEP from Plasticity if there is none, then compiles with the current settings")).clicked() {
+            let free = job.is_none() && !locked;
+            let why_locked = tr("以上传的图纸为准(已锁定); 要重新生成先解锁", "Follows the uploaded drawing (locked); unlock to regenerate");
+            let r = ui.add_enabled(free, egui::Button::new(tr("出图", "Draw")));
+            if r.on_hover_text(if locked { why_locked } else { tr("没有 STEP 时先从 Plasticity 导出; 有了直接按当前设置编译", "Exports a STEP from Plasticity if there is none, then compiles with the current settings") }).clicked() {
                 go = Some(false);
             }
-            if ui.add_enabled(free, egui::Button::new(tr("重新导出 STEP 并出图", "Re-export STEP and draw"))).on_hover_text(tr("模型改过之后用", "Use after the model changed")).clicked() {
+            let r = ui.add_enabled(free, egui::Button::new(tr("重新导出 STEP 并出图", "Re-export STEP and draw")));
+            if r.on_hover_text(if locked { why_locked } else { tr("模型改过之后用", "Use after the model changed") }).clicked() {
                 go = Some(true);
             }
             let dir = pla_ui::drawing::dir(&self.doc_key);
@@ -5044,6 +5160,100 @@ impl PlaApp {
                 None => {}
             }
         });
+        // ---- D8: 上传的图纸(以它为准 = 锁定; 解锁要点两次) ----
+        enum UpAct {
+            Pick,
+            Drop(std::path::PathBuf),
+            Unlock,
+            Relock,
+            Delete,
+            Carry(String),
+        }
+        let mut up_act: Option<UpAct> = None;
+        let up_busy = self.draw_up_job.as_ref().is_some_and(|(k, _)| *k == key);
+        let confirm = self.draw_unlock_confirm.clone();
+        let updir = pla_ui::drawing::dir(&self.doc_key);
+        let mut open_up: Option<std::path::PathBuf> = None;
+        // 拖文件到生产窗口 = 给选中的零件上传
+        if let Some(p) = ui.ctx().input(|i| i.raw.dropped_files.iter().find_map(|f| f.path.clone())) {
+            up_act = Some(UpAct::Drop(p));
+        }
+        if let Some(old) = carry.get(&key) {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new(tr("模型改过(几何变了), 旧版本有上传的图纸。", "The model changed (geometry differs); the old version has an uploaded drawing.")).color(COL_YELLOW));
+                if ui.small_button(tr("沿用旧图纸(待确认)", "Carry it over (to confirm)")).on_hover_text(tr("把旧的上传图纸挂到现在的零件上, 标成「待确认」; 核对后点「仍然有效」或重新上传", "Attaches the old upload to the current part, marked \"to confirm\"; check it, then click \"Still valid\" or upload again")).clicked() {
+                    up_act = Some(UpAct::Carry(old.clone()));
+                }
+            });
+        }
+        ui.horizontal_wrapped(|ui| {
+            match &s.uploaded {
+                None => {
+                    if ui
+                        .add_enabled(!up_busy && self.draw_up_job.is_none(), egui::Button::new(tr("上传图纸…", "Upload drawing…")))
+                        .on_hover_text(tr(
+                            "已有图纸(PDF / 图片 / DWG / DXF)就上传: 这个零件以上传的为准, 不再生成。也可以把文件拖到这个窗口",
+                            "Have a drawing already (PDF / image / DWG / DXF)? Upload it: this part then follows the upload and is not regenerated. You can also drop the file on this window",
+                        ))
+                        .clicked()
+                    {
+                        up_act = Some(UpAct::Pick);
+                    }
+                    ui.label(egui::RichText::new(tr("(或把文件拖到这个窗口)", "(or drop a file on this window)")).size(11.0).color(COL_MUTED));
+                }
+                Some(u) => {
+                    let state = if u.locked {
+                        egui::RichText::new(tr("以上传的图纸为准(锁定)", "Follows the upload (locked)")).color(COL_ACCENT)
+                    } else {
+                        egui::RichText::new(tr("已解锁: 用生成的图, 上传的留作参考", "Unlocked: the generated drawing is used, the upload is kept for reference")).color(COL_MUTED)
+                    };
+                    ui.label(state);
+                    ui.label(egui::RichText::new(t!("{} · {}", "{} · {}", u.orig, u.date)).size(11.0).color(COL_MUTED));
+                    if ui.small_button(tr("打开", "Open")).clicked() {
+                        open_up = Some(updir.join(&u.file));
+                    }
+                    if ui.add_enabled(!up_busy && self.draw_up_job.is_none(), egui::Button::new(tr("替换…", "Replace…")).small()).clicked() {
+                        up_act = Some(UpAct::Pick);
+                    }
+                    if u.locked {
+                        let armed = confirm.as_deref() == Some(&format!("unlock:{key}"));
+                        let b = egui::Button::new(if armed { tr("确认解锁?", "Confirm unlock?") } else { tr("解锁(允许重新生成)", "Unlock (allow regeneration)") }).small();
+                        if ui.add(b).on_hover_text(tr("解锁后出图 / 批量会生成新图, 合订本也用生成的图; 上传的文件保留, 可以再锁回去", "After unlocking, Draw / batch generate a new drawing and the combined PDF uses it; the upload is kept and can be locked again")).clicked() {
+                            if armed {
+                                up_act = Some(UpAct::Unlock);
+                            } else {
+                                self.draw_unlock_confirm = Some(format!("unlock:{key}"));
+                            }
+                        }
+                    } else if ui.small_button(tr("重新锁定", "Lock again")).on_hover_text(tr("回到以上传的图纸为准", "Back to following the upload")).clicked() {
+                        up_act = Some(UpAct::Relock);
+                    }
+                    let armed = confirm.as_deref() == Some(&format!("delete:{key}"));
+                    if ui.small_button(if armed { tr("确认删除?", "Confirm delete?") } else { tr("删除上传", "Remove upload") }).on_hover_text(tr("删掉出图目录里的这份上传(你原来的文件不动)", "Deletes this upload from the drawings folder (your original file is untouched)")).clicked() {
+                        if armed {
+                            up_act = Some(UpAct::Delete);
+                        } else {
+                            self.draw_unlock_confirm = Some(format!("delete:{key}"));
+                        }
+                    }
+                    if u.stale {
+                        ui.label(egui::RichText::new(tr("模型改过, 这份图纸可能过期", "The model changed; this drawing may be out of date")).color(COL_RED));
+                        if ui.small_button(tr("仍然有效", "Still valid")).clicked() {
+                            up_act = Some(UpAct::Relock);
+                        }
+                    }
+                }
+            }
+            if up_busy {
+                ui.label(egui::RichText::new(tr("上传中…", "Uploading…")).color(COL_ACCENT));
+            }
+        });
+        if locked {
+            ui.label(egui::RichText::new(tr("已锁定: 下面的出图设置只在解锁后重新生成时才用", "Locked: the settings below only apply after unlocking and regenerating")).size(11.0).color(COL_MUTED));
+        }
+        if let Some(p) = open_up {
+            self.open_path(&p);
+        }
         // ---- 视图朝向(要先出过一次, 用报告里的实际朝向) ----
         let axes = self.draw_report.as_ref().filter(|(k, _)| *k == key).and_then(|(_, r)| r.axes);
         let mut reorient: Option<(Option<[f64; 3]>, Option<[f64; 3]>)> = None;
@@ -5555,6 +5765,49 @@ impl PlaApp {
             title.extend(s.title.clone());
             self.draw_start(&key, export, title);
         }
+        // D8: 上传动作放在设置保存之后(上面会用本帧开头的副本覆盖整张图); 不算"人修正"次数
+        if let Some(act) = up_act {
+            match act {
+                UpAct::Pick => self.draw_upload_start(&key, None),
+                UpAct::Drop(p) => self.draw_upload_start(&key, Some(p)),
+                UpAct::Carry(old) => {
+                    let up = self.draw_sheets.sheets.iter_mut().find(|x| x.key == old).and_then(|x| x.uploaded.take());
+                    if let (Some(mut u), Some(mut cur)) = (up, self.draw_sheets.get(&key).cloned()) {
+                        u.stale = true;
+                        cur.uploaded = Some(u);
+                        self.draw_sheets.upsert(cur);
+                    }
+                    self.draw_save();
+                }
+                other => {
+                    if let Some(mut cur) = self.draw_sheets.get(&key).cloned() {
+                        match other {
+                            UpAct::Unlock => {
+                                if let Some(u) = cur.uploaded.as_mut() {
+                                    u.locked = false;
+                                }
+                            }
+                            UpAct::Relock => {
+                                if let Some(u) = cur.uploaded.as_mut() {
+                                    u.locked = true;
+                                    u.stale = false;
+                                }
+                            }
+                            UpAct::Delete => {
+                                pla_ui::drawing::remove_upload_files(&updir, &cur);
+                                cur.uploaded = None;
+                            }
+                            _ => {}
+                        }
+                        self.draw_sheets.upsert(cur);
+                        self.draw_save();
+                    }
+                    self.draw_unlock_confirm = None;
+                }
+            }
+            self.draw_up_page = 0;
+            self.draw_load(&key);
+        }
         // 预览在旁边的图纸窗口(show_draw_preview): 选了零件就显示, 切换就切换
         let _ = (&bal_rep, &bal_sel, &placed, &sel_dim);
         if self.draw_png.is_none() && job.is_none() {
@@ -5593,10 +5846,13 @@ impl PlaApp {
             }
             self.draw_prev_anchor = anchor;
         }
-        let rep = self.draw_report.as_ref().filter(|(k, _)| *k == key).map(|(_, r)| r.clone());
-        let paper = rep.as_ref().and_then(|r| r.paper_mm).unwrap_or([420.0, 297.0]);
+        // D8: 显示的是上传的图纸 → 纸张按上传页; 不能选尺寸 / 序号(那是生成图的报告)
+        let up_view = self.draw_up_view;
+        let rep = self.draw_report.as_ref().filter(|(k, _)| *k == key && up_view.is_none()).map(|(_, r)| r.clone());
+        let paper = up_view.map(|u| u.2).or(rep.as_ref().and_then(|r| r.paper_mm)).unwrap_or([420.0, 297.0]);
         let placed = rep.as_ref().map(|r| r.placed.clone()).unwrap_or_default();
         let bal_rep = rep.as_ref().map(|r| r.balloons.clone()).unwrap_or_default();
+        let mut page_to: Option<usize> = None;
         let sel_dim = self.draw_buf.get("dimsel").cloned().unwrap_or_default();
         let bal_sel = self.draw_buf.get("balsel").cloned().unwrap_or_default();
         let png = self.draw_png.clone();
@@ -5617,7 +5873,7 @@ impl PlaApp {
                 id: "panel-draw-prev",
                 prefs_key: DRAW_PREV_RECT_KEY,
                 title: tr("图纸", "Drawing"),
-                subtitle: s.base.clone(),
+                subtitle: if up_view.is_some() { t!("{} · 上传的图纸", "{} · uploaded drawing", s.base) } else { s.base.clone() },
                 close_tip: tr("关闭(取消选择零件)", "Close (deselects the part)"),
                 default_rect: [200.0, 120.0, size[0], size[1]],
                 min_size: egui::vec2(320.0, 240.0),
@@ -5632,11 +5888,24 @@ impl PlaApp {
                         pan = egui::Vec2::ZERO;
                     }
                     ui.label(egui::RichText::new(format!("{:.0}%", zoom * 100.0)).color(COL_MUTED));
-                    ui.label(
-                        egui::RichText::new(tr("滚轮缩放 · 拖动平移 · 单击选尺寸 / 序号 · 双击打开 PDF", "Wheel = zoom · drag = pan · click = pick · double-click = open PDF"))
-                            .size(11.0)
-                            .color(COL_MUTED),
-                    );
+                    if let Some((i, n, _)) = up_view {
+                        if n > 1 {
+                            if ui.add_enabled(i > 0, egui::Button::new("◀").small()).clicked() {
+                                page_to = Some(i - 1);
+                            }
+                            ui.label(format!("{}/{n}", i + 1));
+                            if ui.add_enabled(i + 1 < n, egui::Button::new("▶").small()).clicked() {
+                                page_to = Some(i + 1);
+                            }
+                        }
+                        ui.label(egui::RichText::new(tr("上传的图纸 · 滚轮缩放 · 拖动平移 · 双击打开原文件", "Uploaded drawing · wheel = zoom · drag = pan · double-click = open the file")).size(11.0).color(COL_MUTED));
+                    } else {
+                        ui.label(
+                            egui::RichText::new(tr("滚轮缩放 · 拖动平移 · 单击选尺寸 / 序号 · 双击打开 PDF", "Wheel = zoom · drag = pan · click = pick · double-click = open PDF"))
+                                .size(11.0)
+                                .color(COL_MUTED),
+                        );
+                    }
                     if busy {
                         ui.label(egui::RichText::new(tr("出图中…", "Drawing…")).color(COL_ACCENT));
                     }
@@ -5644,7 +5913,12 @@ impl PlaApp {
                 let (area, resp) = ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
                 ui.painter().rect_filled(area, 2.0, egui::Color32::from_gray(40));
                 let Some((uri, bytes)) = png.clone() else {
-                    ui.painter().text(area.center(), egui::Align2::CENTER_CENTER, tr("还没出过图", "Not drawn yet"), egui::FontId::proportional(13.0), COL_MUTED);
+                    let msg = if s.locked() {
+                        tr("上传的是 DWG / DXF, 没有预览(在出图标签里点「打开」)", "The upload is DWG / DXF: no preview (click Open in the drawings tab)")
+                    } else {
+                        tr("还没出过图", "Not drawn yet")
+                    };
+                    ui.painter().text(area.center(), egui::Align2::CENTER_CENTER, msg, egui::FontId::proportional(13.0), COL_MUTED);
                     return;
                 };
                 let aspect = (paper[0] / paper[1]) as f32;
@@ -5697,8 +5971,16 @@ impl PlaApp {
                 self.draw_buf.insert("balsel".into(), String::new());
             }
         }
+        if let Some(i) = page_to {
+            self.draw_up_page = i;
+            self.draw_load(&key);
+        }
         if open_pdf {
-            let p = pla_ui::drawing::file(&pla_ui::drawing::dir(&self.doc_key), &s, "pdf");
+            let dir = pla_ui::drawing::dir(&self.doc_key);
+            let p = match (&up_view, &s.uploaded) {
+                (Some(_), Some(u)) => dir.join(&u.file),
+                _ => pla_ui::drawing::file(&dir, &s, "pdf"),
+            };
             self.open_path(&p);
         }
         if !open {
@@ -7864,6 +8146,11 @@ impl PlaApp {
 
     /// R8b: 二级面板统一互斥 — 打开一个, 关掉其余全部。
     fn close_secondary_panels_except(&mut self, keep: PanelId) {
+        // 打开快照墙 / 配置窗口 → 关生产窗口(用户 2026-11-17: 不共存; 设置 / 能力面板小, 不受影响)
+        if !matches!(keep, PanelId::Settings | PanelId::Caps) && self.show_bom {
+            self.show_bom = false;
+            self.bom_win.closed();
+        }
         if keep != PanelId::Snapshots {
             self.show_snapshots = false;
         }

@@ -11,6 +11,16 @@ if (-not [IO.Path]::IsPathRooted($Out)) { $Out = [IO.Path]::GetFullPath((Join-Pa
 $pages = New-Object System.Collections.Generic.List[string]
 $sizes = @{}
 foreach ($f in $Svg) {
+  # 上传图纸的页: "<png>|<宽mm>|<高mm>"(upload2png.ps1 转出来的) → 整页一张图
+  if ($f -match '^(.+\.png)\|([0-9.]+)\|([0-9.]+)$') {
+    $png, $w, $h = $Matches[1], $Matches[2], $Matches[3]
+    if (-not (Test-Path $png)) { Write-Output "missing: $png"; continue }
+    $b64 = [Convert]::ToBase64String([IO.File]::ReadAllBytes($png))
+    $name = "p{0}x{1}" -f ([int][double]$w), ([int][double]$h)
+    $sizes[$name] = "${w}mm ${h}mm"
+    $pages.Add("<div class='pg' style='page:$name;width:${w}mm;height:${h}mm'><img style='display:block;width:${w}mm;height:${h}mm' src='data:image/png;base64,$b64'></div>")
+    continue
+  }
   if (-not (Test-Path $f)) { Write-Output "missing: $f"; continue }
   $text = [IO.File]::ReadAllText($f)
   $text = $text.Substring($text.IndexOf('<svg'))
