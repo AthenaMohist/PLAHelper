@@ -452,7 +452,10 @@
   - [x] 前台实测（model1）：`draw_parts`（修了导出后残留的自动移动命令）、`release`、`model_exec` 直接改模型。用户：改模型直接用 model_*，不必经尺寸记录（`dims set` 保留但不是重点）。
   - [x] 零件库 MCP：`parts_library`（search / get / add / update / remove / link / from_bom / suggest；from_bom 与 pla-ui 共用 `doc_jobs::lib_add_from_row`）。
   - 用户：选择集 / 视口 / 材质状态 / 快照只是人操作才需要，不做 MCP。
-  - [ ] 还可以补：上传图纸锁定 / 解锁、BOM 模板编辑、孔规格方案编辑（等用到再做）。
+  - [x] BOM 模板编辑（`bom_template`：建 / 改名 / 删 / 加改删排列，保存前查 id、来源、公式引用、循环）、孔规格方案编辑（`hole_table`：建 / 改名 / 删 / 改规格 / 切当前方案，pla-ui 孔面板跟着切；`model_hole` 可直接给 `size: "M4"`）（2026-11-18）。
+    公式求值改为多遍（前向引用链不再只算两层）。
+  - [ ] 还可以补：上传图纸锁定 / 解锁（等用到再做）。
+  - [ ] `model_hole size` 实机打孔没跑（当时 Plasticity 窗口不可见，按规则没动模型；映射有单测）。
 - [ ] **N5 常用件库**：常用件白名单入库（STEP + 缩略图 + 规格字段，SQLite 索引），PLAhelper 搜索面板一键放入当前文档；
       常用度按本人插入次数统计；商家具体型号用到时下载归档。
 - [ ] **N6 AI 建模**：已细化为 **A 自动建模 pipeline**（见下节）。build123d → STEP → 导入 作为退路保留。

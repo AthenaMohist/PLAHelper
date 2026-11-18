@@ -7513,6 +7513,12 @@ impl PlaApp {
         self.hole_preset_checked = Some(Instant::now());
         let dir = pla_ui::hole_presets::dir();
         self.hole_presets = pla_ui::hole_presets::list_in(&dir);
+        // MCP hole_table select 改的是偏好 → 跟上
+        let want = pla_ui::hole_presets::active_in(&dir);
+        if want != self.hole_preset && self.hole_presets.contains(&want) {
+            self.hole_preset = want;
+            self.hole_preset_mtime = None;
+        }
         if !self.hole_presets.contains(&self.hole_preset) {
             self.hole_preset = self.hole_presets.first().cloned().unwrap_or_default();
             self.hole_preset_mtime = None;

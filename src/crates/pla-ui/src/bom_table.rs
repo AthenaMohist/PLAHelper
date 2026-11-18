@@ -114,6 +114,84 @@ pub fn mtime_in(dir: &Path, name: &str) -> Option<std::time::SystemTime> {
     std::fs::metadata(path_in(dir, name)).and_then(|m| m.modified()).ok()
 }
 
+/// 模型数据列可用的来源(source 省略 + 有公式 = 公式列)。
+pub const SOURCES: &[&str] = &["name", "qty", "material", "volume", "group", "remark", "spec", "field"];
+
+/// 公式里引用的列 id(`{id}`)。
+pub fn formula_refs(f: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = f;
+    while let Some(a) = rest.find('{') {
+        let after = &rest[a + 1..];
+        match after.find('}') {
+            Some(b) => {
+                out.push(after[..b].trim().to_string());
+                rest = &after[b + 1..];
+            }
+            None => break,
+        }
+    }
+    out
+}
+
+/// 模板体检: 至少一列、id 非空不重复、来源合法、公式引用的列存在、公式之间不循环。
+pub fn check(t: &Template) -> Result<(), String> {
+    if t.columns.is_empty() {
+        return Err("a template needs at least one column".into());
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for c in &t.columns {
+        if c.id.trim().is_empty() || c.id.contains(['{', '}']) {
+            return Err(format!("bad column id {:?}", c.id));
+        }
+        if !seen.insert(c.id.as_str()) {
+            return Err(format!("duplicate column id {}", c.id));
+        }
+        match (&c.source, &c.formula) {
+            (Some(s), _) if !SOURCES.contains(&s.as_str()) => return Err(format!("column {}: unknown source {s} (have: {})", c.id, SOURCES.join(", "))),
+            (Some(_), Some(_)) => return Err(format!("column {}: either source or formula, not both", c.id)),
+            _ => {}
+        }
+    }
+    for c in &t.columns {
+        for r in c.formula.as_deref().map(formula_refs).unwrap_or_default() {
+            if !seen.contains(r.as_str()) {
+                return Err(format!("column {}: formula refers to unknown column {{{r}}}", c.id));
+            }
+        }
+    }
+    // 循环: 公式列之间的依赖做 DFS
+    let deps = |id: &str| t.columns.iter().find(|c| c.id == id).and_then(|c| c.formula.as_deref()).map(formula_refs).unwrap_or_default();
+    fn visit(id: &str, deps: &dyn Fn(&str) -> Vec<String>, path: &mut Vec<String>) -> Result<(), String> {
+        if let Some(i) = path.iter().position(|p| p == id) {
+            return Err(format!("formula loop: {} → {id}", path[i..].join(" → ")));
+        }
+        path.push(id.to_string());
+        for d in deps(id) {
+            visit(&d, deps, path)?;
+        }
+        path.pop();
+        Ok(())
+    }
+    for c in t.columns.iter().filter(|c| c.formula.is_some()) {
+        visit(&c.id, &deps, &mut Vec::new())?;
+    }
+    Ok(())
+}
+
+/// 删除模板文件(最后一个不删)。
+pub fn remove_in(dir: &Path, name: &str) -> Result<(), String> {
+    if list_in(dir).len() <= 1 {
+        return Err("cannot remove the only BOM template".into());
+    }
+    std::fs::remove_file(path_in(dir, name)).map_err(|e| e.to_string())
+}
+
+/// 模板名能不能当文件名。
+pub fn valid_name(n: &str) -> bool {
+    !n.trim().is_empty() && !n.contains(['/', '\\', ':', '*', '?', '"', '<', '>', '|'])
+}
+
 // ---------------- 每个文档的编辑 ----------------
 
 /// 一条手动行(模型里没有的件)。
@@ -307,8 +385,9 @@ pub fn build(scan: &Value, t: &Template, e: &Edits, lib: &crate::parts_lib::Libr
         let mut vals: BTreeMap<String, String> = BTreeMap::new();
         let mut overridden = vec![false; t.columns.len()];
         let mut from_lib = vec![false; t.columns.len()];
-        // 两遍: 公式可以引用后面的列
-        for _ in 0..2 {
+        // 多遍: 公式可以引用后面的列(链长最多 = 公式列数; 循环由 check 挡在保存前)
+        let passes = 1 + t.columns.iter().filter(|c| c.formula.is_some()).count().max(1);
+        for _ in 0..passes {
             for (i, c) in t.columns.iter().enumerate() {
                 let v = if let Some(f) = &c.formula {
                     eval_formula(f, &vals)
@@ -483,6 +562,37 @@ mod tests {
         let (rows, _) = build(&scan, &t, &e, &lib);
         assert_eq!(rows[0].link, None);
         assert_eq!(rows[0].cells[col("name")], "杯内六M4x14");
+    }
+
+    #[test]
+    fn template_check_and_forward_chain() {
+        assert!(check(&builtin()).is_ok());
+        assert_eq!(formula_refs("ROUNDUP({a}*{ b },0)"), vec!["a", "b"]);
+        let mut t = builtin();
+        t.columns.push(col("x", "X", None, Some("{nope}*2"), None, false));
+        assert!(check(&t).unwrap_err().contains("nope"));
+        let mut t = builtin();
+        t.columns.push(col("p", "P", None, Some("{q}+1"), None, false));
+        t.columns.push(col("q", "Q", None, Some("{p}+1"), None, false));
+        assert!(check(&t).unwrap_err().contains("loop"));
+        let mut t = builtin();
+        t.columns.push(col("sets", "dup", Some("field"), None, None, false));
+        assert!(check(&t).unwrap_err().contains("duplicate"));
+        let mut t = builtin();
+        t.columns[0].source = Some("colour".into());
+        assert!(check(&t).is_err());
+        // 前向引用链 a → b → c(c 在最后)也要算对
+        let t = Template {
+            columns: vec![
+                col("a", "A", None, Some("{b}+1"), None, false),
+                col("b", "B", None, Some("{c}*2"), None, false),
+                col("c", "C", Some("field"), None, Some("5"), false),
+            ],
+        };
+        assert!(check(&t).is_ok());
+        let scan = json!({ "lines": [ { "key": "k1", "name": "p", "qty": 1 } ] });
+        let (rows, _) = build(&scan, &t, &Edits::default(), &crate::parts_lib::Library::default());
+        assert_eq!(rows[0].cells, vec!["11", "10", "5"]);
     }
 
     #[test]

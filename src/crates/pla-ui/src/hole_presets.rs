@@ -127,6 +127,49 @@ pub fn rename_in(dir: &Path, old: &str, new: &str) -> Result<(), String> {
     std::fs::rename(path_in(dir, old), path_in(dir, new)).map_err(|e| e.to_string())
 }
 
+/// 删除方案(最后一个不删)。
+pub fn remove_in(dir: &Path, name: &str) -> Result<(), String> {
+    if list_in(dir).len() <= 1 {
+        return Err("cannot remove the only hole table".into());
+    }
+    std::fs::remove_file(path_in(dir, name)).map_err(|e| e.to_string())
+}
+
+/// 当前方案(pla-ui 界面选的, 存在偏好 hole_preset 里; 没有 / 不存在 = 列表第一个)。
+pub fn active_in(dir: &Path) -> String {
+    let list = list_in(dir);
+    crate::prefs::load_value("hole_preset").and_then(|v| v.as_str().map(String::from)).filter(|n| list.contains(n)).or_else(|| list.first().cloned()).unwrap_or_default()
+}
+
+/// 规格体检: 规格名非空不重复、数值为正、底孔 < 过孔 < 沉头直径、沉头深 > 0。返回 (错误, 提醒)。
+pub fn check(sizes: &[HoleSize]) -> Result<Vec<String>, String> {
+    if sizes.is_empty() {
+        return Err("a hole table needs at least one size".into());
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    let mut warn = Vec::new();
+    for s in sizes {
+        if s.size.trim().is_empty() || !seen.insert(s.size.trim().to_lowercase()) {
+            return Err(format!("empty or duplicate size {:?}", s.size));
+        }
+        for (k, v) in [("clearance", s.clearance), ("tap", s.tap), ("cbD", s.cb_d), ("cbDepth", s.cb_depth), ("cskD", s.csk_d)] {
+            if !(v.is_finite() && v > 0.0) {
+                return Err(format!("{}: {k} must be > 0 (got {v})", s.size));
+            }
+        }
+        if s.tap >= s.clearance {
+            warn.push(format!("{}: tap {} ≥ clearance {}", s.size, s.tap, s.clearance));
+        }
+        if s.cb_d <= s.clearance {
+            warn.push(format!("{}: counterbore ⌀{} ≤ clearance {}", s.size, s.cb_d, s.clearance));
+        }
+        if s.csk_d <= s.clearance {
+            warn.push(format!("{}: countersink ⌀{} ≤ clearance {}", s.size, s.csk_d, s.clearance));
+        }
+    }
+    Ok(warn)
+}
+
 /// 文件修改时间(热生效用)。
 pub fn mtime_in(dir: &Path, name: &str) -> Option<std::time::SystemTime> {
     std::fs::metadata(path_in(dir, name)).and_then(|m| m.modified()).ok()
@@ -156,5 +199,19 @@ mod tests {
         let txt = std::fs::read_to_string(path_in(&d, BUILTIN_NAME)).unwrap();
         assert!(txt.contains("\"cbD\"") && txt.contains("\"cskD\""));
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn sizes_check() {
+        assert!(check(&builtin()).unwrap().is_empty(), "内置方案无提醒");
+        let mut s = builtin();
+        s[0].tap = 0.0;
+        assert!(check(&s).is_err());
+        let mut s = builtin();
+        s.push(s[0].clone());
+        assert!(check(&s).unwrap_err().contains("duplicate"));
+        let mut s = builtin();
+        s[0].cb_d = 1.0;
+        assert_eq!(check(&s).unwrap().len(), 1);
     }
 }

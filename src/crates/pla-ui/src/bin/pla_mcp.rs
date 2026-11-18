@@ -94,13 +94,14 @@ bool: union | subtract | intersect with targets [solid refs]. Give a step id: \"
             "ops": {"type": "array", "items": {"type": "object"}},
             "atomic": {"type": "boolean"}, "units": {"type": "string"}}, "required": ["ops"]}},
         {"name": "model_hole", "annotations": {"destructiveHint": true},
-         "description": "CHANGES THE USER'S MODEL. Hole wizard in one atomic step: face (plane face id where the hole starts), type simple|counterbore|countersink, d (diameter), depth (omit = through), cbD/cbDepth (counterbore), cskD (countersink, 90°), position: at [x,y,z] or offset [u,v] from the face center (u/v axes are returned), or points (sketch points). stack = further solid ids for a hole through several parts (tapD = diameter in the last one). Returns the created faces per hole.",
+         "description": "CHANGES THE USER'S MODEL. Hole wizard in one atomic step: face (plane face id where the hole starts), type simple|counterbore|countersink, d (diameter) OR size (\"M4\": d / cbD / cbDepth / cskD / tapD come from the active hole table, see hole_table; usage clearance (default) | tap; table = another hole table; explicit numbers still win), depth (omit = through), cbD/cbDepth (counterbore), cskD (countersink, 90°), position: at [x,y,z] or offset [u,v] from the face center (u/v axes are returned), or points (sketch points). stack = further solid ids for a hole through several parts (tapD = diameter in the last one). Returns the created faces per hole.",
          "inputSchema": {"type": "object", "properties": {
             "face": {"type": "string"}, "type": {"type": "string", "enum": ["simple", "counterbore", "countersink"]}, "d": {"type": "number"},
             "depth": {"type": "number"}, "cbD": {"type": "number"}, "cbDepth": {"type": "number"}, "cskD": {"type": "number"}, "tapD": {"type": "number"},
             "at": {"type": "array", "items": {"type": "number"}}, "offset": {"type": "array", "items": {"type": "number"}},
-            "points": {"type": "array", "items": {"type": "object"}}, "stack": {"type": "array", "items": {"type": "string"}}, "units": {"type": "string"}},
-          "required": ["face", "d"]}},
+            "points": {"type": "array", "items": {"type": "object"}}, "stack": {"type": "array", "items": {"type": "string"}}, "units": {"type": "string"},
+            "size": {"type": "string"}, "usage": {"type": "string", "enum": ["clearance", "tap"]}, "table": {"type": "string"}},
+          "required": ["face"]}},
         {"name": "model_assets", "annotations": ro, "description": "List the asset packs registered in Plasticity (Assets panel) and their assets: name, folder, size (document units). Prefer the user's own assets (e.g. their screw pack) over building standard parts with model_part; hole sizes come from the GB tables (model_hole), never from assets.",
          "inputSchema": {"type": "object", "properties": {"pack": {"type": "string", "description": "path or part of it (default: all)"}}}},
         {"name": "model_asset_place", "annotations": {"destructiveHint": true},
@@ -155,7 +156,7 @@ The spec, a map (bodies, solid ids, undo range) and a log are saved under the do
          "description": "The BOM of a document as PLAhelper computes it (template columns with formulas, user entries, part library, part identity tracking): columns (id, header, editable, formula, default), rows (row key, cells by column id, which cells were overridden, supplier for release, drawing status), totals, excluded rows, document defaults, available templates and suppliers. doc = foreground (default, the document open in the user's Plasticity) / background. scope = a configuration name (default: currently visible). Use it before bom_edit to see row keys and column ids.",
          "inputSchema": {"type": "object", "properties": {"doc": {"type": "string", "enum": ["foreground", "background"]}, "scope": {"type": "string"}}}},
         {"name": "bom_edit", "annotations": {"destructiveHint": true},
-         "description": "Change BOM entries the way the user would in PLAhelper's BOM tab (saved per document; PLAhelper picks the change up at once). set: [{part, column, value}] (part = row key / part number / name; column = id or header, also a supplier's own columns like finish / color; value null = back to the computed / default value). assign: [{part, supplier}] = which supplier makes it in a release (supplier id or name, \"buy\" = bought, \"\" = unassigned). exclude / include: [part] (leave out of / back into the BOM). add_rows: [{column: value}] (manual rows for parts not in the model, e.g. purchased items). remove_rows: [\"manual:<id>\"]. defaults: {column: value} (document-wide defaults, e.g. sets = 5; null clears). template: BOM template name. project: project number prefix for part numbers. Returns the updated table and what changed.",
+         "description": "Change BOM entries the way the user would in PLAhelper's BOM tab (saved per document; PLAhelper picks the change up at once). set: [{part, column, value}] (part = row key / part number / name; column = id or header, also a supplier's own columns like finish / color; value null = back to the computed / default value). assign: [{part, supplier}] = which supplier makes it in a release (supplier id or name, \"buy\" = bought, \"\" = unassigned). exclude / include: [part] (leave out of / back into the BOM). add_rows: [{column: value}] (manual rows for parts not in the model, e.g. purchased items). remove_rows: [\"manual:<id>\"]. defaults: {column: value} (document-wide defaults, e.g. sets = 5; null clears). template: BOM template name (\"\" = default; edit templates with bom_template). project: project number prefix for part numbers. Returns the updated table and what changed.",
          "inputSchema": {"type": "object", "properties": {
             "doc": {"type": "string", "enum": ["foreground", "background"]}, "scope": {"type": "string"},
             "set": {"type": "array", "items": {"type": "object", "properties": {"part": {"type": "string"}, "column": {"type": "string"}, "value": {}}, "required": ["part", "column"]}},
@@ -193,6 +194,18 @@ The spec, a map (bodies, solid ids, undo range) and a log are saved under the do
             "query": {"type": "string"}, "category": {"type": "string"}, "limit": {"type": "integer"}, "pn": {"type": "string"}, "name": {"type": "string"}, "project": {"type": "string"},
             "fields": {"type": "object"}, "supplier": {"type": "object"}, "suppliers": {"type": "array", "items": {"type": "object"}}, "preferred": {}, "aliases": {"type": "array", "items": {"type": "string"}},
             "spec": {"type": "string"}, "notes": {"type": "string"}, "doc": {"type": "string", "enum": ["foreground", "background"]}, "part": {"type": "string"}, "scope": {"type": "string"}}, "required": ["action"]}},
+        {"name": "bom_template", "annotations": {"destructiveHint": true},
+         "description": "BOM templates (global; each is a list of columns that every document's BOM uses; a document picks one with bom_edit template). Column: id, header, source (model data: name / qty / material / volume / group / remark / spec; \"field\" = editable, with default) or formula (e.g. \"ROUNDUP({total_qty}*{redundancy}/{pcs_unit},0)\", {id} = another column; ROUNDUP / CEILING / IF ...), sum (total row). action=list / get (name) / create (name, from?: template name or \"builtin\") / rename (name, new_name) / remove (name; not the last) / edit (name; add_columns: [{id, header, source|formula, default?, sum?, after?: column id}], update_columns: [{id, header?, source?, formula?, default?, sum?}] (null clears an item), remove_columns: [id], order: [ids first], columns: [...] replaces all). Checked before saving: unique ids, known sources, formulas only refer to existing columns, no formula loops. Removing a column keeps the documents' entries for it on file (they come back if the column is re-added with the same id). PLAhelper picks changes up within a second.",
+         "inputSchema": {"type": "object", "properties": {
+            "action": {"type": "string", "enum": ["list", "get", "create", "rename", "remove", "edit"]}, "name": {"type": "string"}, "new_name": {"type": "string"}, "from": {"type": "string"},
+            "add_columns": {"type": "array", "items": {"type": "object"}}, "update_columns": {"type": "array", "items": {"type": "object"}},
+            "remove_columns": {"type": "array", "items": {"type": "string"}}, "order": {"type": "array", "items": {"type": "string"}}, "columns": {"type": "array", "items": {"type": "object"}}}, "required": ["action"]}},
+        {"name": "hole_table", "annotations": {"destructiveHint": true},
+         "description": "Hole tables (global; PLAhelper's hole panel and model_hole size use the active one): per size (\"M4\") clearance (through-hole ⌀), tap (tap drill ⌀), cbD / cbDepth (counterbore), cskD (90° countersink ⌀), in document units (built-in ISO metric in mm). action=list (tables + active) / get (name?: default active) / create (name, from?: table name / \"builtin\"; default copies the active one) / rename (name, new_name) / remove (name; not the last) / select (name: make it active; the hole panel switches) / edit (name?: default active; set: [{size, clearance?, tap?, cbD?, cbDepth?, cskD?}] updates a size or adds one (a new size needs all five), remove_sizes: [size]). Values are checked (> 0) and suspicious ones reported as warnings (tap ≥ clearance, counterbore / countersink not wider than the clearance hole).",
+         "inputSchema": {"type": "object", "properties": {
+            "action": {"type": "string", "enum": ["list", "get", "create", "rename", "remove", "select", "edit"]}, "name": {"type": "string"}, "new_name": {"type": "string"}, "from": {"type": "string"},
+            "set": {"type": "array", "items": {"type": "object", "properties": {"size": {"type": "string"}, "clearance": {"type": "number"}, "tap": {"type": "number"}, "cbD": {"type": "number"}, "cbDepth": {"type": "number"}, "cskD": {"type": "number"}}, "required": ["size"]}},
+            "remove_sizes": {"type": "array", "items": {"type": "string"}}}, "required": ["action"]}},
         {"name": "background_bom", "annotations": {"destructiveHint": true},
          "description": "(Same as bom_export with doc=background.) Scan the BOM of the document open in the background instance (same as PLAhelper's BOM tab: template, user entries, part library, part identity tracking) and export it as CSV next to the document. scope = a configuration name (default: currently visible). Refused when the same document is open in the foreground.",
          "inputSchema": {"type": "object", "properties": {"scope": {"type": "string"}}}},
@@ -436,7 +449,11 @@ fn call_model_tool(name: &str, a: &Value) -> Option<Value> {
             Ok(v) => json_text(&v),
             Err(e) => err(e),
         },
-        "model_hole" => call(api::HOLE_MAKE, pick(a, &["face", "type", "d", "depth", "cbD", "cbDepth", "cskD", "tapD", "at", "offset", "points", "stack", "units"])),
+        "model_hole" => match hole_from_table(a) {
+            Ok(a) if a["d"].is_number() => call(api::HOLE_MAKE, pick(&a, &["face", "type", "d", "depth", "cbD", "cbDepth", "cskD", "tapD", "at", "offset", "points", "stack", "units"])),
+            Ok(_) => err("model_hole needs d or size"),
+            Err(e) => err(e),
+        },
         "model_transaction" => match a["action"].as_str().unwrap_or("") {
             "begin" => call(api::HIST_BEGIN, Value::Null),
             "commit" => call(api::HIST_COMMIT, Value::Null),
@@ -943,7 +960,7 @@ fn doc_scan(d: &Doc, scope: Option<&str>) -> Result<(Value, pla_ui::doc_jobs::Mi
 
 const DOC_TOOLS: &[&str] = &[
     "bom_table", "bom_edit", "bom_export", "draw_parts", "release", "release_history", "suppliers", "configs", "dims", "parts_library",
-    "background_bom", "background_draw", "background_release",
+    "bom_template", "hole_table", "background_bom", "background_draw", "background_release",
 ];
 
 fn doc_tool(name: &str, a: &Value) -> Value {
@@ -962,6 +979,12 @@ fn doc_tool(name: &str, a: &Value) -> Value {
         }
         if name == "parts_library" {
             return parts_library_tool(&a);
+        }
+        if name == "bom_template" {
+            return bom_template_tool(&a);
+        }
+        if name == "hole_table" {
+            return hole_table_tool(&a);
         }
         let d = doc_target(&a)?;
         match name.as_str() {
@@ -1057,14 +1080,16 @@ fn bom_edit_tool(d: &Doc, a: &Value) -> Result<Value, String> {
     let mut log: Vec<String> = Vec::new();
     // 模板
     if let Some(t) = a["template"].as_str() {
-        if !pla_ui::bom_table::list_in(&pla_ui::bom_table::dir()).iter().any(|x| x == t) {
+        // "" = 回到默认(列表第一个)
+        if !t.is_empty() && !pla_ui::bom_table::list_in(&pla_ui::bom_table::dir()).iter().any(|x| x == t) {
             return Err(format!("no BOM template {t}"));
         }
         st.edits.template = t.to_string();
         log.push(format!("template = {t}"));
         st = pla_ui::doc_jobs::DocState { edits: st.edits.clone(), ..pla_ui::doc_jobs::DocState::load(&d.key) };
         let dir = pla_ui::bom_table::dir();
-        st.tpl = pla_ui::bom_table::load_in(&dir, t).unwrap_or_else(|_| pla_ui::bom_table::builtin());
+        let name = if t.is_empty() { pla_ui::bom_table::list_in(&dir).first().cloned().unwrap_or_default() } else { t.to_string() };
+        st.tpl = pla_ui::bom_table::load_in(&dir, &name).unwrap_or_else(|_| pla_ui::bom_table::builtin());
     }
     if let Some(p) = a["project"].as_str() {
         st.edits.project = p.to_string();
@@ -1709,5 +1734,327 @@ fn parts_library_tool(a: &Value) -> Result<Value, String> {
             Ok(out)
         }
         x => Err(format!("unknown action {x} (search / get / add / update / remove / link / from_bom / suggest)")),
+    }
+}
+
+// ---- BOM 模板(全局; 用户 2026-11-18)
+
+fn val_str(v: &Value) -> Option<String> {
+    v.as_str().map(String::from).or_else(|| v.as_f64().map(|x| x.to_string()))
+}
+
+/// 一列的 JSON → Col(在 old 上改; null = 去掉该项)。
+fn tpl_col(v: &Value, old: Option<&pla_ui::bom_table::Col>) -> Result<pla_ui::bom_table::Col, String> {
+    let mut c = old.cloned().unwrap_or(pla_ui::bom_table::Col { id: String::new(), header: String::new(), source: None, formula: None, default: None, sum: false });
+    if let Some(x) = v["id"].as_str() {
+        c.id = x.trim().to_string();
+    }
+    if let Some(x) = v["header"].as_str() {
+        c.header = x.to_string();
+    }
+    let opt = |k: &str, cur: &mut Option<String>| {
+        if let Some(o) = v.as_object().and_then(|m| m.get(k)) {
+            *cur = val_str(o).filter(|s| !s.is_empty());
+        }
+    };
+    opt("source", &mut c.source);
+    opt("formula", &mut c.formula);
+    opt("default", &mut c.default);
+    // 给了公式就是公式列; 改成 source 就不再是公式列
+    if v.get("formula").is_some_and(|f| f.is_string()) && v.get("source").is_none() {
+        c.source = None;
+    }
+    if v.get("source").is_some_and(|s| s.is_string()) && v.get("formula").is_none() {
+        c.formula = None;
+    }
+    if let Some(b) = v["sum"].as_bool() {
+        c.sum = b;
+    }
+    if c.header.is_empty() {
+        c.header = c.id.clone();
+    }
+    if c.source.is_none() && c.formula.is_none() {
+        c.source = Some("field".into());
+    }
+    Ok(c)
+}
+
+fn tpl_json(name: &str, t: &pla_ui::bom_table::Template) -> Value {
+    json!({
+        "name": name,
+        "columns": t.columns.iter().map(|c| json!({ "id": c.id, "header": c.header, "source": c.source, "formula": c.formula, "default": c.default, "sum": c.sum })).collect::<Vec<_>>(),
+    })
+}
+
+fn bom_template_tool(a: &Value) -> Result<Value, String> {
+    use pla_ui::bom_table as bt;
+    let dir = bt::dir();
+    let list = bt::list_in(&dir);
+    let action = a["action"].as_str().unwrap_or("list");
+    let need = |k: &str| -> Result<String, String> {
+        let n = a[k].as_str().ok_or_else(|| format!("needs {k}"))?;
+        list.iter().find(|x| x.as_str() == n).cloned().ok_or_else(|| format!("no BOM template {n} (have: {})", list.join(", ")))
+    };
+    let note = "Documents pick a template by name (bom_edit template); a document whose template is gone falls back to the first one.";
+    match action {
+        "list" => Ok(json!({ "dir": dir.display().to_string(), "templates": list, "builtin": bt::BUILTIN_NAME, "sources": bt::SOURCES })),
+        "get" => {
+            let n = need("name")?;
+            Ok(tpl_json(&n, &bt::load_in(&dir, &n)?))
+        }
+        "create" => {
+            let n = a["name"].as_str().ok_or("needs name")?.trim().to_string();
+            if !bt::valid_name(&n) || list.contains(&n) {
+                return Err(format!("bad or taken template name {n:?}"));
+            }
+            let t = match a["from"].as_str() {
+                Some(f) if f == "builtin" => bt::builtin(),
+                Some(_) => bt::load_in(&dir, &need("from")?)?,
+                None => bt::builtin(),
+            };
+            bt::write_in(&dir, &n, &t)?;
+            let first = bt::list_in(&dir).first() == Some(&n);
+            Ok(json!({ "created": tpl_json(&n, &t), "note": if first { "This name sorts first, so documents that never picked a template now use it (the default = first by name)." } else { "" } }))
+        }
+        "rename" => {
+            let n = need("name")?;
+            let nn = a["new_name"].as_str().ok_or("needs new_name")?.trim().to_string();
+            if !bt::valid_name(&nn) || list.contains(&nn) {
+                return Err(format!("bad or taken template name {nn:?}"));
+            }
+            std::fs::rename(bt::path_in(&dir, &n), bt::path_in(&dir, &nn)).map_err(|e| e.to_string())?;
+            Ok(json!({ "renamed": format!("{n} → {nn}"), "note": note }))
+        }
+        "remove" => {
+            let n = need("name")?;
+            bt::remove_in(&dir, &n)?;
+            Ok(json!({ "removed": n, "note": note }))
+        }
+        "edit" => {
+            let n = need("name")?;
+            let mut t = bt::load_in(&dir, &n)?;
+            let mut log = Vec::new();
+            if let Some(cols) = a["columns"].as_array() {
+                t.columns = cols.iter().map(|c| tpl_col(c, None)).collect::<Result<_, _>>()?;
+                log.push(format!("columns replaced ({})", t.columns.len()));
+            }
+            for c in a["remove_columns"].as_array().into_iter().flatten().filter_map(|x| x.as_str()) {
+                let before = t.columns.len();
+                t.columns.retain(|x| x.id != c);
+                if t.columns.len() == before {
+                    return Err(format!("no column {c}"));
+                }
+                log.push(format!("removed {c}"));
+            }
+            for u in a["update_columns"].as_array().into_iter().flatten() {
+                let id = u["id"].as_str().ok_or("update_columns items need id")?;
+                let i = t.columns.iter().position(|c| c.id == id).ok_or_else(|| format!("no column {id}"))?;
+                let mut u2 = u.clone();
+                if let Some(o) = u2.as_object_mut() {
+                    o.remove("id");
+                }
+                t.columns[i] = tpl_col(&u2, Some(&t.columns[i]))?;
+                log.push(format!("updated {id}"));
+            }
+            for c in a["add_columns"].as_array().into_iter().flatten() {
+                let col = tpl_col(c, None)?;
+                let at = match c["after"].as_str() {
+                    Some(x) => t.columns.iter().position(|c| c.id == x).map(|i| i + 1).ok_or_else(|| format!("no column {x} (after)"))?,
+                    None => t.columns.len(),
+                };
+                log.push(format!("added {}", col.id));
+                t.columns.insert(at, col);
+            }
+            if let Some(order) = a["order"].as_array() {
+                let ids: Vec<&str> = order.iter().filter_map(|x| x.as_str()).collect();
+                let mut out = Vec::new();
+                for id in &ids {
+                    let i = t.columns.iter().position(|c| c.id == *id).ok_or_else(|| format!("no column {id} (order)"))?;
+                    out.push(t.columns.remove(i));
+                }
+                out.append(&mut t.columns); // 没列到的保持原顺序排在后面
+                t.columns = out;
+                log.push("reordered".into());
+            }
+            bt::check(&t)?;
+            bt::write_in(&dir, &n, &t)?;
+            Ok(json!({ "template": tpl_json(&n, &t), "changed": log, "note": "PLAhelper picks the change up within a second; see the result with bom_table." }))
+        }
+        x => Err(format!("unknown action {x} (list / get / create / rename / remove / edit)")),
+    }
+}
+
+// ---- 孔规格方案(全局; 用户 2026-11-18)
+
+fn hole_size_json(s: &pla_ui::hole_presets::HoleSize) -> Value {
+    serde_json::to_value(s).unwrap_or_default()
+}
+
+fn hole_table_tool(a: &Value) -> Result<Value, String> {
+    use pla_ui::hole_presets as hp;
+    let dir = hp::dir();
+    let list = hp::list_in(&dir);
+    let active = hp::active_in(&dir);
+    let action = a["action"].as_str().unwrap_or("list");
+    let pick = |k: &str| -> Result<String, String> {
+        match a[k].as_str() {
+            None if k == "name" => Ok(active.clone()),
+            None => Err(format!("needs {k}")),
+            Some(n) => list.iter().find(|x| x.as_str() == n).cloned().ok_or_else(|| format!("no hole table {n} (have: {})", list.join(", "))),
+        }
+    };
+    let bad_name = |n: &str| n.trim().is_empty() || n.contains(['/', '\\', ':', '*', '?', '"', '<', '>', '|']) || list.iter().any(|x| x == n);
+    match action {
+        "list" => Ok(json!({ "dir": dir.display().to_string(), "tables": list, "active": active, "builtin": hp::BUILTIN_NAME })),
+        "get" => {
+            let n = pick("name")?;
+            Ok(json!({ "name": n, "active": n == active, "sizes": hp::load_in(&dir, &n)?.iter().map(hole_size_json).collect::<Vec<_>>() }))
+        }
+        "create" => {
+            let n = a["name"].as_str().ok_or("needs name")?.trim().to_string();
+            if bad_name(&n) {
+                return Err(format!("bad or taken hole table name {n:?}"));
+            }
+            // from: 省略 = 复制当前方案; "builtin" = 内置 ISO; 其它 = 那个方案
+            let sizes = match a["from"].as_str() {
+                None => hp::load_in(&dir, &active).unwrap_or_else(|_| hp::builtin()),
+                Some("builtin") => hp::builtin(),
+                Some(_) => hp::load_in(&dir, &pick("from")?)?,
+            };
+            hp::write_in(&dir, &n, &sizes)?;
+            Ok(json!({ "created": n, "sizes": sizes.len() }))
+        }
+        "rename" => {
+            let n = pick("name")?;
+            let nn = a["new_name"].as_str().ok_or("needs new_name")?.trim().to_string();
+            hp::rename_in(&dir, &n, &nn)?;
+            if n == active {
+                pla_ui::prefs::save_value("hole_preset", json!(nn))?;
+            }
+            Ok(json!({ "renamed": format!("{n} → {nn}") }))
+        }
+        "remove" => {
+            let n = pick("name")?;
+            if a["name"].is_null() {
+                return Err("remove needs an explicit name".into());
+            }
+            hp::remove_in(&dir, &n)?;
+            Ok(json!({ "removed": n, "active": hp::active_in(&dir) }))
+        }
+        "select" => {
+            let n = pick("name")?;
+            pla_ui::prefs::save_value("hole_preset", json!(n))?;
+            Ok(json!({ "active": n, "note": "PLAhelper's hole panel switches within a second." }))
+        }
+        "edit" => {
+            let n = pick("name")?;
+            let mut sizes = hp::load_in(&dir, &n)?;
+            let mut log = Vec::new();
+            let num = |v: &Value, k: &str| v.get(k).and_then(|x| x.as_f64().or_else(|| x.as_str().and_then(|s| s.trim().parse().ok())));
+            for v in a["set"].as_array().into_iter().flatten() {
+                let size = v["size"].as_str().ok_or("set items need size")?.trim().to_string();
+                let i = sizes.iter().position(|s| s.size.eq_ignore_ascii_case(&size));
+                let mut s = match i {
+                    Some(i) => sizes[i].clone(),
+                    None => {
+                        let all = ["clearance", "tap", "cbD", "cbDepth", "cskD"].iter().all(|k| num(v, k).is_some());
+                        if !all {
+                            return Err(format!("new size {size} needs clearance, tap, cbD, cbDepth and cskD"));
+                        }
+                        hp::HoleSize { size: size.clone(), clearance: 0.0, tap: 0.0, cb_d: 0.0, cb_depth: 0.0, csk_d: 0.0 }
+                    }
+                };
+                for (k, f) in [("clearance", &mut s.clearance), ("tap", &mut s.tap), ("cbD", &mut s.cb_d), ("cbDepth", &mut s.cb_depth), ("cskD", &mut s.csk_d)] {
+                    if let Some(x) = num(v, k) {
+                        *f = x;
+                    }
+                }
+                match i {
+                    Some(i) => {
+                        log.push(format!("updated {size}"));
+                        sizes[i] = s;
+                    }
+                    None => {
+                        log.push(format!("added {size}"));
+                        sizes.push(s);
+                    }
+                }
+            }
+            for r in a["remove_sizes"].as_array().into_iter().flatten().filter_map(|x| x.as_str()) {
+                let before = sizes.len();
+                sizes.retain(|s| !s.size.eq_ignore_ascii_case(r));
+                if sizes.len() == before {
+                    return Err(format!("no size {r} in {n}"));
+                }
+                log.push(format!("removed {r}"));
+            }
+            // 按公称直径排(M2 < M2.5 < M10), 认不出的放后面
+            let dia = |s: &str| s.trim_start_matches(['M', 'm']).split(['x', 'X', '×']).next().and_then(|x| x.parse::<f64>().ok()).unwrap_or(f64::MAX);
+            sizes.sort_by(|x, y| dia(&x.size).total_cmp(&dia(&y.size)));
+            let warn = hp::check(&sizes)?;
+            hp::write_in(&dir, &n, &sizes)?;
+            Ok(json!({ "name": n, "changed": log, "warnings": warn, "sizes": sizes.iter().map(hole_size_json).collect::<Vec<_>>() }))
+        }
+        x => Err(format!("unknown action {x} (list / get / create / rename / remove / select / edit)")),
+    }
+}
+
+/// model_hole 的 size → 按当前孔规格方案填 d / cbD / cbDepth / cskD / tapD(显式给的数值优先)。
+fn hole_from_table(a: &Value) -> Result<Value, String> {
+    let Some(size) = a["size"].as_str().map(|s| s.trim().to_string()).or_else(|| a["size"].as_f64().map(|d| format!("M{d}"))) else {
+        return Ok(a.clone());
+    };
+    use pla_ui::hole_presets as hp;
+    let dir = hp::dir();
+    let name = a["table"].as_str().map(String::from).unwrap_or_else(|| hp::active_in(&dir));
+    let sizes = hp::load_in(&dir, &name)?;
+    hole_params(a, &size, &name, &sizes)
+}
+
+fn hole_params(a: &Value, size: &str, name: &str, sizes: &[pla_ui::hole_presets::HoleSize]) -> Result<Value, String> {
+    let s = sizes.iter().find(|s| s.size.eq_ignore_ascii_case(&size)).ok_or_else(|| format!("no size {size} in hole table {name} (have: {})", sizes.iter().map(|s| s.size.as_str()).collect::<Vec<_>>().join(", ")))?;
+    let tap = a["usage"].as_str() == Some("tap");
+    let mut out = a.clone();
+    let mut fill = |k: &str, v: f64| {
+        if out.get(k).is_none_or(|x| x.is_null()) {
+            out[k] = json!(v);
+        }
+    };
+    let has_stack = a["stack"].as_array().is_some_and(|x| !x.is_empty());
+    fill("d", if tap && !has_stack { s.tap } else { s.clearance });
+    match a["type"].as_str() {
+        Some("counterbore") => {
+            fill("cbD", s.cb_d);
+            fill("cbDepth", s.cb_depth);
+        }
+        Some("countersink") => fill("cskD", s.csk_d),
+        _ => {}
+    }
+    if has_stack {
+        fill("tapD", s.tap);
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hole_size_from_table() {
+        let sizes = pla_ui::hole_presets::builtin();
+        let p = |a: Value| hole_params(&a, a["size"].as_str().unwrap(), "ISO metric", &sizes);
+        let cb = p(json!({"face": "f", "size": "M4", "type": "counterbore"})).unwrap();
+        assert_eq!((cb["d"].as_f64(), cb["cbD"].as_f64(), cb["cbDepth"].as_f64()), (Some(4.5), Some(8.0), Some(4.4)));
+        assert!(cb.get("cskD").is_none());
+        let tap = p(json!({"face": "f", "size": "m4", "usage": "tap"})).unwrap();
+        assert_eq!(tap["d"].as_f64(), Some(3.3));
+        // 组合孔: d = 过孔, 最后一件 tapD = 底孔
+        let st = p(json!({"face": "f", "size": "M5", "usage": "tap", "stack": ["7"]})).unwrap();
+        assert_eq!((st["d"].as_f64(), st["tapD"].as_f64()), (Some(5.5), Some(4.2)));
+        // 显式数值优先
+        let ex = p(json!({"face": "f", "size": "M3", "type": "countersink", "d": 3.2})).unwrap();
+        assert_eq!((ex["d"].as_f64(), ex["cskD"].as_f64()), (Some(3.2), Some(6.7)));
+        assert!(p(json!({"face": "f", "size": "M7"})).unwrap_err().contains("M7"));
     }
 }
