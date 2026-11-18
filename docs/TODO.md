@@ -433,7 +433,12 @@
       `assets.add([..])` / `remove`。已做：垫片 `part.stretch` / `asset.mark` / `asset.exportPack {expect}` / `asset.register` · `unregister`；
       pla-bridge `build_pack`（事务内建 → 标 → 导出到临时文件 → 回滚 → 换上）；`asset_lib`（一个标准一个 pack，`assets/packs` 随软件，「加入 Plasticity」拷到数据目录再登记）；
       打孔面板「资产库」行（加入 Plasticity / 建库…）+ pack 螺钉放好后自动改长度；pla-mcp `model_asset_library` / `model_part_stretch`。
-      **待做**：Plasticity 可见时实测一次建库（如 GB/T 70.1）+ 从库里放螺丝改长度；建好的 pack 提交进 `assets/packs`；安装包带上 `assets/packs`；十字槽 / 一字槽建模。- [ ] **N5 常用件库**：常用件白名单入库（STEP + 缩略图 + 规格字段，SQLite 索引），PLAhelper 搜索面板一键放入当前文档；
+      实测 2026-11-18：GB/T 70.1 全 14 规格建库（15 s，文档不变）+ 从库里放 M4、改成 25 长 ✓；pack 已提交 `assets/packs/PLAhelper GB-T 70.1.plasticitypack`。
+  - [ ] 其余系列按需建库（打孔面板「建库…」或 MCP `model_asset_library`，action=build）。
+  - [ ] 安装包带上 `assets/packs`。
+  - [ ] 十字槽 / 一字槽建模（GB/T 818 / 819.1 / 65 / 67 / 68 现在只有头型，没有槽）。
+  - [ ] 打孔面板（紧固件两行 + 资产库行）屏幕点测（用户）。
+- [ ] **N5 常用件库**：常用件白名单入库（STEP + 缩略图 + 规格字段，SQLite 索引），PLAhelper 搜索面板一键放入当前文档；
       常用度按本人插入次数统计；商家具体型号用到时下载归档。
 - [ ] **N6 AI 建模**：已细化为 **A 自动建模 pipeline**（见下节）。build123d → STEP → 导入 作为退路保留。
 - [ ] **N7 轻量装配**：实例 + PLAhelper 记录装配关系 + 干涉检查 + 隐藏线/SVG 导出。完整配合约束和工程图不在范围内。
