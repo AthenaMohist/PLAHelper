@@ -12,7 +12,9 @@
 
 ## 后台实例(2026-11-18)
 
-`background {action: start|status|stop, doc?}` 起一个独立、隐藏的 Plasticity(不闪现、不进任务栏、不抢焦点 / 鼠标), 之后任何 `model_*` 加 `instance: "background"` 就在它里面做; = 前台(用户正在用的)。细节 / 实测: know-how/background-instance.md。
+`background {action: start|status|stop, doc?}` 起一个独立、隐藏的 Plasticity(不闪现、不进任务栏、不抢焦点 / 鼠标), 之后任何 `model_*` 加 `instance: "background"` 就在它里面做; 不加 = 前台(用户正在用的)。
+`background` 还有 open / save_as(文档); 对后台文档的作业: `background_bom` / `background_draw` / `background_release`。
+**前台开着的同名文档一律拒绝**(打开 / 另存为 / 作业), 报警并提示用户先在前台关掉。细节 / 实测: know-how/background-instance.md。
 
 ## 建模的工作方式(给 agent 的要点)
 
