@@ -428,7 +428,9 @@
       dest: 'destination', destQ: 'destinationOrientation', baseNormal: [0, 0, 1],
       pack: { id: 'id', revision: 'revision', path: 'filePath', assets: 'assets' },
       asset: { id: 'id', name: 'name', folder: 'path', pivot: 'pivot', bbox: 'bbox', hash: 'contentHash' },
-      startWaitMs: 3000, placeWaitMs: 6000, moveSettleMs: 150
+      startWaitMs: 3000, placeWaitMs: 6000, moveSettleMs: 150,
+      // 建库 setPivot 要真的 Vector3 / Quaternion(给数组时导出静默失败, 实测 2026-11-18); 类从视图的这两个字段取
+      pivotCtors: { vec: 'position', quat: 'quaternion' }
     },
     sketchFields: {
       polygon: { center: 'center', point: 'point', orientation: 'orientation', sides: 'vertexCount', radius: 'radius', baseNormal: [0, 0, 1] },
@@ -2648,7 +2650,7 @@
 
   // N5b 建库(实测 2026-11-18, know-how/asset-place.md): 资产 = 标了资产标记的组**或单个实体**; 名字和 pivot 在标记那一刻定下来
   // (之后改名 / setPivot 不进 pack)→ 先改名 + setPivot 再标。ToggleAssetCommand 作用于当前选择, 标完 Plasticity 会自动起一个
-  // MoveItemCommand(agent automatic), 取消即可。pivot 格式同 pack: {position: [米], orientation: [x,y,z,w]}; 不进撤销栈。
+  // MoveItemCommand(agent automatic), 取消即可。pivot = {position: Vector3(米), orientation: Quaternion}(给数组 getPivot 照样回, 但导出静默失败); 不进撤销栈。
   // args = { solid, name, pivot: [x,y,z](文档单位), orientation?: [x,y,z,w](默认不转 = 资产 +Z 同世界 +Z), units? } → { solid, name, asset: true }
   def('asset.mark', 'asset.lib', function (a) {
     a = a || {};
@@ -2659,7 +2661,10 @@
     if (!Array.isArray(a.pivot) || a.pivot.length !== 3) throw new Error('pivot must be [x,y,z]');
     var key = invokeOn('nodes.item2key', [v]);
     invokeOn('nodes.setName', [key, String(a.name)]);
-    invokeOn('nodes.setPivot', [key, { position: a.pivot.map(function (x) { return Number(x) * k; }), orientation: Array.isArray(a.orientation) && a.orientation.length === 4 ? a.orientation.map(Number) : [0, 0, 0, 1] }]);
+    var PC = NAMES.assetDnd.pivotCtors, Vc = v[PC.vec] && v[PC.vec].constructor, Qc = v[PC.quat] && v[PC.quat].constructor;
+    if (!Vc || !Qc) throw new Error('asset.mark: no Vector3 / Quaternion class on the solid view');
+    var o = Array.isArray(a.orientation) && a.orientation.length === 4 ? a.orientation.map(Number) : [0, 0, 0, 1];
+    invokeOn('nodes.setPivot', [key, { position: new Vc(Number(a.pivot[0]) * k, Number(a.pivot[1]) * k, Number(a.pivot[2]) * k), orientation: new Qc(o[0], o[1], o[2], o[3]) }]);
     if (invokeOn('nodes.isAsset', [key])) return { solid: itemIdOf(v), name: String(a.name), asset: true, already: true };
     var s = need('sel.selected');
     var prev = [];
@@ -2668,25 +2673,27 @@
     invokeOn('sel.removeAll', [], s);
     invokeOn('sel.add', [v], s);
     var Toggle = need('cmd.toggleAsset');
-    invokeOn('ed.enqueue', [new Toggle(editor())]);
+    var tg = new Toggle(editor());
+    invokeOn('ed.enqueue', [tg]);
+    // 选上实体后 Plasticity 会自动起 MoveItemCommand(agent automatic), 排在它后面的标记命令就一直等 —— 不是我们的标记命令就取消;
+    // 标上以后再安静 500ms(没有活动命令)才算完(实测 2026-11-18: 第二件起必卡)
     return new Promise(function (res, rej) {
-      var t0 = Date.now();
+      var t0 = Date.now(), tOk = 0;
       (function poll() {
         var ok = false;
         try { ok = invokeOn('nodes.isAsset', [key]); } catch (e) { return rej(e); }
         var act = get('exec.activeCmd');
+        if (act && act !== tg) { try { invokeOn('exec.cancel'); } catch (e) {} }
         if (ok) {
-          // 标完自动起的移动命令: 取消(等一会儿它可能才出现)
-          if (act) { try { invokeOn('exec.cancel'); } catch (e) {} }
-          if (act || Date.now() - t0 > 1500) {
+          if (!tOk) tOk = Date.now();
+          if (!act && Date.now() - tOk > 500) {
             try { invokeOn('sel.removeAll', [], s); prev.forEach(function (x) { invokeOn('sel.add', [x], s); }); } catch (e) {}
             return res({ solid: itemIdOf(v), name: String(a.name), asset: true });
           }
         } else if (Date.now() - t0 > 5000) return rej(new Error('asset.mark: not marked within 5 s'));
         setTimeout(poll, 100);
       })();
-    });
-  }, { async: true });
+    });  }, { async: true });
 
   // N5b: 把文档里所有资产导出成一个 pack(存盘对话框要先在主进程武装, 见 pla-bridge export_pack)。导出会顺手把 pack 登记进 Assets 面板。
   // 不覆盖已有文件(实测: 目标已存在时什么也不写)→ 调用方导到新文件名再换上。

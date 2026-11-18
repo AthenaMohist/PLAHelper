@@ -60,8 +60,13 @@ pack 里的螺钉统一 10mm; 放进来后**只移动杆端的面**, 不整体�
 
 ## 建库 / 分发(N5b, 2026-11-18 实测)
 
+实测建库: GB/T 70.1 全部 14 个规格 → `assets/packs/PLAhelper GB-T 70.1.plasticitypack`(679 KB, 15 s, 文档撤销深度不变, 自动登记);
+从库里放 M4 到 (2000, 0, 20): 支承面正好在 z = 20(头 20..24), 再 part.stretch +15 → 杆端 −5 = M4×25。
+
 - 资产 = 标了资产标记的组**或单个实体**(用户)。`ToggleAssetCommand` 作用于当前选择(一个撤销步); 标完 Plasticity 自动起一个
   `MoveItemCommand`(agent automatic, 不是选 pivot), 取消即可。`nodes.isAsset / findAllAssets` 可查。
+- **setPivot 要真的 Vector3 / Quaternion**(类从视图的 position / quaternion 取): 给数组时 getPivot 照样回, 但之后导出**静默不写文件**。
+- 选上实体时 Plasticity 会自动起 MoveItemCommand, 排在后面的 ToggleAsset 就一直等(第二件起必卡)→ 标记期间不是标记命令的活动命令都取消。
 - **名字和 pivot 在标记那一刻定下来**: 之后 `setName` / `setPivot` 不进 pack。`nodes.setPivot(key, {position: [米], orientation: [x,y,z,w]})`
   (格式同 pack 里的 pivot; 不进撤销栈); 不设 = 包围盒中心(用户旧 pack 的 pivot 就是这样: 螺钉 + 负体的中心)。
 - `ExportAssetPackCommand`: 主进程 `dialog.showSaveDialog`(title "Export asset pack", 过滤 .plasticitypack), 用 export.rs 的一次性应答即可,
