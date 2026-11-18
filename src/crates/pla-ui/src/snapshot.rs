@@ -235,7 +235,20 @@ static DOC_CACHE: std::sync::Mutex<Option<(String, PathBuf, std::time::Instant)>
 const DOC_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// 带缓存的「当前文档路径」。
+/// 后台作业(pla-mcp background_*)明确知道文档路径: 钉住 doc_key → 路径, 优先于"最近打开"的查找
+/// (后台实例开的文件不一定在用户的最近列表里)。
+static DOC_PINS: std::sync::Mutex<Option<std::collections::HashMap<String, PathBuf>>> = std::sync::Mutex::new(None);
+
+pub fn pin_doc_path(doc_key: &str, path: &std::path::Path) {
+    if let Ok(mut g) = DOC_PINS.lock() {
+        g.get_or_insert_with(Default::default).insert(doc_key.to_string(), path.to_path_buf());
+    }
+}
+
 pub fn latest_doc_cached(doc_key: &str) -> Option<PathBuf> {
+    if let Some(p) = DOC_PINS.lock().ok().and_then(|g| g.as_ref().and_then(|m| m.get(doc_key).cloned())) {
+        return Some(p);
+    }
     let now = std::time::Instant::now();
     if let Ok(g) = DOC_CACHE.lock() {
         if let Some((k, p, t)) = &*g {

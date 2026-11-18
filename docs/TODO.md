@@ -443,7 +443,9 @@
       pla-mcp `background` 工具 + 所有 `model_*` 的 `instance: "background"`；导出 / 建库的另存为按实例应答（inspector = 代理 + 1）。
       实测：全程无可见窗口；建件 / 放资产 / 截图 / 后台建库 GB/T 97.1（31 s）都正常。
   - [ ] pla-ui 里给后台实例一个状态 / 开关（现在只有 MCP 能起停）。
-  - [ ] 后台任务完成后可选另存为指定文件（`file:save-as` + savePath）、打开指定文档做批处理（如批量出图）。
+  - [x] 后台打开 / 另存为文档；**前台开着的同名文档一律拒绝**（打开 / 另存为 / 每个作业前都查，报警并提示先关前台）。
+  - [x] 后台扫 BOM / 出图 / 外发包（pla-mcp `background_bom` / `background_draw` / `background_release`；逻辑抽到 `pla_ui::doc_jobs`，pla-ui 共用）。实测 bgtest：BOM 6 种、出图 2 张 86 s + 合订、外发 R1。
+  - [ ] 后台装配图、按配置出图；外发包在有供应商分配的真项目上验一次（分包 + 缺件清单）。
 - [ ] **N5 常用件库**：常用件白名单入库（STEP + 缩略图 + 规格字段，SQLite 索引），PLAhelper 搜索面板一键放入当前文档；
       常用度按本人插入次数统计；商家具体型号用到时下载归档。
 - [ ] **N6 AI 建模**：已细化为 **A 自动建模 pipeline**（见下节）。build123d → STEP → 导入 作为退路保留。

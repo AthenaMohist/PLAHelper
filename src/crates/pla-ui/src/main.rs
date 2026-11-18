@@ -4838,24 +4838,10 @@ impl PlaApp {
 
     /// 零件第一次出图: 建一张图(图名 = 料号或名字, 重名加 -2…; 密度按材料猜); 已有的跟着 BOM 换实例。
     fn draw_ensure(&mut self, key: &str, title: &std::collections::BTreeMap<String, String>, member: &(String, String)) {
-        if self.draw_sheets.get(key).is_none() {
-            let want = pla_ui::drawing::base_name(title.get("pn").map(|s| s.as_str()).unwrap_or(""), title.get("name").map(|s| s.as_str()).unwrap_or(&member.1));
-            let base = self.draw_sheets.unique_base(key, &want);
-            let mut s = pla_ui::drawing::Sheet::new(key, &base, &member.0, &member.1);
-            s.density = title.get("material").and_then(|m| pla_ui::drawing::guess_density(m));
-            self.draw_sheets.upsert(s);
+        if pla_ui::doc_jobs::ensure_sheet(&mut self.draw_sheets, key, title, member) {
             self.draw_save();
-        } else if let Some(mut s) = self.draw_sheets.get(key).cloned() {
-            // 实例可能换了(删了重建): 跟着 BOM 走
-            if !member.0.is_empty() && (s.member != member.0 || s.model_name != member.1) {
-                s.member = member.0.clone();
-                s.model_name = member.1.clone();
-                self.draw_sheets.upsert(s);
-                self.draw_save();
-            }
         }
     }
-
     fn prefs_get(&mut self) -> &pla_ui::drawing::Prefs {
         self.draw_prefs.get_or_insert_with(pla_ui::drawing::Prefs::load)
     }
@@ -4948,35 +4934,28 @@ impl PlaApp {
     fn draw_compile(&mut self, key: &str, title: std::collections::BTreeMap<String, String>) {
         let (Some(s), Some(tools)) = (self.draw_sheets.get(key).cloned(), pla_ui::drawing::tools_dir()) else { return };
         let dir = pla_ui::drawing::dir(&self.doc_key);
-        // D6: 偏好(标题栏默认字段、技术要求)垫在底下, BOM / 本图覆盖
-        let (title, mut run) = self.prefs_get().apply(&s, &title);
-        run.title = title;
-        // 变更表: 外发过的 ECN 里涉及这个零件的最近两条(模板字段 rev1_* 在下、rev2_* 在上)
-        let hist = pla_ui::release::History::load(&pla_ui::release::STORE.dir(&self.doc_key));
-        for (i, (no, desc, by, date)) in hist.rev_rows(key).into_iter().enumerate() {
-            let r = i + 1;
-            run.title.insert(format!("rev{r}_ecn"), no);
-            run.title.insert(format!("rev{r}_desc"), desc);
-            run.title.insert(format!("rev{r}_by"), by);
-            run.title.insert(format!("rev{r}_date"), date);
-        }
-        let spec = if pla_ui::drawing::is_asm(key) {
-            pla_ui::drawing::asm_spec(&run, &dir, self.draw_asm.get(key).map(|v| v.as_slice()).unwrap_or(&[]))
-        } else {
-            let mut v = pla_ui::drawing::spec(&run, &dir, Some(&pla_ui::dims::path(&self.doc_key)));
-            // D4: 装配图上记下的配合 → 本件孔 / 轴的公差
-            let fits: Vec<serde_json::Value> = self.draw_sheets.sheets.iter().filter(|a| pla_ui::drawing::is_asm(&a.key)).flat_map(|a| pla_ui::drawing::part_fits(&a.fits, key)).collect();
-            if !fits.is_empty() {
-                v["fits"] = serde_json::json!(fits);
+        let spec_file = if pla_ui::drawing::is_asm(key) {
+            // D6: 偏好(标题栏默认字段、技术要求)垫在底下, BOM / 本图覆盖
+            let (title, mut run) = self.prefs_get().apply(&s, &title);
+            run.title = title;
+            let spec = pla_ui::drawing::asm_spec(&run, &dir, self.draw_asm.get(key).map(|v| v.as_slice()).unwrap_or(&[]));
+            let spec_file = pla_ui::drawing::file(&dir, &s, "spec.json");
+            if let Err(e) = std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&spec_file, serde_json::to_vec_pretty(&spec).unwrap_or_default())) {
+                self.set_notice((true, t!("写出图方案失败: {e}", "Writing the drawing spec failed: {e}")));
+                return;
             }
-            v
-        };
-        let spec_file = pla_ui::drawing::file(&dir, &s, "spec.json");
-        if let Err(e) = std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&spec_file, serde_json::to_vec_pretty(&spec).unwrap_or_default())) {
-            self.set_notice((true, t!("写出图方案失败: {e}", "Writing the drawing spec failed: {e}")));
-            return;
-        }
-        let (tx, rx) = std::sync::mpsc::channel();
+            spec_file
+        } else {
+            // 零件图: 与后台作业共用(pla_ui::doc_jobs, 偏好 + 变更表 + 配合)
+            let prefs = self.prefs_get().clone();
+            match pla_ui::doc_jobs::write_part_spec(&self.doc_key, key, &self.draw_sheets, &prefs, &title) {
+                Ok(p) => p,
+                Err(e) => {
+                    self.set_notice((true, t!("写出图方案失败: {e}", "Writing the drawing spec failed: {e}")));
+                    return;
+                }
+            }
+        };        let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let _ = tx.send(pla_ui::drawing::compile(&tools, &spec_file));
         });
@@ -5060,106 +5039,49 @@ impl PlaApp {
     /// 增量更新(每次 BOM 扫描回包): 记 key → 实例 id, 找出"同一实体换了 key"的零件, 把 BOM 填写 / 链接 / 排除和出图设置迁过去。
     /// 以前没有 ids 记录的旧图: 用图上记的实体 id(member)补上, 这样早先因改模型变成"不在当前范围"的图也能接回来。
     fn identity_migrate(&mut self, scan: &serde_json::Value) {
-        let dir = pla_ui::drawing::dir(&self.doc_key);
-        let mut sheets = if self.draw_doc == self.doc_key { self.draw_sheets.clone() } else { pla_ui::drawing::load_in(&dir) };
-        let mut ids = pla_ui::identity::load(&self.doc_key);
-        for s in sheets.sheets.iter().filter(|s| !pla_ui::drawing::is_asm(&s.key) && !s.member.is_empty()) {
-            ids.entry(s.key.clone()).or_insert_with(|| vec![s.member.clone()]);
-        }
-        let renames = pla_ui::identity::track(&mut ids, scan);
-        if let Err(e) = pla_ui::identity::save(&self.doc_key, &ids) {
-            self.set_notice((true, t!("零件身份记录保存失败: {e}", "Saving part identities failed: {e}")));
-        }
-        if renames.is_empty() {
+        let m = match pla_ui::doc_jobs::identity_migrate(&self.doc_key, scan) {
+            Ok(m) => m,
+            Err(e) => {
+                self.set_notice((true, t!("零件身份迁移失败: {e}", "Part identity migration failed: {e}")));
+                return;
+            }
+        };
+        if m.renames.is_empty() {
             return;
         }
-        let mut edits = if self.bom_edits_doc == self.doc_key { self.bom_edits.clone() } else { pla_ui::bom_table::load_edits(&self.doc_key) };
-        let (mut nb, mut nd) = (0, 0);
-        let rroot = pla_ui::release::STORE.dir(&self.doc_key);
-        let mut hist = pla_ui::release::History::load(&rroot);
-        let mut hist_changed = false;
-        for (old, new) in &renames {
-            nb += usize::from(edits.rename_key(old, new));
-            nd += usize::from(sheets.rename_key(&dir, old, new));
-            hist_changed |= hist.rename_key(old, new);
+        for (old, new) in &m.renames {
             if self.draw_sel.as_deref() == Some(old.as_str()) {
                 self.draw_sel = Some(new.clone());
             }
         }
-        if hist_changed {
-            if let Err(e) = hist.save(&rroot) {
-                self.set_notice((true, t!("版本记录保存失败: {e}", "Saving the version history failed: {e}")));
+        if m.bom > 0 && self.bom_edits_doc == self.doc_key {
+            self.bom_edits = pla_ui::bom_table::load_edits(&self.doc_key);
+            self.bom_cell_buf.clear();
+        }
+        if m.drawings > 0 && self.draw_doc == self.doc_key {
+            self.draw_sheets = pla_ui::drawing::load_in(&pla_ui::drawing::dir(&self.doc_key));
+            if let Some(k) = self.draw_sel.clone() {
+                self.draw_load(&k);
             }
         }
-        if nb > 0 {
-            if let Err(e) = pla_ui::bom_table::save_edits(&self.doc_key, &edits) {
-                self.set_notice((true, t!("BOM 填写保存失败: {e}", "Saving BOM entries failed: {e}")));
-            }
-            if self.bom_edits_doc == self.doc_key {
-                self.bom_edits = edits;
-                self.bom_cell_buf.clear();
-            }
-        }
-        if nd > 0 {
-            if let Err(e) = pla_ui::drawing::save_in(&dir, &sheets) {
-                self.set_notice((true, t!("出图设置保存失败: {e}", "Saving drawing settings failed: {e}")));
-            }
-            if self.draw_doc == self.doc_key {
-                self.draw_sheets = sheets;
-                if let Some(k) = self.draw_sel.clone() {
-                    self.draw_load(&k);
-                }
-            }
-        }
-        if nb + nd > 0 {
+        if m.bom + m.drawings > 0 {
+            let (nb, nd) = (m.bom, m.drawings);
             self.set_notice((
                 false,
                 t!(
                     "{} 个零件改过模型: 沿用了原来的 BOM 填写({nb})和出图设置({nd}), 图标成「待重出」",
                     "{} part(s) changed shape: kept their BOM entries ({nb}) and drawing settings ({nd}); drawings marked for redraw",
-                    renames.len()
+                    m.renames.len()
                 ),
             ));
         }
     }
-
     // ---------------------------------------------------------------- MCP 桥(pla-mcp)
     /// BOM 行 → 每个零件: 标题栏字段(pn / name / material / finish / qty)、第一个实例、给 MCP 的摘要。
-    fn bom_parts(&self) -> Vec<(std::collections::BTreeMap<String, String>, (String, String), pla_ui::mcp_bridge::PartInfo)> {
+    fn bom_parts(&self) -> Vec<pla_ui::doc_jobs::Part> {
         let Some(Ok(v)) = &self.bom_result else { return Vec::new() };
-        let (rows, _) = pla_ui::bom_table::build(v, &self.bom_tpl, &self.bom_edits, &self.lib);
-        let cols = &self.bom_tpl.columns;
-        let mut out = Vec::new();
-        for r in rows.iter().filter(|r| !r.manual) {
-            let get = |id: &str| cols.iter().position(|c| c.id == id).map(|i| r.cells[i].trim().to_string()).unwrap_or_default();
-            let line = v["lines"].as_array().into_iter().flatten().find(|l| l["key"].as_str() == Some(r.key.as_str()));
-            let m = line.and_then(|l| l["members"].as_array()).and_then(|a| a.first());
-            let member = m.map(|m| (m["id"].as_str().unwrap_or("").to_string(), m["name"].as_str().unwrap_or("").to_string())).unwrap_or_default();
-            let qty = line.and_then(|l| l["qty"].as_u64()).unwrap_or(1);
-            let mut title = std::collections::BTreeMap::new();
-            for id in ["pn", "name", "material", "finish"] {
-                let x = get(id);
-                if !x.is_empty() {
-                    title.insert(id.to_string(), x);
-                }
-            }
-            title.insert("qty".into(), qty.to_string());
-            let name = if get("name").is_empty() { member.1.clone() } else { get("name") };
-            let bought = line.is_some_and(|l| pla_ui::drawing::member_bought(&l["members"], &self.draw_sheets.purchased)) || pla_ui::drawing::looks_standard(&name, &get("pn"));
-            let info = pla_ui::mcp_bridge::PartInfo {
-                key: r.key.clone(),
-                pn: get("pn"),
-                name,
-                qty,
-                material: get("material"),
-                supplier: pla_ui::release::process_of(&self.bom_edits, &r.key).to_string(),
-                bought,
-            };
-            out.push((title, member, info));
-        }
-        out
+        pla_ui::doc_jobs::bom_parts(v, &self.bom_tpl, &self.bom_edits, &self.lib, &self.draw_sheets.purchased)
     }
-
     fn mcp_tick(&mut self) {
         if self.mcp_checked.is_some_and(|t| t.elapsed() < Duration::from_millis(300)) {
             return;
@@ -5317,51 +5239,13 @@ impl PlaApp {
     // ---------------------------------------------------------------- 外发包
     /// 各家的包内容(按当前 BOM / 填写 / 图)。
     fn rel_packs(&self, rows: &[pla_ui::bom_table::Row], totals: &[String], sheets: &pla_ui::drawing::Sheets) -> (Vec<pla_ui::release::Pack>, String) {
-        use pla_ui::release as rel;
-        let ddir = pla_ui::drawing::dir(&self.doc_key);
-        let mut packs = Vec::new();
-        for s in &self.suppliers.list {
-            let (h, t, keys) = rel::supplier_table(s, &self.bom_tpl, rows, &self.bom_edits);
-            if t.is_empty() {
-                continue;
-            }
-            let mut files = Vec::new();
-            let mut missing = Vec::new();
-            for (k, row) in keys.iter().zip(&t) {
-                let (f, m) = rel::part_files(&ddir, sheets.get(k), &s.files);
-                files.extend(f);
-                if !m.is_empty() {
-                    missing.push((row.get(2).cloned().unwrap_or_default(), m));
-                }
-            }
-            packs.push(rel::Pack { supplier: s.clone(), csv: rel::table_csv(&h, &t), files, missing });
-        }
-        (packs, pla_ui::bom_table::to_csv(&self.bom_tpl, rows, totals))
+        pla_ui::doc_jobs::rel_packs(&self.doc_key, &self.suppliers, &self.bom_tpl, rows, totals, &self.bom_edits, sheets)
     }
-
     /// 当前全部零件的快照(外发时存, 之后跟它比出变更)。
     fn rel_snapshot(&self) -> std::collections::BTreeMap<String, pla_ui::release::PartSnap> {
-        let ids = pla_ui::identity::load(&self.doc_key);
         let sheets = if self.draw_doc == self.doc_key { self.draw_sheets.clone() } else { pla_ui::drawing::load_in(&pla_ui::drawing::dir(&self.doc_key)) };
-        self.bom_parts()
-            .into_iter()
-            .map(|(_, member, p)| {
-                let sh = sheets.get(&p.key);
-                let snap = pla_ui::release::PartSnap {
-                    pn: p.pn,
-                    name: p.name,
-                    qty: p.qty,
-                    material: p.material,
-                    supplier: p.supplier,
-                    ids: ids.get(&p.key).cloned().unwrap_or_else(|| if member.0.is_empty() { vec![] } else { vec![member.0.clone()] }),
-                    sheet: sh.map(pla_ui::release::sheet_hash).unwrap_or_default(),
-                    upload: sh.and_then(|s| s.uploaded.as_ref()).map(|u| format!("{} {}", u.file, u.date)).unwrap_or_default(),
-                };
-                (p.key, snap)
-            })
-            .collect()
+        pla_ui::doc_jobs::rel_snapshot(&self.doc_key, &self.bom_parts(), &sheets)
     }
-
     /// 点了「生成外发包」: 记版本(新外发冻结 ECN / 同一批补发重算)→ ECN 涉及的已出图零件重出(变更表带 ECN)→ 出完写包(rel_tick)。
     fn rel_start(&mut self) {
         use pla_ui::release as rel;

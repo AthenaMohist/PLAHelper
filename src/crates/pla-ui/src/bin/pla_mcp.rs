@@ -146,8 +146,17 @@ The spec, a map (bodies, solid ids, undo range) and a log are saved under the do
          "description": "Group several model_exec / model_hole calls so they can be undone together. action=begin (remember the undo depth) → work → commit (keep) or rollback (undo everything since begin, including anything the user did in between; refused if the undo stack below begin was changed). action=undo with steps = undo the last N steps (like Ctrl+Z). action=state = undo / redo depth. The transaction survives shim updates (kept on the page).",
          "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["begin", "commit", "rollback", "undo", "state"]}, "steps": {"type": "integer", "description": "for undo: how many steps (default 1)"}}, "required": ["action"]}},
         {"name": "background", "annotations": {"destructiveHint": true},
-         "description": "A separate, hidden Plasticity instance for independent jobs, so the user can keep working (browser, or their own Plasticity on another project) undisturbed: it never shows a window, never appears in the taskbar, never takes focus, and never moves the real mouse. action=start (doc?: a .plasticity file to open; uses a copy of the user's login/settings in its own data folder; ~5 s) / status / stop. Then pass instance: \"background\" to any model_* tool to work in it. Native dialogs there never show: save dialogs are answered by PLAhelper (pack / STEP export), other message boxes are auto-cancelled and logged (see status).",
-         "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["start", "status", "stop"]}, "doc": {"type": "string"}}, "required": ["action"]}}
+         "description": "A separate, hidden Plasticity instance for independent jobs, so the user can keep working (browser, or their own Plasticity on another project) undisturbed: it never shows a window, never appears in the taskbar, never takes focus, and never moves the real mouse. action=start (doc?: a .plasticity file to open; uses a copy of the user's login/settings in its own data folder; ~5 s) / open (doc, discard?: drop unsaved changes) / save_as (doc) / status / stop. A document that is open in the user's foreground Plasticity is REFUSED (open / save_as / jobs) - tell the user to close it there first. Jobs on the open document: background_bom / background_draw / background_release. Then pass instance: \"background\" to any model_* tool to work in it. Native dialogs there never show: save dialogs are answered by PLAhelper (pack / STEP export), other message boxes are auto-cancelled and logged (see status).",
+         "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["start", "status", "stop", "open", "save_as"]}, "doc": {"type": "string"}, "discard": {"type": "boolean"}}, "required": ["action"]}},
+        {"name": "background_bom", "annotations": {"destructiveHint": true},
+         "description": "Scan the BOM of the document open in the background instance (same as PLAhelper's BOM tab: template, user entries, part library, part identity tracking) and export it as CSV next to the document. scope = a configuration name (default: currently visible). Refused when the same document is open in the foreground.",
+         "inputSchema": {"type": "object", "properties": {"scope": {"type": "string"}}}},
+        {"name": "background_draw", "annotations": {"destructiveHint": true},
+         "description": "Make 2D drawings in the background instance: STEP export from the hidden Plasticity + compile (PLAhelper's drawing pipeline, same settings / preferences / revision table as the drawing tab; ~20-90 s per sheet; part drawings, not assembly drawings). parts = [\"undrawn\"] (not drawn or model changed), [\"all\"], or keys / part numbers / names. export = force STEP re-export. Two or more sheets are also combined into one PDF. Refused when the same document is open in the foreground.",
+         "inputSchema": {"type": "object", "properties": {"parts": {"type": "array", "items": {"type": "string"}}, "export": {"type": "boolean"}}, "required": ["parts"]}},
+        {"name": "background_release", "annotations": {"destructiveHint": true},
+         "description": "Write a release (external) package for the background document, like PLAhelper's release tab: records the version (a new release freezes an ECN of everything changed since the last one; amend = true re-sends the same batch), redraws the drawn parts the ECN touches so their revision table shows it, then writes the master BOM plus one folder per supplier (CNC / 3D printing / ... with that supplier's BOM columns and files). Refused when the same document is open in the foreground.",
+         "inputSchema": {"type": "object", "properties": {"amend": {"type": "boolean"}}}}
     ]);
     // 所有 model_* 工具都可以指向后台实例
     if let Some(arr) = tools.as_array_mut() {
@@ -174,14 +183,20 @@ fn bg_script() -> Option<std::path::PathBuf> {
 /// background 工具: 起 / 查 / 停后台隐藏实例(node pla-bg.js, 一行 JSON)。
 fn background_tool(a: &Value) -> Value {
     let action = a["action"].as_str().unwrap_or("status");
-    if !matches!(action, "start" | "status" | "stop") {
-        return err(format!("unknown action {action} (start / status / stop)"));
+    if !matches!(action, "start" | "status" | "stop" | "open" | "save_as") {
+        return err(format!("unknown action {action} (start / status / stop / open / save_as)"));
     }
     let Some(script) = bg_script() else { return err(String::from("tools/pla-cdp/pla-bg.js not found next to pla-mcp")) };
     let mut cmd = std::process::Command::new("node");
-    cmd.arg(&script).arg(action);
-    if let (Some(doc), "start") = (a["doc"].as_str(), action) {
+    cmd.arg(&script).arg(if action == "save_as" { "save-as" } else { action });
+    if let Some(doc) = a["doc"].as_str().filter(|_| matches!(action, "start" | "open" | "save_as")) {
         cmd.arg("--doc").arg(doc);
+    }
+    if a["discard"].as_bool() == Some(true) && action == "open" {
+        cmd.arg("--discard");
+    }
+    if matches!(action, "open" | "save_as") && a["doc"].as_str().is_none() {
+        return err(format!("{action} needs doc (a .plasticity path)"));
     }
     #[cfg(windows)]
     {
@@ -259,6 +274,9 @@ fn call_model_tool(name: &str, a: &Value) -> Option<Value> {
     let h = if bg { 0 } else { hwnd() };
     if name == "background" {
         return Some(background_tool(a));
+    }
+    if name.starts_with("background_") {
+        return Some(bg_job(name, a));
     }
     let json_text = |v: &Value| text(serde_json::to_string_pretty(v).unwrap_or_default());
     let call = |api_name: &str, args: Value| match rt().block_on(pla_bridge::query::call_once(port(), h, api_name, &args)) {
@@ -773,4 +791,258 @@ fn main() {
             let _ = out.flush();
         }
     }
+}
+
+// ---------------------------------------------------------------- 后台作业(用户 2026-11-18: 后台实例也要能扫 BOM、出图、出外发包)
+// 只在后台实例里开着的**已保存文档**上做(pla-bg.js open / start --doc 记下的那个); 每次先确认前台没开同名文档(同名就报警拒绝)。
+// 逻辑与 pla-ui 共用 pla_ui::doc_jobs; 数据写进该文档的 .pla/… 存档, 前台以后打开同一个文档时 pla-ui 看到的是同一份。
+
+/// 后台实例的状态文件(pla-bg.js 写)。
+fn bg_state() -> Value {
+    let base = std::env::var("LOCALAPPDATA").unwrap_or_default();
+    let p = std::path::Path::new(&base).join("PLAhelper").join("bg-plasticity").join("state.json");
+    std::fs::read_to_string(p).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(Value::Null)
+}
+
+fn doc_stem(p: &str) -> String {
+    let b = std::path::Path::new(p).file_name().map(|x| x.to_string_lossy().to_string()).unwrap_or_default();
+    let b = b.trim_start_matches('*').trim();
+    let lower = b.to_lowercase();
+    lower.strip_suffix(".plasticity").unwrap_or(&lower).trim().to_string()
+}
+
+/// 前台 Plasticity 各窗口标题里的文档名(前台没开 = 空)。
+fn foreground_stems() -> Vec<String> {
+    let js = "(() => JSON.stringify(process.mainModule.require('electron').BrowserWindow.getAllWindows().map((w) => w.getTitle())))()";
+    match rt().block_on(pla_bridge::export::main_eval_once(pla_bridge::export::INSPECT_PORT, js)) {
+        Ok(v) => serde_json::from_str::<Vec<String>>(v.as_str().unwrap_or("[]"))
+            .unwrap_or_default()
+            .iter()
+            .map(|t| doc_stem(t.split(" - ").next().unwrap_or("")))
+            .filter(|s| !s.is_empty() && s != "untitled" && s != "plasticity")
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// 后台作业的文档: (doc_key, 路径)。没开文档 / 前台开着同名 → 错误(后者是报警)。
+fn bg_doc() -> Result<(String, std::path::PathBuf), String> {
+    let st = bg_state();
+    let Some(doc) = st["doc"].as_str().filter(|d| !d.is_empty()) else {
+        return Err("the background instance has no saved document open - background {action: open, doc} (or start with doc) first".into());
+    };
+    // 后台窗口现在的标题要还是它(防止中途换了)
+    let js = "(() => JSON.stringify((process.mainModule.require('electron').BaseWindow || process.mainModule.require('electron').BrowserWindow).getAllWindows().filter((w) => w.webContents).map((w) => w.webContents.getTitle())))()";
+    let titles: Vec<String> = rt()
+        .block_on(pla_bridge::export::main_eval_once(pla_bridge::export::inspect_port_for(BG_PORT), js))
+        .ok()
+        .and_then(|v| serde_json::from_str(v.as_str().unwrap_or("[]")).ok())
+        .ok_or("the background instance is not running - background {action: start} first")?;
+    let stem = doc_stem(doc);
+    if !titles.iter().any(|t| doc_stem(t.split(" - ").next().unwrap_or("")) == stem) {
+        return Err(format!("the background instance no longer shows {doc} (titles: {titles:?}) - open it again"));
+    }
+    if foreground_stems().contains(&stem) {
+        return Err(format!(
+            "REFUSED: \"{}\" is also open in your foreground Plasticity - background jobs must not work on a document that is open in the foreground (both would write the same files). Close it in the foreground first. / 拒绝执行: 前台 Plasticity 也开着这个文档, 后台不能同时处理同一个文档。请先在前台关掉它。",
+            std::path::Path::new(doc).file_name().map(|x| x.to_string_lossy().to_string()).unwrap_or_default()
+        ));
+    }
+    let key = std::path::Path::new(doc).file_stem().map(|x| x.to_string_lossy().to_string()).unwrap_or_default();
+    let path = std::path::PathBuf::from(doc);
+    pla_ui::snapshot::pin_doc_path(&key, &path);
+    Ok((key, path))
+}
+
+/// 扫 BOM(后台实例)+ 零件身份迁移。scope = 配置名(None = 当前可见)。
+fn bg_scan(key: &str, scope: Option<&str>) -> Result<(Value, pla_ui::doc_jobs::Migrated), String> {
+    let args = match scope {
+        None => json!({}),
+        Some(cf) => {
+            let st = pla_ui::configs::STORE.load(key, cf).ok_or_else(|| format!("configuration {cf} not found for {key}"))?;
+            json!({ "members": pla_ui::configs::members(&st).into_iter().map(|m| m.0).collect::<Vec<_>>() })
+        }
+    };
+    let scan = rt().block_on(pla_bridge::query::call_once(BG_PORT, 0, pla_bridge::shim::api::BOM_SCAN, &args)).map_err(|e| format!("BOM scan: {e:#}"))?;
+    let m = pla_ui::doc_jobs::identity_migrate(key, &scan)?;
+    Ok((scan, m))
+}
+
+fn bg_job(name: &str, a: &Value) -> Value {
+    let r = (|| -> Result<Value, String> {
+        let (key, path) = bg_doc()?;
+        match name {
+            "background_bom" => bg_bom(&key, &path, a),
+            "background_draw" => bg_draw(&key, &path, a),
+            "background_release" => bg_release(&key, &path, a),
+            x => Err(format!("unknown tool {x}")),
+        }
+    })();
+    match r {
+        Ok(v) => text(serde_json::to_string_pretty(&v).unwrap_or_default()),
+        Err(e) => err(e),
+    }
+}
+
+fn bg_bom(key: &str, path: &std::path::Path, a: &Value) -> Result<Value, String> {
+    let scope = a["scope"].as_str().filter(|s| !s.is_empty());
+    let (scan, m) = bg_scan(key, scope)?;
+    let st = pla_ui::doc_jobs::DocState::load(key);
+    let (rows, totals) = pla_ui::bom_table::build(&scan, &st.tpl, &st.edits, &st.lib);
+    let label = scope.map_or_else(|| "当前可见".to_string(), |s| format!("配置 {s}"));
+    let csv = pla_ui::bom::export_text(key, &label, &pla_ui::bom_table::to_csv(&st.tpl, &rows, &totals))?;
+    let parts: Vec<Value> = pla_ui::doc_jobs::bom_parts(&scan, &st.tpl, &st.edits, &st.lib, &st.sheets.purchased).into_iter().map(|p| json!(p.2)).collect();
+    Ok(json!({ "document": path.display().to_string(), "scope": label, "parts": parts, "csv": csv.display().to_string(), "identityRenames": m.renames.len() }))
+}
+
+/// 出一张零件图(后台实例导 STEP → 编译)。返回 (图名, PDF 路径)。
+fn bg_draw_one(key: &str, st: &mut pla_ui::doc_jobs::DocState, part: &pla_ui::doc_jobs::Part, export: bool, prefs: &pla_ui::drawing::Prefs, tools: &std::path::Path) -> Result<(String, String), String> {
+    let (title, member, info) = part;
+    if pla_ui::doc_jobs::ensure_sheet(&mut st.sheets, &info.key, title, member) {
+        st.save_sheets()?;
+    }
+    let s = st.sheets.get(&info.key).cloned().ok_or("sheet vanished")?;
+    if s.locked() {
+        return Err(format!("{} is locked to an uploaded drawing", s.base));
+    }
+    let dir = pla_ui::drawing::dir(key);
+    let step = pla_ui::drawing::file(&dir, &s, "step");
+    if export || !step.exists() {
+        if s.member.is_empty() {
+            return Err(format!("{}: no model solid (rescan the BOM)", s.base));
+        }
+        let v = rt()
+            .block_on(pla_bridge::query::export_step_once(BG_PORT, 0, &step.display().to_string(), std::slice::from_ref(&s.member), Some("AP214")))
+            .map_err(|e| format!("{}: STEP export: {e:#}", s.base))?;
+        let mut s2 = s.clone();
+        if let Some(p) = v["parts"].as_array().filter(|a| a.len() == 1).and_then(|a| a.first()) {
+            s2.volume = p["volume"].as_f64();
+            s2.area = p["area"].as_f64();
+        }
+        s2.exported = pla_ui::parts_lib::today();
+        st.sheets.upsert(s2);
+        st.save_sheets()?;
+    }
+    let mut t = title.clone();
+    t.extend(s.title.clone());
+    let spec = pla_ui::doc_jobs::write_part_spec(key, &info.key, &st.sheets, prefs, &t)?;
+    pla_ui::drawing::compile(tools, &spec).map_err(|e| format!("{}: {e}", s.base))?;
+    let mut s3 = st.sheets.get(&info.key).cloned().ok_or("sheet vanished")?;
+    s3.compiled = pla_ui::parts_lib::today();
+    s3.model_changed = false;
+    let pdf = pla_ui::drawing::file(&dir, &s3, "pdf").display().to_string();
+    let base = s3.base.clone();
+    st.sheets.upsert(s3);
+    st.save_sheets()?;
+    Ok((base, pdf))
+}
+
+/// 选零件: ["all"] = 全部自制件, ["undrawn"] = 没出过 / 模型改过的, 否则按 key / 料号 / 名字。
+fn pick_parts<'p>(parts: &'p [pla_ui::doc_jobs::Part], sheets: &pla_ui::drawing::Sheets, want: &[String]) -> (Vec<&'p pla_ui::doc_jobs::Part>, Vec<String>) {
+    let mut out = Vec::new();
+    let mut missing = Vec::new();
+    let own = |p: &&pla_ui::doc_jobs::Part| !p.2.bought;
+    if want.iter().any(|w| w == "all") {
+        out.extend(parts.iter().filter(own));
+    } else if want.iter().any(|w| w == "undrawn") {
+        out.extend(parts.iter().filter(own).filter(|p| sheets.get(&p.2.key).is_none_or(|s| !s.locked() && (s.compiled.is_empty() || s.model_changed))));
+    } else {
+        for w in want {
+            match parts.iter().find(|p| p.2.key == *w || (!p.2.pn.is_empty() && p.2.pn == *w) || p.2.name == *w) {
+                Some(p) => out.push(p),
+                None => missing.push(w.clone()),
+            }
+        }
+    }
+    (out, missing)
+}
+
+fn bg_draw(key: &str, path: &std::path::Path, a: &Value) -> Result<Value, String> {
+    let want: Vec<String> = a["parts"].as_array().into_iter().flatten().filter_map(|x| x.as_str().map(String::from)).collect();
+    if want.is_empty() {
+        return Err("parts is required: [\"undrawn\"], [\"all\"], or keys / part numbers / names".into());
+    }
+    let tools = pla_ui::drawing::tools_dir().ok_or("drawing needs the tools/drawing compiler")?;
+    if pla_ui::drawing::freecad_bin().is_none() {
+        return Err("drawing needs FreeCAD 1.1".into());
+    }
+    let (scan, m) = bg_scan(key, None)?;
+    let mut st = pla_ui::doc_jobs::DocState::load(key);
+    let parts = pla_ui::doc_jobs::bom_parts(&scan, &st.tpl, &st.edits, &st.lib, &st.sheets.purchased);
+    let (picked, missing) = pick_parts(&parts, &st.sheets, &want);
+    let picked: Vec<pla_ui::doc_jobs::Part> = picked.into_iter().cloned().collect();
+    let prefs = pla_ui::drawing::Prefs::load();
+    let export = a["export"].as_bool().unwrap_or(false);
+    let mut done = Vec::new();
+    let mut failed = Vec::new();
+    for p in &picked {
+        match bg_draw_one(key, &mut st, p, export, &prefs, &tools) {
+            Ok((base, pdf)) => done.push(json!({ "part": base, "pdf": pdf })),
+            Err(e) => failed.push(e),
+        }
+    }
+    // 出成两张以上 → 合订一份
+    let mut book = Value::Null;
+    if done.len() >= 2 {
+        let dir = pla_ui::drawing::dir(key);
+        let keys: Vec<String> = picked.iter().map(|p| p.2.key.clone()).collect();
+        let pages: Vec<String> = keys.iter().filter_map(|k| st.sheets.get(k)).flat_map(|s| pla_ui::drawing::book_pages(&dir, s)).collect();
+        let out = pla_ui::drawing::book_file(&dir, key);
+        book = match pla_ui::drawing::book(&tools, &out, &pages) {
+            Ok(_) => json!(out.display().to_string()),
+            Err(e) => json!(format!("combine failed: {e}")),
+        };
+    }
+    Ok(json!({ "document": path.display().to_string(), "drawn": done, "failed": failed, "notFound": missing, "book": book, "identityRenames": m.renames.len(), "folder": pla_ui::drawing::dir(key).display().to_string() }))
+}
+
+fn bg_release(key: &str, path: &std::path::Path, a: &Value) -> Result<Value, String> {
+    use pla_ui::release as rel;
+    let (scan, _) = bg_scan(key, None)?;
+    let mut st = pla_ui::doc_jobs::DocState::load(key);
+    let parts = pla_ui::doc_jobs::bom_parts(&scan, &st.tpl, &st.edits, &st.lib, &st.sheets.purchased);
+    let prefs = pla_ui::drawing::Prefs::load();
+    let root = rel::STORE.dir(key);
+    let mut hist = rel::History::load(&root);
+    if hist.open_by.trim().is_empty() {
+        hist.open_by = prefs.title.get("designer").cloned().unwrap_or_default();
+    }
+    let amend = a["amend"].as_bool().unwrap_or(false) && hist.last().is_some();
+    let (ver, no) = hist.record(pla_ui::doc_jobs::rel_snapshot(key, &parts, &st.sheets), &pla_ui::parts_lib::today(), amend);
+    hist.save(&root).map_err(|e| format!("saving the version history: {e}"))?;
+    let ecn = no.as_ref().and_then(|n| hist.ecns.iter().find(|e| &e.no == n).cloned());
+    // ECN 涉及、出过图(没锁定)的零件重出, 让变更表带上 ECN
+    let redraw: Vec<String> = ecn
+        .as_ref()
+        .map(|e| {
+            e.items
+                .iter()
+                .filter(|i| !i.kinds.iter().any(|k| k == "removed"))
+                .filter(|i| st.sheets.get(&i.key).is_some_and(|s| !s.locked() && (!s.compiled.is_empty() || s.model_changed)))
+                .map(|i| i.key.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut redrawn = Vec::new();
+    let mut failed = Vec::new();
+    if !redraw.is_empty() {
+        let tools = pla_ui::drawing::tools_dir().ok_or("redrawing needs the tools/drawing compiler")?;
+        for k in &redraw {
+            if let Some(p) = parts.iter().find(|p| &p.2.key == k).cloned() {
+                match bg_draw_one(key, &mut st, &p, false, &prefs, &tools) {
+                    Ok((base, _)) => redrawn.push(base),
+                    Err(e) => failed.push(e),
+                }
+            }
+        }
+    }
+    let (rows, totals) = pla_ui::bom_table::build(&scan, &st.tpl, &st.edits, &st.lib);
+    let (packs, total) = pla_ui::doc_jobs::rel_packs(key, &st.suppliers, &st.tpl, &rows, &totals, &st.edits, &st.sheets);
+    let out = rel::write(&root, &ver, &pla_ui::parts_lib::today(), &total, &packs, ecn.as_ref())?;
+    Ok(json!({
+        "document": path.display().to_string(), "version": ver, "ecn": no, "amend": amend,
+        "package": out.display().to_string(), "suppliers": packs.iter().map(|p| p.supplier.name.clone()).collect::<Vec<_>>(),
+        "missingFiles": packs.iter().flat_map(|p| p.missing.iter().map(move |(part, m)| format!("{}: {} ({})", p.supplier.name, part, m.join(", ")))).collect::<Vec<_>>(),
+        "redrawn": redrawn, "redrawFailed": failed,
+    }))
 }

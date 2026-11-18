@@ -43,3 +43,18 @@
   → pla-mcp 先把自己的 stdin/stdout/stderr 设成不可继承, node 的输出写临时文件、只等 node 退出。
 - 建库(build_pack)直接调 cmd.exec, 新实例要先挂工厂(`exec::ensure_factories`), 否则 need-factories。
 - 调试时第一次没钩上(以为 --inspect-brk 会停)→ 窗口正常创建、可能在前台闪过几秒; 之后的版本都先钩再放行。
+
+## 文档 + 作业(2026-11-18 下午)
+
+- **同一个文档不许前后台同时开**(用户规定): `pla-bg.js open / save-as / start --doc` 先查前台主进程(9334)各窗口的文档
+  (`editor.document._filename`, 拿不到就用标题), **按文档名(不含 .plasticity)比** —— PLAhelper 按名字归档数据, 同名不同目录也会撞;
+  撞了就报警拒绝(中英文, 提示先在前台关掉)。pla-mcp 每个后台作业开始前再查一次(前台后来打开了也拦得住)。前台 Plasticity 有自动保存计时器, 两边开同一个文件真会互相覆盖。
+- 打开 / 另存为: 预置 `__PLA_BG__.openPaths / savePath` → 视口上派发 `file:open / file:save-as` → 等标题变成它; 后台文档有未保存改动时 open 要 `discard`。
+  打开的路径记在 `state.json`(`doc / docKey`)。
+- 作业(pla-mcp): `background_bom`(扫描 + 零件身份迁移 + 导 CSV)、`background_draw`(后台导 STEP → 编译; 零件图, 两张以上合订)、
+  `background_release`(记版本 / ECN → ECN 涉及的已出图零件重出 → 写总 BOM + 各家包)。逻辑与 pla-ui 共用 `pla_ui::doc_jobs`
+  (BOM 零件、身份迁移、外发快照 / 各家包、建图、零件图方案), pla-ui 也改成调它 —— 唯一来源。
+  文档路径用 `snapshot::pin_doc_path` 钉住(后台开的文件不一定在用户的最近列表里), 数据写进该文档旁边的 `.pla/…`。
+- 实测(bgtest = model1 的副本, 全程窗口监视无可见窗口): 前台开着的 model1 → 拒绝; BOM 6 种零件 → CSV;
+  出图 Box.001 + Pipe.001 共 86 s(GB A3, 标题栏数量取自 BOM)+ 合订 PDF; 外发包 R1(总 BOM; 没分配供应商所以没有分包)。
+- 还没有: 装配图(依赖 pla-ui 里的装配范围数据)、按配置出图。

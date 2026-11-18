@@ -10,6 +10,8 @@
  *
  * 用法: node pla-bg.js start [--exe <Plasticity.exe>] [--doc <file.plasticity>] [--resync]
  *       node pla-bg.js status | stop | eval <主进程表达式文件> | page <页面表达式文件>(在后台窗口的页面里执行, 可返回 Promise)
+ *       node pla-bg.js open --doc <file> [--discard] | save-as --doc <file> | check [--doc <file>]
+ * 前台开着同名文档时, 后台 open / save-as / start --doc 一律拒绝(报警, 提示先关掉前台的)。
  * 输出一行 JSON。
  */
 'use strict';
@@ -29,6 +31,85 @@ const SEED = ['Local Storage', 'Preferences', 'Local State'];
 // 视口元素 = Rust 垫片配置 VIEWPORT_SELECTOR; 命令名 = Plasticity 命令注册表里的 file:new(同垫片 cmd.dispatch 的派发方式)。
 const VIEWPORT_SELECTOR = 'plasticity-viewport';
 const NEW_DOC_CMD = 'file:new';
+const OPEN_DOC_CMD = 'file:open';
+const SAVE_AS_CMD = 'file:save-as';
+// 前台 Plasticity 的主进程 inspector(用来查它开着哪些文档; 同一个文件不许在后台再开 —— 用户 2026-11-18)
+const FG_INSPECT_PORT = Number(process.env.PLA_FG_INSPECT_PORT || 9334);
+
+/** 文档名(不含 .plasticity, 不分大小写)。PLAhelper 按它归档数据, 同名不同目录也会撞, 所以按名字比。 */
+function docStem(p) {
+  return path.basename(String(p || '')).replace(/\.plasticity$/i, '').replace(/^\*/, '').trim().toLowerCase();
+}
+
+/** 前台开着的文档: [{title, stem, path?}]; 前台没开(inspector 连不上)= []。 */
+async function foregroundDocs() {
+  const t = await inspectorTarget(FG_INSPECT_PORT);
+  if (!t) return [];
+  const js = `(async () => { const e = process.mainModule.require('electron'); const out = [];
+    for (const w of e.BrowserWindow.getAllWindows()) {
+      let p = null; try { p = await w.webContents.executeJavaScript('(window.__PLA_EDITOR__ && window.__PLA_EDITOR__.document && window.__PLA_EDITOR__.document._filename) || null'); } catch (x) {}
+      out.push({ title: w.getTitle(), path: p });
+    }
+    return JSON.stringify(out); })()`;
+  const c = await cdp(t.webSocketDebuggerUrl);
+  try {
+    const r = await c.send('Runtime.evaluate', { expression: js, returnByValue: true, awaitPromise: true });
+    const list = JSON.parse((r.result && r.result.value) || '[]');
+    return list.map((d) => ({ ...d, stem: docStem(d.path || d.title.split(' - ')[0]) })).filter((d) => d.stem && d.stem !== 'untitled' && d.stem !== 'plasticity');
+  } finally { c.close(); }
+}
+
+/** 同名文档在前台开着 → 报警并拒绝。 */
+async function guardForeground(doc, what) {
+  const stem = docStem(doc);
+  const hit = (await foregroundDocs()).find((d) => d.stem === stem);
+  if (hit) {
+    throw new Error('REFUSED: "' + path.basename(doc) + '" is open in your foreground Plasticity' + (hit.path ? ' (' + hit.path + ')' : '')
+      + ' — the background instance must not ' + what + ' the same document (two Plasticity windows on one file can overwrite each other, and PLAhelper files its data by document name). Close it in the foreground first.'
+      + ' / 拒绝执行: 前台 Plasticity 正开着「' + path.basename(doc) + '」, 后台不能同时' + (what === 'open' ? '打开' : '保存成') + '同一个文档。请先在前台关掉它。');
+  }
+}
+
+function readState() { try { return JSON.parse(fs.readFileSync(STATE, 'utf8')); } catch (e) { return {}; } }
+function writeState(patch) { fs.writeFileSync(STATE, JSON.stringify(Object.assign(readState(), patch))); }
+
+/** 后台打开文档(另存为同理): 预置对话框应答 → 派发命令 → 等标题变成它。 */
+async function openDoc(doc, discard) {
+  doc = path.resolve(doc);
+  if (!fs.existsSync(doc)) throw new Error('no such file: ' + doc);
+  await guardForeground(doc, 'open');
+  if (!discard) {
+    const dirty = await pageEval('!!(window.__PLA_EDITOR__ && window.__PLA_EDITOR__._hasUnsavedChanges)');
+    if (dirty) throw new Error('the background document has unsaved changes (save_as first, or pass discard)');
+  }
+  await mainEval('(() => { globalThis.__PLA_BG__.openPaths = ' + JSON.stringify([doc]) + '; return 1; })()');
+  const stem = docStem(doc);
+  const js = '(async () => { const el = document.querySelector(' + JSON.stringify(VIEWPORT_SELECTOR) + '); if (!el) return "no viewport"; '
+    + (discard ? 'if (window.__PLA_EDITOR__) window.__PLA_EDITOR__._hasUnsavedChanges = false; ' : '')
+    + 'el.dispatchEvent(new CustomEvent(' + JSON.stringify(OPEN_DOC_CMD) + ', { bubbles: true })); '
+    + 'for (let i = 0; i < 150; i++) { const t = document.title.split(" - ")[0].replace(/^\\*/, "").replace(/\\.plasticity$/i, "").trim().toLowerCase(); if (t === ' + JSON.stringify(stem) + ') return document.title; await new Promise((r) => setTimeout(r, 100)); } return "timeout: " + document.title; })()';
+  const title = await pageEval(js);
+  await mainEval('(() => { globalThis.__PLA_BG__.openPaths = null; return 1; })()');
+  if (String(title).startsWith('timeout') || title === 'no viewport') throw new Error('open did not complete (' + title + ') — a dialog may have been auto-cancelled, see status');
+  writeState({ doc, docKey: path.basename(doc).replace(/\.plasticity$/i, '') });
+  return { opened: doc, title };
+}
+
+async function saveAs(doc) {
+  doc = path.resolve(doc);
+  if (!/\.plasticity$/i.test(doc)) throw new Error('save_as needs a .plasticity path');
+  await guardForeground(doc, 'save');
+  await mainEval('(() => { globalThis.__PLA_BG__.savePath = ' + JSON.stringify(doc) + '; return 1; })()');
+  const stem = docStem(doc);
+  const js = '(async () => { const el = document.querySelector(' + JSON.stringify(VIEWPORT_SELECTOR) + '); '
+    + 'el.dispatchEvent(new CustomEvent(' + JSON.stringify(SAVE_AS_CMD) + ', { bubbles: true })); '
+    + 'for (let i = 0; i < 150; i++) { const t = document.title.split(" - ")[0].replace(/^\\*/, "").replace(/\\.plasticity$/i, "").trim().toLowerCase(); if (t === ' + JSON.stringify(stem) + ') return document.title; await new Promise((r) => setTimeout(r, 100)); } return "timeout: " + document.title; })()';
+  const title = await pageEval(js);
+  if (String(title).startsWith('timeout')) throw new Error('save_as did not complete (' + title + ')');
+  for (let i = 0; i < 50 && !fs.existsSync(doc); i++) await sleep(100);
+  writeState({ doc, docKey: path.basename(doc).replace(/\.plasticity$/i, '') });
+  return { saved: doc, title, bytes: fs.existsSync(doc) ? fs.statSync(doc).size : 0 };
+}
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const out = (o) => { process.stdout.write(JSON.stringify(o) + '\n'); };
@@ -109,12 +190,12 @@ const STATUS_JS = `(() => {
 })()`.replace(/require\('electron'\)/g, "process.mainModule.require('electron')");
 
 async function start(args) {
+  if (args.doc) await guardForeground(path.resolve(args.doc), 'open');
   if (await inspectorTarget(INSPECT_PORT)) return { already: true, ...JSON.parse(await mainEval(STATUS_JS)) };
   const exe = args.exe || findExe();
   if (!exe) throw new Error('Plasticity.exe not found (pass --exe)');
   const copied = seedUserData(!!args.resync);
   const argv = [`--user-data-dir=${USER_DATA}`, `--inspect-brk=127.0.0.1:${INSPECT_PORT}`];
-  if (args.doc) argv.push(args.doc);
   const child = spawn(exe, argv, { detached: true, stdio: 'ignore', windowsHide: true });
   child.unref();
   const pid = child.pid;
@@ -163,13 +244,11 @@ async function start(args) {
     if (st.windows.length && st.windows.every((w) => !w.loading)) break;
   }
   let title = null;
-  if (!args.doc) {
+  {
     const js = '(async () => { const el = document.querySelector(' + JSON.stringify(VIEWPORT_SELECTOR) + '); if (!el) return "no viewport"; '
       + 'el.dispatchEvent(new CustomEvent(' + JSON.stringify(NEW_DOC_CMD) + ', { bubbles: true })); '
       + 'for (let i = 0; i < 50 && !/^Untitled/.test(document.title); i++) await new Promise((r) => setTimeout(r, 100)); return document.title; })()';
     try { title = await pageEval(js); } catch (e) { title = 'new doc failed: ' + e.message; }
-  } else {
-    try { title = await pageEval('document.title'); } catch (e) {}
   }
   // CDP 代理(9343 → 后台实例的 inspector 9344)
   const proxy = spawn(process.execPath, [path.join(__dirname, 'pla-cdp-v8.js'), 'proxy'], {
@@ -180,7 +259,9 @@ async function start(args) {
   const s = JSON.parse(fs.readFileSync(STATE, 'utf8'));
   s.proxyPid = proxy.pid;
   fs.writeFileSync(STATE, JSON.stringify(s));
-  return { started: true, pid, hooked, document: title, seeded: copied, userData: ud, proxy: PROXY_PORT, status: st };
+  let opened = null;
+  if (args.doc) { try { opened = await openDoc(args.doc, true); title = opened.title; } catch (e) { opened = { error: e.message }; } }
+  return { started: true, pid, hooked, document: title, opened, seeded: copied, userData: ud, proxy: PROXY_PORT, status: st };
 }
 
 async function stop() {
@@ -202,14 +283,18 @@ async function main() {
     if (rest[i] === '--exe') args.exe = rest[++i];
     else if (rest[i] === '--doc') args.doc = rest[++i];
     else if (rest[i] === '--resync') args.resync = true;
+    else if (rest[i] === '--discard') args.discard = true;
     else args._ = rest[i];
   }
   try {
     if (cmd === 'start') out(await start(args));
-    else if (cmd === 'status') out((await inspectorTarget(INSPECT_PORT)) ? { running: true, ...JSON.parse(await mainEval(STATUS_JS)) } : { running: false });
+    else if (cmd === 'status') out((await inspectorTarget(INSPECT_PORT)) ? { running: true, doc: readState().doc || null, ...JSON.parse(await mainEval(STATUS_JS)) } : { running: false });
     else if (cmd === 'stop') out(await stop());
     else if (cmd === 'eval') out({ value: await mainEval(fs.readFileSync(args._, 'utf8')) });
     else if (cmd === 'page') out({ value: await pageEval(fs.readFileSync(args._, 'utf8')) });
+    else if (cmd === 'open') out(await openDoc(args.doc, !!args.discard));
+    else if (cmd === 'save-as') out(await saveAs(args.doc));
+    else if (cmd === 'check') out({ docs: await foregroundDocs(), conflict: args.doc ? (await foregroundDocs()).some((d) => d.stem === docStem(args.doc)) : null });
     else { out({ error: 'usage: pla-bg.js start [--exe X] [--doc F] [--resync] | status | stop | eval <file>' }); process.exitCode = 2; }
   } catch (e) { out({ error: e.message }); process.exitCode = 1; }
   process.exit();
