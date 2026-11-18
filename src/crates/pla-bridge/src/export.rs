@@ -16,6 +16,11 @@ use std::time::Duration;
 
 /// Plasticity 主进程 inspector 端口(补丁版以 `--inspect=127.0.0.1:9334` 启动)。
 pub const INSPECT_PORT: u16 = 9334;
+
+/// CDP 代理端口 → 同一个 Plasticity 的主进程 inspector 端口(约定 = 代理 + 1: 前台 9333 → 9334, 后台实例 9343 → 9344)。
+pub fn inspect_port_for(cdp_port: u16) -> u16 {
+    cdp_port.wrapping_add(1)
+}
 /// 一次性应答的有效期: 超时没被用掉就还原。
 pub const ARM_TIMEOUT_MS: u64 = 20_000;
 /// 等文件落盘的上限。

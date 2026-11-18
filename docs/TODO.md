@@ -438,6 +438,12 @@
   - [ ] 安装包带上 `assets/packs`。
   - [ ] 十字槽 / 一字槽建模（GB/T 818 / 819.1 / 65 / 67 / 68 现在只有头型，没有槽）。
   - [ ] 打孔面板（紧固件两行 + 资产库行）屏幕点测（用户）。
+- [x] **N6 后台 Plasticity 实例**（用户 2026-11-18：人在前台用浏览器 / 另一个 Plasticity，helper + MCP 在后台起独立的 Plasticity 做独立任务，不闪现、不抢鼠标；know-how/background-instance.md）：
+      `tools/pla-cdp/pla-bg.js`（单独 userData + 先钩后放行：窗口隐藏 / 不进任务栏 / 不可聚焦 / 不节流，对话框不弹，起来就换新文档，代理 9343）；
+      pla-mcp `background` 工具 + 所有 `model_*` 的 `instance: "background"`；导出 / 建库的另存为按实例应答（inspector = 代理 + 1）。
+      实测：全程无可见窗口；建件 / 放资产 / 截图 / 后台建库 GB/T 97.1（31 s）都正常。
+  - [ ] pla-ui 里给后台实例一个状态 / 开关（现在只有 MCP 能起停）。
+  - [ ] 后台任务完成后可选另存为指定文件（`file:save-as` + savePath）、打开指定文档做批处理（如批量出图）。
 - [ ] **N5 常用件库**：常用件白名单入库（STEP + 缩略图 + 规格字段，SQLite 索引），PLAhelper 搜索面板一键放入当前文档；
       常用度按本人插入次数统计；商家具体型号用到时下载归档。
 - [ ] **N6 AI 建模**：已细化为 **A 自动建模 pipeline**（见下节）。build123d → STEP → 导入 作为退路保留。

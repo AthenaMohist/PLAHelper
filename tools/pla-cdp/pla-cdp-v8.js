@@ -66,8 +66,8 @@ function runExclusive(fn) {
 const HWND_OF_JS = '(w) => { const b = w.getNativeWindowHandle();'
   + ' return (b.length >= 8 ? b.readBigUInt64LE(0) : BigInt(b.readUInt32LE(0))).toString(); }';
 
-const INSPECTOR_PORT = 9334;
-const PROXY_PORT = 9333;
+const INSPECTOR_PORT = Number(process.env.PLA_INSPECT_PORT || 9334); // 后台实例(pla-bg.js)用 9344
+const PROXY_PORT = Number(process.env.PLA_PROXY_PORT || 9333); // 后台实例用 9343
 const FUSE_SENTINEL = Buffer.from('dL7pKGdnNz796PbbjQWNKmHXBZaB9tsX');
 const FUSE_INDEX_INSPECT = 3; // RunAsNode, CookieEncryption, NodeOptions, NodeCliInspect, ...
 

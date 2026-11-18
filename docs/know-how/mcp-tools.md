@@ -10,6 +10,10 @@
 | `model_state` `model_snaps` `model_measure` `model_view`(只读)<br>`model_exec` `model_hole` `model_transaction`(改模型) | pla-mcp 直接经 CDP 9333 连 Plasticity(`pla_bridge::query::call_once` / `exec::run_once`) | Plasticity 以 CDP 模式运行; pla-ui 在跑时用它吸附的窗口(state.json 的 hwnd), 否则代理挑唯一的那个 |
 | `status` `list_parts` `get_drawing` `apply_drawing_changes` `draw` `list_rules` `remember_rule` `show_part` | 读: 直接读出图目录的文件; 写 / 出图: 文件队列交给 pla-ui(`pla_ui::mcp_bridge`) | pla-ui 在跑(心跳 15 s 内); 零件清单空时自动让它扫一次 BOM(只读) |
 
+## 后台实例(2026-11-18)
+
+`background {action: start|status|stop, doc?}` 起一个独立、隐藏的 Plasticity(不闪现、不进任务栏、不抢焦点 / 鼠标), 之后任何 `model_*` 加 `instance: "background"` 就在它里面做; = 前台(用户正在用的)。细节 / 实测: know-how/background-instance.md。
+
 ## 建模的工作方式(给 agent 的要点)
 
 1. 先 `model_state`(概览) → 再按物体查 `detail: faces/edges`; 面 / 边 id 形如 `34f9439`, **物体版本 id(34)每次改动都变**, 改完要重新查。

@@ -60,7 +60,7 @@ pub async fn export_step_once(cdp_port: u16, hwnd: isize, path: &str, ids: &[Str
         .map_err(|_| anyhow::anyhow!("connect timeout (8s)"))??;
     let mut mid: u64 = 100;
     eval_roundtrip(&mut ws, &mut mid, &shim::install_expr()).await?;
-    crate::cdp::export_step(&mut ws, &mut mid, hwnd, path, ids, format).await.map_err(|e| anyhow::anyhow!(e))
+    crate::cdp::export_step(&mut ws, &mut mid, hwnd, path, ids, format, crate::export::inspect_port_for(cdp_port)).await.map_err(|e| anyhow::anyhow!(e))
 }
 
 /// N5b MCP 用: 建一个 asset pack(全流程见 cdp::build_pack)。
@@ -70,7 +70,7 @@ pub async fn build_pack_once(cdp_port: u16, hwnd: isize, items: &[Value], path: 
         .map_err(|_| anyhow::anyhow!("connect timeout (8s)"))??;
     let mut mid: u64 = 100;
     eval_roundtrip(&mut ws, &mut mid, &shim::install_expr()).await?;
-    crate::cdp::build_pack(&mut ws, &mut mid, hwnd, items, path).await.map_err(|e| anyhow::anyhow!(e))
+    crate::cdp::build_pack(&mut ws, &mut mid, hwnd, items, path, crate::export::inspect_port_for(cdp_port)).await.map_err(|e| anyhow::anyhow!(e))
 }
 /// A5 CLI 用: 指定视角截图 → (PNG 字节, 回包去掉 data 后的其余字段)。
 /// 分三步(实测 2026-11-17, 窗口可见时): 摆相机(cam.view shot:false)→ 隔几帧再单独截(cam.thumbnail)→ 还原(cam.viewRestore)。

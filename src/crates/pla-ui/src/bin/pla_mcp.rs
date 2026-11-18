@@ -49,12 +49,19 @@ fn tools() -> Value {
 
 // ---------------------------------------------------------------- A6 建模工具(直接经 CDP 连 Plasticity, 不经 pla-ui)
 
-const CDP_PORT: u16 = 9333;
+/// 前台 Plasticity(用户在用的)/ 后台实例(tools/pla-cdp/pla-bg.js 起的独立隐藏实例)的 CDP 代理端口。
+const FG_PORT: u16 = 9333;
+const BG_PORT: u16 = 9343;
+/// 本次工具调用连哪个(按参数 instance; 每次调用开头设)。
+static PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(FG_PORT);
+fn port() -> u16 {
+    PORT.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 fn model_tools() -> Value {
     let refs = "Topology ids look like '34f9439' (face) / '34e912' (edge) / '34v12' (vertex) - '34' is the solid's version id, which changes after every edit of that solid, so re-query after changes. Solids can also be given as {\"name\": \"<outliner name>\"}.";
     let ro = json!({"readOnlyHint": true});
-    json!([
+    let mut tools = json!([
         {"name": "model_state", "annotations": ro, "description": format!("Read the open Plasticity model: undo depth, current selection, and geometry. detail: solids (default, overview) / faces / edges / all (+ vertices). Filter with of (solid ids or {{name}}), surface (Plane/Cylinder/Cone/Torus/…), curve (Line/Circle/…), normal [x,y,z] with angleTol (deg), near [x,y,z] with tol. Lengths in document units. Start with the overview, then query faces/edges of one solid. {refs}"),
          "inputSchema": {"type": "object", "properties": {
             "detail": {"type": "string", "enum": ["solids", "faces", "edges", "all"]},
@@ -137,8 +144,79 @@ The spec, a map (bodies, solid ids, undo range) and a log are saved under the do
          "inputSchema": {"type": "object", "properties": {"spec": {"type": "object"}, "replace": {"type": "boolean"}}, "required": ["spec"]}},
         {"name": "model_transaction", "annotations": {"destructiveHint": true},
          "description": "Group several model_exec / model_hole calls so they can be undone together. action=begin (remember the undo depth) → work → commit (keep) or rollback (undo everything since begin, including anything the user did in between; refused if the undo stack below begin was changed). action=undo with steps = undo the last N steps (like Ctrl+Z). action=state = undo / redo depth. The transaction survives shim updates (kept on the page).",
-         "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["begin", "commit", "rollback", "undo", "state"]}, "steps": {"type": "integer", "description": "for undo: how many steps (default 1)"}}, "required": ["action"]}}
-    ])
+         "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["begin", "commit", "rollback", "undo", "state"]}, "steps": {"type": "integer", "description": "for undo: how many steps (default 1)"}}, "required": ["action"]}},
+        {"name": "background", "annotations": {"destructiveHint": true},
+         "description": "A separate, hidden Plasticity instance for independent jobs, so the user can keep working (browser, or their own Plasticity on another project) undisturbed: it never shows a window, never appears in the taskbar, never takes focus, and never moves the real mouse. action=start (doc?: a .plasticity file to open; uses a copy of the user's login/settings in its own data folder; ~5 s) / status / stop. Then pass instance: \"background\" to any model_* tool to work in it. Native dialogs there never show: save dialogs are answered by PLAhelper (pack / STEP export), other message boxes are auto-cancelled and logged (see status).",
+         "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["start", "status", "stop"]}, "doc": {"type": "string"}}, "required": ["action"]}}
+    ]);
+    // 所有 model_* 工具都可以指向后台实例
+    if let Some(arr) = tools.as_array_mut() {
+        for t in arr.iter_mut().filter(|t| t["name"].as_str().is_some_and(|n| n.starts_with("model_"))) {
+            t["inputSchema"]["properties"]["instance"] = json!({"type": "string", "enum": ["foreground", "background"], "description": "which Plasticity: foreground (default, the user's) or background (the hidden instance started with the background tool)"});
+        }
+    }
+    tools
+}
+
+/// tools/pla-cdp/pla-bg.js 在哪: 从程序目录往上找。
+fn bg_script() -> Option<std::path::PathBuf> {
+    let mut d = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    for _ in 0..7 {
+        let p = d.join("tools").join("pla-cdp").join("pla-bg.js");
+        if p.is_file() {
+            return Some(p);
+        }
+        d = d.parent()?.to_path_buf();
+    }
+    None
+}
+
+/// background 工具: 起 / 查 / 停后台隐藏实例(node pla-bg.js, 一行 JSON)。
+fn background_tool(a: &Value) -> Value {
+    let action = a["action"].as_str().unwrap_or("status");
+    if !matches!(action, "start" | "status" | "stop") {
+        return err(format!("unknown action {action} (start / status / stop)"));
+    }
+    let Some(script) = bg_script() else { return err(String::from("tools/pla-cdp/pla-bg.js not found next to pla-mcp")) };
+    let mut cmd = std::process::Command::new("node");
+    cmd.arg(&script).arg(action);
+    if let (Some(doc), "start") = (a["doc"].as_str(), action) {
+        cmd.arg("--doc").arg(doc);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW: 不弹控制台
+        // 本进程的 stdin / stdout(MCP 客户端的管道)不能被继承: 否则一路传给常驻的后台 Plasticity / 代理,
+        // 客户端那头的管道永远关不掉(实测: 调用方等 EOF 就一直挂着)
+        for h in [std::io::stdin().as_raw_handle(), std::io::stdout().as_raw_handle(), std::io::stderr().as_raw_handle()] {
+            unsafe {
+                let _ = windows::Win32::Foundation::SetHandleInformation(
+                    windows::Win32::Foundation::HANDLE(h as isize),
+                    windows::Win32::Foundation::HANDLE_FLAG_INHERIT.0,
+                    windows::Win32::Foundation::HANDLE_FLAGS(0),
+                );
+            }
+        }
+    }
+    // 输出写临时文件、只等 node 退出: 它起的 Plasticity / 代理会继承管道句柄, 用 output() 等管道关闭就永远等不到(实测)
+    let out_path = std::env::temp_dir().join(format!("pla-bg-{}.json", std::process::id()));
+    let Ok(out_file) = std::fs::File::create(&out_path) else { return err(String::from("cannot create temp file")) };
+    cmd.stdout(out_file).stderr(std::process::Stdio::null()).stdin(std::process::Stdio::null());
+    match cmd.status() {
+        Ok(_) => {
+            let s = std::fs::read_to_string(&out_path).unwrap_or_default();
+            let _ = std::fs::remove_file(&out_path);
+            let line = s.lines().rev().find(|l| l.trim_start().starts_with('{')).unwrap_or("").to_string();
+            match serde_json::from_str::<Value>(&line) {
+                Ok(v) if v.get("error").is_some() => err(v["error"].as_str().unwrap_or("").to_string()),
+                Ok(v) => text(serde_json::to_string_pretty(&v).unwrap_or_default()),
+                Err(_) => err(format!("pla-bg.js said: {}", s.trim())),
+            }
+        }
+        Err(e) => err(format!("cannot run node: {e}")),
+    }
 }
 
 fn rt() -> &'static tokio::runtime::Runtime {
@@ -156,7 +234,7 @@ fn cdp_err(e: impl std::fmt::Display) -> Value {
     let m = format!("{e:#}");
     let conn = ["connect", "timeout", "refused", "json/list", "no page", "no ws url"].iter().any(|k| m.to_lowercase().contains(k));
     if conn {
-        err(format!("Cannot reach Plasticity over CDP (port {CDP_PORT}): {m}. Is Plasticity running in CDP mode (PLAhelper settings → CDP MODE) with a document open?"))
+        err(format!("Cannot reach Plasticity over CDP (port {}): {m}. Is Plasticity running in CDP mode (PLAhelper settings → CDP MODE) with a document open? For instance=background, start it first with the background tool.", port()))
     } else {
         err(m)
     }
@@ -175,9 +253,15 @@ fn pick(a: &Value, keys: &[&str]) -> Value {
 
 fn call_model_tool(name: &str, a: &Value) -> Option<Value> {
     use pla_bridge::shim::api;
-    let h = hwnd();
+    // instance = background → 后台隐藏实例(代理里只有它一个窗口, hwnd 0 = 让代理挑)
+    let bg = a["instance"].as_str() == Some("background");
+    PORT.store(if bg { BG_PORT } else { FG_PORT }, std::sync::atomic::Ordering::Relaxed);
+    let h = if bg { 0 } else { hwnd() };
+    if name == "background" {
+        return Some(background_tool(a));
+    }
     let json_text = |v: &Value| text(serde_json::to_string_pretty(v).unwrap_or_default());
-    let call = |api_name: &str, args: Value| match rt().block_on(pla_bridge::query::call_once(CDP_PORT, h, api_name, &args)) {
+    let call = |api_name: &str, args: Value| match rt().block_on(pla_bridge::query::call_once(port(), h, api_name, &args)) {
         Ok(v) if v.get("err").is_some() => err(v["err"].to_string()),
         Ok(v) => json_text(&v),
         Err(e) => cdp_err(e),
@@ -185,7 +269,7 @@ fn call_model_tool(name: &str, a: &Value) -> Option<Value> {
     Some(match name {
         "model_state" => {
             let args = pick(a, &["detail", "of", "surface", "curve", "normal", "angleTol", "near", "tol", "units", "limit"]);
-            match rt().block_on(pla_bridge::query::state_once(CDP_PORT, h, &args)) {
+            match rt().block_on(pla_bridge::query::state_once(port(), h, &args)) {
                 Ok(v) => json_text(&v),
                 Err(e) => cdp_err(e),
             }
@@ -197,7 +281,7 @@ fn call_model_tool(name: &str, a: &Value) -> Option<Value> {
             if let Some(w) = a["width"].as_u64() {
                 args["maxWidth"] = json!(w);
             }
-            match rt().block_on(pla_bridge::query::view_png_once(CDP_PORT, h, &args)) {
+            match rt().block_on(pla_bridge::query::view_png_once(port(), h, &args)) {
                 Ok((png, meta)) => json!({"content": [{"type": "image", "data": b64(&png), "mimeType": "image/png"}, {"type": "text", "text": meta.to_string()}]}),
                 Err(e) => cdp_err(e),
             }
@@ -205,7 +289,7 @@ fn call_model_tool(name: &str, a: &Value) -> Option<Value> {
         "model_exec" => {
             let mut script = pick(a, &["ops", "units"]);
             script["atomic"] = json!(a["atomic"].as_bool().unwrap_or(true));
-            match rt().block_on(pla_bridge::exec::run_once(CDP_PORT, h, &script)) {
+            match rt().block_on(pla_bridge::exec::run_once(port(), h, &script)) {
                 Ok(v) => {
                     let (ok, msg) = pla_bridge::exec::summary(&v);
                     let mut r = json_text(&v);
@@ -228,7 +312,7 @@ fn call_model_tool(name: &str, a: &Value) -> Option<Value> {
                 Err(e) => return Some(err(e)),
             };
             let script = json!({"ops": x.ops, "atomic": true});
-            match rt().block_on(pla_bridge::exec::run_once(CDP_PORT, h, &script)) {
+            match rt().block_on(pla_bridge::exec::run_once(port(), h, &script)) {
                 Ok(v) => {
                     let (ok, msg) = pla_bridge::exec::summary(&v);
                     let part = v["results"].as_array().and_then(|r| r.last()).map(|r| r["items"].clone()).unwrap_or(Value::Null);
@@ -246,7 +330,7 @@ fn call_model_tool(name: &str, a: &Value) -> Option<Value> {
         "model_asset_place" => call(api::ASSET_PLACE, pick(a, &["asset", "pack", "at", "normal", "rotate", "units"])),
         "model_part_stretch" => call(api::PART_STRETCH, pick(a, &["solid", "axis", "delta", "zone", "units"])),
         "model_asset_library" => {
-            let register = |paths: Vec<String>| rt().block_on(pla_bridge::query::call_once(CDP_PORT, h, api::ASSET_REGISTER, &json!({ "paths": paths })));
+            let register = |paths: Vec<String>| rt().block_on(pla_bridge::query::call_once(port(), h, api::ASSET_REGISTER, &json!({ "paths": paths })));
             match a["action"].as_str().unwrap_or("series") {
                 "series" => {
                     let dir = pla_ui::asset_lib::build_dir();
@@ -274,7 +358,7 @@ fn call_model_tool(name: &str, a: &Value) -> Option<Value> {
                         return Some(err(pla_ui::asset_lib::build_items(id, &sizes).err().unwrap_or_else(|| format!("unknown series {id}"))));
                     };
                     let path = pla_ui::asset_lib::build_dir().join(file).display().to_string();
-                    match rt().block_on(pla_bridge::query::build_pack_once(CDP_PORT, h, &items, &path)) {
+                    match rt().block_on(pla_bridge::query::build_pack_once(port(), h, &items, &path)) {
                         Ok(v) => {
                             let reg: Result<Value, String> = pla_ui::asset_lib::install().and_then(|ps| register(ps.iter().map(|p| p.display().to_string()).collect()).map_err(|e| e.to_string()));
                             json_text(&json!({ "built": v, "registered": reg.is_ok(), "registerError": reg.err() }))
@@ -503,7 +587,7 @@ fn call_tool(name: &str, a: &Value) -> Value {
 // ---------------------------------------------------------------- A7 / A8: 按规格建模(逐特征执行 + 语义引用 + 验收 + 回滚 + 存档)
 
 fn shim(h: isize, name: &str, args: Value) -> Result<Value, String> {
-    let v = rt().block_on(pla_bridge::query::call_once(CDP_PORT, h, name, &args)).map_err(|e| format!("{e:#}"))?;
+    let v = rt().block_on(pla_bridge::query::call_once(port(), h, name, &args)).map_err(|e| format!("{e:#}"))?;
     if let Some(e) = v.get("err") {
         return Err(e.to_string());
     }
@@ -581,7 +665,7 @@ fn build_spec(h: isize, a: &Value) -> Result<Value, String> {
             match act {
                 Action::Exec { ops, body } => {
                     let script = with_units(json!({"ops": ops}));
-                    let v = match rt().block_on(pla_bridge::exec::run_once(CDP_PORT, h, &script)) {
+                    let v = match rt().block_on(pla_bridge::exec::run_once(port(), h, &script)) {
                         Ok(v) => v,
                         Err(e) => return fail(format!("{fid}: {e:#}")),
                     };

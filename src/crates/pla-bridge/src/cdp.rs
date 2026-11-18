@@ -389,11 +389,11 @@ async fn session_loop(
                 let _ = ev_tx.send(CdpEvent::CallResult { name, result });
             }
             Ok(CdpCmd::ExportStep { path, ids, format }) => {
-                let result = export_step(ws, &mut mid, connected_to, &path, &ids, format.as_deref()).await;
+                let result = export_step(ws, &mut mid, connected_to, &path, &ids, format.as_deref(), crate::export::INSPECT_PORT).await;
                 let _ = ev_tx.send(CdpEvent::CallResult { name: shim::api::FILE_EXPORT_STEP, result });
             }
             Ok(CdpCmd::BuildPack { items, path }) => {
-                let result = build_pack(ws, &mut mid, connected_to, &items, &path).await;
+                let result = build_pack(ws, &mut mid, connected_to, &items, &path, crate::export::INSPECT_PORT).await;
                 let _ = ev_tx.send(CdpEvent::CallResult { name: shim::api::ASSET_BUILD_PACK, result });
             }
             Ok(CdpCmd::ProbeCaps) => {
@@ -1150,6 +1150,7 @@ pub(crate) async fn export_step(
     path: &str,
     ids: &[String],
     format: Option<&str>,
+    inspect: u16,
 ) -> Result<Value, String> {
     use crate::export as ex;
     ex::check_path(path)?;
@@ -1158,7 +1159,7 @@ pub(crate) async fn export_step(
     }
     // 旧文件先删: 以"文件出现"判断写完
     let _ = std::fs::remove_file(path);
-    let armed = ex::main_eval_once(ex::INSPECT_PORT, &ex::arm_save_dialog_js(hwnd, path, ex::ARM_TIMEOUT_MS))
+    let armed = ex::main_eval_once(inspect, &ex::arm_save_dialog_js(hwnd, path, ex::ARM_TIMEOUT_MS))
         .await
         .map_err(|e| format!("arm save dialog: {e}"))?;
     if armed.as_str() != Some("armed") {
@@ -1177,7 +1178,7 @@ pub(crate) async fn export_step(
         Ok(v) => v,
         Err(e) => {
             // 没导成: 撤销武装 + 还原选择, 免得之后用户自己的"另存为"被吞掉
-            let _ = ex::main_eval_once(ex::INSPECT_PORT, ex::DISARM_JS).await;
+            let _ = ex::main_eval_once(inspect, ex::DISARM_JS).await;
             let _ = shim_call(ws, mid, shim::api::FILE_EXPORT_RESTORE, Value::Null).await;
             return Err(format!("export: {e}"));
         }
@@ -1211,7 +1212,7 @@ pub(crate) async fn export_step(
 /// 开事务 → 每件: cmd.exec 建(ops)→ asset.mark(先改名 + 定 pivot 再标)→ 武装主进程"另存为"到同目录的临时文件 → asset.exportPack →
 /// 等文件写完 → 撤掉临时文件的登记(导出会自动登记)→ 回滚事务(文档恢复原样)→ 临时文件换上目标文件。
 /// items = [{ ops, name, pivot, units? }]; path = 目标 .plasticitypack(绝对路径; 已有就替换)。→ { path, bytes, assets, names }
-pub(crate) async fn build_pack(ws: &mut WsStream, mid: &mut u64, hwnd: isize, items: &[Value], path: &str) -> Result<Value, String> {
+pub(crate) async fn build_pack(ws: &mut WsStream, mid: &mut u64, hwnd: isize, items: &[Value], path: &str, inspect: u16) -> Result<Value, String> {
     use crate::export as ex;
     let p = std::path::Path::new(path);
     if !path.to_lowercase().ends_with(".plasticitypack") || !p.is_absolute() {
@@ -1224,6 +1225,8 @@ pub(crate) async fn build_pack(ws: &mut WsStream, mid: &mut u64, hwnd: isize, it
     std::fs::create_dir_all(dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
     let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
     let tmp = dir.join(format!("~build-{stamp}.plasticitypack")).display().to_string();
+    // 新起的实例(如后台实例)还没挂几何工厂: 先挂(已挂过就是缓存, 很快)
+    crate::exec::ensure_factories(ws, mid, false).await.map_err(|e| format!("load factories: {e}"))?;
     shim_call(ws, mid, shim::api::HIST_BEGIN, Value::Null).await.map_err(|e| format!("begin transaction: {e}"))?;
     // 事务里的步骤; 任何一步出错都回滚
     let mut names: Vec<String> = Vec::new();
@@ -1266,14 +1269,14 @@ pub(crate) async fn build_pack(ws: &mut WsStream, mid: &mut u64, hwnd: isize, it
     let mut bytes = 0u64;
     if err.is_none() {
         let _ = std::fs::remove_file(&tmp);
-        match ex::main_eval_once(ex::INSPECT_PORT, &ex::arm_save_dialog_js(hwnd, &tmp, ex::ARM_TIMEOUT_MS)).await {
+        match ex::main_eval_once(inspect, &ex::arm_save_dialog_js(hwnd, &tmp, ex::ARM_TIMEOUT_MS)).await {
             Ok(v) if v.as_str() == Some("armed") => {}
             Ok(v) => err = Some(format!("arm save dialog: unexpected {v}")),
             Err(e) => err = Some(format!("arm save dialog: {e}")),
         }
         if err.is_none() {
             if let Err(e) = shim_call(ws, mid, shim::api::ASSET_EXPORT_PACK, serde_json::json!({ "expect": names.len() })).await {
-                let _ = ex::main_eval_once(ex::INSPECT_PORT, ex::DISARM_JS).await;
+                let _ = ex::main_eval_once(inspect, ex::DISARM_JS).await;
                 err = Some(format!("export: {e}"));
             } else {
                 // 等文件出现且大小稳定
@@ -1291,7 +1294,7 @@ pub(crate) async fn build_pack(ws: &mut WsStream, mid: &mut u64, hwnd: isize, it
                     }
                 };
                 if bytes == 0 {
-                    let _ = ex::main_eval_once(ex::INSPECT_PORT, ex::DISARM_JS).await;
+                    let _ = ex::main_eval_once(inspect, ex::DISARM_JS).await;
                     err = Some(format!("export: no pack written within {}s", ex::WRITE_WAIT.as_secs()));
                 }
             }
