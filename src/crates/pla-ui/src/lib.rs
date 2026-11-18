@@ -37,3 +37,4 @@ pub mod wincap;
 pub mod window_drag;
 pub mod window_finder;
 pub mod screw_kit;
+pub mod asset_lib;

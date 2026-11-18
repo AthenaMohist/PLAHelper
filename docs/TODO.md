@@ -428,11 +428,12 @@
       打孔面板：第一行标准 → 第二行规格 × 长度（自动 / 手选，★ = pack 里有）+ 头下垫圈 / 弹垫 + 螺母（只有过孔通孔可配；盲孔 / 螺纹孔 / 组合孔不配）→ 孔参数；
       长度 = 夹紧厚（面厚 / 组合孔层深，扣沉孔深）+ 垫圈 + 螺母 + 2P 或旋合 1.5d（盲孔不超过孔深 − 2P）；沉头 → 锥形沉孔、紧定 → 螺纹底孔。
       每件：pack 里认到就 asset.place，没有就按宏建（十字槽 / 一字槽暂不建）。**待做**：屏幕点测（用户）；每件一个撤销步（以后可合成一步）。
-- [ ] **N5b 建库进 asset pack + 随软件分发**（用户 2026-11-18）：按需 / 有空时按规格书把某系列建出来（规范姿态、pivot = 支承面、+Z = 杆→头，
-      命名 `GB/T 70.1 M4×12`、文件夹 = 标准），存进 asset pack；pack 随 PLAhelper 安装，给一个按钮一键加入用户的 Plasticity。
-      已知（只读探查）：Plasticity 做 pack = 把组标成资产（`ToggleAssetCommand` / `nodes.setAsset`）再 `ExportAssetPackCommand` 导出（存盘对话框可用
-      export.rs 的主进程应答）；登记 pack = `editor.assets.add / remove`（参数待实测）。**待做**：在单独的库文档里实测 标资产 → 导出 → 登记。
-- [ ] **N5 常用件库**：常用件白名单入库（STEP + 缩略图 + 规格字段，SQLite 索引），PLAhelper 搜索面板一键放入当前文档；
+- [~] **N5b 建库进 asset pack + 随软件分发**（用户 2026-11-18：按需 / 有空时逐系列建库；资产可以是单个实体；螺钉统一 10mm，放进来后只移动杆端改长度）：
+      实测清楚（know-how/asset-place.md）：先改名 + setPivot 再 ToggleAsset（标完自动起的移动取消）→ ExportAssetPack（另存为主进程应答；不覆盖已有文件；自动登记）→
+      `assets.add([..])` / `remove`。已做：垫片 `part.stretch` / `asset.mark` / `asset.exportPack {expect}` / `asset.register` · `unregister`；
+      pla-bridge `build_pack`（事务内建 → 标 → 导出到临时文件 → 回滚 → 换上）；`asset_lib`（一个标准一个 pack，`assets/packs` 随软件，「加入 Plasticity」拷到数据目录再登记）；
+      打孔面板「资产库」行（加入 Plasticity / 建库…）+ pack 螺钉放好后自动改长度；pla-mcp `model_asset_library` / `model_part_stretch`。
+      **待做**：Plasticity 可见时实测一次建库（如 GB/T 70.1）+ 从库里放螺丝改长度；建好的 pack 提交进 `assets/packs`；安装包带上 `assets/packs`；十字槽 / 一字槽建模。- [ ] **N5 常用件库**：常用件白名单入库（STEP + 缩略图 + 规格字段，SQLite 索引），PLAhelper 搜索面板一键放入当前文档；
       常用度按本人插入次数统计；商家具体型号用到时下载归档。
 - [ ] **N6 AI 建模**：已细化为 **A 自动建模 pipeline**（见下节）。build123d → STEP → 导入 作为退路保留。
 - [ ] **N7 轻量装配**：实例 + PLAhelper 记录装配关系 + 干涉检查 + 隐藏线/SVG 导出。完整配合约束和工程图不在范围内。

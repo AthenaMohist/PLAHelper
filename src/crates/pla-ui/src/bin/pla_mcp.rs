@@ -101,6 +101,18 @@ bool: union | subtract | intersect with targets [solid refs]. Give a step id: \"
             "normal": {"type": "array", "items": {"type": "number"}, "description": "direction of the asset's +Z (for a screw: the face's outward normal, head outward); default [0,0,1]"},
             "rotate": {"type": "number", "description": "degrees about normal"}},
           "required": ["asset", "at"]}},
+        {"name": "model_part_stretch", "annotations": {"destructiveHint": true},
+         "description": "CHANGES THE USER'S MODEL. Change a screw's length by moving only its tip faces (end face + chamfer) along xis - never scale. Use after placing a pack screw (packs keep screws at 10 mm). One undo step.",
+         "inputSchema": {"type": "object", "properties": {
+            "solid": {"description": "solid id"}, "axis": {"type": "array", "items": {"type": "number"}, "description": "direction toward the tip (into the hole)"},
+            "delta": {"type": "number", "description": "length change in document units (+ = longer)"}, "zone": {"type": "number", "description": "tip region length (default min(2.5, 0.3 x part length))"}},
+          "required": ["solid", "axis", "delta"]}},
+        {"name": "model_asset_library", "annotations": {"destructiveHint": true},
+         "description": "PLAhelper's GB fastener asset library (one Plasticity asset pack per standard, shipped with PLAhelper). action=series: list buildable series and which packs exist. action=build (series, sizes?): build every size (or the given ones) per the GB tables - screws at 10 mm, pivot on the bearing face, +Z tip->head - mark them as assets, export the pack into the library folder, then roll the document back (the document must hold no other assets; needs the Plasticity window visible) and register the pack. action=install: copy the bundled packs to the user's data folder and register them in Plasticity's Assets panel.",
+         "inputSchema": {"type": "object", "properties": {
+            "action": {"type": "string", "enum": ["series", "build", "install"]}, "series": {"type": "string", "description": "e.g. gb70.1, gb818, gb97.1, gb6170"},
+            "sizes": {"type": "array", "description": "e.g. [\"M3\", \"M4\"] (default: all)"}},
+          "required": ["action"]}},
         {"name": "model_part", "annotations": {"destructiveHint": true},
          "description": format!("CHANGES THE USER'S MODEL. Build a GB standard part in one atomic call (A10 macros; threads not modelled). kind: screw (any catalog standard via std, e.g. gb818 pan cross / gb70.2 button; recesses for cross / slot not modelled) / screw-cap (GB/T 70.1 socket head cap) / screw-csk (GB/T 70.3 countersunk socket, length includes head) / screw-hex (GB/T 5783 hex bolt) / screw-set (GB/T 77 socket set screw, flat point) / nut (std gb6170 default / gb6172.1 / gb889.1) / washer (std gb97.1 default / gb848 / gb96.1 / gb93 spring) / pin (GB/T 119.2 dowel, size = diameter) / shaft (steps [[diameter, length], …], chamfer). Placement: at + axis. Screws: at = centre of the head's bearing face (countersunk: of the head top), axis = from head toward the tip (into the hole). Set screw: at = socket end. Nut / washer / pin / shaft: at = one end face centre, axis = thickness / length direction. Returns the steps' results and the spec key PLAhelper's BOM recognizer will report. Sizes: {}", pla_ui::fasteners::sizes()),
          "inputSchema": {"type": "object", "properties": {
@@ -232,6 +244,47 @@ fn call_model_tool(name: &str, a: &Value) -> Option<Value> {
         }
         "model_assets" => call(api::ASSET_LIST, pick(a, &["pack", "units"])),
         "model_asset_place" => call(api::ASSET_PLACE, pick(a, &["asset", "pack", "at", "normal", "rotate", "units"])),
+        "model_part_stretch" => call(api::PART_STRETCH, pick(a, &["solid", "axis", "delta", "zone", "units"])),
+        "model_asset_library" => {
+            let register = |paths: Vec<String>| rt().block_on(pla_bridge::query::call_once(CDP_PORT, h, api::ASSET_REGISTER, &json!({ "paths": paths })));
+            match a["action"].as_str().unwrap_or("series") {
+                "series" => {
+                    let dir = pla_ui::asset_lib::build_dir();
+                    let list: Vec<Value> = pla_ui::asset_lib::series()
+                        .into_iter()
+                        .map(|(id, code, zh, en)| {
+                            let file = pla_ui::asset_lib::pack_file(id).unwrap_or_default();
+                            json!({ "series": id, "code": code, "name": zh, "en": en, "built": dir.join(&file).is_file(), "pack": file })
+                        })
+                        .collect();
+                    json_text(&json!({ "dir": dir.display().to_string(), "series": list }))
+                }
+                "install" => match pla_ui::asset_lib::install() {
+                    Ok(ps) if ps.is_empty() => err(String::from("no packs built yet - build a series first")),
+                    Ok(ps) => match register(ps.iter().map(|p| p.display().to_string()).collect()) {
+                        Ok(v) => json_text(&json!({ "registered": ps.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(), "packs": v["packs"] })),
+                        Err(e) => cdp_err(e),
+                    },
+                    Err(e) => err(e),
+                },
+                "build" => {
+                    let id = a["series"].as_str().unwrap_or("");
+                    let sizes: Vec<f64> = a["sizes"].as_array().map(|s| s.iter().filter_map(|x| x.as_f64().or_else(|| x.as_str().and_then(|t| t.trim_start_matches(['M', 'm']).parse().ok()))).collect()).unwrap_or_default();
+                    let (Some(file), Ok(items)) = (pla_ui::asset_lib::pack_file(id), pla_ui::asset_lib::build_items(id, &sizes)) else {
+                        return Some(err(pla_ui::asset_lib::build_items(id, &sizes).err().unwrap_or_else(|| format!("unknown series {id}"))));
+                    };
+                    let path = pla_ui::asset_lib::build_dir().join(file).display().to_string();
+                    match rt().block_on(pla_bridge::query::build_pack_once(CDP_PORT, h, &items, &path)) {
+                        Ok(v) => {
+                            let reg: Result<Value, String> = pla_ui::asset_lib::install().and_then(|ps| register(ps.iter().map(|p| p.display().to_string()).collect()).map_err(|e| e.to_string()));
+                            json_text(&json!({ "built": v, "registered": reg.is_ok(), "registerError": reg.err() }))
+                        }
+                        Err(e) => cdp_err(e),
+                    }
+                }
+                x => err(format!("unknown action {x} (series / build / install)")),
+            }
+        }
         "model_build" => match build_spec(h, a) {
             Ok(v) => json_text(&v),
             Err(e) => err(e),

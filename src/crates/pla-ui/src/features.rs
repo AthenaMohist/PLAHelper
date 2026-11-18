@@ -65,6 +65,7 @@ pub fn cap_label(c: &str) -> &'static str {
         cap::SNAP_READ => tr("吸附点(面心/边中点/圆心/顶点…)", "Snap points (face centres/edge midpoints/circle centres/vertices…)"),
         cap::BOOL_RUN => tr("布尔运算", "Boolean operations"),
         cap::ASSET_PLACE => tr("放置常用件", "Place common parts"),
+        cap::ASSET_LIB => tr("紧固件资产库(建库 / 导出 / 登记 pack)", "Fastener asset library (build / export / register packs)"),
         _ => "",
     }
 }

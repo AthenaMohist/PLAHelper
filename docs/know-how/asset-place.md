@@ -51,8 +51,25 @@ destination / destinationOrientation 换成要的(`setFromUnitVectors(+Z, normal
     认到就 `asset.place`, 没有就按国标宏建(`cmd.exec`); 长度下拉里 ★ = pack 里有。
 - pla-mcp: `model_assets`(列表)、`model_asset_place`(放)、`model_part`(`kind: screw` + `std` = 目录 id)。
 
-## 建库 / 分发(N5b, 待实测)
+## 改长度(用户 2026-11-18)
 
-只读探查(2026-11-18): `editor.assets` 只有 `getAssetPacks / load / add / remove`(源码被隐藏, 只能看行为); 命令里有 `ToggleAssetCommand`(把组标成资产)、
-`ExportAssetPackCommand`(导出 pack)、`ReloadAssetCommand`; `nodes` 上有 `setAsset / isAsset / findAllAssets / setAssetReference / getAssetReference`。
-打算: 在单独的库文档里按规范姿态建件 → 成组命名 → 标成资产 → 导出(存盘对话框用 export.rs 的主进程一次性应答)→ `assets.add` 登记。
+pack 里的螺钉统一 10mm; 放进来后**只移动杆端的面**, 不整体缩放。垫片 `part.stretch {solid, axis(朝杆端), delta}`: 沿 axis 投影后贴着最远端、
+且整个落在端部区(默认 min(2.5, 0.3 × 总长))里的面 = 端面 + 倒角锥, 一起 `moveFaces` 平移 delta, 杆的圆柱面跟着伸缩(一个撤销步)。
+实测: M4×10 +15 → 杆端 z 10 → −5, 动了 2 个面, 头不变。打孔面板: pack 认到螺钉(不看长度)→ asset.place → 按 (要的长度 − 资产长度) 接着 stretch;
+资产长度 = 名字里的 ×l, 否则包围盒最长边 − 头高, 都没有当 10。
+
+## 建库 / 分发(N5b, 2026-11-18 实测)
+
+- 资产 = 标了资产标记的组**或单个实体**(用户)。`ToggleAssetCommand` 作用于当前选择(一个撤销步); 标完 Plasticity 自动起一个
+  `MoveItemCommand`(agent automatic, 不是选 pivot), 取消即可。`nodes.isAsset / findAllAssets` 可查。
+- **名字和 pivot 在标记那一刻定下来**: 之后 `setName` / `setPivot` 不进 pack。`nodes.setPivot(key, {position: [米], orientation: [x,y,z,w]})`
+  (格式同 pack 里的 pivot; 不进撤销栈); 不设 = 包围盒中心(用户旧 pack 的 pivot 就是这样: 螺钉 + 负体的中心)。
+- `ExportAssetPackCommand`: 主进程 `dialog.showSaveDialog`(title "Export asset pack", 过滤 .plasticitypack), 用 export.rs 的一次性应答即可,
+  没有站内对话框; **文档里所有资产**都进 pack; **目标文件已存在时什么也不写** → 导到同目录临时文件再换上; 导出会**自动登记**这个 pack。
+- 登记清单: `assets.add([路径…])` 收**数组**(新的排最前、去重; 给字符串会被拆成单个字符登记, 还会把别的项挤掉 —— 实测踩过, 已修复),
+  `assets.remove(路径)`。`getAssetPacks()` → `[{filePath, path, lastOpened}]`。
+- 实现: 垫片 `asset.mark`(改名 + pivot + 标, 取消自动移动, 还原选择)/ `asset.exportPack {expect}`(文档里资产数不对就拒绝, 免得用户自己的资产混进库)/
+  `asset.register` · `asset.unregister {paths}`; pla-bridge `build_pack`: 开事务 → 逐件 cmd.exec + asset.mark → 武装另存为到 `~build-<ms>.plasticitypack` →
+  导出 → 等写完 → 撤掉临时文件登记 → 回滚事务 → 换上目标。pla-ui `asset_lib`: 建库件(螺钉 10mm、沿 X 排开、头朝 +Z、pivot = 支承面,
+  名字 `GB/T 70.1 M4x10`)、一个标准一个 pack(`PLAhelper GB-T 70.1.plasticitypack`)、分发目录 = 程序往上找 `assets/packs`(开发时 = 仓库),
+  「加入 Plasticity」= 拷到 `数据目录/asset-packs` 再登记。界面: 打孔面板紧固件下面「资产库」一行; pla-mcp `model_asset_library`(series / build / install)、`model_part_stretch`。

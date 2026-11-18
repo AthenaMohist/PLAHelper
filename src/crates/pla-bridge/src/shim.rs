@@ -123,8 +123,17 @@ pub mod api {
     pub const HOLE_MAKE: &str = "hole.make";
     /// N5: 已登记的 asset pack 与里面的资产(名字 / 文件夹 / 尺寸)。
     pub const ASSET_LIST: &str = "asset.list";
-    /// N5: 按名字放一个资产(走 Plasticity 拖放导入, 带资产引用)到给定点 / 朝向; 可选把负体从目标零件减掉。
+    /// N5: 按名字 / id 放一个资产(走 Plasticity 拖放导入, 带资产引用)到给定点 / 朝向。
     pub const ASSET_PLACE: &str = "asset.place";
+    /// N5: 螺钉改长度 = 只把杆端的面(端面 + 倒角)沿轴平移(pack 里统一 10mm, 放进来再改)。
+    pub const PART_STRETCH: &str = "part.stretch";
+    /// N5b 建库: 改名 + 定 pivot + 标成资产 / 导出文档里所有资产成 pack / 登记 · 撤销登记 pack(paths 数组)。
+    pub const ASSET_MARK: &str = "asset.mark";
+    pub const ASSET_EXPORT_PACK: &str = "asset.exportPack";
+    pub const ASSET_REGISTER: &str = "asset.register";
+    pub const ASSET_UNREGISTER: &str = "asset.unregister";
+    /// N5b: pla-bridge 的建库全流程(不是垫片接口; 只作 CallResult 的名字)。
+    pub const ASSET_BUILD_PACK: &str = "asset.buildPack";
     /// C0: 配置 = 可见性 + 材质指派(抓取 / 恢复; 抓取时附可见实体清单供 BOM)。
     pub const CFG_SAVE: &str = "cfg.save";
     pub const CFG_RESTORE: &str = "cfg.restore";
@@ -140,7 +149,7 @@ pub mod api {
         CMD_PING, ERR_LAST, TREE_LIST, SEL_CANCEL_COMMAND, SEL_CLEAR, SEL_APPLY, CAM_NAVIGATE, CAM_RENDER, CAM_THUMBNAIL, CAM_VP_RECT,
         CAM_SET_ORBIT_STEP, CAM_ROLL, KEYMAP_SET_BINDINGS, VP_SAVE, VP_RESTORE, MAT_SAVE, MAT_RESTORE, CMD_EXEC, CMD_FACTORIES,
         GEO_QUERY, HIST_BEGIN, HIST_ROLLBACK, HIST_COMMIT, HIST_UNDO, GEO_SNAPS, GEO_MEASURE, CAM_VIEW, CAM_VIEW_RESTORE, DIM_FACE, VIEW_HIGHLIGHT, DIM_DISTANCE, DIM_SIGNATURE, GEO_RESOLVE,
-        DIM_RECORD, DIM_MEASURE, DIM_FACES, UI_RCLICK, HOLE_MAKE, ASSET_LIST, ASSET_PLACE, CFG_SAVE, CFG_RESTORE, BOM_SCAN, FILE_EXPORT_STEP, FILE_EXPORT_RESTORE,
+        DIM_RECORD, DIM_MEASURE, DIM_FACES, UI_RCLICK, HOLE_MAKE, ASSET_LIST, ASSET_PLACE, PART_STRETCH, ASSET_MARK, ASSET_EXPORT_PACK, ASSET_REGISTER, ASSET_UNREGISTER, CFG_SAVE, CFG_RESTORE, BOM_SCAN, FILE_EXPORT_STEP, FILE_EXPORT_RESTORE,
     ];
 }
 
@@ -183,11 +192,13 @@ pub mod cap {
     pub const FILE_EXPORT: &str = "file.export";
     pub const BOOL_RUN: &str = "bool.run";
     pub const ASSET_PLACE: &str = "asset.place";
+    /// N5b: 建库(标资产 / 导出 pack / 登记)。
+    pub const ASSET_LIB: &str = "asset.lib";
 
     /// 全部能力名（契约测试用）。
     pub const ALL: &[&str] = &[
         EDITOR, SEL_READ, SEL_WRITE, HIST_READ, CAM_READ, CAM_WRITE, CAM_NAV, CAM_STEP, CAM_ROLL, SEL_APPLY,
-        VP_STATE, KEYMAP, CMD_DISPATCH, ERR_HOOK, TREE, MAT_STATE, MAT_SET, CMD_EXEC, GEO_READ, HIST_WRITE, SNAP_READ, VIEW_HIGHLIGHT, MEASURE_WRITE, CFG_STATE, BOM_READ, FILE_EXPORT, BOOL_RUN, ASSET_PLACE,
+        VP_STATE, KEYMAP, CMD_DISPATCH, ERR_HOOK, TREE, MAT_STATE, MAT_SET, CMD_EXEC, GEO_READ, HIST_WRITE, SNAP_READ, VIEW_HIGHLIGHT, MEASURE_WRITE, CFG_STATE, BOM_READ, FILE_EXPORT, BOOL_RUN, ASSET_PLACE, ASSET_LIB,
     ];
 }
 

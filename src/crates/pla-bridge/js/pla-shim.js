@@ -156,6 +156,14 @@
     // ---- N5 资产(asset pack)放置(实测 2026-11-18, know-how/asset-place.md) ----
     'ed.assets':               ['ed', 'assets'],
     'assets.packs':            ['assets', 'getAssetPacks'],
+    'assets.add':              ['assets', 'add'],
+    'assets.remove':           ['assets', 'remove'],
+    'nodes.setName':           ['nodes', 'setName'],
+    'nodes.setPivot':          ['nodes', 'setPivot'],
+    'nodes.isAsset':           ['nodes', 'isAsset'],
+    'nodes.findAllAssets':     ['nodes', 'findAllAssets'],
+    'cmd.toggleAsset':         ['ed', 'commands.ToggleAssetCommand'],
+    'cmd.exportAssetPack':     ['ed', 'commands.ExportAssetPackCommand'],
     'assets.load':             ['assets', 'load'],
     'exec.last':               ['exec', 'lastCommand'],
     // 正在执行的命令(lastCommand 在上一条被取消后可能还指着旧的)
@@ -496,6 +504,7 @@
                                'ed.snapScene', 'snap.canonicals', 'ed.enqueue', 'sig.commandEnded', 'exec.cancel', 'cmd.factoryBaseHolder',
                                'geo.items', 'geo.lookupTopo', 'geo.lookupItem', 'ed.docUnit'] },
     'bool.run':    { todo: 'N4' },
+    'asset.lib': { needs: ['ed.assets', 'assets.add', 'assets.remove', 'nodes.setName', 'nodes.setPivot', 'nodes.isAsset', 'nodes.findAllAssets', 'cmd.toggleAsset', 'cmd.exportAssetPack', 'ed.enqueue', 'ed.executor', 'nodes.item2key'] },
     'asset.place': { needs: ['ed.assets', 'assets.packs', 'assets.load', 'ed.executor', 'exec.last', 'geo.items', 'ed.undoStack', 'ed.nodes', 'nodes.item2key', 'nodes.getName'] }
   };
 
@@ -2637,6 +2646,111 @@
     });
   }, { async: true });
 
+  // N5b 建库(实测 2026-11-18, know-how/asset-place.md): 资产 = 标了资产标记的组**或单个实体**; 名字和 pivot 在标记那一刻定下来
+  // (之后改名 / setPivot 不进 pack)→ 先改名 + setPivot 再标。ToggleAssetCommand 作用于当前选择, 标完 Plasticity 会自动起一个
+  // MoveItemCommand(agent automatic), 取消即可。pivot 格式同 pack: {position: [米], orientation: [x,y,z,w]}; 不进撤销栈。
+  // args = { solid, name, pivot: [x,y,z](文档单位), orientation?: [x,y,z,w](默认不转 = 资产 +Z 同世界 +Z), units? } → { solid, name, asset: true }
+  def('asset.mark', 'asset.lib', function (a) {
+    a = a || {};
+    var k = unitOf(a).k;
+    var v = viewOf('solid', a.solid);
+    if (!v) throw new Error('solid not found: ' + a.solid);
+    if (!a.name) throw new Error('name is required');
+    if (!Array.isArray(a.pivot) || a.pivot.length !== 3) throw new Error('pivot must be [x,y,z]');
+    var key = invokeOn('nodes.item2key', [v]);
+    invokeOn('nodes.setName', [key, String(a.name)]);
+    invokeOn('nodes.setPivot', [key, { position: a.pivot.map(function (x) { return Number(x) * k; }), orientation: Array.isArray(a.orientation) && a.orientation.length === 4 ? a.orientation.map(Number) : [0, 0, 0, 1] }]);
+    if (invokeOn('nodes.isAsset', [key])) return { solid: itemIdOf(v), name: String(a.name), asset: true, already: true };
+    var s = need('sel.selected');
+    var prev = [];
+    NAMES.exportStep.selSets.forEach(function (k2) { var set = s[k2]; if (set && typeof set.forEach === 'function') set.forEach(function (x) { prev.push(x); }); });
+    try { invokeOn('exec.cancel'); } catch (e) {}
+    invokeOn('sel.removeAll', [], s);
+    invokeOn('sel.add', [v], s);
+    var Toggle = need('cmd.toggleAsset');
+    invokeOn('ed.enqueue', [new Toggle(editor())]);
+    return new Promise(function (res, rej) {
+      var t0 = Date.now();
+      (function poll() {
+        var ok = false;
+        try { ok = invokeOn('nodes.isAsset', [key]); } catch (e) { return rej(e); }
+        var act = get('exec.activeCmd');
+        if (ok) {
+          // 标完自动起的移动命令: 取消(等一会儿它可能才出现)
+          if (act) { try { invokeOn('exec.cancel'); } catch (e) {} }
+          if (act || Date.now() - t0 > 1500) {
+            try { invokeOn('sel.removeAll', [], s); prev.forEach(function (x) { invokeOn('sel.add', [x], s); }); } catch (e) {}
+            return res({ solid: itemIdOf(v), name: String(a.name), asset: true });
+          }
+        } else if (Date.now() - t0 > 5000) return rej(new Error('asset.mark: not marked within 5 s'));
+        setTimeout(poll, 100);
+      })();
+    });
+  }, { async: true });
+
+  // N5b: 把文档里所有资产导出成一个 pack(存盘对话框要先在主进程武装, 见 pla-bridge export_pack)。导出会顺手把 pack 登记进 Assets 面板。
+  // 不覆盖已有文件(实测: 目标已存在时什么也不写)→ 调用方导到新文件名再换上。
+  // args = { expect?: 应有的资产数 —— 文档里还有别的资产就拒绝(否则用户自己的资产会混进库里)} → { started: true, assets }
+  def('asset.exportPack', 'asset.lib', function (a) {
+    var n = Array.from(invokeOn('nodes.findAllAssets', []) || []).length;
+    if (a && a.expect !== undefined && n !== Number(a.expect)) throw new Error('the document holds ' + n + ' assets, expected ' + a.expect + ' (build libraries in a document without other assets)');
+    try { invokeOn('exec.cancel'); } catch (e) {}
+    var Exp = need('cmd.exportAssetPack');
+    invokeOn('ed.enqueue', [new Exp(editor())]);
+    return { started: true, assets: n };
+  });
+
+  // N5b: 登记 / 撤销登记 pack(Assets 面板里的清单)。add 收**数组**(给字符串会被当成一个个字符登记 —— 实测踩过), 新的排最前、去重。
+  function packPaths(a) {
+    var ps = (a && Array.isArray(a.paths)) ? a.paths : [];
+    if (!ps.length) throw new Error('paths must be a non-empty array of .plasticitypack paths');
+    ps.forEach(function (p) { if (typeof p !== 'string' || !/\.plasticitypack$/i.test(p) || !/^([a-zA-Z]:\\|\\\\|\/)/.test(p)) throw new Error('not an absolute .plasticitypack path: ' + p); });
+    return ps;
+  }
+  def('asset.register', 'asset.lib', function (a) {
+    var ps = packPaths(a);
+    var r = invokeOn('assets.add', [ps.slice()]);
+    return Promise.resolve(r).then(function () { return { packs: packList().map(function (p) { return p.path; }) }; });
+  }, { async: true });
+  def('asset.unregister', 'asset.lib', function (a) {
+    var ps = packPaths(a);
+    ps.forEach(function (p) { invokeOn('assets.remove', [p]); });
+    return { packs: packList().map(function (p) { return p.path; }) };
+  });
+  // N5: 螺钉改长度(用户 2026-11-18: pack 里的螺钉统一 10mm, 放进来后**只移动杆端的面**, 不整体缩放)。
+  // 杆端的面 = 沿 axis 投影后贴着最远端、且整个落在端部区(zone)里的面: 端面 + 倒角锥; 整体沿 axis 平移 delta(moveFaces), 杆的圆柱面跟着伸缩。
+  // args = { solid, axis: [x,y,z](朝杆端), delta: 文档单位(+ = 加长), zone?: 端部区长度(默认 min(2.5, 0.3 × 总长)), units? }
+  // → { solid: 结果实体 id, moved: [面 id], delta }
+  def('part.stretch', 'cmd.exec', function (a) {
+    a = a || {};
+    var U = unitOf(a), k = U.k;
+    var sv = viewOf('solid', a.solid);
+    if (!sv) throw new Error('solid not found: ' + a.solid);
+    if (!Array.isArray(a.axis) || a.axis.length !== 3) throw new Error('axis must be [x,y,z] (toward the tip)');
+    var ax = vnorm(a.axis.map(Number)), delta = Number(a.delta);
+    if (!isFinite(delta)) throw new Error('delta must be a number');
+    var sid = itemIdOf(sv);
+    if (Math.abs(delta) < 1e-9) return { solid: sid, moved: [], delta: 0 };
+    var span = function (b) {
+      var lo = Infinity, hi = -Infinity;
+      for (var i = 0; i < 8; i++) { var t = vdot([(i & 1 ? b[1] : b[0])[0], (i & 2 ? b[1] : b[0])[1], (i & 4 ? b[1] : b[0])[2]], ax); lo = Math.min(lo, t); hi = Math.max(hi, t); }
+      return [lo, hi];
+    };
+    var ents = groupEntries(sv, 'face', k).filter(function (e) { return e.bbox; }).map(function (e) { return { id: e.id, s: span(e.bbox) }; });
+    if (!ents.length) throw new Error('solid has no faces: ' + a.solid);
+    var far = Math.max.apply(null, ents.map(function (e) { return e.s[1]; })), near = Math.min.apply(null, ents.map(function (e) { return e.s[0]; }));
+    var zone = a.zone !== undefined ? Number(a.zone) : Math.min(2.5, 0.3 * (far - near)), eps = 1e-6 * Math.max(1, Math.abs(far));
+    var tip = ents.filter(function (e) { return e.s[1] >= far - eps && e.s[0] >= far - zone - eps; });
+    if (!tip.length) throw new Error('no tip faces found');
+    // 缩短不能吃到头
+    if (delta < 0 && -delta >= (far - near) - zone) throw new Error('cannot shorten by ' + (-delta) + ' (part is ' + sig7(far - near) + ' long)');
+    var move = ax.map(function (x) { return x * delta; });
+    return API['cmd.exec'].fn({ atomic: true, ops: [{ op: 'moveFaces', id: 's0', faces: tip.map(function (e) { return e.id; }), move: move }], units: U.unit }).then(function (r) {
+      if (r.failed) throw new Error('stretch: ' + r.failed.err + (r.rolledBack !== undefined ? ' — rolled back' : ''));
+      var it = r.results[0] && r.results[0].items && r.results[0].items[0];
+      return { solid: it && it.id !== undefined ? it.id : sid, moved: tip.map(function (e) { return e.id; }), delta: sig7(delta) };
+    });
+  }, { async: true });
   // N4b 打孔位置: 选择里的草图点 → 文档单位坐标(用户 2026-11-15: 用草图端点定孔位, 选几个点打几个孔)。
   // curveVertex = 曲线端点(lookupTopologyItemById → Vertex.GetPoint); curve = 整条曲线: 有端点 → 各端点, 闭合(圆等)→ 包围盒中心(= 圆心)。
   function sketchPoints(refs, k) {

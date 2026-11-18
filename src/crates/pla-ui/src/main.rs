@@ -415,6 +415,10 @@ struct PlaApp {
     /// 逐个执行: (垫片 api, 参数) —— asset.place(pack 里有)或 cmd.exec(宏建)
     screw_queue: std::collections::VecDeque<(&'static str, serde_json::Value)>,
     screw_running: bool,
+    /// 正在执行的那一件的参数(pack 螺钉放好后要接着改长度)
+    screw_inflight: Option<serde_json::Value>,
+    /// N5b 建库 / 登记进行中
+    asset_lib_busy: bool,
     screw_count: (usize, usize, Option<String>),
     /// P4: 进行中的组联动。
     link_run: Option<LinkRun>,
@@ -2754,6 +2758,8 @@ impl PlaApp {
             screw_after: None,
             screw_queue: std::collections::VecDeque::new(),
             screw_running: false,
+            screw_inflight: None,
+            asset_lib_busy: false,
             screw_count: (0, 0, None),
             attach_prompt: None,
             link_run: None,
@@ -3268,13 +3274,23 @@ impl PlaApp {
                     Err(e) => pla_ui::diag::log(&format!("asset.list failed: {e}")),
                 },
                 pla_bridge::cdp::CdpEvent::CallResult { name, result }
-                    if self.screw_running && (name == pla_bridge::shim::api::ASSET_PLACE || name == pla_bridge::shim::api::CMD_EXEC) =>
+                    if self.screw_running && (name == pla_bridge::shim::api::ASSET_PLACE || name == pla_bridge::shim::api::CMD_EXEC || name == pla_bridge::shim::api::PART_STRETCH) =>
                 {
                     // cmd.exec 的失败在回包里(failed)
                     let result = result.and_then(|v| match v.get("failed") {
                         Some(f) if !f.is_null() => Err(format!("{} {}", f["op"].as_str().unwrap_or(""), f["err"].as_str().unwrap_or(""))),
                         _ => Ok(v),
                     });
+                    // 放好的 pack 螺钉要改长度 → 紧接着改(算同一件)
+                    let stretch = self.screw_inflight.take().filter(|_| name == pla_bridge::shim::api::ASSET_PLACE).map(|a| a["_stretch"].clone()).filter(|s| s.is_object());
+                    if let (Some(s), Ok(v)) = (&stretch, &result) {
+                        let solid = v["items"].as_array().into_iter().flatten().find(|i| i["kind"] == "solid").map(|i| i["id"].clone());
+                        if let Some(solid) = solid {
+                            self.screw_queue.push_front((pla_bridge::shim::api::PART_STRETCH, serde_json::json!({ "solid": solid, "axis": s["axis"], "delta": s["delta"] })));
+                            self.screw_pump();
+                            continue;
+                        }
+                    }
                     match result {
                         Ok(_) => self.screw_count.0 += 1,
                         Err(e) => {
@@ -3283,6 +3299,37 @@ impl PlaApp {
                         }
                     }
                     self.screw_pump();
+                }
+                // N5b 建库回包: 成功 → 拷到用户目录并登记(Assets 面板马上能用)
+                pla_bridge::cdp::CdpEvent::CallResult { name, result } if name == pla_bridge::shim::api::ASSET_BUILD_PACK => {
+                    self.asset_lib_busy = false;
+                    match result {
+                        Ok(v) => {
+                            let n = v["assets"].as_u64().unwrap_or(0);
+                            let path = v["path"].as_str().unwrap_or("").to_string();
+                            match pla_ui::asset_lib::install() {
+                                Ok(ps) if !ps.is_empty() => {
+                                    let paths: Vec<String> = ps.iter().map(|p| p.display().to_string()).collect();
+                                    self.asset_lib_busy = true;
+                                    self.cdp.send(pla_bridge::cdp::CdpCmd::Call { name: pla_bridge::shim::api::ASSET_REGISTER, args: serde_json::json!({ "paths": paths }) });
+                                }
+                                Ok(_) => {}
+                                Err(e) => pla_ui::diag::log(&format!("asset_lib install: {e}")),
+                            }
+                            self.set_notice((false, t!("已建库: {n} 件 → {path}", "Library built: {n} parts → {path}")));
+                        }
+                        Err(e) => self.set_notice((true, t!("建库失败: {e}", "Library build failed: {e}"))),
+                    }
+                }
+                pla_bridge::cdp::CdpEvent::CallResult { name, result } if name == pla_bridge::shim::api::ASSET_REGISTER => {
+                    self.asset_lib_busy = false;
+                    match result {
+                        Ok(_) => {
+                            self.cdp.send(pla_bridge::cdp::CdpCmd::Call { name: pla_bridge::shim::api::ASSET_LIST, args: serde_json::json!({}) });
+                            self.set_notice((false, tr("紧固件 pack 已加入 Plasticity(Assets 面板)", "Fastener packs added to Plasticity (Assets panel)").into()));
+                        }
+                        Err(e) => self.set_notice((true, t!("登记 pack 失败: {e}", "Registering packs failed: {e}"))),
+                    }
                 }
                 // N3e: 本体测量回包: 成功只记日志(大纲里能看到); 失败如实提示(尺寸记录本身不受影响)
                 pla_bridge::cdp::CdpEvent::CallResult { name, result } if name == pla_bridge::shim::api::DIM_MEASURE => match result {
@@ -7925,6 +7972,7 @@ impl PlaApp {
         if let Some(id) = pick {
             self.screw_set_std(id);
         }
+        self.asset_lib_row(ui);
         let st = fs::screw_std(&self.screw_choice.std)?;
         let d = self.screw_choice.d;
         let plan = sk::plan(&self.screw_choice, ctx);
@@ -7932,7 +7980,7 @@ impl PlaApp {
         rz_label(ui, tr("规格 / 长度", "Size / length"));
         let mut new_d: Option<f64> = None;
         let mut new_l: Option<Option<f64>> = None;
-        let in_pack = sk::pack_lengths(&self.screw_assets, st.id, d);
+        let in_pack = sk::pack_has(&self.screw_assets, st.id, d);
         ui.horizontal(|ui| {
             egui::ComboBox::from_id_salt("screw-d").width(70.0).selected_text(format!("M{d}")).show_ui(ui, |ui| {
                 for r in st.rows {
@@ -7942,7 +7990,7 @@ impl PlaApp {
                 }
             });
             ui.label("×");
-            let lab = |l: f64| if in_pack.contains(&l) { format!("{l} ★") } else { format!("{l}") };
+            let lab = |l: f64| format!("{l}");
             let cur = match self.screw_choice.length {
                 Some(l) => lab(l),
                 None => plan.auto.map_or(tr("自动(无)", "Auto (none)").to_string(), |a| t!("自动 {}", "Auto {}", lab(a))),
@@ -7957,8 +8005,8 @@ impl PlaApp {
                     }
                 }
             });
-            if !in_pack.is_empty() {
-                ui.label(egui::RichText::new(tr("★ = pack 里有", "★ = in a pack")).size(11.0).color(COL_MUTED));
+            if in_pack {
+                ui.label(egui::RichText::new(tr("pack 里有(放进来后改长度)", "In a pack (length set after placing)")).size(11.0).color(COL_MUTED));
             }
         });
         if let Some(nd) = new_d {
@@ -8054,6 +8102,51 @@ impl PlaApp {
         Some(plan)
     }
 
+    /// N5b 资产库一行: 「加入 Plasticity」(随软件的 pack 拷到用户数据目录并登记)+「建库…」(选一个系列, 按国标建成 pack)。
+    fn asset_lib_row(&mut self, ui: &mut egui::Ui) {
+        let en = pla_bridge::i18n::is_en();
+        let mut build: Option<&'static str> = None;
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(tr("资产库", "Asset library")).size(11.0).color(COL_MUTED));
+            if ui
+                .add_enabled(!self.asset_lib_busy, egui::Button::new(tr("加入 Plasticity", "Add to Plasticity")).small())
+                .on_hover_text(tr("把 PLAhelper 自带的紧固件 pack 加进 Plasticity 的 Assets 面板", "Add PLAhelper's bundled fastener packs to Plasticity's Assets panel"))
+                .clicked()
+            {
+                match pla_ui::asset_lib::install() {
+                    Ok(ps) if ps.is_empty() => self.set_notice((true, tr("还没有建好的 pack(先「建库…」)", "No packs built yet (use Build library… first)").into())),
+                    Ok(ps) => {
+                        let paths: Vec<String> = ps.iter().map(|p| p.display().to_string()).collect();
+                        self.asset_lib_busy = true;
+                        self.cdp.send(pla_bridge::cdp::CdpCmd::Call { name: pla_bridge::shim::api::ASSET_REGISTER, args: serde_json::json!({ "paths": paths }) });
+                    }
+                    Err(e) => self.set_notice((true, t!("拷贝 pack 失败: {e}", "Copying packs failed: {e}"))),
+                }
+            }
+            ui.add_enabled_ui(!self.asset_lib_busy && !self.dim_busy, |ui| {
+                egui::ComboBox::from_id_salt("asset-lib-build").width(110.0).selected_text(tr("建库…", "Build library…")).show_ui(ui, |ui| {
+                    for (id, code, zh, en_name) in pla_ui::asset_lib::series() {
+                        if ui.selectable_label(false, format!("{code} {}", if en { en_name } else { zh })).on_hover_text(tr("按国标全部规格建成一个 pack(螺钉 10mm); 临时建在当前文档里, 导出后回滚", "Build every size into one pack (screws 10 mm); built in this document, rolled back after export")).clicked() {
+                            build = Some(id);
+                        }
+                    }
+                });
+            });
+        });
+        if let Some(id) = build {
+            let Some(file) = pla_ui::asset_lib::pack_file(id) else { return };
+            match pla_ui::asset_lib::build_items(id, &[]) {
+                Ok(items) => {
+                    let path = pla_ui::asset_lib::build_dir().join(file).display().to_string();
+                    let n = items.len();
+                    self.asset_lib_busy = true;
+                    self.cdp.send(pla_bridge::cdp::CdpCmd::BuildPack { items, path });
+                    self.set_notice((false, t!("正在建库({n} 件, 建完回滚)…", "Building the library ({n} parts, rolled back afterwards)…")));
+                }
+                Err(e) => self.set_notice((true, e)),
+            }
+        }
+    }
     /// N5: 打完孔 → 每个孔位按计划排队: pack 里有现成件 = asset.place, 没有 = 按国标宏建(cmd.exec)。
     fn screw_enqueue(&mut self, v: &serde_json::Value, items: &[pla_ui::screw_kit::Item]) {
         use pla_ui::screw_kit::Kind;
@@ -8072,10 +8165,15 @@ impl PlaApp {
                 let pt: Vec<f64> = (0..3).map(|i| ((at[i] - n[i] * it.z) * 1000.0).round() / 1000.0).collect();
                 let out: Vec<f64> = n.iter().map(|x| if it.up { *x } else { -*x }).collect();
                 if let Some(a) = pla_ui::screw_kit::find(&self.screw_assets, it) {
-                    self.screw_queue.push_back((
-                        pla_bridge::shim::api::ASSET_PLACE,
-                        serde_json::json!({ "asset": a.id, "pack": a.pack, "at": pt, "normal": out, "units": units }),
-                    ));
+                    let mut args = serde_json::json!({ "asset": a.id, "pack": a.pack, "at": pt, "normal": out, "units": units });
+                    // 螺钉: pack 里是统一长度(10mm), 放好后只移动杆端改到要的长度(用户 2026-11-18)
+                    if let (Kind::Screw, Some(l)) = (it.kind, it.length) {
+                        let l0 = pla_ui::screw_kit::asset_len(a, it.std, it.d);
+                        if (l - l0).abs() > 1e-6 {
+                            args["_stretch"] = serde_json::json!({ "delta": ((l - l0) * 1000.0).round() / 1000.0, "axis": n.iter().map(|x| -x).collect::<Vec<f64>>() });
+                        }
+                    }
+                    self.screw_queue.push_back((pla_bridge::shim::api::ASSET_PLACE, args));
                     continue;
                 }
                 let (kind, axis) = match it.kind {
@@ -8101,6 +8199,7 @@ impl PlaApp {
             self.dim_busy = true;
             self.screw_running = true;
             let left = self.screw_queue.len();
+            self.screw_inflight = Some(args.clone());
             self.cdp.send(pla_bridge::cdp::CdpCmd::Call { name: api, args });
             self.set_notice((false, t!("正在放紧固件…(还有 {left} 件)", "Placing fasteners… ({left} more)")));
             return;

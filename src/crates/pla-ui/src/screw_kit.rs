@@ -366,44 +366,39 @@ fn aliases(kind: Kind, std: &str) -> &'static [&'static str] {
     }
 }
 
-/// 资产的螺钉长度: 名字里有 ×l 就用它, 否则用包围盒最长边 − 头露出的高度(六角头 = k)。
-fn asset_length(a: &Asset, std: &str, d: f64, named: Option<f64>) -> Option<f64> {
-    if named.is_some() {
-        return named;
+/// pack 里螺钉统一一个长度(用户 2026-11-18: 留 10mm, 放进来后再只移动杆端改长度)。
+pub const PACK_SCREW_LEN: f64 = 10.0;
+
+/// 资产里螺钉的公称长度: 名字里有 ×l 就用它, 否则按包围盒最长边 − 头露出的高度推, 推不出就当 [PACK_SCREW_LEN]。
+pub fn asset_len(a: &Asset, std: &str, d: f64) -> f64 {
+    let named = sizes_in(&norm(&a.name)).into_iter().find(|(x, _)| (x - d).abs() < 1e-9).and_then(|(_, l)| l);
+    if let Some(l) = named {
+        return l;
     }
-    let st = fasteners::screw_std(std)?;
+    let Some(st) = fasteners::screw_std(std) else { return PACK_SCREW_LEN };
     let ext = a.size.iter().copied().fold(0.0, f64::max);
-    let head = st.head_above(d);
-    let l = ext - head;
-    st.lengths(d).into_iter().find(|x| (x - l).abs() < 0.3)
+    let l = ((ext - st.head_above(d)) * 100.0).round() / 100.0;
+    if l > 0.0 {
+        l
+    } else {
+        PACK_SCREW_LEN
+    }
 }
 
-/// 在 pack 里找这件东西(标准俗称在名字 / 文件夹里 + 规格对 + 螺钉长度对)。
+/// 在 pack 里找这件东西: 标准俗称在名字 / 文件夹里 + M 规格对(螺钉不看长度, 放进来后改长度)。
 pub fn find<'a>(assets: &'a [Asset], it: &Item) -> Option<&'a Asset> {
     let al: Vec<String> = aliases(it.kind, it.std).iter().map(|a| norm(a)).collect();
     assets.iter().find(|a| {
         let hay = norm(&format!("{}/{}", a.folder, a.name));
-        if !al.iter().any(|x| hay.contains(x.as_str())) {
-            return false;
-        }
-        sizes_in(&hay).iter().any(|(d, l)| {
-            (d - it.d).abs() < 1e-9 && (it.kind != Kind::Screw || it.length.is_some_and(|want| asset_length(a, it.std, it.d, *l).is_some_and(|x| (x - want).abs() < 1e-6)))
-        })
+        al.iter().any(|x| hay.contains(x.as_str())) && sizes_in(&hay).iter().any(|(d, _)| (d - it.d).abs() < 1e-9)
     })
 }
 
-/// pack 里这个标准 + 规格有哪些长度(界面在长度下拉里标出来)。
-pub fn pack_lengths(assets: &[Asset], std: &str, d: f64) -> Vec<f64> {
-    let mut out: Vec<f64> = fasteners::screw_std(std)
-        .map(|st| st.lengths(d))
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|l| find(assets, &Item { kind: Kind::Screw, std: fasteners::screw_std(std).map_or("", |s| s.id), d, length: Some(*l), z: 0.0, up: true }).is_some())
-        .collect();
-    out.dedup();
-    out
+/// pack 里有没有这个标准 + 规格的螺钉。
+pub fn pack_has(assets: &[Asset], std: &str, d: f64) -> bool {
+    let id = fasteners::screw_std(std).map_or("", |s| s.id);
+    find(assets, &Item { kind: Kind::Screw, std: id, d, length: None, z: 0.0, up: true }).is_some()
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -515,15 +510,17 @@ mod tests {
             a("M4", "六角螺母", [8.1, 7.0, 3.2]),
         ];
         let sc = |std: &'static str, d: f64, l: f64| Item { kind: Kind::Screw, std, d, length: Some(l), z: 0.0, up: true };
-        assert_eq!(find(&assets, &sc("gb70.1", 4.0, 10.0)).map(|x| x.id.as_str()), Some("node:M4"));
-        assert!(find(&assets, &sc("gb70.1", 4.0, 12.0)).is_none());
+        // 螺钉不看长度(放进来再改): M4×25 也用这个 M4, 原长 10(包围盒 14 − 头 4)
+        let m4 = find(&assets, &sc("gb70.1", 4.0, 25.0)).unwrap();
+        assert_eq!((m4.id.as_str(), asset_len(m4, "gb70.1", 4.0)), ("node:M4", 10.0));
         assert!(find(&assets, &sc("gb70.1", 3.0, 10.0)).is_none());
-        assert_eq!(find(&assets, &sc("gb818", 3.0, 8.0)).map(|x| x.name.as_str()), Some("GB/T 818 M3×8"));
+        let m3 = find(&assets, &sc("gb818", 3.0, 12.0)).unwrap();
+        assert_eq!((m3.name.as_str(), asset_len(m3, "gb818", 3.0)), ("GB/T 818 M3×8", 8.0));
         let w = Item { kind: Kind::Washer, std: "gb97.1", d: 4.0, length: None, z: 0.0, up: true };
         assert_eq!(find(&assets, &w).map(|x| x.name.as_str()), Some("平垫 M4"));
         let n = Item { kind: Kind::Nut, std: "gb6170", d: 4.0, length: None, z: 0.0, up: false };
         assert_eq!(find(&assets, &n).map(|x| x.folder.as_str()), Some("六角螺母"));
-        assert_eq!(pack_lengths(&assets, "gb70.1", 4.0), vec![10.0]);
+        assert!(pack_has(&assets, "gb70.1", 4.0) && !pack_has(&assets, "gb70.1", 5.0));
         assert_eq!(sizes_in("m2.5x10/m3"), vec![(2.5, Some(10.0)), (3.0, None)]);
     }
 }
