@@ -264,6 +264,10 @@ struct PlaApp {
     /// D6 出图偏好(全局; 第一次用时读)。
     draw_prefs: Option<pla_ui::drawing::Prefs>,
     lib: pla_ui::parts_lib::Library,
+    /// 外部改 BOM 填写 / 供应商的检测(修改时间)
+    bom_ext_checked: Option<Instant>,
+    bom_edits_mtime: Option<std::time::SystemTime>,
+    suppliers_mtime: Option<std::time::SystemTime>,
     lib_mtime: Option<std::time::SystemTime>,
     lib_checked: Option<Instant>,
     lib_search: String,
@@ -2651,6 +2655,9 @@ impl PlaApp {
             draw_asm: Default::default(),
             draw_prefs: None,
             lib: Default::default(),
+            bom_ext_checked: None,
+            bom_edits_mtime: None,
+            suppliers_mtime: None,
             lib_mtime: None,
             lib_checked: None,
             lib_search: String::new(),
@@ -4157,17 +4164,24 @@ impl PlaApp {
             self.set_notice((false, t!("{label}: 绑定的尺寸都已是计算值", "{label}: bound dimensions already match")));
             return;
         }
+        if let Err(e) = self.link_start(label, changes.into_iter().collect()) {
+            self.set_notice((true, e));
+        }
+    }
+
+    /// P5 / MCP: 逐条改尺寸(事务内; 每条 = 按签名定位 + 读 + 应用 + 刷新记录; 任何一条失败整体撤回)。
+    fn link_start(&mut self, label: &str, changes: Vec<(String, f64)>) -> Result<(), String> {
         if self.link_run.is_some() || self.dim_busy || self.dim_pending.is_some() {
-            self.set_notice((true, tr("上一次修改还没完成, 稍后再改", "The previous change is still running; try again shortly").into()));
-            return;
+            return Err(tr("上一次修改还没完成, 稍后再改", "The previous change is still running; try again shortly").into());
         }
         if !self.require_feature(Feature::DimFace) {
-            return;
+            return Err(tr("当前不能改尺寸(需要 CDP 模式与尺寸功能)", "Dimensions cannot be changed right now (needs CDP mode)").into());
         }
         self.cdp.send(pla_bridge::cdp::CdpCmd::Call { name: pla_bridge::shim::api::HIST_BEGIN, args: serde_json::Value::Null });
         let total = changes.len();
         self.link_run = Some(LinkRun { label: label.to_string(), queue: changes.into_iter().collect(), total });
         self.link_next();
+        Ok(())
     }
 
     /// P5: 下一条(没有了 → 提交事务)。
@@ -4222,6 +4236,24 @@ impl PlaApp {
 
     /// B3: 本文档的编辑按需载入; 模板列表 / 当前模板每秒查一次修改时间, 改了重读(读错保留上一次能用的)。
     fn bom_template_tick(&mut self) {
+        // 外部(pla-mcp 的 bom_edit / suppliers)改了存档 → 重读(按修改时间, 每秒最多查一次)
+        if self.bom_edits_doc == self.doc_key && self.bom_ext_checked.is_none_or(|t| t.elapsed() >= Duration::from_secs(1)) {
+            self.bom_ext_checked = Some(Instant::now());
+            let m = pla_ui::bom_table::edits_mtime(&self.doc_key);
+            if m.is_some() && self.bom_edits_mtime.is_some() && m != self.bom_edits_mtime {
+                let e = pla_ui::bom_table::load_edits(&self.doc_key);
+                if e != self.bom_edits {
+                    self.bom_edits = e;
+                    self.bom_cell_buf.clear();
+                }
+            }
+            self.bom_edits_mtime = m;
+            let sm = std::fs::metadata(pla_ui::release::Suppliers::path()).and_then(|x| x.modified()).ok();
+            if sm.is_some() && self.suppliers_mtime.is_some() && sm != self.suppliers_mtime {
+                self.suppliers = pla_ui::release::Suppliers::load();
+            }
+            self.suppliers_mtime = sm;
+        }
         if self.bom_edits_doc != self.doc_key {
             self.bom_edits_doc = self.doc_key.clone();
             self.bom_edits = pla_ui::bom_table::load_edits(&self.doc_key);
@@ -5174,6 +5206,42 @@ impl PlaApp {
                     let s = self.bom_scope.clone();
                     self.bom_scan(s);
                 }
+                json!({"ok": true})
+            }
+            // 按名字改尺寸(前台文档): [{name, value}] → 同"参数联动"那条路(事务内逐条)
+            "dims_set" => {
+                self.dims_reload();
+                let mut changes = Vec::new();
+                for c in req["changes"].as_array().into_iter().flatten() {
+                    let (Some(n), Some(v)) = (c["name"].as_str(), c["value"].as_f64()) else {
+                        return json!({"ok": false, "error": "each change needs name and value"});
+                    };
+                    if !self.dims_list.iter().any(|d| d.name == n) {
+                        return json!({"ok": false, "error": format!("no dimension named {n} in {}", self.doc_key)});
+                    }
+                    changes.push((n.to_string(), v));
+                }
+                if changes.is_empty() {
+                    return json!({"ok": false, "error": "no changes"});
+                }
+                match self.link_start("MCP", changes) {
+                    Ok(()) => json!({"ok": true}),
+                    Err(e) => json!({"ok": false, "error": e}),
+                }
+            }
+            // 改参数表达式(前台文档)→ 重新求值, 绑定的尺寸跟着改
+            "param_set" => {
+                let (Some(n), Some(expr)) = (req["name"].as_str(), req["expr"].as_str()) else {
+                    return json!({"ok": false, "error": "needs name and expr"});
+                };
+                let f = pla_ui::dims::load_file(&self.doc_key);
+                let Some(p) = f.params.iter().find(|p| p.name == n) else {
+                    return json!({"ok": false, "error": format!("no parameter named {n}")});
+                };
+                if let Err(e) = pla_ui::dims::update_param(&self.doc_key, &p.id.clone(), None, None, Some(expr)) {
+                    return json!({"ok": false, "error": e});
+                }
+                self.formula_run("MCP");
                 json!({"ok": true})
             }
             "rule" => {

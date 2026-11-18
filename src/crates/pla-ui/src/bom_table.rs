@@ -158,6 +158,11 @@ pub fn load_edits(doc_key: &str) -> Edits {
     std::fs::read_to_string(edits_path(doc_key)).ok().and_then(|s| serde_json::from_str(s.trim_start_matches('\u{feff}')).ok()).unwrap_or_default()
 }
 
+/// 填写存档的修改时间(pla-ui 检测外部修改用)。
+pub fn edits_mtime(doc_key: &str) -> Option<std::time::SystemTime> {
+    std::fs::metadata(edits_path(doc_key)).and_then(|m| m.modified()).ok()
+}
+
 pub fn save_edits(doc_key: &str, e: &Edits) -> Result<(), String> {
     let p = edits_path(doc_key);
     if let Some(d) = p.parent() {

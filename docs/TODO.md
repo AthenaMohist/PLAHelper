@@ -445,7 +445,12 @@
   - [ ] pla-ui 里给后台实例一个状态 / 开关（现在只有 MCP 能起停）。
   - [x] 后台打开 / 另存为文档；**前台开着的同名文档一律拒绝**（打开 / 另存为 / 每个作业前都查，报警并提示先关前台）。
   - [x] 后台扫 BOM / 出图 / 外发包（pla-mcp `background_bom` / `background_draw` / `background_release`；逻辑抽到 `pla_ui::doc_jobs`，pla-ui 共用）。实测 bgtest：BOM 6 种、出图 2 张 86 s + 合订、外发 R1。
-  - [ ] 后台装配图、按配置出图；外发包在有供应商分配的真项目上验一次（分包 + 缺件清单）。
+  - [ ] 后台装配图、按配置出图。
+- [~] **N7 MCP 补齐"操作"**（用户 2026-11-18：用语言描述就能完成任务，不按界面 1:1；know-how/mcp-tools.md「文档作业」）：
+      前台 / 后台通用的 `bom_table` / `bom_edit` / `bom_export` / `draw_parts` / `release` / `release_history` / `suppliers` / `configs` / `dims`；
+      pla-ui 按修改时间重读 BOM 填写 / 供应商；尺寸改值 / 参数改值经 pla-ui（`link_start` 抽出来共用）。实测后台 bgtest：BOM 读改 → 外发 R2（ECN + CNC / 3D 打印分包）、配置。
+  - [ ] `dims set` / `set_param` 在前台实测（会改用户模型，等用户同意）；前台 `draw_parts` / `release` 实测。
+  - [ ] 还没 MCP 化：选择集 / 视口状态 / 材质状态、快照、零件库（library.json）、上传图纸锁定、BOM 模板编辑、孔规格方案编辑。
 - [ ] **N5 常用件库**：常用件白名单入库（STEP + 缩略图 + 规格字段，SQLite 索引），PLAhelper 搜索面板一键放入当前文档；
       常用度按本人插入次数统计；商家具体型号用到时下载归档。
 - [ ] **N6 AI 建模**：已细化为 **A 自动建模 pipeline**（见下节）。build123d → STEP → 导入 作为退路保留。

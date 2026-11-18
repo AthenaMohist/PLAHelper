@@ -16,6 +16,25 @@
 `background` 还有 open / save_as(文档); 对后台文档的作业: `background_bom` / `background_draw` / `background_release`。
 **前台开着的同名文档一律拒绝**(打开 / 另存为 / 作业), 报警并提示用户先在前台关掉。细节 / 实测: know-how/background-instance.md。
 
+## 文档作业(2026-11-18, 前台 / 后台通用)
+
+用户要求: 用语言描述就能完成任务, 所以按"操作"补齐 MCP, 不按界面 1:1。`doc`: `foreground`(默认, pla-ui 绑定的文档; pla-ui 没开就看前台窗口标题)/ `background`。
+数据直接读写文档的 `.pla/…` 存档(逻辑 = `pla_ui::doc_jobs` / `bom_table` / `release`, 与 pla-ui 共用); pla-ui 按修改时间重读 BOM 填写与供应商, 界面马上看得到。
+
+| 工具 | 做什么 |
+|---|---|
+| `bom_table` | 算好的 BOM: 列(id / 表头 / 可编辑 / 公式)、行(key、各列值、哪些是人工改的、归哪家、出图状态)、合计、排除、文档默认值、模板 / 供应商清单 |
+| `bom_edit` | `set` 单元格(零件 = key / 料号 / 名字; 列 = id 或表头, 供应商自有列也行; null = 恢复)、`assign` 归哪家(id / 名字 / buy / "")、`exclude` / `include`、`add_rows` / `remove_rows` 手动行、`defaults`(如套数)、`template`、`project` |
+| `bom_export` | 导 CSV |
+| `draw_parts` | 直接出零件图(导 STEP + 编译, 两张以上合订); 前台会临时换选择再还原, 用户在用时优先 background 或排队的 `draw` |
+| `release` / `release_history` | 外发包(版本 / ECN / 重出 ECN 涉及的图 / 总 BOM + 各家包; 报没分配供应商的零件)/ 版本记录 |
+| `suppliers` | 供应商(全局): list / add / update / remove(要的文件、主表列、自有列) |
+| `configs` | 配置: list / apply / save |
+| `dims` | 尺寸记录与参数: list; `set`(按名字改尺寸, 事务内)/ `set_param`(改参数, 绑定的尺寸跟着改)经 pla-ui 在前台文档上做 |
+
+实测(后台 bgtest): 读表 → 改料号 / 表面处理 / 归 CNC·3D 打印·外购 / 套数 2 / 加手动行(公式跟着算)→ 外发 R2: ECN-001(3 项)、重出 2 张图、CNC 包(PDF/DXF/STEP + BOM, 带表面处理)、3D 打印包(STEP + BOM)、zip;
+配置存 / 列 / 切; 前台 dims 列表。`dims set` 会改用户模型, 没在 model1 上实测。
+
 ## 建模的工作方式(给 agent 的要点)
 
 1. 先 `model_state`(概览) → 再按物体查 `detail: faces/edges`; 面 / 边 id 形如 `34f9439`, **物体版本 id(34)每次改动都变**, 改完要重新查。

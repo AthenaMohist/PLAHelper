@@ -70,6 +70,20 @@ async function guardForeground(doc, what) {
   }
 }
 
+/** 等后台页面标题稳定(ms 内没变)再动手: 启动后 Plasticity 可能还在恢复上次的文档, 命令也是异步落地的(实测: 新文档命令在打开之后才生效)。 */
+async function waitTitleStable(ms, maxMs) {
+  let last = null, since = Date.now();
+  const t0 = Date.now();
+  while (Date.now() - t0 < (maxMs || 15000)) {
+    let t = null;
+    try { t = await pageEval('document.title'); } catch (e) {}
+    if (t !== last) { last = t; since = Date.now(); }
+    else if (Date.now() - since >= ms) return last;
+    await sleep(150);
+  }
+  return last;
+}
+
 function readState() { try { return JSON.parse(fs.readFileSync(STATE, 'utf8')); } catch (e) { return {}; } }
 function writeState(patch) { fs.writeFileSync(STATE, JSON.stringify(Object.assign(readState(), patch))); }
 
@@ -88,7 +102,15 @@ async function openDoc(doc, discard) {
     + (discard ? 'if (window.__PLA_EDITOR__) window.__PLA_EDITOR__._hasUnsavedChanges = false; ' : '')
     + 'el.dispatchEvent(new CustomEvent(' + JSON.stringify(OPEN_DOC_CMD) + ', { bubbles: true })); '
     + 'for (let i = 0; i < 150; i++) { const t = document.title.split(" - ")[0].replace(/^\\*/, "").replace(/\\.plasticity$/i, "").trim().toLowerCase(); if (t === ' + JSON.stringify(stem) + ') return document.title; await new Promise((r) => setTimeout(r, 100)); } return "timeout: " + document.title; })()';
-  const title = await pageEval(js);
+  let title = await pageEval(js);
+  const stemOf = (t) => docStem(String(t || '').split(' - ')[0]);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const settled = await waitTitleStable(1200, 10000);
+    if (stemOf(settled) === stem) { title = settled; break; }
+    if (attempt === 1) { title = 'timeout: replaced by ' + settled; break; }
+    await mainEval('(() => { globalThis.__PLA_BG__.openPaths = ' + JSON.stringify([doc]) + '; return 1; })()');
+    title = await pageEval(js);
+  }
   await mainEval('(() => { globalThis.__PLA_BG__.openPaths = null; return 1; })()');
   if (String(title).startsWith('timeout') || title === 'no viewport') throw new Error('open did not complete (' + title + ') — a dialog may have been auto-cancelled, see status');
   writeState({ doc, docKey: path.basename(doc).replace(/\.plasticity$/i, '') });
@@ -243,12 +265,13 @@ async function start(args) {
     try { st = JSON.parse(await mainEval(STATUS_JS)); } catch (e) { continue; }
     if (st.windows.length && st.windows.every((w) => !w.loading)) break;
   }
-  let title = null;
-  {
+  let title = await waitTitleStable(1500, 20000);
+  if (!args.doc) {
     const js = '(async () => { const el = document.querySelector(' + JSON.stringify(VIEWPORT_SELECTOR) + '); if (!el) return "no viewport"; '
       + 'el.dispatchEvent(new CustomEvent(' + JSON.stringify(NEW_DOC_CMD) + ', { bubbles: true })); '
       + 'for (let i = 0; i < 50 && !/^Untitled/.test(document.title); i++) await new Promise((r) => setTimeout(r, 100)); return document.title; })()';
     try { title = await pageEval(js); } catch (e) { title = 'new doc failed: ' + e.message; }
+    title = await waitTitleStable(1000, 8000);
   }
   // CDP 代理(9343 → 后台实例的 inspector 9344)
   const proxy = spawn(process.execPath, [path.join(__dirname, 'pla-cdp-v8.js'), 'proxy'], {

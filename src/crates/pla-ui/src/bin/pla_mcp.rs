@@ -148,14 +148,49 @@ The spec, a map (bodies, solid ids, undo range) and a log are saved under the do
         {"name": "background", "annotations": {"destructiveHint": true},
          "description": "A separate, hidden Plasticity instance for independent jobs, so the user can keep working (browser, or their own Plasticity on another project) undisturbed: it never shows a window, never appears in the taskbar, never takes focus, and never moves the real mouse. action=start (doc?: a .plasticity file to open; uses a copy of the user's login/settings in its own data folder; ~5 s) / open (doc, discard?: drop unsaved changes) / save_as (doc) / status / stop. A document that is open in the user's foreground Plasticity is REFUSED (open / save_as / jobs) - tell the user to close it there first. Jobs on the open document: background_bom / background_draw / background_release. Then pass instance: \"background\" to any model_* tool to work in it. Native dialogs there never show: save dialogs are answered by PLAhelper (pack / STEP export), other message boxes are auto-cancelled and logged (see status).",
          "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["start", "status", "stop", "open", "save_as"]}, "doc": {"type": "string"}, "discard": {"type": "boolean"}}, "required": ["action"]}},
+        {"name": "bom_table", "annotations": ro,
+         "description": "The BOM of a document as PLAhelper computes it (template columns with formulas, user entries, part library, part identity tracking): columns (id, header, editable, formula, default), rows (row key, cells by column id, which cells were overridden, supplier for release, drawing status), totals, excluded rows, document defaults, available templates and suppliers. doc = foreground (default, the document open in the user's Plasticity) / background. scope = a configuration name (default: currently visible). Use it before bom_edit to see row keys and column ids.",
+         "inputSchema": {"type": "object", "properties": {"doc": {"type": "string", "enum": ["foreground", "background"]}, "scope": {"type": "string"}}}},
+        {"name": "bom_edit", "annotations": {"destructiveHint": true},
+         "description": "Change BOM entries the way the user would in PLAhelper's BOM tab (saved per document; PLAhelper picks the change up at once). set: [{part, column, value}] (part = row key / part number / name; column = id or header, also a supplier's own columns like finish / color; value null = back to the computed / default value). assign: [{part, supplier}] = which supplier makes it in a release (supplier id or name, \"buy\" = bought, \"\" = unassigned). exclude / include: [part] (leave out of / back into the BOM). add_rows: [{column: value}] (manual rows for parts not in the model, e.g. purchased items). remove_rows: [\"manual:<id>\"]. defaults: {column: value} (document-wide defaults, e.g. sets = 5; null clears). template: BOM template name. project: project number prefix for part numbers. Returns the updated table and what changed.",
+         "inputSchema": {"type": "object", "properties": {
+            "doc": {"type": "string", "enum": ["foreground", "background"]}, "scope": {"type": "string"},
+            "set": {"type": "array", "items": {"type": "object", "properties": {"part": {"type": "string"}, "column": {"type": "string"}, "value": {}}, "required": ["part", "column"]}},
+            "assign": {"type": "array", "items": {"type": "object", "properties": {"part": {"type": "string"}, "supplier": {"type": "string"}}, "required": ["part", "supplier"]}},
+            "exclude": {"type": "array", "items": {"type": "string"}}, "include": {"type": "array", "items": {"type": "string"}},
+            "add_rows": {"type": "array", "items": {"type": "object"}}, "remove_rows": {"type": "array", "items": {"type": "string"}},
+            "defaults": {"type": "object"}, "template": {"type": "string"}, "project": {"type": "string"}}}},
+        {"name": "bom_export", "annotations": {"destructiveHint": true},
+         "description": "Export a document's BOM as CSV (next to the document, under .pla/bom). doc = foreground / background; scope = configuration name.",
+         "inputSchema": {"type": "object", "properties": {"doc": {"type": "string", "enum": ["foreground", "background"]}, "scope": {"type": "string"}}}},
+        {"name": "draw_parts", "annotations": {"destructiveHint": true},
+         "description": "Make 2D part drawings directly (STEP export from Plasticity + PLAhelper's compiler, same settings / preferences / revision table as the drawing tab; ~20-90 s per sheet; two or more sheets are also combined into one PDF). parts = [\"undrawn\"] / [\"all\"] / keys, part numbers or names. export = force STEP re-export. doc = foreground (exports from the user's Plasticity: it briefly changes and then restores the selection) / background (the hidden instance). For foreground drawings while the user works, prefer doc=background or the queued draw tool.",
+         "inputSchema": {"type": "object", "properties": {"doc": {"type": "string", "enum": ["foreground", "background"]}, "parts": {"type": "array", "items": {"type": "string"}}, "export": {"type": "boolean"}}, "required": ["parts"]}},
+        {"name": "release", "annotations": {"destructiveHint": true},
+         "description": "Write a release (external) package: records the version (a new release freezes an ECN of everything changed since the last one; amend = true re-sends the same batch with the current state), redraws the drawn parts the ECN touches so their revision table shows it, then writes the master BOM plus one folder (and zip) per supplier with that supplier's BOM columns and files. Reports parts not assigned to any supplier (assign them with bom_edit) and missing files. doc = foreground / background.",
+         "inputSchema": {"type": "object", "properties": {"doc": {"type": "string", "enum": ["foreground", "background"]}, "amend": {"type": "boolean"}}}},
+        {"name": "release_history", "annotations": ro,
+         "description": "A document's release history: versions, ECNs (what changed per part), who opened them. doc = foreground / background.",
+         "inputSchema": {"type": "object", "properties": {"doc": {"type": "string", "enum": ["foreground", "background"]}}}},
+        {"name": "suppliers", "annotations": {"destructiveHint": true},
+         "description": "Release suppliers (global, shared by all documents; default: CNC / 3D printing / silicone molding / plastic molding). action=list / add (name, id?, files?: pdf|dxf|step, columns?: master BOM column ids, extra?: [{header, id?, default?}] = the supplier's own BOM columns) / update (id or name, new_name?, files?, columns?, extra?) / remove (id or name).",
+         "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["list", "add", "update", "remove"]}, "id": {"type": "string"}, "name": {"type": "string"}, "new_name": {"type": "string"},
+            "files": {"type": "array", "items": {"type": "string"}}, "columns": {"type": "array", "items": {"type": "string"}}, "extra": {"type": "array", "items": {"type": "object"}}}, "required": ["action"]}},
+        {"name": "configs", "annotations": {"destructiveHint": true},
+         "description": "Configurations of a document (saved visibility + material assignments; also usable as BOM scope). action=list / apply (name: switch the model to it) / save (name?: capture the current visibility + materials, overwriting a configuration of that name). doc = foreground / background.",
+         "inputSchema": {"type": "object", "properties": {"doc": {"type": "string", "enum": ["foreground", "background"]}, "action": {"type": "string", "enum": ["list", "apply", "save"]}, "name": {"type": "string"}}, "required": ["action"]}},
+        {"name": "dims", "annotations": {"destructiveHint": true},
+         "description": "The document's named dimensions and parameters (PLAhelper's records: D001 / H001 hole features ..., parameters with expressions that drive dimensions). action=list / set (changes: [{name, value}] - changes the model so each named dimension gets that value, in one transaction; a failed step rolls everything back) / set_param (name, expr - change a parameter; every dimension bound to it follows). set / set_param work on the foreground document through PLAhelper (pla-ui must be running). Values in document units.",
+         "inputSchema": {"type": "object", "properties": {"doc": {"type": "string", "enum": ["foreground", "background"]}, "action": {"type": "string", "enum": ["list", "set", "set_param"]},
+            "changes": {"type": "array", "items": {"type": "object", "properties": {"name": {"type": "string"}, "value": {"type": "number"}}, "required": ["name", "value"]}}, "name": {"type": "string"}, "expr": {}}, "required": ["action"]}},
         {"name": "background_bom", "annotations": {"destructiveHint": true},
-         "description": "Scan the BOM of the document open in the background instance (same as PLAhelper's BOM tab: template, user entries, part library, part identity tracking) and export it as CSV next to the document. scope = a configuration name (default: currently visible). Refused when the same document is open in the foreground.",
+         "description": "(Same as bom_export with doc=background.) Scan the BOM of the document open in the background instance (same as PLAhelper's BOM tab: template, user entries, part library, part identity tracking) and export it as CSV next to the document. scope = a configuration name (default: currently visible). Refused when the same document is open in the foreground.",
          "inputSchema": {"type": "object", "properties": {"scope": {"type": "string"}}}},
         {"name": "background_draw", "annotations": {"destructiveHint": true},
-         "description": "Make 2D drawings in the background instance: STEP export from the hidden Plasticity + compile (PLAhelper's drawing pipeline, same settings / preferences / revision table as the drawing tab; ~20-90 s per sheet; part drawings, not assembly drawings). parts = [\"undrawn\"] (not drawn or model changed), [\"all\"], or keys / part numbers / names. export = force STEP re-export. Two or more sheets are also combined into one PDF. Refused when the same document is open in the foreground.",
+         "description": "(Same as draw_parts with doc=background.) Make 2D drawings in the background instance: STEP export from the hidden Plasticity + compile (PLAhelper's drawing pipeline, same settings / preferences / revision table as the drawing tab; ~20-90 s per sheet; part drawings, not assembly drawings). parts = [\"undrawn\"] (not drawn or model changed), [\"all\"], or keys / part numbers / names. export = force STEP re-export. Two or more sheets are also combined into one PDF. Refused when the same document is open in the foreground.",
          "inputSchema": {"type": "object", "properties": {"parts": {"type": "array", "items": {"type": "string"}}, "export": {"type": "boolean"}}, "required": ["parts"]}},
         {"name": "background_release", "annotations": {"destructiveHint": true},
-         "description": "Write a release (external) package for the background document, like PLAhelper's release tab: records the version (a new release freezes an ECN of everything changed since the last one; amend = true re-sends the same batch), redraws the drawn parts the ECN touches so their revision table shows it, then writes the master BOM plus one folder per supplier (CNC / 3D printing / ... with that supplier's BOM columns and files). Refused when the same document is open in the foreground.",
+         "description": "(Same as release with doc=background.) Write a release (external) package for the background document, like PLAhelper's release tab: records the version (a new release freezes an ECN of everything changed since the last one; amend = true re-sends the same batch), redraws the drawn parts the ECN touches so their revision table shows it, then writes the master BOM plus one folder per supplier (CNC / 3D printing / ... with that supplier's BOM columns and files). Refused when the same document is open in the foreground.",
          "inputSchema": {"type": "object", "properties": {"amend": {"type": "boolean"}}}}
     ]);
     // 所有 model_* 工具都可以指向后台实例
@@ -275,8 +310,8 @@ fn call_model_tool(name: &str, a: &Value) -> Option<Value> {
     if name == "background" {
         return Some(background_tool(a));
     }
-    if name.starts_with("background_") {
-        return Some(bg_job(name, a));
+    if DOC_TOOLS.contains(&name) {
+        return Some(doc_tool(name, a));
     }
     let json_text = |v: &Value| text(serde_json::to_string_pretty(v).unwrap_or_default());
     let call = |api_name: &str, args: Value| match rt().block_on(pla_bridge::query::call_once(port(), h, api_name, &args)) {
@@ -793,9 +828,10 @@ fn main() {
     }
 }
 
-// ---------------------------------------------------------------- 后台作业(用户 2026-11-18: 后台实例也要能扫 BOM、出图、出外发包)
-// 只在后台实例里开着的**已保存文档**上做(pla-bg.js open / start --doc 记下的那个); 每次先确认前台没开同名文档(同名就报警拒绝)。
-// 逻辑与 pla-ui 共用 pla_ui::doc_jobs; 数据写进该文档的 .pla/… 存档, 前台以后打开同一个文档时 pla-ui 看到的是同一份。
+// ---------------------------------------------------------------- 文档作业(前台 / 后台; 用户 2026-11-18: 用语言描述就能完成任务 —— BOM 读改、出图、外发包、配置、尺寸)
+// doc = "foreground"(默认, 用户正在用的文档)/ "background"(后台实例里开着的已保存文档)。
+// 后台: 每次先确认前台没开同名文档(同名就报警拒绝)。逻辑与 pla-ui 共用 pla_ui::doc_jobs; 数据写进该文档的 .pla/… 存档,
+// pla-ui 按修改时间重读 BOM 填写 / 供应商, 所以前台改了界面里马上看得到。
 
 /// 后台实例的状态文件(pla-bg.js 写)。
 fn bg_state() -> Value {
@@ -811,38 +847,46 @@ fn doc_stem(p: &str) -> String {
     lower.strip_suffix(".plasticity").unwrap_or(&lower).trim().to_string()
 }
 
-/// 前台 Plasticity 各窗口标题里的文档名(前台没开 = 空)。
-fn foreground_stems() -> Vec<String> {
+/// 前台 Plasticity 各窗口的标题(前台没开 = 空)。
+fn foreground_titles() -> Vec<String> {
     let js = "(() => JSON.stringify(process.mainModule.require('electron').BrowserWindow.getAllWindows().map((w) => w.getTitle())))()";
     match rt().block_on(pla_bridge::export::main_eval_once(pla_bridge::export::INSPECT_PORT, js)) {
-        Ok(v) => serde_json::from_str::<Vec<String>>(v.as_str().unwrap_or("[]"))
-            .unwrap_or_default()
-            .iter()
-            .map(|t| doc_stem(t.split(" - ").next().unwrap_or("")))
-            .filter(|s| !s.is_empty() && s != "untitled" && s != "plasticity")
-            .collect(),
+        Ok(v) => serde_json::from_str::<Vec<String>>(v.as_str().unwrap_or("[]")).unwrap_or_default(),
         Err(_) => Vec::new(),
     }
 }
 
-/// 后台作业的文档: (doc_key, 路径)。没开文档 / 前台开着同名 → 错误(后者是报警)。
+fn title_key(t: &str) -> String {
+    let base = t.split(" - ").next().unwrap_or(t).trim().trim_start_matches('*').trim();
+    base.strip_suffix(".plasticity").unwrap_or(base).to_string()
+}
+
+/// 作业对象。
+struct Doc {
+    key: String,
+    port: u16,
+    hwnd: isize,
+    bg: bool,
+    label: String,
+}
+
+/// 后台文档: (doc_key, 路径)。没开文档 / 前台开着同名 → 错误(后者是报警)。
 fn bg_doc() -> Result<(String, std::path::PathBuf), String> {
     let st = bg_state();
     let Some(doc) = st["doc"].as_str().filter(|d| !d.is_empty()) else {
         return Err("the background instance has no saved document open - background {action: open, doc} (or start with doc) first".into());
     };
-    // 后台窗口现在的标题要还是它(防止中途换了)
-    let js = "(() => JSON.stringify((process.mainModule.require('electron').BaseWindow || process.mainModule.require('electron').BrowserWindow).getAllWindows().filter((w) => w.webContents).map((w) => w.webContents.getTitle())))()";
+    let js = "(() => { const e = process.mainModule.require('electron'); return JSON.stringify((e.BaseWindow || e.BrowserWindow).getAllWindows().filter((w) => w.webContents).map((w) => w.webContents.getTitle())); })()";
     let titles: Vec<String> = rt()
         .block_on(pla_bridge::export::main_eval_once(pla_bridge::export::inspect_port_for(BG_PORT), js))
         .ok()
         .and_then(|v| serde_json::from_str(v.as_str().unwrap_or("[]")).ok())
         .ok_or("the background instance is not running - background {action: start} first")?;
     let stem = doc_stem(doc);
-    if !titles.iter().any(|t| doc_stem(t.split(" - ").next().unwrap_or("")) == stem) {
+    if !titles.iter().any(|t| doc_stem(&title_key(t)) == stem) {
         return Err(format!("the background instance no longer shows {doc} (titles: {titles:?}) - open it again"));
     }
-    if foreground_stems().contains(&stem) {
+    if foreground_titles().iter().any(|t| doc_stem(&title_key(t)) == stem) {
         return Err(format!(
             "REFUSED: \"{}\" is also open in your foreground Plasticity - background jobs must not work on a document that is open in the foreground (both would write the same files). Close it in the foreground first. / 拒绝执行: 前台 Plasticity 也开着这个文档, 后台不能同时处理同一个文档。请先在前台关掉它。",
             std::path::Path::new(doc).file_name().map(|x| x.to_string_lossy().to_string()).unwrap_or_default()
@@ -854,27 +898,68 @@ fn bg_doc() -> Result<(String, std::path::PathBuf), String> {
     Ok((key, path))
 }
 
-/// 扫 BOM(后台实例)+ 零件身份迁移。scope = 配置名(None = 当前可见)。
-fn bg_scan(key: &str, scope: Option<&str>) -> Result<(Value, pla_ui::doc_jobs::Migrated), String> {
+fn doc_target(a: &Value) -> Result<Doc, String> {
+    if a["doc"].as_str() == Some("background") {
+        let (key, path) = bg_doc()?;
+        return Ok(Doc { key, port: BG_PORT, hwnd: 0, bg: true, label: path.display().to_string() });
+    }
+    // 前台: pla-ui 在跑就用它绑定的文档 / 窗口; 否则看前台窗口标题
+    if let Ok(st) = bridge::read_state() {
+        if !st.doc_key.is_empty() && st.doc_key != "untitled" && bridge::now().saturating_sub(st.ts) < 30 {
+            return Ok(Doc { label: st.doc_key.clone(), key: st.doc_key, port: FG_PORT, hwnd: st.hwnd, bg: false });
+        }
+    }
+    let titles: Vec<String> = foreground_titles().into_iter().filter(|t| !matches!(doc_stem(&title_key(t)).as_str(), "" | "untitled" | "plasticity")).collect();
+    match titles.as_slice() {
+        [] => Err("no saved document open in the foreground Plasticity (or it is not running in CDP mode)".into()),
+        [t] => Ok(Doc { key: title_key(t), port: FG_PORT, hwnd: 0, bg: false, label: title_key(t) }),
+        _ => Err(format!("several foreground documents are open ({}); start PLAhelper (pla-ui) so it knows which one is current", titles.join(", "))),
+    }
+}
+
+/// 扫 BOM + 零件身份迁移。scope = 配置名(None = 当前可见)。
+fn doc_scan(d: &Doc, scope: Option<&str>) -> Result<(Value, pla_ui::doc_jobs::Migrated), String> {
     let args = match scope {
         None => json!({}),
         Some(cf) => {
-            let st = pla_ui::configs::STORE.load(key, cf).ok_or_else(|| format!("configuration {cf} not found for {key}"))?;
+            let st = pla_ui::configs::STORE.load(&d.key, cf).ok_or_else(|| format!("configuration {cf} not found for {}", d.key))?;
             json!({ "members": pla_ui::configs::members(&st).into_iter().map(|m| m.0).collect::<Vec<_>>() })
         }
     };
-    let scan = rt().block_on(pla_bridge::query::call_once(BG_PORT, 0, pla_bridge::shim::api::BOM_SCAN, &args)).map_err(|e| format!("BOM scan: {e:#}"))?;
-    let m = pla_ui::doc_jobs::identity_migrate(key, &scan)?;
+    let scan = rt().block_on(pla_bridge::query::call_once(d.port, d.hwnd, pla_bridge::shim::api::BOM_SCAN, &args)).map_err(|e| format!("BOM scan: {e:#}"))?;
+    let m = pla_ui::doc_jobs::identity_migrate(&d.key, &scan)?;
     Ok((scan, m))
 }
 
-fn bg_job(name: &str, a: &Value) -> Value {
+const DOC_TOOLS: &[&str] = &[
+    "bom_table", "bom_edit", "bom_export", "draw_parts", "release", "release_history", "suppliers", "configs", "dims",
+    "background_bom", "background_draw", "background_release",
+];
+
+fn doc_tool(name: &str, a: &Value) -> Value {
     let r = (|| -> Result<Value, String> {
-        let (key, path) = bg_doc()?;
-        match name {
-            "background_bom" => bg_bom(&key, &path, a),
-            "background_draw" => bg_draw(&key, &path, a),
-            "background_release" => bg_release(&key, &path, a),
+        // 旧名字 = 后台
+        let (name, a) = match name.strip_prefix("background_") {
+            Some(rest) => {
+                let mut a2 = a.clone();
+                a2["doc"] = json!("background");
+                (match rest { "bom" => "bom_export", "draw" => "draw_parts", x => x }.to_string(), a2)
+            }
+            None => (name.to_string(), a.clone()),
+        };
+        if name == "suppliers" {
+            return suppliers_tool(&a);
+        }
+        let d = doc_target(&a)?;
+        match name.as_str() {
+            "bom_table" => bom_table_tool(&d, &a),
+            "bom_edit" => bom_edit_tool(&d, &a),
+            "bom_export" => bom_export_tool(&d, &a),
+            "draw_parts" => draw_tool(&d, &a),
+            "release" => release_tool(&d, &a),
+            "release_history" => release_history_tool(&d),
+            "configs" => configs_tool(&d, &a),
+            "dims" => dims_tool(&d, &a),
             x => Err(format!("unknown tool {x}")),
         }
     })();
@@ -884,19 +969,215 @@ fn bg_job(name: &str, a: &Value) -> Value {
     }
 }
 
-fn bg_bom(key: &str, path: &std::path::Path, a: &Value) -> Result<Value, String> {
-    let scope = a["scope"].as_str().filter(|s| !s.is_empty());
-    let (scan, m) = bg_scan(key, scope)?;
-    let st = pla_ui::doc_jobs::DocState::load(key);
-    let (rows, totals) = pla_ui::bom_table::build(&scan, &st.tpl, &st.edits, &st.lib);
-    let label = scope.map_or_else(|| "当前可见".to_string(), |s| format!("配置 {s}"));
-    let csv = pla_ui::bom::export_text(key, &label, &pla_ui::bom_table::to_csv(&st.tpl, &rows, &totals))?;
-    let parts: Vec<Value> = pla_ui::doc_jobs::bom_parts(&scan, &st.tpl, &st.edits, &st.lib, &st.sheets.purchased).into_iter().map(|p| json!(p.2)).collect();
-    Ok(json!({ "document": path.display().to_string(), "scope": label, "parts": parts, "csv": csv.display().to_string(), "identityRenames": m.renames.len() }))
+// ---- BOM
+
+fn table_json(d: &Doc, scan: &Value, st: &pla_ui::doc_jobs::DocState) -> Value {
+    let (rows, totals) = pla_ui::bom_table::build(scan, &st.tpl, &st.edits, &st.lib);
+    let cols: Vec<Value> = st
+        .tpl
+        .columns
+        .iter()
+        .map(|c| json!({ "id": c.id, "header": c.header, "editable": c.source.as_deref() == Some("field") || c.source.is_none() && c.formula.is_none(), "source": c.source, "formula": c.formula, "default": c.default }))
+        .collect();
+    let parts = pla_ui::doc_jobs::bom_parts(scan, &st.tpl, &st.edits, &st.lib, &st.sheets.purchased);
+    let rows_j: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            let cells: serde_json::Map<String, Value> = st.tpl.columns.iter().zip(&r.cells).map(|(c, v)| (c.id.clone(), json!(v))).collect();
+            let over: Vec<&str> = st.tpl.columns.iter().zip(&r.overridden).filter(|(_, o)| **o).map(|(c, _)| c.id.as_str()).collect();
+            let sup = pla_ui::release::process_of(&st.edits, &r.key);
+            let sh = st.sheets.get(&r.key);
+            json!({
+                "row": r.key, "manual": r.manual, "cells": cells, "overridden": over,
+                "supplier": sup, "bought": parts.iter().any(|p| p.2.key == r.key && p.2.bought),
+                "drawing": sh.map(|s| if s.locked() { "uploaded (locked)".to_string() } else if s.model_changed { "model changed".into() } else if !s.compiled.is_empty() { format!("drawn {}", s.compiled) } else { "not drawn".into() }).unwrap_or_else(|| "not drawn".into()),
+            })
+        })
+        .collect();
+    json!({
+        "document": d.label, "template": if st.edits.template.is_empty() { "(default)".to_string() } else { st.edits.template.clone() },
+        "templates": pla_ui::bom_table::list_in(&pla_ui::bom_table::dir()), "columns": cols, "rows": rows_j,
+        "totals": st.tpl.columns.iter().zip(&totals).filter(|(_, t)| !t.is_empty()).map(|(c, t)| json!({ c.id.clone(): t })).collect::<Vec<_>>(),
+        "excluded": st.edits.excluded, "defaults": st.edits.defaults, "project": st.edits.project,
+        "suppliers": st.suppliers.list.iter().map(|s| json!({ "id": s.id, "name": s.name })).collect::<Vec<_>>(),
+        "processColumn": pla_ui::release::PROCESS_COL,
+    })
 }
 
-/// 出一张零件图(后台实例导 STEP → 编译)。返回 (图名, PDF 路径)。
-fn bg_draw_one(key: &str, st: &mut pla_ui::doc_jobs::DocState, part: &pla_ui::doc_jobs::Part, export: bool, prefs: &pla_ui::drawing::Prefs, tools: &std::path::Path) -> Result<(String, String), String> {
+fn bom_table_tool(d: &Doc, a: &Value) -> Result<Value, String> {
+    let (scan, _) = doc_scan(d, a["scope"].as_str().filter(|s| !s.is_empty()))?;
+    let st = pla_ui::doc_jobs::DocState::load(&d.key);
+    Ok(table_json(d, &scan, &st))
+}
+
+/// 行: key / "manual:<id>" / 料号 / 名字(名字按当前表里算好的 name 列)。
+fn find_row(rows: &[pla_ui::bom_table::Row], tpl: &pla_ui::bom_table::Template, q: &str) -> Result<String, String> {
+    let col = |id: &str| tpl.columns.iter().position(|c| c.id == id);
+    let (pn, name) = (col("pn"), col("name"));
+    let hit: Vec<&pla_ui::bom_table::Row> = rows
+        .iter()
+        .filter(|r| r.key == q || pn.is_some_and(|i| !r.cells[i].is_empty() && r.cells[i] == q) || name.is_some_and(|i| r.cells[i] == q))
+        .collect();
+    match hit.as_slice() {
+        [r] => Ok(r.key.clone()),
+        [] => Err(format!("no BOM row matches {q:?} (use the row key, part number or name from bom_table)")),
+        _ => Err(format!("{q:?} matches {} rows - use the row key", hit.len())),
+    }
+}
+
+fn find_col(tpl: &pla_ui::bom_table::Template, extra: &[pla_ui::bom_table::Col], q: &str) -> Result<String, String> {
+    if q == pla_ui::release::PROCESS_COL {
+        return Ok(q.to_string());
+    }
+    let low = q.to_lowercase();
+    tpl.columns
+        .iter()
+        .chain(extra.iter())
+        .find(|c| c.id == q || c.header.to_lowercase() == low)
+        .map(|c| c.id.clone())
+        .ok_or_else(|| format!("no column {q:?} (columns: {})", tpl.columns.iter().map(|c| format!("{}={}", c.id, c.header)).collect::<Vec<_>>().join(", ")))
+}
+
+fn bom_edit_tool(d: &Doc, a: &Value) -> Result<Value, String> {
+    let (scan, _) = doc_scan(d, a["scope"].as_str().filter(|s| !s.is_empty()))?;
+    let mut st = pla_ui::doc_jobs::DocState::load(&d.key);
+    let mut log: Vec<String> = Vec::new();
+    // 模板
+    if let Some(t) = a["template"].as_str() {
+        if !pla_ui::bom_table::list_in(&pla_ui::bom_table::dir()).iter().any(|x| x == t) {
+            return Err(format!("no BOM template {t}"));
+        }
+        st.edits.template = t.to_string();
+        log.push(format!("template = {t}"));
+        st = pla_ui::doc_jobs::DocState { edits: st.edits.clone(), ..pla_ui::doc_jobs::DocState::load(&d.key) };
+        let dir = pla_ui::bom_table::dir();
+        st.tpl = pla_ui::bom_table::load_in(&dir, t).unwrap_or_else(|_| pla_ui::bom_table::builtin());
+    }
+    if let Some(p) = a["project"].as_str() {
+        st.edits.project = p.to_string();
+        log.push(format!("project = {p}"));
+    }
+    // 供应商自有列也能当列名用(填表面处理 / 颜色 …)
+    let extra: Vec<pla_ui::bom_table::Col> = st.suppliers.list.iter().flat_map(|s| s.extra.clone()).collect();
+    if let Some(m) = a["defaults"].as_object() {
+        for (k, v) in m {
+            let id = find_col(&st.tpl, &extra, k)?;
+            match v.as_str().map(String::from).or_else(|| v.as_f64().map(|x| x.to_string())) {
+                Some(val) => {
+                    st.edits.defaults.insert(id.clone(), val.clone());
+                    log.push(format!("default {id} = {val}"));
+                }
+                None => {
+                    st.edits.defaults.remove(&id);
+                    log.push(format!("default {id} cleared"));
+                }
+            }
+        }
+    }
+    // 手动行
+    for r in a["add_rows"].as_array().into_iter().flatten() {
+        let id = st.edits.add_manual();
+        for (k, v) in r.as_object().into_iter().flatten() {
+            let col = find_col(&st.tpl, &extra, k)?;
+            let val = v.as_str().map(String::from).unwrap_or_else(|| v.to_string());
+            st.edits.set_cell(&format!("manual:{id}"), &col, &val, "\u{0}");
+        }
+        log.push(format!("added row manual:{id}"));
+    }
+    for r in a["remove_rows"].as_array().into_iter().flatten().filter_map(|x| x.as_str()) {
+        let id = r.trim_start_matches("manual:");
+        let n = st.edits.manual.len();
+        st.edits.manual.retain(|m| m.id != id);
+        if st.edits.manual.len() == n {
+            return Err(format!("no manual row {r}"));
+        }
+        log.push(format!("removed row manual:{id}"));
+    }
+    let (rows, _) = pla_ui::bom_table::build(&scan, &st.tpl, &st.edits, &st.lib);
+    // 排除 / 恢复
+    for q in a["exclude"].as_array().into_iter().flatten().filter_map(|x| x.as_str()) {
+        let k = find_row(&rows, &st.tpl, q)?;
+        if !st.edits.excluded.contains(&k) {
+            st.edits.excluded.push(k.clone());
+        }
+        log.push(format!("excluded {q}"));
+    }
+    for q in a["include"].as_array().into_iter().flatten().filter_map(|x| x.as_str()) {
+        let before = st.edits.excluded.len();
+        st.edits.excluded.retain(|k| k != q && find_row(&rows, &st.tpl, q).ok().as_deref() != Some(k.as_str()));
+        if st.edits.excluded.len() == before {
+            return Err(format!("{q} is not excluded"));
+        }
+        log.push(format!("included {q}"));
+    }
+    // 单元格
+    for c in a["set"].as_array().into_iter().flatten() {
+        let q = c["part"].as_str().ok_or("each set entry needs part")?;
+        let k = find_row(&rows, &st.tpl, q)?;
+        let col = find_col(&st.tpl, &extra, c["column"].as_str().ok_or("each set entry needs column")?)?;
+        if c["value"].is_null() {
+            if let Some(mid) = k.strip_prefix("manual:") {
+                if let Some(m) = st.edits.manual.iter_mut().find(|m| m.id == mid) {
+                    m.fields.remove(&col);
+                }
+            } else if let Some(m) = st.edits.parts.get_mut(&k) {
+                m.remove(&col);
+                if m.is_empty() {
+                    st.edits.parts.remove(&k);
+                }
+            }
+            log.push(format!("{q}.{col} reset"));
+        } else {
+            let val = c["value"].as_str().map(String::from).unwrap_or_else(|| c["value"].to_string());
+            st.edits.set_cell(&k, &col, &val, "\u{0}");
+            log.push(format!("{q}.{col} = {val}"));
+        }
+    }
+    // 归哪家(外发): 供应商 id 或名字 / "buy" = 外购 / "" = 不分配
+    for c in a["assign"].as_array().into_iter().flatten() {
+        let q = c["part"].as_str().ok_or("each assign entry needs part")?;
+        let k = find_row(&rows, &st.tpl, q)?;
+        let s = c["supplier"].as_str().unwrap_or("");
+        let id = if s.is_empty() || s == pla_ui::release::BUY {
+            s.to_string()
+        } else {
+            st.suppliers.list.iter().find(|x| x.id == s || x.name.eq_ignore_ascii_case(s)).map(|x| x.id.clone()).ok_or_else(|| {
+                format!("no supplier {s} (have: {}, or buy)", st.suppliers.list.iter().map(|x| format!("{}={}", x.id, x.name)).collect::<Vec<_>>().join(", "))
+            })?
+        };
+        if id.is_empty() {
+            if let Some(m) = st.edits.parts.get_mut(&k) {
+                m.remove(pla_ui::release::PROCESS_COL);
+            }
+        } else {
+            st.edits.set_cell(&k, pla_ui::release::PROCESS_COL, &id, "\u{0}");
+        }
+        log.push(format!("{q} → {}", if id.is_empty() { "unassigned" } else { &id }));
+    }
+    if log.is_empty() {
+        return Err("nothing to change (set / assign / exclude / include / add_rows / remove_rows / defaults / template / project)".into());
+    }
+    pla_ui::bom_table::save_edits(&d.key, &st.edits)?;
+    let mut out = table_json(d, &scan, &st);
+    out["changed"] = json!(log);
+    Ok(out)
+}
+
+fn bom_export_tool(d: &Doc, a: &Value) -> Result<Value, String> {
+    let scope = a["scope"].as_str().filter(|s| !s.is_empty());
+    let (scan, m) = doc_scan(d, scope)?;
+    let st = pla_ui::doc_jobs::DocState::load(&d.key);
+    let (rows, totals) = pla_ui::bom_table::build(&scan, &st.tpl, &st.edits, &st.lib);
+    let label = scope.map_or_else(|| "当前可见".to_string(), |s| format!("配置 {s}"));
+    let csv = pla_ui::bom::export_text(&d.key, &label, &pla_ui::bom_table::to_csv(&st.tpl, &rows, &totals))?;
+    let parts: Vec<Value> = pla_ui::doc_jobs::bom_parts(&scan, &st.tpl, &st.edits, &st.lib, &st.sheets.purchased).into_iter().map(|p| json!(p.2)).collect();
+    Ok(json!({ "document": d.label, "scope": label, "parts": parts, "csv": csv.display().to_string(), "identityRenames": m.renames.len() }))
+}
+
+// ---- 出图
+
+/// 出一张零件图(导 STEP → 编译)。返回 (图名, PDF 路径)。
+fn draw_one(d: &Doc, st: &mut pla_ui::doc_jobs::DocState, part: &pla_ui::doc_jobs::Part, export: bool, prefs: &pla_ui::drawing::Prefs, tools: &std::path::Path) -> Result<(String, String), String> {
     let (title, member, info) = part;
     if pla_ui::doc_jobs::ensure_sheet(&mut st.sheets, &info.key, title, member) {
         st.save_sheets()?;
@@ -905,14 +1186,14 @@ fn bg_draw_one(key: &str, st: &mut pla_ui::doc_jobs::DocState, part: &pla_ui::do
     if s.locked() {
         return Err(format!("{} is locked to an uploaded drawing", s.base));
     }
-    let dir = pla_ui::drawing::dir(key);
+    let dir = pla_ui::drawing::dir(&d.key);
     let step = pla_ui::drawing::file(&dir, &s, "step");
     if export || !step.exists() {
         if s.member.is_empty() {
             return Err(format!("{}: no model solid (rescan the BOM)", s.base));
         }
         let v = rt()
-            .block_on(pla_bridge::query::export_step_once(BG_PORT, 0, &step.display().to_string(), std::slice::from_ref(&s.member), Some("AP214")))
+            .block_on(pla_bridge::query::export_step_once(d.port, d.hwnd, &step.display().to_string(), std::slice::from_ref(&s.member), Some("AP214")))
             .map_err(|e| format!("{}: STEP export: {e:#}", s.base))?;
         let mut s2 = s.clone();
         if let Some(p) = v["parts"].as_array().filter(|a| a.len() == 1).and_then(|a| a.first()) {
@@ -925,7 +1206,7 @@ fn bg_draw_one(key: &str, st: &mut pla_ui::doc_jobs::DocState, part: &pla_ui::do
     }
     let mut t = title.clone();
     t.extend(s.title.clone());
-    let spec = pla_ui::doc_jobs::write_part_spec(key, &info.key, &st.sheets, prefs, &t)?;
+    let spec = pla_ui::doc_jobs::write_part_spec(&d.key, &info.key, &st.sheets, prefs, &t)?;
     pla_ui::drawing::compile(tools, &spec).map_err(|e| format!("{}: {e}", s.base))?;
     let mut s3 = st.sheets.get(&info.key).cloned().ok_or("sheet vanished")?;
     s3.compiled = pla_ui::parts_lib::today();
@@ -957,7 +1238,7 @@ fn pick_parts<'p>(parts: &'p [pla_ui::doc_jobs::Part], sheets: &pla_ui::drawing:
     (out, missing)
 }
 
-fn bg_draw(key: &str, path: &std::path::Path, a: &Value) -> Result<Value, String> {
+fn draw_tool(d: &Doc, a: &Value) -> Result<Value, String> {
     let want: Vec<String> = a["parts"].as_array().into_iter().flatten().filter_map(|x| x.as_str().map(String::from)).collect();
     if want.is_empty() {
         return Err("parts is required: [\"undrawn\"], [\"all\"], or keys / part numbers / names".into());
@@ -966,8 +1247,8 @@ fn bg_draw(key: &str, path: &std::path::Path, a: &Value) -> Result<Value, String
     if pla_ui::drawing::freecad_bin().is_none() {
         return Err("drawing needs FreeCAD 1.1".into());
     }
-    let (scan, m) = bg_scan(key, None)?;
-    let mut st = pla_ui::doc_jobs::DocState::load(key);
+    let (scan, m) = doc_scan(d, None)?;
+    let mut st = pla_ui::doc_jobs::DocState::load(&d.key);
     let parts = pla_ui::doc_jobs::bom_parts(&scan, &st.tpl, &st.edits, &st.lib, &st.sheets.purchased);
     let (picked, missing) = pick_parts(&parts, &st.sheets, &want);
     let picked: Vec<pla_ui::doc_jobs::Part> = picked.into_iter().cloned().collect();
@@ -976,42 +1257,41 @@ fn bg_draw(key: &str, path: &std::path::Path, a: &Value) -> Result<Value, String
     let mut done = Vec::new();
     let mut failed = Vec::new();
     for p in &picked {
-        match bg_draw_one(key, &mut st, p, export, &prefs, &tools) {
+        match draw_one(d, &mut st, p, export, &prefs, &tools) {
             Ok((base, pdf)) => done.push(json!({ "part": base, "pdf": pdf })),
             Err(e) => failed.push(e),
         }
     }
-    // 出成两张以上 → 合订一份
     let mut book = Value::Null;
     if done.len() >= 2 {
-        let dir = pla_ui::drawing::dir(key);
-        let keys: Vec<String> = picked.iter().map(|p| p.2.key.clone()).collect();
-        let pages: Vec<String> = keys.iter().filter_map(|k| st.sheets.get(k)).flat_map(|s| pla_ui::drawing::book_pages(&dir, s)).collect();
-        let out = pla_ui::drawing::book_file(&dir, key);
+        let dir = pla_ui::drawing::dir(&d.key);
+        let pages: Vec<String> = picked.iter().filter_map(|p| st.sheets.get(&p.2.key)).flat_map(|s| pla_ui::drawing::book_pages(&dir, s)).collect();
+        let out = pla_ui::drawing::book_file(&dir, &d.key);
         book = match pla_ui::drawing::book(&tools, &out, &pages) {
             Ok(_) => json!(out.display().to_string()),
             Err(e) => json!(format!("combine failed: {e}")),
         };
     }
-    Ok(json!({ "document": path.display().to_string(), "drawn": done, "failed": failed, "notFound": missing, "book": book, "identityRenames": m.renames.len(), "folder": pla_ui::drawing::dir(key).display().to_string() }))
+    Ok(json!({ "document": d.label, "drawn": done, "failed": failed, "notFound": missing, "book": book, "identityRenames": m.renames.len(), "folder": pla_ui::drawing::dir(&d.key).display().to_string() }))
 }
 
-fn bg_release(key: &str, path: &std::path::Path, a: &Value) -> Result<Value, String> {
+// ---- 外发
+
+fn release_tool(d: &Doc, a: &Value) -> Result<Value, String> {
     use pla_ui::release as rel;
-    let (scan, _) = bg_scan(key, None)?;
-    let mut st = pla_ui::doc_jobs::DocState::load(key);
+    let (scan, _) = doc_scan(d, None)?;
+    let mut st = pla_ui::doc_jobs::DocState::load(&d.key);
     let parts = pla_ui::doc_jobs::bom_parts(&scan, &st.tpl, &st.edits, &st.lib, &st.sheets.purchased);
     let prefs = pla_ui::drawing::Prefs::load();
-    let root = rel::STORE.dir(key);
+    let root = rel::STORE.dir(&d.key);
     let mut hist = rel::History::load(&root);
     if hist.open_by.trim().is_empty() {
         hist.open_by = prefs.title.get("designer").cloned().unwrap_or_default();
     }
     let amend = a["amend"].as_bool().unwrap_or(false) && hist.last().is_some();
-    let (ver, no) = hist.record(pla_ui::doc_jobs::rel_snapshot(key, &parts, &st.sheets), &pla_ui::parts_lib::today(), amend);
+    let (ver, no) = hist.record(pla_ui::doc_jobs::rel_snapshot(&d.key, &parts, &st.sheets), &pla_ui::parts_lib::today(), amend);
     hist.save(&root).map_err(|e| format!("saving the version history: {e}"))?;
     let ecn = no.as_ref().and_then(|n| hist.ecns.iter().find(|e| &e.no == n).cloned());
-    // ECN 涉及、出过图(没锁定)的零件重出, 让变更表带上 ECN
     let redraw: Vec<String> = ecn
         .as_ref()
         .map(|e| {
@@ -1029,7 +1309,7 @@ fn bg_release(key: &str, path: &std::path::Path, a: &Value) -> Result<Value, Str
         let tools = pla_ui::drawing::tools_dir().ok_or("redrawing needs the tools/drawing compiler")?;
         for k in &redraw {
             if let Some(p) = parts.iter().find(|p| &p.2.key == k).cloned() {
-                match bg_draw_one(key, &mut st, &p, false, &prefs, &tools) {
+                match draw_one(d, &mut st, &p, false, &prefs, &tools) {
                     Ok((base, _)) => redrawn.push(base),
                     Err(e) => failed.push(e),
                 }
@@ -1037,12 +1317,180 @@ fn bg_release(key: &str, path: &std::path::Path, a: &Value) -> Result<Value, Str
         }
     }
     let (rows, totals) = pla_ui::bom_table::build(&scan, &st.tpl, &st.edits, &st.lib);
-    let (packs, total) = pla_ui::doc_jobs::rel_packs(key, &st.suppliers, &st.tpl, &rows, &totals, &st.edits, &st.sheets);
+    let (packs, total) = pla_ui::doc_jobs::rel_packs(&d.key, &st.suppliers, &st.tpl, &rows, &totals, &st.edits, &st.sheets);
     let out = rel::write(&root, &ver, &pla_ui::parts_lib::today(), &total, &packs, ecn.as_ref())?;
+    let unassigned: Vec<String> = parts.iter().filter(|p| !p.2.bought && p.2.supplier.is_empty()).map(|p| p.2.name.clone()).collect();
     Ok(json!({
-        "document": path.display().to_string(), "version": ver, "ecn": no, "amend": amend,
+        "document": d.label, "version": ver, "ecn": no, "amend": amend,
         "package": out.display().to_string(), "suppliers": packs.iter().map(|p| p.supplier.name.clone()).collect::<Vec<_>>(),
         "missingFiles": packs.iter().flat_map(|p| p.missing.iter().map(move |(part, m)| format!("{}: {} ({})", p.supplier.name, part, m.join(", ")))).collect::<Vec<_>>(),
-        "redrawn": redrawn, "redrawFailed": failed,
+        "unassignedParts": unassigned, "redrawn": redrawn, "redrawFailed": failed,
     }))
+}
+
+fn release_history_tool(d: &Doc) -> Result<Value, String> {
+    let root = pla_ui::release::STORE.dir(&d.key);
+    let hist = pla_ui::release::History::load(&root);
+    Ok(json!({ "document": d.label, "folder": root.display().to_string(), "history": serde_json::to_value(&hist).unwrap_or(Value::Null) }))
+}
+
+/// 供应商(全局): list / add / update / remove。
+fn suppliers_tool(a: &Value) -> Result<Value, String> {
+    use pla_ui::release as rel;
+    let mut s = rel::Suppliers::load();
+    let action = a["action"].as_str().unwrap_or("list");
+    let cols = |v: &Value| -> Option<Vec<pla_ui::bom_table::Col>> {
+        v.as_array().map(|arr| {
+            arr.iter()
+                .filter_map(|c| {
+                    let header = c["header"].as_str().or_else(|| c.as_str())?.to_string();
+                    let id = c["id"].as_str().map(String::from).unwrap_or_else(|| header.to_lowercase().chars().map(|ch| if ch.is_alphanumeric() { ch } else { '_' }).collect());
+                    Some(pla_ui::bom_table::Col { id, header, source: Some("field".into()), formula: None, default: c["default"].as_str().map(String::from), sum: false })
+                })
+                .collect()
+        })
+    };
+    let strs = |v: &Value| v.as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect::<Vec<_>>());
+    match action {
+        "list" => {}
+        "add" => {
+            let name = a["name"].as_str().ok_or("add needs name")?;
+            let id = a["id"].as_str().map(String::from).unwrap_or_else(|| s.next_id());
+            if s.get(&id).is_some() {
+                return Err(format!("supplier id {id} exists"));
+            }
+            s.list.push(rel::Supplier {
+                id,
+                name: name.into(),
+                files: strs(&a["files"]).unwrap_or_else(|| vec!["pdf".into(), "step".into()]),
+                columns: strs(&a["columns"]).unwrap_or_else(|| vec!["pn".into(), "name".into(), "total_qty".into()]),
+                extra: cols(&a["extra"]).unwrap_or_default(),
+            });
+            s.save()?;
+        }
+        "update" | "remove" => {
+            let q = a["id"].as_str().or(a["name"].as_str()).ok_or("needs id or name")?;
+            let i = s.list.iter().position(|x| x.id == q || x.name.eq_ignore_ascii_case(q)).ok_or_else(|| format!("no supplier {q}"))?;
+            if action == "remove" {
+                s.list.remove(i);
+            } else {
+                let x = &mut s.list[i];
+                if let Some(n) = a["new_name"].as_str() {
+                    x.name = n.into();
+                }
+                if let Some(f) = strs(&a["files"]) {
+                    if let Some(bad) = f.iter().find(|k| !rel::FILE_KINDS.contains(&k.as_str())) {
+                        return Err(format!("file kind {bad} (pdf / dxf / step)"));
+                    }
+                    x.files = f;
+                }
+                if let Some(c) = strs(&a["columns"]) {
+                    x.columns = c;
+                }
+                if let Some(e) = cols(&a["extra"]) {
+                    x.extra = e;
+                }
+            }
+            s.save()?;
+        }
+        x => return Err(format!("unknown action {x} (list / add / update / remove)")),
+    }
+    Ok(json!({ "suppliers": serde_json::to_value(&s.list).unwrap_or(Value::Null), "file": rel::Suppliers::path().display().to_string() }))
+}
+
+// ---- 配置(可见性 + 材质指派)
+
+fn configs_tool(d: &Doc, a: &Value) -> Result<Value, String> {
+    let store = pla_ui::configs::STORE;
+    match a["action"].as_str().unwrap_or("list") {
+        "list" => {
+            let list: Vec<Value> = store
+                .list(&d.key)
+                .into_iter()
+                .map(|m| {
+                    let brief = store.load(&d.key, &m.name).map(|s| pla_ui::configs::brief(&s)).unwrap_or_default();
+                    json!({ "name": m.name, "summary": brief })
+                })
+                .collect();
+            Ok(json!({ "document": d.label, "configs": list }))
+        }
+        "apply" => {
+            let name = a["name"].as_str().ok_or("apply needs name")?;
+            let st = store.load(&d.key, name).ok_or_else(|| format!("no configuration {name}"))?;
+            let args: Value = serde_json::from_str(&st).map_err(|e| format!("configuration {name} is unreadable: {e}"))?;
+            let r = rt().block_on(pla_bridge::query::call_once(d.port, d.hwnd, pla_bridge::shim::api::CFG_RESTORE, &args)).map_err(|e| format!("{e:#}"))?;
+            Ok(json!({ "document": d.label, "applied": name, "result": r }))
+        }
+        "save" => {
+            let v = rt().block_on(pla_bridge::query::call_once(d.port, d.hwnd, pla_bridge::shim::api::CFG_SAVE, &Value::Null)).map_err(|e| format!("{e:#}"))?;
+            let state = v.to_string();
+            let name = match a["name"].as_str() {
+                Some(n) if store.load(&d.key, n).is_some() => {
+                    store.update(&d.key, n, &state, None)?;
+                    n.to_string()
+                }
+                Some(n) => {
+                    let got = store.save(&d.key, &state, None)?;
+                    if got != n {
+                        store.rename(&d.key, &got, n)?;
+                    }
+                    n.to_string()
+                }
+                None => store.save(&d.key, &state, None)?,
+            };
+            Ok(json!({ "document": d.label, "saved": name, "summary": pla_ui::configs::brief(&state) }))
+        }
+        x => Err(format!("unknown action {x} (list / apply / save)")),
+    }
+}
+
+// ---- 尺寸记录 / 参数
+
+fn dims_tool(d: &Doc, a: &Value) -> Result<Value, String> {
+    let f = pla_ui::dims::load_file(&d.key);
+    let list = |f: &pla_ui::dims::DimsFile| {
+        json!({
+            "document": d.label,
+            "dims": f.dims.iter().map(|r| json!({ "name": r.name, "kind": r.kind, "value": r.value, "units": r.units, "expr": r.expr })).collect::<Vec<_>>(),
+            "params": f.params.iter().map(|p| json!({ "name": p.name, "kind": p.kind, "expr": p.expr, "note": p.note })).collect::<Vec<_>>(),
+        })
+    };
+    match a["action"].as_str().unwrap_or("list") {
+        "list" => Ok(list(&f)),
+        act @ ("set" | "set_param") => {
+            if d.bg {
+                return Err("changing dimensions runs through PLAhelper (pla-ui) on the foreground document only".into());
+            }
+            let req = if act == "set" {
+                let ch = a["changes"].as_array().filter(|c| !c.is_empty()).ok_or("set needs changes: [{name, value}]")?;
+                json!({ "op": "dims_set", "changes": ch })
+            } else {
+                json!({ "op": "param_set", "name": a["name"], "expr": a["expr"].as_str().map(String::from).or_else(|| a["expr"].as_f64().map(|x| x.to_string())) })
+            };
+            let r = bridge::call(&req, Duration::from_secs(10))?;
+            if r["ok"] != true {
+                return Err(r["error"].as_str().unwrap_or("failed").to_string());
+            }
+            // 等改完(记录里的值到位, 或没有绑定可改)
+            let want: Vec<(String, f64)> = a["changes"].as_array().into_iter().flatten().filter_map(|c| Some((c["name"].as_str()?.to_string(), c["value"].as_f64()?))).collect();
+            let t0 = std::time::Instant::now();
+            let mut last = pla_ui::dims::load_file(&d.key);
+            while t0.elapsed() < Duration::from_secs(60) {
+                std::thread::sleep(Duration::from_millis(700));
+                last = pla_ui::dims::load_file(&d.key);
+                let done = if act == "set" {
+                    want.iter().all(|(n, v)| last.dims.iter().any(|r| &r.name == n && (r.value - v).abs() < 1e-3))
+                } else {
+                    t0.elapsed() > Duration::from_secs(5)
+                };
+                if done {
+                    break;
+                }
+            }
+            let mut out = list(&last);
+            out["note"] = json!("check PLAhelper's message if a value did not change (a failed step rolls the whole change back)");
+            Ok(out)
+        }
+        x => Err(format!("unknown action {x} (list / set / set_param)")),
+    }
 }
