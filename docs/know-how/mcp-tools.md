@@ -30,10 +30,12 @@
 | `release` / `release_history` | 外发包(版本 / ECN / 重出 ECN 涉及的图 / 总 BOM + 各家包; 报没分配供应商的零件)/ 版本记录 |
 | `suppliers` | 供应商(全局): list / add / update / remove(要的文件、主表列、自有列) |
 | `configs` | 配置: list / apply / save |
+| `parts_library` | 零件库(全局): search / get / add(按分类 + 项目自动编号, 分类不给就猜)/ update(字段、供应商价格自动记日期、首选、改分类 = 重新编号旧号进 former)/ remove; 与 BOM 行: link / from_bom(把行存成新条目并链接)/ suggest |
 | `dims` | 尺寸记录与参数: list; `set`(按名字改尺寸, 事务内)/ `set_param`(改参数, 绑定的尺寸跟着改)经 pla-ui 在前台文档上做 |
 
 实测(后台 bgtest): 读表 → 改料号 / 表面处理 / 归 CNC·3D 打印·外购 / 套数 2 / 加手动行(公式跟着算)→ 外发 R2: ECN-001(3 项)、重出 2 张图、CNC 包(PDF/DXF/STEP + BOM, 带表面处理)、3D 打印包(STEP + BOM)、zip;
-配置存 / 列 / 切; 前台 dims 列表。`dims set` 会改用户模型, 没在 model1 上实测。
+配置存 / 列 / 切; 前台 dims 列表。前台(model1): 零件库 search / add / update / from_bom / link / remove(测试条目已删)、draw_parts(导出后若还原成空选择, 取消 Plasticity 自动起的移动命令)、release R1、model_exec 直接改模型。
+用户 2026-11-18: 选择集 / 视口 / 材质状态 / 快照是人操作才需要的, 不做 MCP; 改模型直接用 model_* 工具, 不必经尺寸记录。
 
 ## 建模的工作方式(给 agent 的要点)
 

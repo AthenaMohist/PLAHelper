@@ -449,8 +449,10 @@
 - [~] **N7 MCP 补齐"操作"**（用户 2026-11-18：用语言描述就能完成任务，不按界面 1:1；know-how/mcp-tools.md「文档作业」）：
       前台 / 后台通用的 `bom_table` / `bom_edit` / `bom_export` / `draw_parts` / `release` / `release_history` / `suppliers` / `configs` / `dims`；
       pla-ui 按修改时间重读 BOM 填写 / 供应商；尺寸改值 / 参数改值经 pla-ui（`link_start` 抽出来共用）。实测后台 bgtest：BOM 读改 → 外发 R2（ECN + CNC / 3D 打印分包）、配置。
-  - [ ] `dims set` / `set_param` 在前台实测（会改用户模型，等用户同意）；前台 `draw_parts` / `release` 实测。
-  - [ ] 还没 MCP 化：选择集 / 视口状态 / 材质状态、快照、零件库（library.json）、上传图纸锁定、BOM 模板编辑、孔规格方案编辑。
+  - [x] 前台实测（model1）：`draw_parts`（修了导出后残留的自动移动命令）、`release`、`model_exec` 直接改模型。用户：改模型直接用 model_*，不必经尺寸记录（`dims set` 保留但不是重点）。
+  - [x] 零件库 MCP：`parts_library`（search / get / add / update / remove / link / from_bom / suggest；from_bom 与 pla-ui 共用 `doc_jobs::lib_add_from_row`）。
+  - 用户：选择集 / 视口 / 材质状态 / 快照只是人操作才需要，不做 MCP。
+  - [ ] 还可以补：上传图纸锁定 / 解锁、BOM 模板编辑、孔规格方案编辑（等用到再做）。
 - [ ] **N5 常用件库**：常用件白名单入库（STEP + 缩略图 + 规格字段，SQLite 索引），PLAhelper 搜索面板一键放入当前文档；
       常用度按本人插入次数统计；商家具体型号用到时下载归档。
 - [ ] **N6 AI 建模**：已细化为 **A 自动建模 pipeline**（见下节）。build123d → STEP → 导入 作为退路保留。
