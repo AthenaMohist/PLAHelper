@@ -446,7 +446,9 @@
     // 对话框外层容器里(往上找同时含两者的祖先, 最多 boxClimb 层); 选择里要记 / 还原的集合。
     exportStep: { dialogTag: 'export-step-58-dialog', formats: ['AP203', 'AP214', 'AP242'], defaultFormat: 'AP214',
                   nurbsInput: 'saveAnalyticsToNurbs', okText: 'OK', cancelText: 'Cancel', boxClimb: 6,
-                  dialogWaitMs: 10000, closeWaitMs: 20000, selSets: ['solids', 'sheets', 'curves', 'faces', 'edges'] },
+                  dialogWaitMs: 10000, closeWaitMs: 20000, selSets: ['solids', 'sheets', 'curves', 'faces', 'edges'],
+                  // 选上实体时 Plasticity 自动起的移动命令(agent automatic); 还原成空选择后它还挂着 → 取消(实测 2026-11-18)
+                  autoMove: { cmd: 'MoveItemCommand', agentKey: 'agent', agent: 'automatic' } },
     // ---- 右键确认扩展到 Plasticity 窗口(ui.rightClick): 捕获这些事件, 右键松开计一次; contextmenu 只吃不计 ----
     rightClick: { events: ['pointerdown', 'pointerup', 'mousedown', 'mouseup', 'contextmenu'], button: 2,
                   countOn: 'pointerup', menuEvent: 'contextmenu' },
@@ -4013,7 +4015,11 @@
     var bad = 0;
     prev.forEach(function (v) { try { invokeOn('sel.add', [v], s); } catch (e) { bad++; } });
     state.exportPrev = null;
-    return { restored: prev.length - bad, failed: bad };
+    var AM = NAMES.exportStep.autoMove, act = get('exec.activeCmd'), cancelled = false;
+    if (!prev.length && act && act.constructor && act.constructor.name === AM.cmd && act[AM.agentKey] === AM.agent) {
+      try { invokeOn('exec.cancel'); cancelled = true; } catch (e) {}
+    }
+    return { restored: prev.length - bad, failed: bad, cancelledAutoMove: cancelled };
   });
 
   def('err.last', 'err.hook', function () { return state.lastError; });

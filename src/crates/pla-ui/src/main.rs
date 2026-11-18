@@ -4327,48 +4327,12 @@ impl PlaApp {
 
     /// B4: 把 BOM 里的一行存成零件库新条目(料号按规则自动给, 字段 / 单价取这一行的当前值, 记下零件 key 与模型名作匹配), 并链接。
     fn lib_add_from_row(&mut self, row: &pla_ui::bom_table::Row, model_name: &str) {
-        let cols = self.bom_tpl.columns.clone();
-        let get = |id: &str| cols.iter().position(|c| c.id == id).map(|i| row.cells[i].clone()).unwrap_or_default();
-        let origin = get("origin");
-        // 分类: 按名称 / 型号关键词猜(工具 / 耗材 / 橡胶 / 外购组件 / 传动 / 紧固件 / 电气), 否则采购 → 007, 再按材料(塑胶 001 / 金属 002); 认不出 → 001
-        let category = pla_ui::parts_lib::guess_category(&get("name"), &get("model"), &get("material"), &origin).unwrap_or("001");
-        let pn = if get("pn").trim().is_empty() || self.lib.find(get("pn").trim()).is_some() { self.lib.next_pn_for(&self.bom_edits.project, category) } else { get("pn").trim().to_string() };
-        let mut en = pla_ui::parts_lib::Entry { pn: pn.clone(), name: get("name"), category: category.into(), ..Default::default() };
-        for c in cols.iter().filter(|c| c.source.as_deref() == Some("field") && c.formula.is_none() && c.id != "pn" && c.id != "unit_price") {
-            let v = get(&c.id);
-            if !v.trim().is_empty() {
-                en.fields.insert(c.id.clone(), v);
-            }
-        }
-        let price = get("unit_price");
-        if price.trim().parse::<f64>().is_ok_and(|p| p != 0.0) {
-            en.suppliers.push(pla_ui::parts_lib::Supplier { price, date: pla_ui::parts_lib::today(), ..Default::default() });
-        }
-        if !model_name.is_empty() && model_name != en.name {
-            en.aliases.push(model_name.to_string());
-        }
-        if !row.manual {
-            en.keys.push(row.key.clone());
-        }
-        if let Some(sp) = &row.spec {
-            en.spec = sp.key.clone();
-            // 型号空着就用认出的规格
-            if en.fields.get("model").is_none_or(|m| m.trim().is_empty()) {
-                en.fields.insert("model".into(), sp.text());
-            }
-        }
-        self.lib.upsert(en);
+        let pn = pla_ui::doc_jobs::lib_add_from_row(&mut self.lib, &mut self.bom_edits, &self.bom_tpl, row, model_name);
         self.lib_save();
-        self.bom_edits.links.insert(row.key.clone(), pn.clone());
-        // 已存进库的字段不再作为本文档覆盖重复保存
-        if let Some(m) = self.bom_edits.parts.get_mut(&row.key) {
-            m.retain(|k, _| k == "usage" || k == "sets");
-        }
         self.bom_edits_save();
         self.bom_cell_buf.clear();
         self.set_notice((false, t!("已存入零件库: {pn}", "Saved to the parts library: {pn}")));
     }
-
     /// B4: 从 CSV 导入零件库, 报告写进 lib_import_report。
     fn lib_import(&mut self) {
         let path = self.lib_import_path.trim().trim_matches('"').to_string();

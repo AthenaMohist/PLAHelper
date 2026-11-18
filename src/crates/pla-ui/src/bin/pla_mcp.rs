@@ -4,6 +4,9 @@
 //! 接入 Claude Code:  claude mcp add plahelper -- "<repo>\src\target\release\pla-mcp.exe"
 //! 读直接读文件; 改 / 出图交给正在跑的 pla-ui(见 pla_ui::mcp_bridge)。
 
+// 工具清单是一个很大的 json! 字面量(宏展开深度超过默认 128)
+#![recursion_limit = "512"]
+
 use std::io::{BufRead, Write};
 use std::time::Duration;
 
@@ -183,6 +186,13 @@ The spec, a map (bodies, solid ids, undo range) and a log are saved under the do
          "description": "The document's named dimensions and parameters (PLAhelper's records: D001 / H001 hole features ..., parameters with expressions that drive dimensions). action=list / set (changes: [{name, value}] - changes the model so each named dimension gets that value, in one transaction; a failed step rolls everything back) / set_param (name, expr - change a parameter; every dimension bound to it follows). set / set_param work on the foreground document through PLAhelper (pla-ui must be running). Values in document units.",
          "inputSchema": {"type": "object", "properties": {"doc": {"type": "string", "enum": ["foreground", "background"]}, "action": {"type": "string", "enum": ["list", "set", "set_param"]},
             "changes": {"type": "array", "items": {"type": "object", "properties": {"name": {"type": "string"}, "value": {"type": "number"}}, "required": ["name", "value"]}}, "name": {"type": "string"}, "expr": {}}, "required": ["action"]}},
+        {"name": "parts_library", "annotations": {"destructiveHint": true},
+         "description": "PLAhelper's parts library (global, all documents): purchase name, part number (rule: project prefix + category code + serial), BOM fields (model / origin / unit / pcs_unit / ... by BOM column id), suppliers with price / currency / MOQ / lead time / price date, preferred supplier, aliases, standard-part spec. A BOM row linked to an entry takes its name, fields and preferred price (document overrides still win). action=search (query?, category?, limit?) / get (pn; former numbers work too) / add (name, category? (guessed when omitted), pn? (auto by category + project), project?, fields?, suppliers?: [{name, price, currency, moq, lead, url}], aliases?, spec?, notes?) / update (pn, name?, fields? (null value removes), supplier?: {name, price, ...} (updates that supplier or adds it; a new price stamps today's date), suppliers? (replace all), preferred? (supplier name or index), category? (renumbers, old number kept as former), aliases?, spec?, notes?) / remove (pn) / link (doc?, part, pn; empty pn unlinks) / from_bom (doc?, part: save that BOM row as a new entry and link it) / suggest (doc?: library suggestions per BOM row).",
+         "inputSchema": {"type": "object", "properties": {
+            "action": {"type": "string", "enum": ["search", "get", "add", "update", "remove", "link", "from_bom", "suggest"]},
+            "query": {"type": "string"}, "category": {"type": "string"}, "limit": {"type": "integer"}, "pn": {"type": "string"}, "name": {"type": "string"}, "project": {"type": "string"},
+            "fields": {"type": "object"}, "supplier": {"type": "object"}, "suppliers": {"type": "array", "items": {"type": "object"}}, "preferred": {}, "aliases": {"type": "array", "items": {"type": "string"}},
+            "spec": {"type": "string"}, "notes": {"type": "string"}, "doc": {"type": "string", "enum": ["foreground", "background"]}, "part": {"type": "string"}, "scope": {"type": "string"}}, "required": ["action"]}},
         {"name": "background_bom", "annotations": {"destructiveHint": true},
          "description": "(Same as bom_export with doc=background.) Scan the BOM of the document open in the background instance (same as PLAhelper's BOM tab: template, user entries, part library, part identity tracking) and export it as CSV next to the document. scope = a configuration name (default: currently visible). Refused when the same document is open in the foreground.",
          "inputSchema": {"type": "object", "properties": {"scope": {"type": "string"}}}},
@@ -932,7 +942,7 @@ fn doc_scan(d: &Doc, scope: Option<&str>) -> Result<(Value, pla_ui::doc_jobs::Mi
 }
 
 const DOC_TOOLS: &[&str] = &[
-    "bom_table", "bom_edit", "bom_export", "draw_parts", "release", "release_history", "suppliers", "configs", "dims",
+    "bom_table", "bom_edit", "bom_export", "draw_parts", "release", "release_history", "suppliers", "configs", "dims", "parts_library",
     "background_bom", "background_draw", "background_release",
 ];
 
@@ -949,6 +959,9 @@ fn doc_tool(name: &str, a: &Value) -> Value {
         };
         if name == "suppliers" {
             return suppliers_tool(&a);
+        }
+        if name == "parts_library" {
+            return parts_library_tool(&a);
         }
         let d = doc_target(&a)?;
         match name.as_str() {
@@ -1492,5 +1505,209 @@ fn dims_tool(d: &Doc, a: &Value) -> Result<Value, String> {
             Ok(out)
         }
         x => Err(format!("unknown action {x} (list / set / set_param)")),
+    }
+}
+
+// ---- 零件库(全局; 用户 2026-11-18: 要能访问和改动)
+
+fn lib_entry_json(e: &pla_ui::parts_lib::Entry, full: bool) -> Value {
+    let pref = e.suppliers.get(e.preferred).or_else(|| e.suppliers.first());
+    let mut v = json!({
+        "pn": e.pn, "name": e.name, "category": e.category, "fields": e.fields,
+        "price": pref.map(|s| s.price.clone()), "supplier": pref.map(|s| s.name.clone()), "spec": e.spec,
+    });
+    if full {
+        v["suppliers"] = json!(e.suppliers.iter().map(|s| json!({ "name": s.name, "url": s.url, "price": s.price, "currency": s.currency, "moq": s.moq, "lead": s.lead, "date": s.date })).collect::<Vec<_>>());
+        v["preferred"] = json!(e.preferred);
+        v["aliases"] = json!(e.aliases);
+        v["keys"] = json!(e.keys.len());
+        v["notes"] = json!(e.notes);
+        v["former"] = json!(e.former);
+    }
+    v
+}
+
+fn lib_supplier(v: &Value, old: Option<&pla_ui::parts_lib::Supplier>) -> pla_ui::parts_lib::Supplier {
+    let mut s = old.cloned().unwrap_or_default();
+    let get = |k: &str| v[k].as_str().map(String::from).or_else(|| v[k].as_f64().map(|x| x.to_string()));
+    if let Some(x) = get("name") { s.name = x; }
+    if let Some(x) = get("url") { s.url = x; }
+    if let Some(x) = get("price") {
+        if x != s.price {
+            s.date = pla_ui::parts_lib::today();
+        }
+        s.price = x;
+    }
+    if let Some(x) = get("currency") { s.currency = x; }
+    if let Some(x) = get("moq") { s.moq = x; }
+    if let Some(x) = get("lead") { s.lead = x; }
+    s
+}
+
+fn strs_of(v: &Value) -> Option<Vec<String>> {
+    v.as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+}
+
+fn parts_library_tool(a: &Value) -> Result<Value, String> {
+    use pla_ui::parts_lib as pl;
+    let dir = pl::dir();
+    let mut lib = pl::load_in(&dir);
+    let action = a["action"].as_str().unwrap_or("search");
+    let need_pn = |lib: &pl::Library| -> Result<String, String> {
+        let q = a["pn"].as_str().ok_or("needs pn")?;
+        lib.find_any(q).map(|e| e.pn.clone()).ok_or_else(|| format!("no library entry {q}"))
+    };
+    match action {
+        "search" => {
+            let q = a["query"].as_str().unwrap_or("").to_lowercase();
+            let cat = a["category"].as_str();
+            let limit = a["limit"].as_u64().unwrap_or(50) as usize;
+            let hits: Vec<Value> = lib
+                .entries
+                .iter()
+                .filter(|e| cat.is_none_or(|c| e.category == c))
+                .filter(|e| {
+                    q.is_empty()
+                        || e.pn.to_lowercase().contains(&q)
+                        || e.name.to_lowercase().contains(&q)
+                        || e.spec.to_lowercase().contains(&q)
+                        || e.aliases.iter().any(|x| x.to_lowercase().contains(&q))
+                        || e.former.iter().any(|x| x.to_lowercase().contains(&q))
+                        || e.fields.values().any(|x| x.to_lowercase().contains(&q))
+                })
+                .take(limit)
+                .map(|e| lib_entry_json(e, false))
+                .collect();
+            Ok(json!({ "file": dir.join("library.json").display().to_string(), "count": lib.entries.len(), "hits": hits, "categories": lib.pn_rule.categories, "prefix": lib.pn_rule.prefix }))
+        }
+        "get" => {
+            let pn = need_pn(&lib)?;
+            Ok(lib_entry_json(lib.find(&pn).unwrap(), true))
+        }
+        "add" => {
+            let name = a["name"].as_str().ok_or("add needs name")?.to_string();
+            let fields: std::collections::BTreeMap<String, String> =
+                a["fields"].as_object().map(|m| m.iter().filter_map(|(k, v)| Some((k.clone(), v.as_str().map(String::from).or_else(|| v.as_f64().map(|x| x.to_string()))?))).collect()).unwrap_or_default();
+            let g = |k: &str| fields.get(k).cloned().unwrap_or_default();
+            let category = a["category"].as_str().map(String::from).unwrap_or_else(|| pl::guess_category(&name, &g("model"), &g("material"), &g("origin")).unwrap_or("009").to_string());
+            if !lib.pn_rule.categories.contains_key(&category) {
+                return Err(format!("unknown category {category} (have: {})", lib.pn_rule.categories.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(", ")));
+            }
+            let pn = match a["pn"].as_str() {
+                Some(p) if lib.find_any(p).is_some() => return Err(format!("part number {p} is taken")),
+                Some(p) => p.to_string(),
+                None => lib.next_pn_for(a["project"].as_str().unwrap_or(""), &category),
+            };
+            let suppliers: Vec<pl::Supplier> = a["suppliers"].as_array().into_iter().flatten().map(|s| lib_supplier(s, None)).collect();
+            lib.upsert(pl::Entry {
+                pn: pn.clone(), name, category, fields, suppliers, preferred: 0,
+                aliases: strs_of(&a["aliases"]).unwrap_or_default(), spec: a["spec"].as_str().unwrap_or("").to_string(),
+                notes: a["notes"].as_str().unwrap_or("").to_string(), ..Default::default()
+            });
+            pl::save_in(&dir, &lib)?;
+            Ok(json!({ "added": lib_entry_json(lib.find(&pn).unwrap(), true) }))
+        }
+        "update" => {
+            let mut pn = need_pn(&lib)?;
+            // 改分类 = 按新分类重新编号(旧号记进 former)
+            if let Some(c) = a["category"].as_str() {
+                if !lib.pn_rule.categories.contains_key(c) {
+                    return Err(format!("unknown category {c}"));
+                }
+                if let Some(n) = lib.reclassify(&pn, c) {
+                    pn = n;
+                }
+            }
+            let e = lib.find_mut(&pn).unwrap();
+            if let Some(n) = a["name"].as_str() {
+                e.name = n.into();
+            }
+            for (k, v) in a["fields"].as_object().into_iter().flatten() {
+                match v.as_str().map(String::from).or_else(|| v.as_f64().map(|x| x.to_string())) {
+                    Some(x) => {
+                        e.fields.insert(k.clone(), x);
+                    }
+                    None => {
+                        e.fields.remove(k);
+                    }
+                }
+            }
+            if let Some(s) = a["suppliers"].as_array() {
+                e.suppliers = s.iter().map(|x| lib_supplier(x, None)).collect();
+                e.preferred = 0;
+            }
+            // 改 / 加一家: supplier = {name, price, …}(按名字找, 没有就加)
+            if a["supplier"].is_object() {
+                let nm = a["supplier"]["name"].as_str().unwrap_or("");
+                match e.suppliers.iter().position(|s| !nm.is_empty() && s.name == nm) {
+                    Some(i) => e.suppliers[i] = lib_supplier(&a["supplier"], Some(&e.suppliers[i])),
+                    None => e.suppliers.push(lib_supplier(&a["supplier"], None)),
+                }
+            }
+            if let Some(p) = a["preferred"].as_str() {
+                e.preferred = e.suppliers.iter().position(|s| s.name == p).ok_or_else(|| format!("no supplier {p} on {pn}"))?;
+            } else if let Some(i) = a["preferred"].as_u64() {
+                e.preferred = (i as usize).min(e.suppliers.len().saturating_sub(1));
+            }
+            if let Some(x) = strs_of(&a["aliases"]) {
+                e.aliases = x;
+            }
+            if let Some(x) = a["spec"].as_str() {
+                e.spec = x.into();
+            }
+            if let Some(x) = a["notes"].as_str() {
+                e.notes = x.into();
+            }
+            pl::save_in(&dir, &lib)?;
+            Ok(json!({ "updated": lib_entry_json(lib.find(&pn).unwrap(), true) }))
+        }
+        "remove" => {
+            let pn = need_pn(&lib)?;
+            lib.remove(&pn);
+            pl::save_in(&dir, &lib)?;
+            Ok(json!({ "removed": pn }))
+        }
+        // BOM 行 ↔ 库: link(pn; pn 为空 = 取消链接)/ from_bom(把这一行存成新条目并链接)/ suggest(库给的建议)
+        "link" | "from_bom" | "suggest" => {
+            let d = doc_target(a)?;
+            let (scan, _) = doc_scan(&d, a["scope"].as_str().filter(|s| !s.is_empty()))?;
+            let mut st = pla_ui::doc_jobs::DocState::load(&d.key);
+            st.lib = lib;
+            let (rows, _) = pla_ui::bom_table::build(&scan, &st.tpl, &st.edits, &st.lib);
+            if action == "suggest" {
+                let out: Vec<Value> = rows.iter().map(|r| json!({ "row": r.key, "linked": r.link, "suggest": r.suggest })).collect();
+                return Ok(json!({ "document": d.label, "rows": out }));
+            }
+            let q = a["part"].as_str().ok_or("needs part (row key / part number / name)")?;
+            let k = find_row(&rows, &st.tpl, q)?;
+            let row = rows.iter().find(|r| r.key == k).unwrap();
+            let pn = if action == "link" {
+                match a["pn"].as_str().filter(|p| !p.is_empty()) {
+                    Some(p) => {
+                        let pn = st.lib.find_any(p).map(|e| e.pn.clone()).ok_or_else(|| format!("no library entry {p}"))?;
+                        st.edits.links.insert(k.clone(), pn.clone());
+                        Some(pn)
+                    }
+                    None => {
+                        st.edits.links.remove(&k);
+                        None
+                    }
+                }
+            } else {
+                let parts = pla_ui::doc_jobs::bom_parts(&scan, &st.tpl, &st.edits, &st.lib, &st.sheets.purchased);
+                let model_name = parts.iter().find(|p| p.2.key == k).map(|p| p.1 .1.clone()).unwrap_or_default();
+                let pn = pla_ui::doc_jobs::lib_add_from_row(&mut st.lib, &mut st.edits, &st.tpl, row, &model_name);
+                pl::save_in(&dir, &st.lib)?;
+                Some(pn)
+            };
+            pla_ui::bom_table::save_edits(&d.key, &st.edits)?;
+            let mut out = table_json(&d, &scan, &st);
+            out["changed"] = json!([format!("{q} → {}", pn.clone().unwrap_or_else(|| "unlinked".into()))]);
+            if let Some(p) = pn.as_ref().and_then(|p| st.lib.find(p)) {
+                out["entry"] = lib_entry_json(p, true);
+            }
+            Ok(out)
+        }
+        x => Err(format!("unknown action {x} (search / get / add / update / remove / link / from_bom / suggest)")),
     }
 }

@@ -1561,7 +1561,7 @@ const callAsync = async (name, args) => JSON.parse(await run(`window.__PLA__.cal
       assert.deepStrictEqual(clicks, ['AP242', 'nurbs', 'OK'], '先选格式、勾 NURBS, 再点外层容器里的 OK');
       assert.strictEqual(open, null, '对话框已关');
       const back = call('file.exportRestore');
-      assert.deepStrictEqual(back.v, { restored: 1, failed: 0 });
+      assert.deepStrictEqual(back.v, { restored: 1, failed: 0, cancelledAutoMove: false }, '原来有选择 → 不取消自动移动');
       assert.deepStrictEqual([...solids], [userPick], '还原成用户原来的选择');
       // 不给 ids = 全部可见: 导出时选择为空
       clicks.length = 0;

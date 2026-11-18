@@ -205,6 +205,44 @@ pub fn write_part_spec(doc_key: &str, key: &str, sheets: &Sheets, prefs: &Prefs,
     Ok(spec_file)
 }
 
+/// B4: BOM 的一行存成零件库新条目(料号按规则自动给 —— 行里已有且库里没占用就用它; 字段 / 单价取这一行的当前值;
+/// 记下零件 key 与模型名作匹配; 认出的标准件规格记进 spec)并链接到这一行; 已进库的字段不再作为文档覆盖重复保存。返回料号。不存盘。
+pub fn lib_add_from_row(lib: &mut Library, edits: &mut Edits, tpl: &Template, row: &Row, model_name: &str) -> String {
+    let cols = &tpl.columns;
+    let get = |id: &str| cols.iter().position(|c| c.id == id).map(|i| row.cells[i].clone()).unwrap_or_default();
+    let origin = get("origin");
+    let category = parts_lib::guess_category(&get("name"), &get("model"), &get("material"), &origin).unwrap_or("001");
+    let pn = if get("pn").trim().is_empty() || lib.find(get("pn").trim()).is_some() { lib.next_pn_for(&edits.project, category) } else { get("pn").trim().to_string() };
+    let mut en = parts_lib::Entry { pn: pn.clone(), name: get("name"), category: category.into(), ..Default::default() };
+    for c in cols.iter().filter(|c| c.source.as_deref() == Some("field") && c.formula.is_none() && c.id != "pn" && c.id != "unit_price") {
+        let v = get(&c.id);
+        if !v.trim().is_empty() {
+            en.fields.insert(c.id.clone(), v);
+        }
+    }
+    let price = get("unit_price");
+    if price.trim().parse::<f64>().is_ok_and(|p| p != 0.0) {
+        en.suppliers.push(parts_lib::Supplier { price, date: parts_lib::today(), ..Default::default() });
+    }
+    if !model_name.is_empty() && model_name != en.name {
+        en.aliases.push(model_name.to_string());
+    }
+    if !row.manual {
+        en.keys.push(row.key.clone());
+    }
+    if let Some(sp) = &row.spec {
+        en.spec = sp.key.clone();
+        if en.fields.get("model").is_none_or(|m| m.trim().is_empty()) {
+            en.fields.insert("model".into(), sp.text());
+        }
+    }
+    lib.upsert(en);
+    edits.links.insert(row.key.clone(), pn.clone());
+    if let Some(m) = edits.parts.get_mut(&row.key) {
+        m.retain(|k, _| k == "usage" || k == "sets");
+    }
+    pn
+}
 #[cfg(test)]
 mod tests {
     use super::*;
