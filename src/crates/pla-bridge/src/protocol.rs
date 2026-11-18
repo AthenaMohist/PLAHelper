@@ -512,8 +512,7 @@ fn kind_name(tcode: u32) -> String {
         0 => "solid".to_string(),
         1 => "sheet".to_string(),
         5 => "group".to_string(),
-        // TODO-PROBE: 真机 fillet 的 T 码未实锤(R7-18); 9 沿用 mock 约定,
-        // 维持 pla-dim 拓扑硬拒(TOPOLOGY_KINDS)的测试路径。真机码探明后更新。
+        // TODO-PROBE: 真机 fillet 的 T 码未实锤(R7-18); 9 沿用 mock 约定。
         9 => "fillet".to_string(),
         other => format!("type{other}"),
     }

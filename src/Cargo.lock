@@ -3593,7 +3593,6 @@ dependencies = [
  "futures-util",
  "pla-bridge",
  "pla-core",
- "pla-dim",
  "pla-selection",
  "pla-snapshot",
  "serde",
@@ -3629,20 +3628,6 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "tracing",
-]
-
-[[package]]
-name = "pla-dim"
-version = "0.1.0"
-dependencies = [
- "futures-util",
- "pla-bridge",
- "pla-selection",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "tokio",
- "tokio-tungstenite",
 ]
 
 [[package]]

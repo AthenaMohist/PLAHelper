@@ -3,7 +3,6 @@ members = [
     "crates/pla-app",
     "crates/pla-bridge",
     "crates/pla-core",
-    "crates/pla-dim",
     "crates/pla-selection",
     "crates/pla-snapshot",
     "crates/pla-ui",

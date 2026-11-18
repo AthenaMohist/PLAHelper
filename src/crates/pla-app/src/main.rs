@@ -47,12 +47,12 @@ pub fn data_dir() -> PathBuf {
         })
 }
 
-/// 共享应用状态：快照存储 + 清理策略 + M3/M4 选择集与尺寸存储 + 实体树缓存。
+/// 共享应用状态：快照存储 + 清理策略 + M3 选择集存储 + 实体树缓存。
+/// （旧 pla-dim "网格顶点平移 + PUT_SOME 写回"尺寸驱动已删，2026-11-18；尺寸改走 pla-ui 的 N3 / 垫片 cmd.exec。）
 pub struct AppState {
     pub store: SnapshotStore,
     pub cleanup_policy: Mutex<CleanupPolicy>,
     pub selections: SelectionStore,
-    pub dims: pla_dim::DimStore,
     pub cache: EntityCache,
 }
 
@@ -63,7 +63,6 @@ impl AppState {
             store: SnapshotStore::new(&base),
             cleanup_policy: Mutex::new(CleanupPolicy::default()),
             selections: SelectionStore::new(&base),
-            dims: pla_dim::DimStore::new(&base),
             cache: EntityCache::new(),
         }
     }
@@ -144,25 +143,6 @@ impl AppState {
     pub fn cmd_selection_delete(&self, doc_key: &str, name: &str) -> Result<(), String> {
         self.selections.delete(doc_key, name).map_err(|e| e.to_string())
     }
-
-    /// dim_define：选择集 + 方向向量 + 数值定义尺寸。
-    pub fn cmd_dim_define(
-        &self,
-        doc_key: &str,
-        name: &str,
-        set_name: &str,
-        dir: [f64; 3],
-        value: f64,
-    ) -> Result<pla_dim::DimDef, String> {
-        self.dims
-            .define(doc_key, name, set_name, pla_dim::DimDir::new(dir[0], dir[1], dir[2]), value)
-            .map_err(|e| e.to_string())
-    }
-
-    /// dim_list。
-    pub fn cmd_dim_list(&self, doc_key: &str) -> Vec<pla_dim::DimDef> {
-        self.dims.list(doc_key)
-    }
 }
 
 /// bridge WS 端点。可用 `PLA_BRIDGE_WS` 覆盖（缺省本机 mock/实机端口）。
@@ -188,19 +168,6 @@ pub async fn selection_apply(
     state
         .selections
         .apply(client, doc_key, &tree, name)
-        .await
-        .map_err(|e| e.to_string())
-}
-
-/// dim_update：拉成员 facet 顶点平移 + PUT_SOME 替换写回（§3.3/D4）。
-pub async fn dim_update(
-    state: &AppState,
-    client: &pla_bridge::BridgeClient,
-    doc_key: &str,
-    name: &str,
-    new_value: f64,
-) -> Result<pla_dim::DimReport, String> {
-    pla_dim::dim_update(client, &state.selections, &state.dims, doc_key, name, new_value)
         .await
         .map_err(|e| e.to_string())
 }
@@ -239,9 +206,6 @@ fn main() {
         println!("  selection-save <doc_key> <name> <逗号分隔成员>");
         println!("  selection-list <doc_key>");
         println!("  selection-apply <doc_key> <name>               走 bridge: LIST_ALL+PUT_SOME");
-        println!("  dim-define <doc_key> <name> <set_name> <dx dy dz> <value>");
-        println!("  dim-list <doc_key>");
-        println!("  dim-update <doc_key> <name> <new_value>        走 bridge: 顶点平移写回");
         println!("  entities <doc_key>                            列出 bridge 实体(id/kind/name)");
         println!("  cdp-eval <js>                                 经 CDP(9333) 在 Plasticity renderer 执行 JS");
         println!("  cdp-probe                                     注入垫片 __PLA__ 并打印能力探测 + 只读接口回读");
@@ -528,26 +492,6 @@ fn main() {
                 Err(e) => { eprintln!("ERROR: {e}"); std::process::exit(1); }
             }
         }
-        "dim-define" => { need(7);
-            let dir = [a[3].parse::<f64>().unwrap_or(0.0), a[4].parse::<f64>().unwrap_or(0.0), a[5].parse::<f64>().unwrap_or(0.0)];
-            let value = a[6].parse::<f64>().unwrap_or_else(|_| { eprintln!("value 不是数字"); std::process::exit(2); });
-            match state.cmd_dim_define(&a[0], &a[1], &a[2], dir, value) {
-                Ok(d) => println!("{}", serde_json::to_string_pretty(&d).unwrap()),
-                Err(e) => { eprintln!("ERROR: {e}"); std::process::exit(1); }
-            }
-        }
-        "dim-list" => { need(1);
-            println!("{}", serde_json::to_string_pretty(&state.cmd_dim_list(&a[0])).unwrap());
-        }
-        "dim-update" => { need(3);
-            let nv = a[2].parse::<f64>().unwrap_or_else(|_| { eprintln!("new_value 不是数字"); std::process::exit(2); });
-            let client = rt.block_on(async { pla_bridge::BridgeClient::connect(&bridge_url()) })
-                .map_err(|e| e.to_string()).unwrap_or_else(|e| { eprintln!("BRIDGE ERROR: {e}"); std::process::exit(3); });
-            match rt.block_on(dim_update(&state, &client, &a[0], &a[1], nv)) {
-                Ok(r) => println!("{}", serde_json::to_string_pretty(&r).unwrap()),
-                Err(e) => { eprintln!("ERROR: {e}"); std::process::exit(1); }
-            }
-        }
         other => { eprintln!("未知命令: {other}（--help 看列表）"); std::process::exit(2); }
     }
     }
@@ -574,9 +518,7 @@ fn run_tauri() {
                 doc_list,
                 entities_fetch,
                 selection_save,
-                selection_apply,
-                dim_define,
-                dim_update
+                selection_apply
             ])
             .run(tauri::generate_context!())
             .expect("error while running tauri application");
@@ -638,10 +580,9 @@ fn run_tauri() {
     }
 
     // ---- M3/M4 commands（架构 §5；feature gate 内，M2 先例） ----------------
-    // 异步命令 selection_apply / dim_update 需 tauri async runtime；此环境
+    // 异步命令 selection_apply 需 tauri async runtime；此环境
     // 不可编译，按 M1-a 先例以注释固化契约，启用 feature 后补 await+emit：
     //   selection_apply 成功后 app.emit("pla://doc-updated", {"doc_key", "kind": "selection"})
-    //   dim_update 成功后 app.emit("pla://doc-updated", {"doc_key", "kind": "dim"})
 
     #[cfg(feature = "tauri")]
     #[tauri::command]
@@ -686,32 +627,6 @@ fn run_tauri() {
         let client = pla_bridge::BridgeClient::connect(&bridge_url()).map_err(|e| e.to_string())?;
         tokio::runtime::Handle::current()
             .block_on(super::selection_apply(&state, &client, &doc_key, &name))
-    }
-
-    #[cfg(feature = "tauri")]
-    #[tauri::command]
-    fn dim_define(
-        state: tauri::State<AppState>,
-        doc_key: String,
-        name: String,
-        set_name: String,
-        dir: [f64; 3],
-        value: f64,
-    ) -> Result<pla_dim::DimDef, String> {
-        state.cmd_dim_define(&doc_key, &name, &set_name, dir, value)
-    }
-
-    #[cfg(feature = "tauri")]
-    #[tauri::command]
-    fn dim_update(
-        state: tauri::State<AppState>,
-        doc_key: String,
-        name: String,
-        new_value: f64,
-    ) -> Result<pla_dim::DimReport, String> {
-        let client = pla_bridge::BridgeClient::connect(&bridge_url()).map_err(|e| e.to_string())?;
-        tokio::runtime::Handle::current()
-            .block_on(super::dim_update(&state, &client, &doc_key, &name, new_value))
     }
 }
 
@@ -803,7 +718,7 @@ mod tests {
     }
 
     #[test]
-    fn m34_commands_selection_and_dim_crud() {
+    fn m3_commands_selection_crud() {
         let dir = std::env::temp_dir().join(format!(
             "pla-app-m34-{}-{}",
             std::process::id(),
@@ -823,13 +738,6 @@ mod tests {
         assert_eq!(state.cmd_selection_list("doc.plasticity").len(), 1);
         assert_eq!(state.cmd_doc_list(), vec!["doc.plasticity".to_string()]);
 
-        // dim_define + list
-        let def = state
-            .cmd_dim_define("doc.plasticity", "len", "arms", [0.0, 3.0, 4.0], 10.0)
-            .unwrap();
-        assert_eq!(def.value, 10.0);
-        assert_eq!(state.cmd_dim_list("doc.plasticity").len(), 1);
-
         // selection_delete cleans up; doc disappears from doc_list
         state.cmd_selection_delete("doc.plasticity", "arms").unwrap();
         assert!(state.cmd_doc_list().is_empty());
@@ -839,7 +747,6 @@ mod tests {
         assert!(state
             .cmd_selection_save("doc.plasticity", "///", vec![])
             .is_err());
-        assert!(state.cmd_dim_define("", "x", "s", [1.0, 0.0, 0.0], 1.0).is_err());
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -911,7 +818,7 @@ mod tests {
                 v.extend_from_slice(name.as_bytes());
                 let pad = (4 - (name.len() % 4)) % 4;
                 v.extend_from_slice(&vec![0u8; pad]);
-                // facets 段(mock 语义, 供 dim 顶点平移测试; 真机块布局待探针):
+                // facets 段(mock 语义; 真机块布局待探针):
                 v.extend_from_slice(&1u32.to_le_bytes());
                 v.extend_from_slice(&2u32.to_le_bytes());
                 for pt in [[0.0f32, 0.0, 0.0], [1.0, 0.0, 0.0]] {
@@ -954,7 +861,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn selection_apply_and_dim_update_over_bridge() {
+        async fn selection_apply_over_bridge() {
             let (_url, _guard, counter) = spawn_mock().await;
             let dir = std::env::temp_dir().join(format!(
                 "pla-app-e2e-{}-{}",
@@ -970,9 +877,6 @@ mod tests {
             state
                 .cmd_selection_save("doc.plasticity", "arms", vec!["1".into(), "2".into()])
                 .unwrap();
-            state
-                .cmd_dim_define("doc.plasticity", "len", "arms", [0.0, 0.0, 1.0], 5.0)
-                .unwrap();
 
             let client = pla_bridge::BridgeClient::connect(&bridge_url()).unwrap();
             client.wait_alive(Duration::from_secs(2)).await.unwrap();
@@ -983,22 +887,11 @@ mod tests {
             assert!(report.ok && report.missing.is_empty());
             assert_eq!(counter.load(Ordering::SeqCst), 1);
 
-            let dim = dim_update(&state, &client, "doc.plasticity", "len", 8.0)
-                .await
-                .unwrap();
-            assert!(dim.ok && dim.moved == 2, "both members translated");
-            assert_eq!(
-                state.dims.load("doc.plasticity", "len").unwrap().value,
-                8.0,
-                "dim value persisted after update"
-            );
-
             // Stale selection: missing surfaced, no write (D3).
             state
                 .cmd_selection_save("doc.plasticity", "stale", vec!["gone".into()])
                 .unwrap();
-            // dim_update 的 PUT_SOME 替换写回已计入 counter；stale apply 必须
-            // 不再额外发起 PUT_SOME → 比较前后计数而非写死绝对值。
+            // stale apply 不能再额外发起 PUT_SOME → 比较前后计数。
             let before_stale = counter.load(Ordering::SeqCst);
             let report = selection_apply(&state, &client, "doc.plasticity", "stale")
                 .await

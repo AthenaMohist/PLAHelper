@@ -12,7 +12,6 @@ pla-bridge = { path = "../pla-bridge" }
 pla-core = { path = "../pla-core" }
 pla-snapshot = { path = "../pla-snapshot" }
 pla-selection = { path = "../pla-selection" }
-pla-dim = { path = "../pla-dim" }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -21,7 +20,7 @@ tracing-subscriber = { workspace = true }
 tauri = { version = "2", features = [], optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true }  # CLI 薄壳 runtime（dim-update/selection-apply 走 bridge）
+tokio = { workspace = true }  # CLI 薄壳 runtime（selection-apply 走 bridge）
 
 [features]
 default = []
