@@ -172,7 +172,23 @@ class Layout:
             d = next(x for x in self.dims if x["id"] == did)
             need = self.D["gap"] + lane * self.D["step"] + self.T.h + 1.0
             h[d["view"]][side] = max(h[d["view"]][side], need)
+        # 预留(编译器自己画的东西: 坐标尺寸条、剖视名、剖切符号箭头 …): 叠在尺寸层外面
+        for rsv in self.p.get("reserve", []):
+            if rsv["view"] in h:
+                h[rsv["view"]][rsv["side"]] += rsv["depth"]
         return h
+
+    def reserved_rects(self, place):
+        """预留区域(页面矩形): 标签不进去。"""
+        out = []
+        for rsv in self.p.get("reserve", []):
+            c = place.get(rsv["view"])
+            if not c:
+                continue
+            r, dep = c["rect"], rsv["depth"]
+            out.append({"top": (r[0], r[1] - dep, r[2], r[1]), "bottom": (r[0], r[3], r[2], r[3] + dep),
+                        "left": (r[0] - dep, r[1], r[0], r[3]), "right": (r[2], r[1], r[2] + dep, r[3])}[rsv["side"]])
+        return out
 
     # ---- 视图摆放
     def grid(self):
@@ -246,7 +262,8 @@ class Layout:
                 group = (x, y, xx - gap - gx, yy - gap - gy)
                 for vid, (r, c) in pos.items():
                     place[vid] = {"cx": cx[c], "cy": cy[r], "scale": s}
-                for fi, fs in enumerate(self.free_scales(s)):
+                cap = min([self.views[f].get("max_rel", 1.0) for f in free] or [1.0])
+                for fi, fs in enumerate(self.free_scales(s, cap)):
                     ok = self.place_free(place, free, fs, [grow(group, 0)])
                     if ok is not None:
                         score = (fi, 0 if mode == "spread" else 1, -(mw * mh))
@@ -267,9 +284,11 @@ class Layout:
                 c["parts"] = [c["rect"]]
         return place, None
 
-    def free_scales(self, s):
-        """free 视图可用的比例: 与主视图相同, 再依次取更小的标准比例(最多小到 1/4)。"""
-        return [s] + [x for x in self.L["scales"] if x < s and x >= s / 4.0 - 1e-9]
+    def free_scales(self, s, cap=1.0):
+        """free 视图可用的比例: 不超过 s × cap(max_rel, 如轴测只作参考 ≤ 0.75 × 主视), 依次取更小的标准比例(最多小到 1/4)。"""
+        top = s * cap + 1e-9
+        out = [x for x in sorted(set(self.L["scales"] + [s]), reverse=True) if x <= top and x >= s / 4.0 - 1e-9]
+        return out or [s * cap]
 
     def place_free(self, place, free, fs, taken):
         place = {k: dict(v) for k, v in place.items()}
@@ -559,7 +578,7 @@ class Layout:
             texts = [d["text_rect"] for d in dims.values()]
             inl, un1 = self.realize_inline(place, s, list(texts))
             dims.update(inl)
-            obstacles = [d["text_rect"] for d in dims.values()]   # inline 文字可能伸出零件轮廓, 也算
+            obstacles = [d["text_rect"] for d in dims.values()] + self.reserved_rects(place)   # inline 文字可能伸出零件轮廓, 也算
             dim_lines = [tuple(d.get("line_ext") or d["line"]) for d in dims.values()] + [tuple(e) for d in dims.values() for e in d.get("ext", [])] \
                 + [tuple(d["tick"]) for d in dims.values() if d.get("tick")]
             # 尺寸线本身也是障碍(标签文字不能压线): 线 → 细长矩形

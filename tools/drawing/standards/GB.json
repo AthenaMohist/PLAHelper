@@ -12,7 +12,7 @@
  },
  "comment_layout_engine": "布局中间层(tools/drawing/layout.py)的参数, 页面毫米。scales = GB/T 14690 优先比例(从大到小试); char_w = 字宽 / 字高(实测 A3 PDF: 汉字 1.0, 数字字母 0.85); gap / step 沿用 dims; label_r = 引出标注候选半径; view_gap = 视图之间最小间距(含标注圈之外), max_gap = 余量均分时的上限。",
  "layout": {
-  "scales": [10, 5, 4, 2.5, 2, 1, 0.5, 0.4, 0.25, 0.2, 0.1],
+  "scales": [10, 5, 4, 2.5, 2, 1.5, 1, 0.6667, 0.5, 0.4, 0.3333, 0.25, 0.2, 0.1, 0.05],
   "char_w": { "cjk": 1.0, "latin": 0.85 },
   "arrow": 3.0, "ext_gap": 1.0, "ext_over": 2.0, "pad": 1.2,
   "view_gap": 10.0, "max_gap": 40.0, "edge_gap": 6.0,
