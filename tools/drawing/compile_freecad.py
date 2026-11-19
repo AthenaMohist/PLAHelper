@@ -363,9 +363,63 @@ inner_t = H - fr["outer"] - fr["zone_band"]
 area_b = 297 - std["title_block"]["rows_top"]  # 标题栏上沿(Y 向上; 标题栏跟着下边走, 与图幅无关)
 AREA = (inner_l + 6, area_b + 6, inner_r - 6, inner_t - 6)  # l, b, r, t
 
+# ---------------------------------------------------------------- 回转件(轴 / 盘 / 套): 外圆柱面基本都同轴
+def turned_axis():
+    """外圆柱面(整圈)按轴线分组, 面积最大的一组占 ≥ 80% 且最大外圆在这组、轴线是坐标轴、垂直轴向的外形 ≈ 最大直径 → 回转件。
+    → {ax, c, rmax, steps: [{d, t0, t1}](沿轴, 以 c 为原点)} 或 None。"""
+    cyls = []
+    for f in shape.Faces:
+        cy = geomutil.cylinder_of(f)
+        # 整圈或半圈(Plasticity 导出的圆柱常拆成两个半面; 同一段按 直径 + 轴向位置 去重)
+        if cy and not cy["internal"] and cy["span"] >= math.pi - 0.05:
+            cyls.append((cy, f.Area))
+    if not cyls:
+        return None
+    groups = []
+    for cy, a in cyls:
+        for g in groups:
+            if abs(abs(g["ax"].dot(cy["ax"])) - 1) < 1e-6:
+                d = cy["c"] - g["c"]
+                if (d - g["ax"] * d.dot(g["ax"])).Length < 1e-3:
+                    g["area"] += a
+                    g["m"].append(cy)
+                    break
+        else:
+            groups.append({"ax": V(cy["ax"]), "c": V(cy["c"]), "area": a, "m": [cy]})
+    g = max(groups, key=lambda g: g["area"])
+    total = sum(a for _, a in cyls)
+    rmax = max(cy["r"] for cy, _ in cyls)
+    if g["area"] < 0.8 * total or max(m["r"] for m in g["m"]) < rmax - 1e-6:
+        return None
+    ax = g["ax"]
+    if max(abs(ax.x), abs(ax.y), abs(ax.z)) < 1 - 1e-6:
+        return None   # 轴线不是坐标轴(视图方向按坐标轴取)
+    perp = [L for L, e in ((bb.XLength, V(1, 0, 0)), (bb.YLength, V(0, 1, 0)), (bb.ZLength, V(0, 0, 1))) if abs(e.dot(ax)) < 0.5]
+    if any(abs(L - 2 * rmax) > 0.02 * 2 * rmax for L in perp):
+        return None
+    steps = []
+    for m in g["m"]:
+        # 面自己的 t 沿它自己的轴向量量(可能与组轴反向): 位置 = 轴心差投影 + 方向符号 × t
+        sh_ = (m["c"] - g["c"]).dot(ax)
+        sg = 1.0 if m["ax"].dot(ax) > 0 else -1.0
+        a_, b_ = sh_ + sg * m["t0"], sh_ + sg * m["t1"]
+        steps.append({"d": round(2 * m["r"], 4), "t0": min(a_, b_), "t1": max(a_, b_)})
+    steps.sort(key=lambda s: s["t0"])
+    return {"ax": V(abs(ax.x), abs(ax.y), abs(ax.z)), "axs": V(ax), "c": g["c"], "rmax": rmax, "steps": steps}
+
+
+TURN = turned_axis() if spec.get("turned", "auto") == "auto" else None
+rep["turned"] = bool(TURN)
+
 # ---------------------------------------------------------------- 视图方向
 front_spec = spec.get("front", "auto")
-if front_spec == "auto":
+if front_spec == "auto" and TURN:
+    # GB: 轴 / 盘类主视轴线水平放置(侧面看), 端面形状另用左视表达
+    exts = [(bb.XLength, V(1, 0, 0)), (bb.YLength, V(0, 1, 0)), (bb.ZLength, V(0, 0, 1))]
+    side = [e for e in exts if abs(e[1].dot(TURN["ax"])) < 0.5]
+    front = side[0][1]
+    rep["front"] = "auto (turned: axis horizontal)"
+elif front_spec == "auto":
     # 主视 = 最能反映形状的面: 沿最薄方向看(板件看板面, 与用户 OYM 图一致); 视线从正侧来
     exts = [(bb.XLength, V(1, 0, 0)), (bb.YLength, V(0, 1, 0)), (bb.ZLength, V(0, 0, 1))]
     front = min(exts, key=lambda e: e[0])[1]
@@ -375,7 +429,10 @@ else:
 front = front.normalize()
 # 三根轴: ax_d = 视线(主视方向), ax_h = 页面"上", ax_w = 页面"右" = 上 × 视线
 ax_d = V(abs(front.x), abs(front.y), abs(front.z))
-if front_spec == "auto":
+if front_spec == "auto" and TURN:
+    # 页面"上" = 与轴线、视线都垂直的那根 → 页面"右" = 轴线
+    ax_h = next(e[1] for e in exts if abs(e[1].dot(TURN["ax"])) < 0.5 and abs(e[1].dot(ax_d)) < 0.5)
+elif front_spec == "auto":
     # 剩下两根轴里长的横放(用户 OYM 图: 长边水平)
     others = sorted([e for e in exts if abs(e[1].dot(ax_d)) < 0.5], key=lambda e: -e[0])
     ax_h = others[1][1]
@@ -401,6 +458,9 @@ Wm, Hm, Dm = ext(ax_w), ext(ax_h), ext(ax_d)  # 主视宽 / 高, 深(俯视的�
 # ======== 内容(只依赖模型轴, 与视图无关): 先算好, 交给布局层(layout.py)决定比例 / 视图位置 / 标注位置 ========
 # 每个视图: (页面横向对应的模型轴, 页面竖向对应的模型轴, 视线方向轴)。第一角: 俯视在主视下, 左视在主视右。
 VAX = {"Front": (ax_w, ax_h, ax_d), "Top": (ax_w, ax_d, ax_h), "Left": (ax_d, ax_h, ax_w)}
+if TURN:
+    del VAX["Top"]   # 回转件不出俯视(与主视相同)
+VIEWS3 = [n for n in ("Front", "Top", "Left") if n in VAX]
 # ---------------------------------------------------------------- 孔
 holes = spec.get("holes", "auto")
 if holes == "auto":
@@ -488,7 +548,13 @@ def hole_view(h):
 sec = None
 sec_spec = spec.get("section", "auto")
 sec_base = None
-if sec_spec == "auto" and holes:
+if sec_spec == "auto" and TURN:
+    # 回转件: 过轴线剖主视(GB 轴 / 盘类的常规表达; 实测编码器轴按"孔最多的视图"横剖, 剖视是空的)
+    o_ = TURN["c"]
+    n_ = VAX["Front"][2]
+    sec_spec = {"base": "Front", "origin": [o_.x, o_.y, o_.z], "normal": [n_.x, n_.y, n_.z], "symbol": "A"}
+    sec_base = "Front"
+elif sec_spec == "auto" and holes:
     from collections import Counter
 
     per_view = Counter(hole_view(h) for h in holes if hole_view(h))
@@ -694,7 +760,7 @@ def cone_view(c):
     """锥面在哪个视图里显示成斜线(轴 ⟂ 视线): 有剖视且剖切面含轴线就用剖视(内锥要剖开才看得见), 否则主 → 俯 → 左。"""
     if isinstance(sec_spec, dict) and abs(c["axis"].dot(V(*sec_spec["normal"]))) < 1e-6:
         return "Section"
-    for n in ("Front", "Top", "Left"):
+    for n in VIEWS3:
         if abs(c["axis"].dot(VAX[n][2])) < 1e-6:
             return n
     return None
@@ -790,7 +856,9 @@ def taper_text(c, vname):
     return ("◁ " if left else "▷ ") + c["text"]
 
 
-def layout_problem(anchors=None, fixed_scale=None, sec_dir=("Top", "right")):
+def layout_problem(anchors=None, fixed_scale=None, sec_dir=None):
+    if sec_dir is None:
+        sec_dir = ("Front", "below") if TURN else ("Top", "right")
     """anchors = {标签 id: (视图, [x, y])} 第二遍用视图里实际的圆边位置覆盖估计值。"""
     anchors = anchors or {}
     area = [AREA[0], H - AREA[3], AREA[2], H - AREA[1]]
@@ -798,7 +866,7 @@ def layout_problem(anchors=None, fixed_scale=None, sec_dir=("Top", "right")):
     rg = std.get("roughness")
     if rg:
         keep.append([rg["x"] - 30, rg["y"] - 13, inner_r, rg["y"] + 5])   # 右上角"其余 ∇6.3"(符号 + Ra 值伸到 y − 11.5)
-    views_ = [{"id": "Front", "w": Wm, "h": Hm}, {"id": "Top", "w": Wm, "h": Dm, "rel": {"of": "Front", "dir": "below"}},
+    views_ = [{"id": "Front", "w": Wm, "h": Hm}] + ([] if TURN else [{"id": "Top", "w": Wm, "h": Dm, "rel": {"of": "Front", "dir": "below"}}]) + [
               {"id": "Left", "w": Dm, "h": Hm, "rel": {"of": "Front", "dir": "right"}}]
     reserve = []
     if isinstance(sec_spec, dict):
@@ -815,10 +883,37 @@ def layout_problem(anchors=None, fixed_scale=None, sec_dir=("Top", "right")):
         if rs:
             reserve += [{"view": "Front", "side": k, "depth": v} for k, v in rs.items()]
     fr_ = outer_round("Front")
-    if not fr_ and not ORD_GROUPS:
+    if TURN:
+        # 回转件(主视轴线水平): 每段外圆标 ⌀(在视图上, 段内滑动避让) + 轴向链式尺寸(主视下方); 总长仍在上方(极值点)
+        yc = (TURN["c"] - bb.Center).dot(VAX["Front"][1])
+        xt = lambda t: (TURN["c"] + TURN["axs"] * t - bb.Center).dot(VAX["Front"][0])
+        segs = []
+        for s_ in TURN["steps"]:
+            L_ = s_["t1"] - s_["t0"]
+            if L_ < 1.0:      # 倒角 / 退刀槽边的窄环面不单标
+                continue
+            if any(abs(o["d"] - s_["d"]) < 1e-3 and abs(o["t0"] - s_["t0"]) < 1e-3 for o in segs):
+                continue
+            segs.append(s_)
+        for i_, s_ in enumerate(segs):
+            x0_, x1_ = sorted((xt(s_["t0"]), xt(s_["t1"])))
+            id_ = "Dstep%d" % (i_ + 1)
+            tol_ = shaft_tol(s_["d"] / 2)
+            dims_.append({"id": id_, "view": "Front", "kind": "inline", "dir": "y", "span": [yc - s_["d"] / 2, yc + s_["d"] / 2],
+                          "slide": [x0_ + min(0.8, (x1_ - x0_) / 4), x1_ - min(0.8, (x1_ - x0_) / 4)],
+                          "text": shown_text(id_, "Diameter", DIMS["diameter"] + fmt(s_["d"]) + (" " + tol_ if tol_ else ""), s_["d"])})
+        if len(segs) > 1:
+            for i_, s_ in enumerate(sorted(segs, key=lambda s: min(xt(s["t0"]), xt(s["t1"])))):
+                x0_, x1_ = sorted((xt(s_["t0"]), xt(s_["t1"])))
+                id_ = "Lstep%d" % (i_ + 1)
+                dims_.append({"id": id_, "view": "Front", "dir": "x", "side": "bottom", "a": [x0_, yc - s_["d"] / 2], "b": [x1_, yc - s_["d"] / 2],
+                              "text": shown_text(id_, "DistanceX", value=x1_ - x0_)})
+        dims_.append({"id": "LenW", "view": "Front", "dir": "x", "side": "top", "a": [-Wm / 2, Hm / 2], "b": [Wm / 2, Hm / 2], "text": shown_text("LenW", "DistanceX", value=Wm)})
+    elif not fr_ and not ORD_GROUPS:
         dims_.append({"id": "LenW", "view": "Front", "dir": "x", "side": "top", "a": [-Wm / 2, Hm / 2], "b": [Wm / 2, Hm / 2], "text": shown_text("LenW", "DistanceX", value=Wm)})
         dims_.append({"id": "LenH", "view": "Front", "dir": "y", "side": "left", "a": [-Wm / 2, -Hm / 2], "b": [-Wm / 2, Hm / 2], "text": shown_text("LenH", "DistanceY", value=Hm)})
-    dims_.append({"id": "LenD", "view": "Left", "dir": "x", "side": "top", "a": [-Dm / 2, Hm / 2], "b": [Dm / 2, Hm / 2], "text": shown_text("LenD", "DistanceX", value=Dm)})
+    if not TURN:
+        dims_.append({"id": "LenD", "view": "Left", "dir": "x", "side": "top", "a": [-Dm / 2, Hm / 2], "b": [Dm / 2, Hm / 2], "text": shown_text("LenD", "DistanceX", value=Dm)})
     k45 = math.sqrt(0.5)
 
     def lab(id_, vname, center, r, text):
@@ -845,7 +940,7 @@ def layout_problem(anchors=None, fixed_scale=None, sec_dir=("Top", "right")):
     for i_, cn in enumerate(CONES):
         vn = cone_view(cn)
         if vn is None or (vn == "Section" and not isinstance(sec_spec, dict)):
-            vn = next((n for n in ("Front", "Top", "Left") if abs(cn["axis"].dot(VAX[n][2])) < 1e-6), None)
+            vn = next((n for n in VIEWS3 if abs(cn["axis"].dot(VAX[n][2])) < 1e-6), None)
         if vn is None:
             continue
         id_ = "Taper%d" % (i_ + 1)
@@ -863,13 +958,20 @@ LAY = None
 if spec.get("layout", True) is not False:
     try:
         # 剖视的位置: 俯视右边 / 下面, 或紧挨它的基视图右边 / 下面, 都试, 取比例大的(同比例取靠前的)
-        LAY, SEC_DIR = None, ("Top", "right")
-        cands_ = [("Top", "right")]
-        if isinstance(sec_spec, dict):
-            b_ = sec_spec.get("base", "Front")
-            cands_ += [("Top", "below")] + ([(b_, "right"), (b_, "below")] if b_ != "Top" else [])
+        b_ = sec_spec.get("base", "Front") if isinstance(sec_spec, dict) else "Front"
+        if TURN:   # 没有俯视: 剖视放主视下面(主视右边是左视), 或左视的右边 / 下面
+            cands_ = [("Front", "below"), ("Left", "right"), ("Left", "below")]
+        else:
+            cands_ = [("Top", "right")]
+            if isinstance(sec_spec, dict):
+                cands_ += [("Top", "below")] + ([(b_, "right"), (b_, "below")] if b_ != "Top" else [])
+        LAY, SEC_DIR = None, cands_[0]
         for sd_ in cands_:
-            r_ = LAYM.solve(layout_problem(sec_dir=sd_), std)
+            try:
+                r_ = LAYM.solve(layout_problem(sec_dir=sd_), std)
+            except ValueError as e_:
+                rep["warnings"].append("layout candidate %s: %s" % (sd_, e_))
+                continue
             ok_ = r_.get("scale") and not r_["unplaced"]
             if ok_ and (LAY is None or r_["scale"] > LAY["scale"] + 1e-9):
                 LAY, SEC_DIR = r_, sd_
@@ -913,7 +1015,7 @@ grp.ProjectionType = std.get("projection", "First angle")
 grp.ScaleType = "Custom"
 grp.Scale = scale
 # 先建主视并定方向, 再加俯视 / 左视: 子视图方向在 addProjection 时按锚点当时的方向算(后改锚点不跟着变)
-for name in ("Front", "Top", "Left"):
+for name in VIEWS3:   # 回转件: 俯视与主视一样, 不要
     it = grp.addProjection(name)
     try:
         it.HardHidden = True  # 虚线(不可见轮廓); 建好就设, 别等后台消隐算完再改
@@ -993,7 +1095,7 @@ def vcenter(v):
     return q(v.X), q(v.Y)
 
 
-R = {n: vrect(views[n], ext(VAX[n][0]) * scale, ext(VAX[n][1]) * scale) for n in VAX}
+R = {n: vrect(views[n], ext(VAX[n][0]) * scale, ext(VAX[n][1]) * scale) for n in VAX if n in views}
 
 if isinstance(sec_spec, dict):
     sec_base = sec_spec.get("base", "Front")
@@ -1018,6 +1120,10 @@ if isinstance(sec_spec, dict):
     sw, sh_ = ext(bw) * scale, ext(bd) * scale
     if LAY and "Section" in LAY["views"]:
         sec.X, sec.Y = lay_xy("Section")
+    elif "Top" not in R:
+        # 没有俯视(回转件)的旧排法: 剖视放主视下面
+        sec.X = (R["Front"][0] + R["Front"][2]) / 2
+        sec.Y = R["Front"][1] - GAPV - MARGIN - sh_ / 2
     elif SEC_AT == "right":
         sec.X = R["Top"][2] + GAPV + MARGIN + sw / 2
         sec.Y = (R["Top"][1] + R["Top"][3]) / 2
@@ -1281,6 +1387,10 @@ def spread(pos, sep):
 PAGE_SVG = []  # 页面级图形(页面毫米, SVG 坐标 y 向下): 坐标尺寸的引出线 + 数值, 最后合成一个 DrawViewSymbol
 
 
+# 坐标值的界线: full = 从孔心拉到坐标值(看得出量的是哪个孔), stub = 只在轮廓外留一小段(方案 "ordinate_ext")
+ORD_EXT = spec.get("ordinate_ext", "full")
+
+
 def ordinates(vname, hole_list):
     """坐标尺寸: 只取 hole_list 里孔的中心(不取圆角弧心), 基准 = 视图左下角, 末值 = 外形尺寸(所以不再另标总长 / 总宽)。
     引出线: 视图边外一小段 → 斜折到散开后的文字位置。线和字都画进页面级 SVG(一个对象):
@@ -1330,7 +1440,7 @@ def ordinates(vname, hole_list):
         x1_ = x0_ - tick
         x2_ = x1_ - jog
         own = [p[0] for p in pts if abs(p[1] - y) < 0.01]
-        if own and abs(abs(y) - hh_) > 0.01:
+        if ORD_EXT == "full" and own and abs(abs(y) - hh_) > 0.01:
             poly((cxp + min(own) * scale, py_), (x0_, py_))
         poly((x0_, py_), (x1_, py_), (x2_, pg))
         txt = fmt(y + hh_)
@@ -1349,7 +1459,7 @@ def ordinates(vname, hole_list):
         y1_ = y0_ + tick
         y2_ = y1_ + jog
         own = [p[1] for p in pts if abs(p[0] - x) < 0.01]
-        if own and abs(abs(x) - hw) > 0.01:
+        if ORD_EXT == "full" and own and abs(abs(x) - hw) > 0.01:
             poly((px_, cyp + max(own) * scale), (px_, y0_))
         poly((px_, y0_), (px_, y1_), (pg, y2_))
         txt = fmt(x + hw)
@@ -1511,7 +1621,7 @@ if LAY:
             if sec is not None and "Section" in LAY["views"]:
                 sec.X, sec.Y = lay_xy("Section")
             doc.recompute()
-            R = {n: vrect(views[n], ext(VAX[n][0]) * scale, ext(VAX[n][1]) * scale) for n in VAX}
+            R = {n: vrect(views[n], ext(VAX[n][0]) * scale, ext(VAX[n][1]) * scale) for n in VAX if n in views}
             iso_s = q(iso.Scale)
             R["Iso"] = vrect(iso, diag * iso_s, diag * iso_s / 1.2)
             if sec is not None:
@@ -1527,8 +1637,40 @@ if LAY:
     LAY_LAB.update(LAY["labels"])
     # 锥度标注: 引线(锥面上一点 → 折点 → 肩线)+ 文字, 画进页面图形(布局坐标本来就是 y 向下的页面毫米)
     fs_, lw_, fam_ = std["fonts"]["dim"], std["lines"]["thin"], std["fonts"]["latin"]
+    # 回转件的段直径(视图上)/ 轴向链式尺寸(主视下方): 照布局结果画尺寸线 + 箭头 + 界线 + 文字
+    def svg_arrow_(tip, toward):
+        dx, dy = toward[0] - tip[0], toward[1] - tip[1]
+        n = math.hypot(dx, dy) or 1.0
+        ux, uy = dx / n, dy / n
+        L_ = std["layout"]["arrow"]
+        bx, by = tip[0] + ux * L_, tip[1] + uy * L_
+        PAGE_SVG.append('<polygon points="%.3f,%.3f %.3f,%.3f %.3f,%.3f" style="fill:#000"/>'
+                        % (tip[0], tip[1], bx - uy * 0.5, by + ux * 0.5, bx + uy * 0.5, by - ux * 0.5))
+
+    def svg_line_(p, q):
+        PAGE_SVG.append('<line x1="%.3f" y1="%.3f" x2="%.3f" y2="%.3f" style="stroke:#000;stroke-width:%g"/>' % (p[0], p[1], q[0], q[1], lw_))
+
+    for id_, d_ in LAY["dims"].items():
+        if not id_.startswith(("Dstep", "Lstep")):
+            continue
+        (p_, q_) = d_["line"]
+        for e_ in d_.get("ext", []):
+            svg_line_(e_[0], e_[1])
+        lx = d_.get("line_ext") or d_["line"]
+        svg_line_(lx[0], lx[1])
+        if d_.get("tick"):
+            svg_line_(d_["tick"][0], d_["tick"][1])
+        svg_arrow_(p_, q_)
+        svg_arrow_(q_, p_)
+        r_ = d_["text_rect"]
+        cx_, cy_ = (r_[0] + r_[2]) / 2, (r_[1] + r_[3]) / 2
+        rot_ = ' transform="rotate(-90 %.3f %.3f)"' % (cx_, cy_) if d_.get("rot") == -90 else ""
+        PAGE_SVG.append('<text x="%.3f" y="%.3f" style="font-family:%s;font-size:%gpx;text-anchor:middle;fill:#000"%s>%s</text>'
+                        % (cx_, cy_ + fs_ * 0.35, fam_, fs_, rot_, d_["text"]))
+        rep["placed"].append({"name": id_, "type": "Diameter" if id_.startswith("D") else "DistanceX", "text": d_["text"], "at": [round(cx_, 1), round(H - cy_, 1)]})
     for id_, l_ in LAY["labels"].items():
-        if not id_.startswith("Taper"):
+        # 锥度; 窄台阶放不下的段直径(布局改成了引出标注)
+        if not id_.startswith(("Taper", "Dstep")):
             continue
         a_, k_, e_ = l_["leader"]
         PAGE_SVG.append('<polyline points="%.3f,%.3f %.3f,%.3f %.3f,%.3f" style="fill:none;stroke:#000;stroke-width:%g"/>'
@@ -1588,12 +1730,16 @@ def place_diameter(vname, radius, name):
 # 有坐标尺寸时末值就是总长 / 总宽, 不再重复标; 主视轮廓是整圆 → 标直径。
 front_r = outer_round("Front")
 rep["round_front"] = bool(front_r)
-if front_r:
+if TURN:
+    # 回转件: 总长在上; 高 / 厚 = 最大外圆, 已在视图上按段标 ⌀(左视是端面圆, 不再标宽)
+    place_linear("Front", "x", "top", "LenW", Wm)
+elif front_r:
     place_diameter("Front", front_r, "DiaOuter")
 elif not has_ord:
     place_linear("Front", "x", "top", "LenW", Wm)
     place_linear("Front", "y", "left", "LenH", Hm)
-place_linear("Left", "x", "top", "LenD", Dm)
+if not TURN:
+    place_linear("Left", "x", "top", "LenD", Dm)
 
 
 # 配合的轴径(主视外径已标的除外): 在它是圆的视图里标 ⌀ + 公差
@@ -1957,9 +2103,9 @@ def draw_added_dim(item):
     info["value"] = round(val, 4)
     # 视图: d 在视图平面里(⟂ 视线); 圆柱还要求轴线也在视图平面里(侧面看成两条线), 优先主视
     if kind == "dia":
-        cand = [vn for vn in ("Front", "Top", "Left") if abs(t0[2].dot(VAX[vn][2])) < 1e-3]
+        cand = [vn for vn in VIEWS3 if abs(t0[2].dot(VAX[vn][2])) < 1e-3]
     else:
-        cand = [vn for vn in ("Front", "Top", "Left") if abs(d.dot(VAX[vn][2])) < 1e-3]
+        cand = [vn for vn in VIEWS3 if abs(d.dot(VAX[vn][2])) < 1e-3]
     if not cand:
         info["error"] = "no view shows this distance"
         rep["added_failed"].append(info)

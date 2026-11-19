@@ -205,6 +205,9 @@ class Layout:
                 if of in pos:
                     r, c = pos[of]
                     dr, dc = {"right": (0, 1), "left": (0, -1), "below": (1, 0), "above": (-1, 0)}[v["rel"]["dir"]]
+                    if (r + dr, c + dc) in pos.values():
+                        raise ValueError("views %s and %s claim the same grid cell"
+                                         % (v["id"], next(k for k, p in pos.items() if p == (r + dr, c + dc))))
                     pos[v["id"]] = (r + dr, c + dc)
                     pending.remove(v)
         if pending:
@@ -415,21 +418,29 @@ class Layout:
             cands = sorted({min(max(mid + k * 0.5 / s * sgn, a), b) for k in range(steps) for sgn in (1, -1)}, key=lambda t: abs(t - mid))
             done = None
             for t in cands:
-                if d["dir"] == "y":
-                    x = c["cx"] + t * c["scale"]
-                    y0, y1 = c["cy"] - hi * s, c["cy"] - lo * s
-                    cyy = (y0 + y1) / 2
-                    trect = (x - 0.6 - th, cyy - tw / 2, x - 0.6, cyy + tw / 2)
-                    rec = {"line": [(x, y0), (x, y1)], "text_at": (x - 0.6 - th / 2, cyy), "rot": -90}
-                else:
-                    y = c["cy"] - t * s
-                    x0, x1 = c["cx"] + lo * s, c["cx"] + hi * s
-                    cxx = (x0 + x1) / 2
-                    trect = (cxx - tw / 2, y - 0.6 - th, cxx + tw / 2, y - 0.6)
-                    rec = {"line": [(x0, y), (x1, y)], "text_at": (cxx, y - 0.6 - th / 2), "rot": 0}
-                if not any(rect_hit(trect, u, pad) for u in taken_text):
-                    rec.update({"text_rect": trect, "text": d["text"], "at": t, "kind": "inline"})
-                    done = rec
+                # 文字在尺寸线左 / 右(上 / 下)两侧都试: 贴着视图边的段, 一侧会伸出可画区
+                for side in (-1, 1):
+                    if d["dir"] == "y":
+                        x = c["cx"] + t * c["scale"]
+                        y0, y1 = c["cy"] - hi * s, c["cy"] - lo * s
+                        cyy = (y0 + y1) / 2
+                        tx = x - 0.6 - th / 2 if side < 0 else x + 0.6 + th / 2
+                        trect = (tx - th / 2, cyy - tw / 2, tx + th / 2, cyy + tw / 2)
+                        rec = {"line": [(x, y0), (x, y1)], "text_at": (tx, cyy), "rot": -90}
+                    else:
+                        y = c["cy"] - t * s
+                        x0, x1 = c["cx"] + lo * s, c["cx"] + hi * s
+                        cxx = (x0 + x1) / 2
+                        ty = y - 0.6 - th / 2 if side < 0 else y + 0.6 + th / 2
+                        trect = (cxx - tw / 2, ty - th / 2, cxx + tw / 2, ty + th / 2)
+                        rec = {"line": [(x0, y), (x1, y)], "text_at": (cxx, ty), "rot": 0}
+                    if not rect_inside(trect, self.area):
+                        continue
+                    if not any(rect_hit(trect, u, pad) for u in taken_text):
+                        rec.update({"text_rect": trect, "text": d["text"], "at": t, "kind": "inline"})
+                        done = rec
+                        break
+                if done:
                     break
             if done:
                 out[d["id"]] = done
@@ -439,12 +450,12 @@ class Layout:
         return out, unplaced
 
     # ---- 引出标注
-    def realize_labels(self, place, s, obstacles, dim_lines):
+    def realize_labels(self, place, s, obstacles, dim_lines, extra=None):
         L = self.L
         th, pad = self.T.h, L["pad"]
         view_rects = {vid: c["parts"] for vid, c in place.items()}
         placed, unplaced = {}, []
-        order = sorted(self.labels, key=lambda l: (-l.get("prio", 0), l["id"]))
+        order = sorted(self.labels + list(extra or []), key=lambda l: (-l.get("prio", 0), l["id"]))
 
         def candidates(lb, others):
             w, h, lines = self.T.box(lb["text"])
@@ -578,13 +589,21 @@ class Layout:
             texts = [d["text_rect"] for d in dims.values()]
             inl, un1 = self.realize_inline(place, s, list(texts))
             dims.update(inl)
+            # 在段上放不下的 inline(窄台阶的 ⌀): 改成引出标注(引线指到该段轮廓的上沿), 不拖累整张图的比例
+            extra = []
+            for u in un1:
+                d = next(x for x in self.dims if x["id"] == u["id"])
+                a, b = sorted(d["slide"])
+                anchor = [(a + b) / 2, max(d["span"])] if d["dir"] == "y" else [max(d["span"]), (a + b) / 2]
+                extra.append({"id": d["id"], "view": d["view"], "anchor": anchor, "text": d["text"], "prio": 1, "from_inline": True})
+            un1 = []
             obstacles = [d["text_rect"] for d in dims.values()] + self.reserved_rects(place)   # inline 文字可能伸出零件轮廓, 也算
             dim_lines = [tuple(d.get("line_ext") or d["line"]) for d in dims.values()] + [tuple(e) for d in dims.values() for e in d.get("ext", [])] \
                 + [tuple(d["tick"]) for d in dims.values() if d.get("tick")]
             # 尺寸线本身也是障碍(标签文字不能压线): 线 → 细长矩形
             for p, q in dim_lines:
                 obstacles.append((min(p[0], q[0]) - 0.3, min(p[1], q[1]) - 0.3, max(p[0], q[0]) + 0.3, max(p[1], q[1]) + 0.3))
-            labels, un2 = self.realize_labels(place, s, obstacles, dim_lines)
+            labels, un2 = self.realize_labels(place, s, obstacles, dim_lines, extra)
             res = {"scale": s, "views": place, "dims": dims, "labels": labels, "unplaced": un0 + un1 + un2}
             res["conflicts"] = conflicts(res, self)
             # 观感门槛: 有标签引线横穿别的视图 / 与别的引线交叉 / 在零件里走很长(代价高)→ 这个比例太挤, 试更小的
