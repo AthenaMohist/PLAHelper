@@ -221,6 +221,15 @@ The spec, a map (bodies, solid ids, undo range) and a log are saved under the do
             "action": {"type": "string", "enum": ["list", "get", "create", "rename", "remove", "select", "edit"]}, "name": {"type": "string"}, "new_name": {"type": "string"}, "from": {"type": "string"},
             "set": {"type": "array", "items": {"type": "object", "properties": {"size": {"type": "string"}, "clearance": {"type": "number"}, "tap": {"type": "number"}, "cbD": {"type": "number"}, "cbDepth": {"type": "number"}, "cskD": {"type": "number"}}, "required": ["size"]}},
             "remove_sizes": {"type": "array", "items": {"type": "string"}}}, "required": ["action"]}},
+        {"name": "knowledge_bases", "annotations": {"readOnlyHint": true},
+         "description": "Professional knowledge bases (Tencent ima, the user's account): list every knowledge base (own + subscribed) with id, name, item count, kind, role. query filters names. searched_by_default = the mechanical-design ones knowledge_search uses when kb is omitted.",
+         "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}}},
+        {"name": "knowledge_search", "annotations": {"readOnlyHint": true},
+         "description": "Search the user's ima knowledge bases (design handbooks, GB standards, material data…) BEFORE answering engineering questions from memory, and cite what you use. ima matches TITLES by keyword: give short keywords (\"联轴器\", \"键连接\", \"GB/T 1095\"); several words are searched one by one and ranked by how many the title contains. kb = knowledge base names (fragments) or ids; omitted = the mechanical-design ones. Returns hits {kb, title, type, media_id, own}. Subscribed knowledge bases only expose titles; files of the user's own knowledge base can be fetched with knowledge_get.",
+         "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "kb": {"type": "array", "items": {"type": "string"}}, "limit": {"type": "integer", "description": "max hits (default 30)"}}, "required": ["query"]}},
+        {"name": "knowledge_get", "annotations": {"readOnlyHint": true},
+         "description": "Fetch one knowledge-base item (media_id from knowledge_search): downloads the original file to a local cache and returns its path (read the PDF / image / text yourself and cite title + page); notes come back as text. Items of subscribed knowledge bases are refused by ima (available: false) - then tell the user to save the file into their own ima knowledge base.",
+         "inputSchema": {"type": "object", "properties": {"media_id": {"type": "string"}}, "required": ["media_id"]}},
         {"name": "background_bom", "annotations": {"destructiveHint": true},
          "description": "(Same as bom_export with doc=background.) Scan the BOM of the document open in the background instance (same as PLAhelper's BOM tab: template, user entries, part library, part identity tracking) and export it as CSV next to the document. scope = a configuration name (default: currently visible). Refused when the same document is open in the foreground.",
          "inputSchema": {"type": "object", "properties": {"scope": {"type": "string"}}}},
@@ -977,7 +986,30 @@ fn doc_scan(d: &Doc, scope: Option<&str>) -> Result<(Value, pla_ui::doc_jobs::Mi
 const DOC_TOOLS: &[&str] = &[
     "bom_table", "bom_edit", "bom_export", "draw_parts", "release", "release_history", "suppliers", "configs", "dims", "parts_library",
     "bom_template", "hole_table", "background_bom", "background_draw", "background_release",
+    "knowledge_bases", "knowledge_search", "knowledge_get",
 ];
+
+/// K1 专业知识库(腾讯 ima, 只读)
+fn knowledge_tool(name: &str, a: &Value) -> Result<Value, String> {
+    use pla_ui::knowledge as k;
+    let list = |v: &Value| -> Vec<String> {
+        match v {
+            Value::String(s) => vec![s.clone()],
+            Value::Array(xs) => xs.iter().filter_map(|x| x.as_str().map(str::to_string)).collect(),
+            _ => vec![],
+        }
+    };
+    match name {
+        "knowledge_bases" => {
+            let all = k::bases(a["query"].as_str().unwrap_or(""))?;
+            let default: Vec<Value> = k::pick_bases(&all, &[]).iter().map(|b| b["name"].clone()).collect();
+            Ok(json!({"bases": all, "searched_by_default": default}))
+        }
+        "knowledge_search" => k::search(a["query"].as_str().unwrap_or(""), &list(&a["kb"]), a["limit"].as_u64().unwrap_or(30) as usize),
+        "knowledge_get" => k::get(a["media_id"].as_str().unwrap_or("")),
+        _ => Err(format!("unknown tool {name}")),
+    }
+}
 
 fn doc_tool(name: &str, a: &Value) -> Value {
     let r = (|| -> Result<Value, String> {
@@ -1001,6 +1033,9 @@ fn doc_tool(name: &str, a: &Value) -> Value {
         }
         if name == "hole_table" {
             return hole_table_tool(&a);
+        }
+        if name.starts_with("knowledge_") {
+            return knowledge_tool(&name, &a);
         }
         let d = doc_target(&a)?;
         match name.as_str() {

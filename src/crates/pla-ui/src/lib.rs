@@ -11,6 +11,7 @@ pub mod fasteners;
 pub mod features;
 pub mod formula;
 pub mod hole_presets;
+pub mod knowledge;
 pub mod hotkey;
 pub mod identity;
 pub mod llm;

@@ -706,9 +706,11 @@
       还没有：shell（抽壳）、draft（拔模）、thicken、按面 / 边的阵列（RectangularArrayFacesFactory）、曲线阵列。
 - [x] **A4c 大纲**（2026-11-19，用户：MCP 不能和大纲树互动）：`model_outline` 读树；`model_exec` 加 folder / moveTo / hide / show / ungroup，rename 可改文件夹名。
       后台 model1 副本实测（建 / 嵌套 / 移动 / 隐藏 / 显示 / 撤销），契约测试覆盖（know-how/command-dispatch.md「A4c」）。还没有：锁定、大纲排序。
-- [ ] **K1 专业知识库（腾讯 ima）**（2026-11-19 用户）：ima 有 OpenAPI（`POST https://ima.qq.com/openapi/wiki/v1/<op>`，头 `ima-openapi-clientid` / `ima-openapi-apikey`；
-      search_knowledge 返回标题 + 片段 + media_id，无生成式问答），但**无公开官方文档**，路径来自社区实现 → 先拿用户的 key 实测。计划：pla-mcp `knowledge_search` / `knowledge_get` / `knowledge_bases`，
-      key 由用户放在本机配置（不进仓库、不进日志）；只读。等用户在 https://ima.qq.com/agent-interface 建好 Client ID + API Key。
+- [x] **K1 专业知识库（腾讯 ima）**（2026-11-19 用户给了 key 与官方 ima-skill 1.1.10）：pla-mcp `knowledge_bases` / `knowledge_search` / `knowledge_get`（`pla_ui::knowledge`，只读）；
+      凭证在 ~/.config/ima/（同官方 skill，不进仓库 / 日志）；官方 skill 也装进了 ~/.claude/skills/ima-skill。实测限制：① 搜索**只按标题关键词**（多词查 0 条 → 拆词逐个搜、按命中词数排序；片段为空）；
+      ② **订阅知识库拿不到原文**（220030），只有自己知识库的文件能下载（存 %LOCALAPPDATA%\PLAhelper\ima-cache，交给 agent 读 PDF）；③ 频控 200001（并发 4 + 退避重试）；
+      ④ **每日额度**（220021，像是全账号约百次；当天测试用完）→ 默认只搜 5 个核心机械库（~/.config/ima/plahelper_kbs.txt 可改）+ 搜索结果 / 库清单 24 h 本地缓存。
+      待做：额度恢复后实测 knowledge_get（自己库里的 PDF）；请用户把常用手册 / 标准存进自己的知识库，原文才可读。
 - [ ] **K2 工程计算**（2026-11-19 用户：问联轴器孔径是否必要那么大，要从专业角度计算 / 仿真、以数据说话，而不是一句话带过）：
       MCP 计算工具（轴扭转强度 / 刚度、键 / 过盈 / 锥面传扭、螺栓预紧与拧紧力矩、配合间隙与温升、轴承寿命…），输入取自模型（model_measure）与知识库，输出带公式和出处。
 - [ ] **D9 出图迭代**（2026-11-19，评估另一会话手画的编码器轴 / 磁环座图，docs/research/2026-11-19-mcp-drawings/）：手画图信息远多于 helper 出的图，但每张图坐标手写、不能复用、有文字重叠。
