@@ -414,6 +414,38 @@ class Layout:
             lo, hi = sorted(d["span"])
             a, b = sorted(d["slide"])
             mid = (a + b) / 2
+            # 文字比尺寸线还长(⌀20 g7(-0.007/-0.028) 在 ⌀20 段上): 尺寸线延长到零件外, 文字写在延长段上(GB 常用), 不再加引线
+            if tw + 2 * self.L["arrow"] > (hi - lo) * c["scale"] and d["dir"] == "y":
+                ext_done = None
+                cands_o = sorted({min(max(mid + k * 0.5 / s * sg, a), b) for k in range(int(max(0, (b - a) * s) / 0.5) + 1) for sg in (1, -1)}, key=lambda t: abs(t - mid))
+                for t in cands_o:
+                    x = c["cx"] + t * c["scale"]
+                    y0, y1 = c["cy"] - hi * s, c["cy"] - lo * s
+                    for up in (True, False):
+                        if up:
+                            ty0, ty1 = y0 - 2.0 - tw, y0 - 2.0
+                        else:
+                            ty0, ty1 = y1 + 2.0, y1 + 2.0 + tw
+                        for side in (-1, 1):
+                            tx = x - 0.6 - th / 2 if side < 0 else x + 0.6 + th / 2
+                            trect = (tx - th / 2, ty0, tx + th / 2, ty1)
+                            if not rect_inside(trect, self.area) or any(rect_hit(trect, u, pad) for u in taken_text):
+                                continue
+                            if any(rect_hit(trect, pr, pad) for cc in place.values() for pr in cc.get("parts", [cc["rect"]])):
+                                continue
+                            ext_done = {"line": [(x, y0), (x, y1)], "line_ext": [(x, min(y0, ty0)), (x, max(y1, ty1))],
+                                        "text_at": (tx, (ty0 + ty1) / 2), "rot": -90, "text_rect": trect, "text": d["text"], "at": t, "kind": "inline", "outside": True}
+                            break
+                        if ext_done:
+                            break
+                    if ext_done:
+                        break
+                if ext_done:
+                    out[d["id"]] = ext_done
+                    taken_text.append(ext_done["text_rect"])
+                else:
+                    unplaced.append({"id": d["id"], "why": "inline text longer than its dimension line"})
+                continue
             steps = int(max(0, (b - a) * s) / 0.5) + 1
             cands = sorted({min(max(mid + k * 0.5 / s * sgn, a), b) for k in range(steps) for sgn in (1, -1)}, key=lambda t: abs(t - mid))
             done = None
@@ -450,7 +482,7 @@ class Layout:
         return out, unplaced
 
     # ---- 引出标注
-    def realize_labels(self, place, s, obstacles, dim_lines, extra=None):
+    def realize_labels(self, place, s, obstacles, dim_lines, extra=None, dim_texts=()):
         L = self.L
         th, pad = self.T.h, L["pad"]
         view_rects = {vid: c["parts"] for vid, c in place.items()}
@@ -459,6 +491,12 @@ class Layout:
 
         def candidates(lb, others):
             w, h, lines = self.T.box(lb["text"])
+            # 固定尺寸的标签(形位公差框格、粗糙度符号 + 值): 调用方给 w / h; pad_left = 文字左边要留的地方(符号)
+            if lb.get("w"):
+                w = lb["w"]
+            if lb.get("h"):
+                h = lb["h"]
+            w += lb.get("pad_left", 0.0)
             ax, ay = self.to_page(lb["view"], lb["anchor"], place, s)
             cs = []
             own = view_rects[lb["view"]]
@@ -503,6 +541,9 @@ class Layout:
             if any(rect_hit(box, pr, pad) for prs in view_rects.values() for pr in prs):
                 return None
             if any(rect_hit(box, ob, pad) for ob in obstacles):
+                return None
+            # 引线不许穿过尺寸文字(实测: 形位框格的引线压在总长 "96.6" 上)
+            if any(seg_rect_hit(a, k, t) or seg_rect_hit(k, e, t) for t in dim_texts):
                 return None
             for o in others.values():
                 if rect_hit(box, o["text_rect"], pad) or seg_rect_hit(a, k, o["text_rect"]):
@@ -603,7 +644,7 @@ class Layout:
             # 尺寸线本身也是障碍(标签文字不能压线): 线 → 细长矩形
             for p, q in dim_lines:
                 obstacles.append((min(p[0], q[0]) - 0.3, min(p[1], q[1]) - 0.3, max(p[0], q[0]) + 0.3, max(p[1], q[1]) + 0.3))
-            labels, un2 = self.realize_labels(place, s, obstacles, dim_lines, extra)
+            labels, un2 = self.realize_labels(place, s, obstacles, dim_lines, extra, [d["text_rect"] for d in dims.values()] + list(self.p.get("text_obstacles", [])))
             res = {"scale": s, "views": place, "dims": dims, "labels": labels, "unplaced": un0 + un1 + un2}
             res["conflicts"] = conflicts(res, self)
             # 观感门槛: 有标签引线横穿别的视图 / 与别的引线交叉 / 在零件里走很长(代价高)→ 这个比例太挤, 试更小的
@@ -612,7 +653,9 @@ class Layout:
             bad = len(res["unplaced"]) + len(res["conflicts"])
             if not bad and not ugly:
                 return res
-            key = (bad, len(ugly))
+            # 都不干净时: 放不下 / 重叠最少的里面取比例最大的(缩小比例解决不了标注挤 —— 字号不变, 零件变小反而更挤);
+            # 引线观感问题只当警告(res["ugly"])
+            key = (bad, -s, len(ugly))
             if best is None or key < best[0]:
                 best = (key, res)
         if best is not None:

@@ -768,6 +768,181 @@ def cone_view(c):
 
 rep["cones"] = [{"taper": c["text"], "half_angle_deg": round(math.degrees(c["half"]), 4), "internal": c["internal"], "view": cone_view(c)} for c in CONES]
 
+# ---------------------------------------------------------------- 基准 / 形位公差 / 粗糙度(方案给内容, 这里定位 + 自洽检查; 布局层定位置)
+# 方案:
+#   "datums":    [{"label": "A", "on": 选择器}]
+#   "gdt":       [{"symbol": "circular_runout", "value": 0.005, "datums": ["A"], "on": 选择器, "dia": false}]
+#   "roughness": [{"ra": 0.4, "on": 选择器}]          (其余 = 右上角, 规范 roughness_default)
+# 选择器(按几何, agent 从 model_state / model_measure 拿数): {"cyl": 20} 外圆 ⌀20 | {"bore": 8} 内孔 ⌀8 | {"cone": true} / {"cone": "1:10"}
+#   | {"shoulder": {"d": 29.5, "side": "start" | "end"}} 回转件 ⌀29.5 段起 / 止端的台阶面 | {"plane": {"normal": [x,y,z], "at": [x,y,z]}}
+GDT_SYM = {"straightness": "⏤", "flatness": "⏥", "roundness": "○", "cylindricity": "⌭", "profile_line": "⌒", "profile_surface": "⌓",
+           "parallelism": "∥", "perpendicularity": "⊥", "angularity": "∠", "position": "⌖", "coaxiality": "◎", "concentricity": "◎",
+           "symmetry": "⌯", "circular_runout": "↗", "total_runout": "⌰"}
+GDT_NO_DATUM = {"straightness", "flatness", "roundness", "cylindricity"}
+GDT_AXIAL = {"coaxiality", "concentricity"}          # 被测 / 基准都是轴线
+GDT_RUNOUT = {"circular_runout", "total_runout"}
+
+
+def resolve_sel(sel):
+    """选择器 → {kind: cyl | bore | cone | plane, face, ax, c, r, n, p} 或抛错(说清找不到什么)。"""
+    if not isinstance(sel, dict):
+        raise ValueError("selector must be an object, got %r" % (sel,))
+    if "cyl" in sel or "bore" in sel:
+        d_ = float(sel.get("cyl", sel.get("bore")))
+        want_int = "bore" in sel
+        for f in shape.Faces:
+            cy = geomutil.cylinder_of(f)
+            if cy and cy["internal"] == want_int and abs(2 * cy["r"] - d_) < 0.01:
+                return {"kind": "bore" if want_int else "cyl", "face": f, "ax": V(cy["ax"]), "c": V(cy["c"]), "r": cy["r"], "t0": cy["t0"], "t1": cy["t1"]}
+        raise ValueError("no %s of diameter %s" % ("bore" if want_int else "outer cylinder", fmt(d_)))
+    if "cone" in sel:
+        for cn in CONES:
+            if sel["cone"] is True or str(sel["cone"]) == cn["text"]:
+                return {"kind": "cone", "ax": cn["axis"], "c": cn["apex"], "mid": cn["mid"], "cone": cn}
+        raise ValueError("no taper cone %s" % sel["cone"])
+    if "shoulder" in sel:
+        if not TURN:
+            raise ValueError("shoulder selector needs a turned part")
+        s_ = sel["shoulder"]
+        d_ = float(s_["d"])
+        st_ = [x for x in TURN["steps"] if abs(x["d"] - d_) < 0.01]
+        if not st_:
+            raise ValueError("no step of diameter %s" % fmt(d_))
+        t_ = min(x["t0"] for x in st_) if s_.get("side", "start") == "start" else max(x["t1"] for x in st_)
+        best = None
+        for f in shape.Faces:
+            if not isinstance(f.Surface, Part.Plane):
+                continue
+            n = f.normalAt(0, 0)
+            if abs(abs(n.dot(TURN["axs"])) - 1) > 1e-6:
+                continue
+            tf = (f.CenterOfMass - TURN["c"]).dot(TURN["axs"])
+            if abs(tf - t_) < 1.5 and (best is None or abs(tf - t_) < best[0]):   # 倒角会让台阶面离段端点差一点
+                best = (abs(tf - t_), f, tf)
+        if not best:
+            raise ValueError("no shoulder face at the %s of the %s step" % (s_.get("side", "start"), fmt(d_)))
+        f = best[1]
+        rs = [((vx.Point - TURN["c"]) - TURN["axs"] * (vx.Point - TURN["c"]).dot(TURN["axs"])).Length for vx in f.Vertexes] or [d_ / 2]
+        return {"kind": "plane", "face": f, "n": V(TURN["axs"]), "p": TURN["c"] + TURN["axs"] * best[2], "rmin": min(rs), "rmax": max(rs)}
+    if "plane" in sel:
+        n_ = V(*sel["plane"]["normal"]).normalize()
+        p_ = V(*sel["plane"]["at"])
+        for f in shape.Faces:
+            if isinstance(f.Surface, Part.Plane) and abs(abs(f.normalAt(0, 0).dot(n_)) - 1) < 1e-6 and abs((f.CenterOfMass - p_).dot(n_)) < 0.01:
+                return {"kind": "plane", "face": f, "n": n_, "p": f.CenterOfMass}
+        raise ValueError("no planar face with that normal through that point")
+    raise ValueError("unknown selector %r (use cyl / bore / cone / shoulder / plane)" % (sel,))
+
+
+def feature_anchor(ft):
+    """被测 / 基准要素在主视里的锚点(局部坐标): 圆柱 / 锥 = 上轮廓线(面本身), 平面 = 边视的那条线上。只支持在主视里看得到边的要素。"""
+    bw_, bh_, bd_ = VAX["Front"]
+    if ft["kind"] in ("cyl", "bore"):
+        if abs(ft["ax"].dot(bd_)) > 1e-6:
+            return None
+        tm = (ft["t0"] + ft["t1"]) / 2
+        up = bh_ if abs(ft["ax"].dot(bh_)) < 0.5 else bw_
+        return local_of("Front", ft["c"] + ft["ax"] * tm + up * ft["r"])
+    if ft["kind"] == "cone":
+        if abs(ft["ax"].dot(bd_)) > 1e-6:
+            return None
+        return local_of("Front", ft["mid"]) if abs(local_of("Front", ft["mid"])[1]) > 0 else None
+    if ft["kind"] == "plane":
+        if abs(ft["n"].dot(bd_)) > 1e-6:
+            return None
+        if "rmax" in ft:
+            up = bh_ if abs(ft["n"].dot(bh_)) < 0.5 else bw_
+            return local_of("Front", ft["p"] + up * ((ft["rmin"] + ft["rmax"]) / 2))
+        return local_of("Front", ft["p"])
+    return None
+
+
+def gdt_items():
+    """方案里的基准 / 形位 / 粗糙度 → 布局标签 + 自洽检查。违规的不画, 写进报告(用户 2026-11-19: 基准与被测要素要说得通, 引线指到被测要素本身)。"""
+    out, issues = [], []
+    dmap = {}
+    for i_, d_ in enumerate(spec.get("datums") or []):
+        try:
+            ft = resolve_sel(d_["on"])
+        except Exception as e:
+            issues.append("datum %s: %s" % (d_.get("label"), e))
+            continue
+        dmap[str(d_["label"])] = ft
+        a_ = feature_anchor(ft)
+        if a_ is None:
+            issues.append("datum %s: not visible as an edge in the front view" % d_["label"])
+            continue
+        out.append({"id": "DAT%d" % (i_ + 1), "view": "Front", "anchor": a_, "text": str(d_["label"]), "w": 6.0, "h": 6.0, "prio": 3,
+                    "kind": "datum", "axis": ft["kind"] in ("cyl", "bore", "cone")})
+    for i_, g_ in enumerate(spec.get("gdt") or []):
+        sym = str(g_.get("symbol", ""))
+        tag = "gdt %d (%s)" % (i_ + 1, sym)
+        if sym not in GDT_SYM:
+            issues.append("%s: unknown symbol (use %s)" % (tag, ", ".join(sorted(GDT_SYM))))
+            continue
+        ds = [str(x) for x in (g_.get("datums") or [])]
+        if sym in GDT_NO_DATUM and ds:
+            issues.append("%s: form tolerances take no datum" % tag)
+            continue
+        if sym not in GDT_NO_DATUM and not ds:
+            issues.append("%s: needs a datum" % tag)
+            continue
+        miss = [x for x in ds if x not in dmap]
+        if miss:
+            issues.append("%s: datum %s not defined (add it to datums)" % (tag, ", ".join(miss)))
+            continue
+        try:
+            ft = resolve_sel(g_["on"])
+        except Exception as e:
+            issues.append("%s: %s" % (tag, e))
+            continue
+        if sym in GDT_RUNOUT or sym in GDT_AXIAL:
+            dax = dmap[ds[0]]
+            if dax["kind"] not in ("cyl", "bore", "cone"):
+                issues.append("%s: runout / coaxiality need an axis datum (a cylinder or cone), %s is a plane" % (tag, ds[0]))
+                continue
+            if ft["kind"] in ("cyl", "bore", "cone"):
+                if abs(abs(ft["ax"].dot(dax["ax"])) - 1) > 1e-6:
+                    issues.append("%s: the feature is not coaxial with datum %s" % (tag, ds[0]))
+                    continue
+            elif ft["kind"] == "plane":
+                if sym in GDT_AXIAL or abs(abs(ft["n"].dot(dax["ax"])) - 1) > 1e-6:
+                    issues.append("%s: a plane can only take axial runout, and must be perpendicular to datum axis %s" % (tag, ds[0]))
+                    continue
+        if sym in ("perpendicularity", "parallelism") and ft["kind"] == "plane" and dmap[ds[0]]["kind"] == "plane":
+            c_ = abs(ft["n"].dot(dmap[ds[0]]["n"]))
+            if (sym == "parallelism" and c_ < 1 - 1e-6) or (sym == "perpendicularity" and c_ > 1e-6):
+                issues.append("%s: the plane is not %s to datum %s in the model" % (tag, "parallel" if sym == "parallelism" else "perpendicular", ds[0]))
+                continue
+        a_ = feature_anchor(ft)
+        if a_ is None:
+            issues.append("%s: feature not visible as an edge in the front view" % tag)
+            continue
+        val = ("⌀" if g_.get("dia") or sym in GDT_AXIAL else "") + fmt(float(g_["value"]), 4)   # 公差值到微米(0.003), 不按尺寸的 2 位
+        cells = [GDT_SYM[sym], val] + ds
+        T_ = LAYM.Text(std)
+        ws = [max(6.0, T_.width(c_) + 2.0) for c_ in cells]
+        out.append({"id": "GDT%d" % (i_ + 1), "view": "Front", "anchor": a_, "text": " ".join(cells), "w": sum(ws), "h": 6.0, "prio": 2,
+                    "kind": "gdt", "cells": cells, "cell_w": ws})
+    for i_, r_ in enumerate(spec.get("roughness") or []):
+        try:
+            ft = resolve_sel(r_["on"])
+        except Exception as e:
+            issues.append("roughness %d: %s" % (i_ + 1, e))
+            continue
+        a_ = feature_anchor(ft)
+        if a_ is None:
+            issues.append("roughness %d: surface not visible as an edge in the front view" % (i_ + 1))
+            continue
+        txt = "Ra %s" % fmt(float(r_["ra"]))
+        # 符号高 7 mm(长边), 框高按符号算, 否则符号伸出框外压到别的标注
+        out.append({"id": "RA%d" % (i_ + 1), "view": "Front", "anchor": a_, "text": txt, "pad_left": 7.0, "h": 7.5, "prio": 1, "kind": "roughness"})
+    rep["gdt"] = {"items": [{"id": o["id"], "text": o["text"]} for o in out], "issues": issues}
+    for s_ in issues:
+        rep["warnings"].append("annotation skipped: " + s_)
+    return out
+
+
 ORD_GROUPS = ordinate_groups()
 rep["hole_groups"] = [{"id": g["id"], "view": g["view"], "text": g["text"], "count": len(g["holes"]),
                        "positions": group_positions(g), "ordinate": g in ORD_GROUPS} for g in HOLE_GROUPS]
@@ -856,6 +1031,10 @@ def taper_text(c, vname):
     return ("◁ " if left else "▷ ") + c["text"]
 
 
+GDT_LABELS = gdt_items()   # 要 local_of / LAYM, 所以在这里算
+GDT_BY_ID = {o["id"]: o for o in GDT_LABELS}
+
+
 def layout_problem(anchors=None, fixed_scale=None, sec_dir=None):
     if sec_dir is None:
         sec_dir = ("Front", "below") if TURN else ("Top", "right")
@@ -923,7 +1102,7 @@ def layout_problem(anchors=None, fixed_scale=None, sec_dir=None):
     if fr_:
         tol_ = shaft_tol(fr_)
         lab("DiaOuter", "Front", [0, 0], fr_, shown_text("DiaOuter", "Diameter", DIMS["diameter"] + fmt(2 * fr_) + (" " + tol_ if tol_ else ""), 2 * fr_))
-    for i_, (d_, _) in enumerate(sorted(SHAFT_TOL.items())):
+    for i_, (d_, _) in enumerate([] if TURN else sorted(SHAFT_TOL.items())):   # 回转件: 配合已在段直径上
         if fr_ and abs(2 * fr_ - d_) < 0.05:
             continue
         vs_ = outer_cyl_views(d_)
@@ -946,6 +1125,31 @@ def layout_problem(anchors=None, fixed_scale=None, sec_dir=None):
         id_ = "Taper%d" % (i_ + 1)
         a_ = anchors.get(id_, (vn, local_of(vn, cn["mid"])))
         labels_.append({"id": id_, "view": a_[0], "anchor": a_[1], "text": taper_text(cn, a_[0]), "prio": 2})
+    # 基准 / 形位公差 / 粗糙度(锚点都在要素本身上)
+    for o_ in GDT_LABELS:
+        labels_.append({k: o_[k] for k in ("id", "view", "anchor", "text", "prio", "w", "h", "pad_left") if k in o_})
+    # 回转件的实际轮廓(布局层据此判断"引线在零件里走了多少"、标签能不能放进包围盒里空着的地方):
+    # 主视 / 剖视 = 各段矩形 + 段间缝隙(倒角 / 锥)按相邻较小直径补上; 左视(端面圆)= 4 块矩形近似
+    if TURN:
+        yc_ = (TURN["c"] - bb.Center).dot(VAX["Front"][1])
+        xt_ = lambda t: (TURN["c"] + TURN["axs"] * t - bb.Center).dot(VAX["Front"][0])
+        ss_ = sorted(((min(xt_(s["t0"]), xt_(s["t1"])), max(xt_(s["t0"]), xt_(s["t1"])), s["d"]) for s in TURN["steps"]), key=lambda s: s[0])
+        parts_ = [[a, yc_ - d / 2, b, yc_ + d / 2] for a, b, d in ss_]
+        for (a0, b0, d0), (a1, b1, d1) in zip(ss_, ss_[1:]):
+            if a1 > b0 + 1e-6:
+                parts_.append([b0, yc_ - min(d0, d1) / 2, a1, yc_ + min(d0, d1) / 2])
+        lo_, hi_ = -Wm / 2, Wm / 2
+        if ss_ and ss_[0][0] > lo_ + 1e-6:
+            parts_.append([lo_, yc_ - ss_[0][2] / 2, ss_[0][0], yc_ + ss_[0][2] / 2])
+        if ss_ and ss_[-1][1] < hi_ - 1e-6:
+            parts_.append([ss_[-1][1], yc_ - ss_[-1][2] / 2, hi_, yc_ + ss_[-1][2] / 2])
+        rr_ = TURN["rmax"]
+        circ_parts = [[-rr_ * k1, -rr_ * k2, rr_ * k1, rr_ * k2] for k1, k2 in ((1.0, 0.42), (0.88, 0.68), (0.68, 0.88), (0.42, 1.0))]
+        for v_ in views_:
+            if v_["id"] in ("Front",) or (v_["id"] == "Section" and isinstance(sec_spec, dict) and sec_spec.get("base") == "Front"):
+                v_["parts"] = parts_
+            elif v_["id"] == "Left":
+                v_["parts"] = circ_parts
     p_ = {"paper": [W, H], "area": area, "keepout": keep, "views": views_, "dims": dims_, "labels": labels_, "reserve": reserve}
     if fixed_scale:
         p_["scale"] = fixed_scale
@@ -1547,7 +1751,7 @@ if LAY:
     fr2_ = outer_round("Front")
     if fr2_:
         dia_anchor_("DiaOuter", "Front", fr2_)
-    for i_, (d_, _) in enumerate(sorted(SHAFT_TOL.items())):
+    for i_, (d_, _) in enumerate([] if TURN else sorted(SHAFT_TOL.items())):   # 回转件: 配合已在段直径上
         if fr2_ and abs(2 * fr2_ - d_) < 0.05:
             continue
         vs_ = outer_cyl_views(d_)
@@ -1680,6 +1884,56 @@ if LAY:
         PAGE_SVG.append('<text x="%.3f" y="%.3f" style="font-family:%s;font-size:%gpx;fill:#000">%s</text>'
                         % (r_[0] + 0.5, r_[3] - 0.4, fam_, fs_, l_["lines"][0]))
         rep["placed"].append({"name": id_, "type": "Taper", "text": l_["lines"][0], "at": [round(r_[0], 1), round(H - r_[3], 1)]})
+    # 基准(实心三角在要素上 + 方框字母)/ 形位公差框格(箭头指到被测要素)/ 粗糙度(去除材料符号 + Ra 值, 引线指到表面)
+    sym_font_ = fam_ + ", Segoe UI Symbol"
+    for id_, l_ in LAY["labels"].items():
+        o_ = GDT_BY_ID.get(id_)
+        if not o_:
+            continue
+        a_, k_, e_ = l_["leader"]
+        r_ = l_["text_rect"]
+        if o_["kind"] == "gdt":
+            # 引线: 要素 → 折点 → 框格底边(箭头在要素一端)
+            svg_line_(a_, k_)
+            svg_line_(k_, (k_[0], r_[3]))
+            svg_arrow_(a_, k_)
+            x_ = r_[0]
+            for c_, w_ in zip(o_["cells"], o_["cell_w"]):
+                PAGE_SVG.append('<rect x="%.3f" y="%.3f" width="%.3f" height="%.3f" style="fill:none;stroke:#000;stroke-width:%g"/>'
+                                % (x_, r_[1], w_, r_[3] - r_[1], lw_))
+                PAGE_SVG.append('<text x="%.3f" y="%.3f" style="font-family:%s;font-size:%gpx;text-anchor:middle;fill:#000">%s</text>'
+                                % (x_ + w_ / 2, (r_[1] + r_[3]) / 2 + fs_ * 0.35, sym_font_, fs_, c_))
+                x_ += w_
+        elif o_["kind"] == "datum":
+            # 实心三角: 底边在要素上(垂直于引线), 顶点朝外; 再连到方框字母
+            dx, dy = k_[0] - a_[0], k_[1] - a_[1]
+            n_ = math.hypot(dx, dy) or 1.0
+            ux, uy = dx / n_, dy / n_
+            hb, ht = 1.8, 3.0
+            p1 = (a_[0] - uy * hb, a_[1] + ux * hb)
+            p2 = (a_[0] + uy * hb, a_[1] - ux * hb)
+            tp = (a_[0] + ux * ht, a_[1] + uy * ht)
+            PAGE_SVG.append('<polygon points="%.3f,%.3f %.3f,%.3f %.3f,%.3f" style="fill:#000"/>' % (p1[0], p1[1], p2[0], p2[1], tp[0], tp[1]))
+            bx = (r_[0] + r_[2]) / 2
+            svg_line_(tp, k_)
+            svg_line_(k_, (bx, r_[3]) if abs(k_[0] - bx) > 0.1 else k_)
+            PAGE_SVG.append('<rect x="%.3f" y="%.3f" width="%.3f" height="%.3f" style="fill:none;stroke:#000;stroke-width:%g"/>'
+                            % (r_[0], r_[1], r_[2] - r_[0], r_[3] - r_[1], lw_))
+            PAGE_SVG.append('<text x="%.3f" y="%.3f" style="font-family:%s;font-size:%gpx;text-anchor:middle;fill:#000">%s</text>'
+                            % (bx, (r_[1] + r_[3]) / 2 + fs_ * 0.35, fam_, fs_, o_["text"]))
+        else:
+            svg_line_(a_, k_)
+            svg_line_(k_, e_)
+            svg_arrow_(a_, k_)
+            x0_ = r_[0] + 0.5
+            s_ = k_[1]
+            A_, Tp_, B_ = (x0_, s_ - 3.0), (x0_ + 2.0, s_), (x0_ + 5.5, s_ - 7.0)
+            PAGE_SVG.append('<polyline points="%.3f,%.3f %.3f,%.3f %.3f,%.3f" style="fill:none;stroke:#000;stroke-width:%g"/>'
+                            % (A_[0], A_[1], Tp_[0], Tp_[1], B_[0], B_[1], lw_))
+            svg_line_(A_, (x0_ + 3.5, s_ - 3.0))   # 去除材料: 短边封口
+            PAGE_SVG.append('<text x="%.3f" y="%.3f" style="font-family:%s;font-size:%gpx;fill:#000">%s</text>'
+                            % (x0_ + 7.0, s_ - 0.8, fam_, fs_, o_["text"]))
+        rep["placed"].append({"name": id_, "type": o_["kind"], "text": o_["text"], "at": [round(r_[0], 1), round(H - r_[3], 1)]})
     # 布局排好的文字占位交给旧的避让器(后面补的尺寸 / 螺纹等照常避开)
     for d_ in list(LAY["dims"].values()) + list(LAY["labels"].values()):
         r_ = d_["text_rect"]
@@ -1743,7 +1997,7 @@ if not TURN:
 
 
 # 配合的轴径(主视外径已标的除外): 在它是圆的视图里标 ⌀ + 公差
-for i_, (d_, _) in enumerate(sorted(SHAFT_TOL.items())):
+for i_, (d_, _) in enumerate([] if TURN else sorted(SHAFT_TOL.items())):   # 回转件: 配合已在段直径上
     if front_r and abs(2 * front_r - d_) < 0.05:
         continue
     vs_ = outer_cyl_views(d_)
