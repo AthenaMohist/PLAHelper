@@ -153,6 +153,15 @@
     'fac.curve':               ['fac', 'CurveFactory'],
     'fac.extrude':             ['fac', 'ExtrudeFactory'],
     'fac.revolve':             ['fac', 'RevolveFactory'],
+    // ---- A4b: 整体操作(复制 / 镜像 / 移动 / 旋转 / 阵列, 实测 2026-11-19, know-how/command-dispatch.md「A4b」) ----
+    'fac.duplicate':           ['fac', 'DuplicateFactory'],
+    'fac.mirror':              ['fac', 'MirrorFactory'],
+    'fac.moveItems':           ['fac', 'MoveItemAndEmptyFactory'],
+    'fac.rotateItems':         ['fac', 'RotateItemAndEmptyFactory'],
+    'fac.rectArray':           ['fac', 'RectangularArrayFactory'],
+    'fac.radialArray':         ['fac', 'RadialArrayFactory'],
+    'fac.boolean':             ['fac', 'BooleanFactory'],
+    'geo.removeItem':          ['geo', 'removeItem'],
     // ---- N5 资产(asset pack)放置(实测 2026-11-18, know-how/asset-place.md) ----
     'ed.assets':               ['ed', 'assets'],
     'assets.packs':            ['assets', 'getAssetPacks'],
@@ -406,7 +415,44 @@
       // A4: 旋转体(螺钉 / 轴 / 台阶 / 锥): profile = [[r, z], …] —— r = 离轴距离(≥ 0), z = 沿 axis 的位置, 相对 origin(文档单位);
       // 自动闭合; 贴轴的边就是轴线上的线段。degrees 默认 360。
       revolve: { custom: 'revolve', fac: 'fac.revolve', also: ['fac.curve'], bool: true, required: ['origin', 'axis', 'profile'],
-                 params: { origin: [null, 'point'], axis: [null, 'axisQuat'], profile: [null, 'profile'], degrees: [null, 'number'] } }
+                 params: { origin: [null, 'point'], axis: [null, 'axisQuat'], profile: [null, 'profile'], degrees: [null, 'number'] } },
+      // A4b 整体操作(实体; 产物 = 工厂 commit 的返回, 可用 id 引用)。duplicate = 原地复制一份(接 move / rotate 摆位置);
+      // mirror = 按平面(过 origin、法向 normal)镜像出一份, 原件保留(原件版本 id 会变);
+      // move = 平移 [dx,dy,dz]; rotate = 绕过 pivot、方向 axis 的轴转 degrees(右手定则);
+      // pattern = 线性阵列: dir1 方向 count1 个(含原件)间距 spacing1, 可选第二方向 dir2 / count2 / spacing2(产物 = 新增的副本);
+      // radialPattern = 绕过 center、方向 axis 的轴环形阵列 count 个(含原件), 均布在 degrees(默认 360)内:
+      // 360 = 整圈等分(不重叠); 不足一圈时首尾都放(实测 model1 2026-11-19: 3 个 / 180° → 0° / 90° / 180°)。
+      duplicate: { custom: 'duplicate', fac: 'fac.duplicate', required: ['solids'], params: { solids: [null, 'solids'] } },
+      mirror: { custom: 'mirror', fac: 'fac.mirror', required: ['solids', 'origin', 'normal'],
+                params: { solids: [null, 'solids'], origin: [null, 'vecset'], normal: [null, 'axisQuat'] } },
+      move: { custom: 'move', fac: 'fac.moveItems', required: ['solids', 'move'],
+              params: { solids: [null, 'solids'], move: [null, 'translation'] } },
+      rotate: { custom: 'rotate', fac: 'fac.rotateItems', required: ['solids', 'pivot', 'axis', 'degrees'],
+                params: { solids: [null, 'solids'], pivot: [null, 'vecset'], axis: [null, 'axisQuat'], degrees: [null, 'angle'] } },
+      pattern: { custom: 'pattern', fac: 'fac.rectArray', required: ['solids', 'dir1', 'count1', 'spacing1'],
+                 params: { solids: [null, 'solids'], dir1: [null, 'axisQuat'], count1: [null, 'number'], spacing1: [null, 'length'],
+                           dir2: [null, 'axisQuat'], count2: [null, 'number'], spacing2: [null, 'length'] } },
+      radialPattern: { custom: 'radialPattern', fac: 'fac.radialArray', required: ['solids', 'center', 'axis', 'count'],
+                       params: { solids: [null, 'solids'], center: [null, 'vecset'], axis: [null, 'axisQuat'], count: [null, 'number'], degrees: [null, 'number'] } },
+      // boolean = 已有实体之间布尔: targets 被 tools 合并 / 减去 / 求交(operation; 默认 tools 被吃掉, keepTools 保留)。
+      // 实测 2026-11-19: intersect 两个盒子 → 只剩重叠部分一个实体。
+      boolean: { custom: 'boolean', fac: 'fac.boolean', required: ['targets', 'tools', 'operation'],
+                 params: { targets: [null, 'solids'], tools: [null, 'solids'], operation: [null, 'boolOp'], keepTools: [null, 'bool'] } },
+      // delete = 删除实体(同 Plasticity 的 Delete, 一个撤销步; 实测 model1: 撤销后实体回来)
+      delete: { custom: 'delete', fac: 'geo.removeItem', required: ['solids'], params: { solids: [null, 'solids'] } },
+      // rename = 改大纲名(多个实体同名; 复制件改规格后改名, BOM 名称跟着对)
+      rename: { custom: 'rename', fac: 'nodes.setName', required: ['solids', 'name'], params: { solids: [null, 'solids'], name: [null, 'string'] } }
+    },
+    // A4b 工厂字段(实测 2026-11-19): 复制 / 移动 / 旋转 / 阵列的物体列表 = items, 镜像 = shells; 镜像 origin / normal、移动 move、
+    // 旋转 pivot(原地 set)+ axis(VectorProxy, 原地 copy)+ angle(弧度); 线性阵列 dir1 / dir2(新 Vector3)+ num1 / num2 +
+    // distance1 / distance2(mode extent = 首尾总长); 环形阵列 dir1 = 起始方向(⟂ 轴)、dir2 = 轴、center、num2 = 个数、angle = 总角度。
+    xformFields: {
+      items: 'items', mirrorItems: 'shells', origin: 'origin', normal: 'normal', move: 'move',
+      pivot: 'pivot', axis: 'axis', angle: 'angle',
+      dir1: 'dir1', dir2: 'dir2', num1: 'num1', num2: 'num2', dist1: 'distance1', dist2: 'distance2',
+      center: 'center', radialCount: 'num2', radialAngle: 'angle',
+      // 布尔工厂: targets / operationType 同 boolSetters, 另有 tools / keepTools
+      tools: 'tools', keepTools: 'keepTools'
     },
     // N4b 打孔位置: 选择里可当孔位的类型(曲线端点 / 整条曲线); Wire 视图上的端点组(ids + Points 几何)与线段组
     holePointKinds: { vertex: 'curveVertex', curve: 'curve' },
@@ -1482,7 +1528,101 @@
         });
       };
     }
+    var xform = xformBuild(o, rc, ctx);
+    if (xform) return xform;
     throw new Error('recipe: unknown custom builder ' + rc.custom);
+  }
+
+  // ---- A4b: 整体操作(复制 / 镜像 / 移动 / 旋转 / 阵列); 参数在入队前全部换算好 ----
+  function xformBuild(o, rc, ctx) {
+    var X = NAMES.xformFields, V = ctx.V3;
+    var count = function (x, name) {
+      var n = Math.round(Number(x));
+      if (!(n >= 1 && n <= 1000)) throw new Error(name + ' must be 1..1000');
+      return n;
+    };
+    var make = function (sets) {
+      var Fac = need(rc.fac);
+      return function (cmd) {
+        var f = new Fac(cmd.editor);
+        f[NAMES.facResource](cmd);
+        sets(f);
+        return f[NAMES.facCommit]();
+      };
+    };
+    if (rc.custom === 'boolean') {
+      if (!(o.operation in NAMES.boolOps)) throw new Error('operation must be one of ' + Object.keys(NAMES.boolOps).join(', '));
+      var tg = convertParam('solids', o.targets, ctx), tl = convertParam('solids', o.tools, ctx);
+      if (!tg.length || !tl.length) throw new Error('boolean needs targets and tools');
+      if (tl.some(function (v) { return tg.indexOf(v) >= 0; })) throw new Error('a solid cannot be both target and tool');
+      return make(function (f) {
+        f[NAMES.boolSetters.targets] = tg; f[X.tools] = tl; f[NAMES.boolSetters.op] = NAMES.boolOps[o.operation];
+        if (o.keepTools !== undefined) f[X.keepTools] = !!o.keepTools;
+      });
+    }
+    var items = rc.custom === 'mirror' ? X.mirrorItems : X.items;
+    var solids = convertParam('solids', o.solids, ctx);
+    if (!solids.length) throw new Error('solids is empty');
+    var put = function (f) { f[items] = solids; };
+    if (rc.custom === 'delete') {
+      return function () {
+        return Promise.all(solids.map(function (v) { return invokeOn('geo.removeItem', [v]); })).then(function () { return []; });
+      };
+    }
+    if (rc.custom === 'rename') {
+      var nm = String(o.name).trim();
+      if (!nm) throw new Error('name must not be empty');
+      return function () {
+        solids.forEach(function (v) { invokeOn('nodes.setName', [invokeOn('nodes.item2key', [v]), nm]); });
+        return solids;
+      };
+    }
+    switch (rc.custom) {
+      case 'duplicate':
+        return make(put);
+      case 'mirror': {
+        var org = convertParam('vecset', o.origin, ctx), nrm = convertParam('axisQuat', o.normal, ctx);
+        return make(function (f) { put(f); f[X.origin].set(org[0], org[1], org[2]); f[X.normal].set(nrm[0], nrm[1], nrm[2]); });
+      }
+      case 'move': {
+        var mv = convertParam('translation', o.move, ctx);
+        return make(function (f) { put(f); f[X.move].set(mv[0], mv[1], mv[2]); });
+      }
+      case 'rotate': {
+        var pv = convertParam('vecset', o.pivot, ctx), ax = convertParam('axisQuat', o.axis, ctx), ang = convertParam('angle', o.degrees, ctx);
+        if (!ang) throw new Error('degrees must not be 0');
+        return make(function (f) { put(f); f[X.pivot].set(pv[0], pv[1], pv[2]); f[X.axis].copy(new V(ax[0], ax[1], ax[2])); f[X.angle] = ang; });
+      }
+      case 'pattern': {
+        var d1 = convertParam('axisQuat', o.dir1, ctx), n1 = count(o.count1, 'count1'), s1 = convertParam('length', o.spacing1, ctx);
+        var two = o.dir2 !== undefined || o.count2 !== undefined || o.spacing2 !== undefined;
+        if (two && (o.dir2 === undefined || o.count2 === undefined || o.spacing2 === undefined)) throw new Error('second direction needs dir2, count2 and spacing2');
+        var d2 = two ? convertParam('axisQuat', o.dir2, ctx) : perpOf(d1);
+        var n2 = two ? count(o.count2, 'count2') : 1, s2 = two ? convertParam('length', o.spacing2, ctx) : 0;
+        if (n1 * n2 < 2) throw new Error('pattern needs at least 2 instances');
+        if (two && Math.abs(vdot(d1, d2)) > 1 - 1e-9) throw new Error('dir1 and dir2 must not be parallel');
+        return make(function (f) {
+          put(f);
+          f[X.dir1] = new V(d1[0], d1[1], d1[2]); f[X.dir2] = new V(d2[0], d2[1], d2[2]);
+          f[X.num1] = n1; f[X.num2] = n2;
+          f[X.dist1] = s1 * (n1 - 1); f[X.dist2] = s2 * (n2 - 1);
+        });
+      }
+      case 'radialPattern': {
+        var c = convertParam('vecset', o.center, ctx), axr = convertParam('axisQuat', o.axis, ctx), n = count(o.count, 'count');
+        if (n < 2) throw new Error('count must be >= 2');
+        var deg = o.degrees !== undefined ? Number(o.degrees) : 360;
+        if (!(deg > 0 && deg <= 360)) throw new Error('degrees must be in (0, 360]');
+        var st = perpOf(axr);
+        return make(function (f) {
+          put(f);
+          f[X.dir1] = new V(st[0], st[1], st[2]); f[X.dir2] = new V(axr[0], axr[1], axr[2]);
+          f[X.center].set(c[0], c[1], c[2]);
+          f[X.radialCount] = n; f[X.radialAngle] = deg * Math.PI / 180;
+        });
+      }
+    }
+    return null;
   }
 
   // 一步 → build(cmd) 函数。参数在入队前全部换算好(选择器出错就不产生命令)。

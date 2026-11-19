@@ -89,6 +89,12 @@ ops (lengths in document units unless units is given; points [x,y,z]):\n\
 - moveFaces {{faces, move [dx,dy,dz]}} (move a hole / boss / pocket)\n\
 - revolve {{origin, axis, profile [[r, z], ...], degrees?=360}} (+ bool, targets) - solid of revolution: r = distance from the axis (>= 0, never crossing it), z = position along axis from origin; the profile closes itself; points with r = 0 lie on the axis. Screws, shafts, steps, cones, grooves (subtract).\n\
 - prism {{center, normal?=[0,0,1] (extrude direction), sides, radius (circumscribed) | flats (across flats), height (negative = opposite), rotate? (deg about normal)}} (+ bool, targets) - regular polygon prism: hex socket (subtract, normal pointing into the head), hex head, nut.\n\
+Whole solids (solids = [solid refs]: ids, \"$step\", {{\"name\": ...}}; the result items can be referenced like any step):\n\
+- duplicate {{solids}} - copy in place (then move / rotate it: copy a whole part with all its holes, chamfers and screws in one go)\n\
+- move {{solids, move [dx,dy,dz]}} / rotate {{solids, pivot, axis, degrees}} (right-hand rule about the axis through pivot)\n\
+- mirror {{solids, origin, normal}} - adds a mirrored copy about the plane through origin with that normal (originals stay; their ids change)\n\
+- pattern {{solids, dir1, count1, spacing1, dir2?, count2?, spacing2?}} - linear / grid array; counts include the original; result = the new copies\n\
+- radialPattern {{solids, center, axis, count, degrees?=360}} - circular array about the axis through center; 360 = evenly around, less = both ends included (3 over 180° = 0/90/180)\n\
 bool: union | subtract | intersect with targets [solid refs]. Give a step id: \"base\" and later steps can use \"$base\" (its result). Edges / faces: topology ids, or {{\"near\": [x,y,z], \"of\": solid ref, \"tol\"?}} = the item whose bbox center is nearest (errors instead of guessing when ambiguous). {refs} After running, verify with model_state / model_measure / model_view."),
          "inputSchema": {"type": "object", "properties": {
             "ops": {"type": "array", "items": {"type": "object"}},

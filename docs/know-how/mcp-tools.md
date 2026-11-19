@@ -43,7 +43,8 @@
 ## 建模的工作方式(给 agent 的要点)
 
 1. 先 `model_state`(概览) → 再按物体查 `detail: faces/edges`; 面 / 边 id 形如 `34f9439`, **物体版本 id(34)每次改动都变**, 改完要重新查。
-2. 改模型: `model_exec {ops}`, 默认 atomic(某步失败整次撤回)。配方(唯一来源 = 垫片 `NAMES.recipes`): box / cylinder(打孔 = subtract)/ fillet / chamfer / offsetFace / refillet / moveFaces;
+2. 改模型: `model_exec {ops}`, 默认 atomic(某步失败整次撤回)。配方(唯一来源 = 垫片 `NAMES.recipes`): box / cylinder(打孔 = subtract)/ fillet / chamfer / offsetFace / refillet / moveFaces / revolve / prism;
+   整体操作(2026-11-19): duplicate / move / rotate / mirror / pattern / radialPattern / boolean(已有实体之间)/ delete / rename(know-how/command-dispatch.md「A4b」);
    步骤 `id` + `$id` 引用; 挑边 / 面可用 `{near, of, tol}`。参数错在执行前就报, 不产生命令。
 3. 多次调用要能整体撤回: `model_transaction begin` → … → `commit` / `rollback`。
 4. 核对: `model_measure`(距离 / 壁厚 normalDistance / 角度 / 体积)+ `model_view`(截图后还原相机)。

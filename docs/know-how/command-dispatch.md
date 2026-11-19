@@ -157,6 +157,32 @@
   量: 内六角对边 2.99993、深 2.500; 截图正常; 事务回滚 2 步后 model1 原样(26 实体 / 46 曲线 / 5 岛 / 撤销栈 0)。
   已知: 环形平面(端面带孔)`geo.query` 的 center 为空(面中点落在孔里)。
 
+## A4b 整体操作: 复制 / 移动 / 旋转 / 镜像 / 阵列 / 布尔 / 删除 / 改名(2026-11-19)
+
+用户: "复制实体的操作要补上, Plasticity 常用的建模操作都补上(镜像、阵列…)"。工厂字段在后台实例副本上试出(Plasticity 的函数源码被隐藏, toString 为空, 只能试),
+再在 model1 上用 `pla-app cdp-exec --hwnd` 全部跑通、撤回(撤销栈回 0)。
+
+| op | 工厂 | 关键字段(实测) | 产物 |
+|---|---|---|---|
+| duplicate | DuplicateFactory | `items` = 实体视图数组 | 原地复制件 |
+| move | MoveItemAndEmptyFactory | `items`, `move.set()` | 移动后的实体(新版本 id) |
+| rotate | RotateItemAndEmptyFactory | `items`, `pivot.set()`, `axis.copy(V3)`(VectorProxy, 直接赋值也行但 copy 稳), `angle`(弧度); 只设 degrees 无效 → "Operation has no effect" | 转后的实体 |
+| mirror | MirrorFactory | `shells`, `origin.set()`, `normal.set()` | [镜像件, 原件(新版本 id)] |
+| pattern | RectangularArrayFactory | `items`, `dir1` / `dir2`(**必须给新 Vector3**, 没有就在 makeRectangularMatrices 里 clone undefined), `num1` / `num2`, `distance1` / `distance2`(mode extent = 首尾总长) | 新增副本(不含原件) |
+| radialPattern | RadialArrayFactory | `items`, `dir1` = 起始方向(⟂ 轴), `dir2` = 轴, `center.set()`, `num2` = 个数, `angle` = 总角度; 360° 整圈等分, 不足一圈首尾都放(3 个 / 180° → 0/90/180) | 新增副本 |
+| boolean | BooleanFactory | `targets`, `tools`, `operationType`(15901 交 / 15902 减 / 15903 并), `keepTools` | 结果实体(沿用 target 的名字) |
+| delete | (无工厂)`geo.removeItem(view)` 包在自建命令里 | — | 一个撤销步, 撤销后实体回来 |
+| rename | `nodes.setName(item2key(view), name)` 包在自建命令里 | — | 一个撤销步, 撤销恢复原名 |
+
+找"读了哪个 undefined 字段": 用 `new Proxy(factory, {get})` 包一层再读 `params`, 记下返回 undefined 的属性名(dir1 / dir2 就是这样找到的)。
+
+**用例(2026-11-19, encoder calibrator 的编码器座, 先在副本 enc-rehearsal 上演练)**: 编码器座要和电机座同结构。两座布置相同、只差 Δy = 162.663, 竖板外形一致 →
+- 底板: 旧底板端面先 moveFaces +10(让复制件整个落在里面)→ duplicate 电机底板 → move Δy → 远端 6 个面(端面 + 端部倒角)moveFaces −30(长 115 → 85, 倒角原样)→
+  boolean intersect(target = 旧底板, 名字 / 身份沿用 Extruded.009, 几何 = 缩短后的电机底板, 145 面同电机底板);
+- 竖板: duplicate 电机竖板 → move → box union 填掉电机止口 / 6 孔 → boolean intersect(target = 旧编码器竖板): 结果 = 编码器止口 / 中孔 / 4 孔 + 电机竖板的全部连接孔(M3 沉头槽 ×3、侧面 M3 ×2、底部 M6 ×4);
+- 螺钉: 电机座 9 颗 M3 / M6 duplicate + move; M4x12 duplicate → move 到孔位 → part.stretch +13 → radialPattern ×4 → rename "杯内六M4x25"。
+- 一个事务 16 步; 先查 id ↔ 名字, 任何一步失败整体回滚。
+
 ## 加一个新操作
 
 1. 副本上读工厂原型链的 setter 名(本文 4.), 用 lab 脚本试出参数取值与 commit 返回值;

@@ -1143,8 +1143,95 @@ const callAsync = async (name, args) => JSON.parse(await run(`window.__PLA__.cal
         return this.result(r.mn, r.mx);
       }
     }
+    // A4b 整体操作(字段名同真机实测 2026-11-19): 记下设置, 按平移 / 镜像算出新包围盒
+    const vp = (v) => [v.x, v.y, v.z];
+    const shift = (s, d) => add(new Solid(s.mn.map((x, k) => x + d[k]), s.mx.map((x, k) => x + d[k])));
+    const undoPush = () => ed.history._undoStack.push({ name: 'PlaFactory', snapshot: ed.geo.items.slice() });
+    class DuplicateFactory extends AbstractFactory {
+      constructor(editor) { super(editor); this.items = []; }
+      async commit() { this.guard(); undoPush(); ed.lastXform = { kind: 'dup', n: this.items.length }; return this.items.map((s) => shift(s, [0, 0, 0])); }
+    }
+    class MirrorFactory extends AbstractFactory {
+      constructor(editor) { super(editor); this.shells = []; this.origin = vec0(); this.normal = vec0(); }
+      async commit() {
+        this.guard(); undoPush();
+        const o = vp(this.origin), n = vp(this.normal);
+        ed.lastXform = { kind: 'mirror', origin: o, normal: n };
+        const ax = n.findIndex((x) => Math.abs(x) > 0.5);
+        return this.shells.flatMap((s) => {
+          const mn = s.mn.slice(), mx = s.mx.slice();
+          mn[ax] = 2 * o[ax] - s.mx[ax]; mx[ax] = 2 * o[ax] - s.mn[ax];
+          return [s, add(new Solid(mn, mx))];
+        });
+      }
+    }
+    class MoveItemAndEmptyFactory extends AbstractFactory {
+      constructor(editor) { super(editor); this.items = []; this.move = vec0(); }
+      async commit() {
+        this.guard(); undoPush();
+        const d = vp(this.move);
+        ed.lastXform = { kind: 'move', move: d };
+        return this.items.map((s) => { remove(s); return shift(s, d); });
+      }
+    }
+    class RotateItemAndEmptyFactory extends AbstractFactory {
+      constructor(editor) {
+        super(editor); this.items = []; this.pivot = vec0();
+        const ax = vec0(); ax.copy = function (v) { this.x = v.x; this.y = v.y; this.z = v.z; return this; };
+        this.axis = ax; this.angle = 0;
+      }
+      async commit() {
+        this.guard();
+        if (!this.angle) throw new Error('Operation has no effect');
+        undoPush();
+        ed.lastXform = { kind: 'rotate', pivot: vp(this.pivot), axis: vp(this.axis), angle: this.angle };
+        return this.items.map((s) => { remove(s); return shift(s, [0, 0, 0]); });
+      }
+    }
+    class RectangularArrayFactory extends AbstractFactory {
+      constructor(editor) { super(editor); this.items = []; this.num1 = 8; this.num2 = 1; this.distance1 = 0; this.distance2 = 0; this.mode = 'extent'; }
+      async commit() {
+        this.guard();
+        if (!this.dir1 || !this.dir2) throw new TypeError("Cannot read properties of undefined (reading 'clone')");
+        undoPush();
+        const d1 = vp(this.dir1), d2 = vp(this.dir2), s1 = this.num1 > 1 ? this.distance1 / (this.num1 - 1) : 0, s2 = this.num2 > 1 ? this.distance2 / (this.num2 - 1) : 0;
+        ed.lastXform = { kind: 'rect', d1, d2, num1: this.num1, num2: this.num2, distance1: this.distance1, distance2: this.distance2 };
+        const out = [];
+        this.items.forEach((s) => { for (let i = 0; i < this.num1; i++) for (let j = 0; j < this.num2; j++) if (i || j) out.push(shift(s, [0, 1, 2].map((k) => d1[k] * s1 * i + d2[k] * s2 * j))); });
+        return out;
+      }
+    }
+    class RadialArrayFactory extends AbstractFactory {
+      constructor(editor) { super(editor); this.items = []; this.center = vec0(); this.num1 = 1; this.num2 = 8; this.angle = 2 * Math.PI; this.mode = 'total'; }
+      async commit() {
+        this.guard();
+        if (!this.dir1 || !this.dir2) throw new TypeError("Cannot read properties of undefined (reading 'clone')");
+        undoPush();
+        ed.lastXform = { kind: 'radial', d1: vp(this.dir1), d2: vp(this.dir2), center: vp(this.center), num2: this.num2, angle: this.angle };
+        const out = [];
+        this.items.forEach((s) => { for (let i = 1; i < this.num2; i++) out.push(shift(s, [0, 0, 0])); });
+        return out;
+      }
+    }
+    // rename: 记下改名调用
+    const setName0 = ed.nodes.setName;
+    ed.nodes.setName = function (key, name) { (ed.renamed = ed.renamed || []).push(name); if (setName0) return setName0.call(this, key, name); };
+    class BooleanFactory extends AbstractFactory {
+      constructor(editor) { super(editor); this.targets = []; this.tools = []; this.operationType = 15902; this.keepTools = false; }
+      async commit() {
+        this.guard(); undoPush();
+        const t = this.targets[0], u = this.tools[0];
+        ed.lastXform = { kind: 'bool', op: this.operationType, keepTools: this.keepTools, nt: this.targets.length, nu: this.tools.length };
+        let mn = t.mn, mx = t.mx;
+        if (this.operationType === 15901) { mn = t.mn.map((x, k) => Math.max(x, u.mn[k])); mx = t.mx.map((x, k) => Math.min(x, u.mx[k])); }
+        if (this.operationType === 15903) { mn = t.mn.map((x, k) => Math.min(x, u.mn[k])); mx = t.mx.map((x, k) => Math.max(x, u.mx[k])); }
+        remove(t); if (!this.keepTools) this.tools.forEach(remove);
+        return [add(new Solid(mn, mx))];
+      }
+    }
     return { CornerBoxFactory, MultiFilletShellFactory, OffsetFaceFactory, RefilletFaceFactory, MultiMoveFaceFactory, CylinderFactory,
-             CenterPolygonFactory, CurveFactory, ExtrudeFactory, RevolveFactory };
+             CenterPolygonFactory, CurveFactory, ExtrudeFactory, RevolveFactory,
+             DuplicateFactory, MirrorFactory, MoveItemAndEmptyFactory, RotateItemAndEmptyFactory, RectangularArrayFactory, RadialArrayFactory, BooleanFactory };
   }
 
   const L_BRACKET = { ops: [
@@ -1159,8 +1246,11 @@ const callAsync = async (name, args) => JSON.parse(await run(`window.__PLA__.cal
     assert.strictEqual(r.err, 'exc:need-factories');
     const f = call('cmd.factories').v;
     assert.strictEqual(f.loaded, false);
-    assert.deepStrictEqual(f.missing.sort(), ['fac.centerPolygon', 'fac.cornerBox', 'fac.curve', 'fac.cylinder', 'fac.extrude', 'fac.moveFaces', 'fac.multiFillet', 'fac.offsetFace', 'fac.refillet', 'fac.revolve']);
-    assert.deepStrictEqual(f.ops, ['box', 'fillet', 'offsetFace', 'refillet', 'moveFaces', 'cylinder', 'chamfer', 'prism', 'revolve']);
+    assert.deepStrictEqual(f.missing.sort(), ['fac.boolean', 'fac.centerPolygon', 'fac.cornerBox', 'fac.curve', 'fac.cylinder', 'fac.duplicate', 'fac.extrude', 'fac.mirror',
+      'fac.moveFaces', 'fac.moveItems', 'fac.multiFillet', 'fac.offsetFace', 'fac.radialArray', 'fac.rectArray', 'fac.refillet', 'fac.revolve', 'fac.rotateItems',
+      'geo.removeItem', 'nodes.setName']);  // 假编辑器里 removeItem / setName 随假工厂一起挂上
+    assert.deepStrictEqual(f.ops, ['box', 'fillet', 'offsetFace', 'refillet', 'moveFaces', 'cylinder', 'chamfer', 'prism', 'revolve',
+      'duplicate', 'mirror', 'move', 'rotate', 'pattern', 'radialPattern', 'boolean', 'delete', 'rename']);
   });
 
   await ta('N2 cmd.exec M-A: L 形支架 = 底板 + 立板(合并) + 内角倒圆; 文档单位 mm → 内部米; 每步一个命令一个撤销步', async () => {
@@ -1222,6 +1312,74 @@ const callAsync = async (name, args) => JSON.parse(await run(`window.__PLA__.cal
     assert.strictEqual(ed.history._undoStack.length, u1);
   });
 
+  await ta('A4b cmd.exec: 复制 + 移动(引用复制件)/ 镜像(原件保留)/ 旋转 / 线性阵列(间距 → 首尾总长)/ 环形阵列; 参数错执行前报', async () => {
+    const ed = ed3;
+    const u0 = ed.history._undoStack.length;
+    const r = await callAsync('cmd.exec', { ops: [
+      { op: 'box', id: 'src', p1: [0, 300, 0], p2: [10, 310, 0], height: 5 },
+      { op: 'duplicate', id: 'cp', solids: ['$src'] },
+      { op: 'move', id: 'moved', solids: ['$cp'], move: [0, 50, 0] },
+      { op: 'mirror', id: 'mir', solids: ['$moved'], origin: [20, 0, 0], normal: [2, 0, 0] },
+      { op: 'rotate', solids: ['$src'], pivot: [0, 300, 0], axis: [0, 0, 1], degrees: 90 },
+    ] });
+    assert.strictEqual(r.ok, true, JSON.stringify(r));
+    assert.strictEqual(r.v.failed, null, JSON.stringify(r.v.failed));
+    const bb = (i, j) => JSON.parse(JSON.stringify(r.v.results[i].items[j || 0].bbox));
+    assert.deepStrictEqual(bb(1), [[0, 300, 0], [10, 310, 5]], '复制件原地');
+    assert.deepStrictEqual(bb(2), [[0, 350, 0], [10, 360, 5]], '移动 50 mm');
+    assert.strictEqual(r.v.results[3].items.length, 2, '镜像产物 = 原件 + 镜像件');
+    assert.deepStrictEqual(bb(3, 1), [[30, 350, 0], [40, 360, 5]], '按 x = 20 平面镜像');
+    assert.deepStrictEqual(ed.lastXform.pivot, [0, 0.3, 0]);
+    assert.deepStrictEqual(ed.lastXform.axis, [0, 0, 1]);
+    assert.ok(Math.abs(ed.lastXform.angle - Math.PI / 2) < 1e-12, '度 → 弧度');
+    assert.strictEqual(ed.history._undoStack.length - u0, 5, '每步一个撤销步');
+    const p = await callAsync('cmd.exec', { ops: [
+      { op: 'box', id: 'b', p1: [0, 400, 0], p2: [4, 404, 0], height: 2 },
+      { op: 'pattern', solids: ['$b'], dir1: [1, 0, 0], count1: 3, spacing1: 10, dir2: [0, 1, 0], count2: 2, spacing2: 8 },
+      { op: 'radialPattern', solids: ['$b'], center: [50, 400, 0], axis: [0, 0, 1], count: 6, degrees: 180 },
+    ] });
+    assert.strictEqual(p.v.failed, null, JSON.stringify(p.v.failed));
+    assert.strictEqual(p.v.results[1].items.length, 5, '3 × 2 − 原件 = 5 个副本');
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(p.v.results[1].items[4].bbox)), [[20, 408, 0], [24, 412, 2]]);
+    const rx = ed.lastXform;
+    assert.deepStrictEqual([rx.kind, rx.num2, rx.d2, rx.center], ['radial', 6, [0, 0, 1], [0.05, 0.4, 0]]);
+    assert.ok(Math.abs(rx.angle - Math.PI) < 1e-12);
+    assert.ok(Math.abs(rx.d1[0] * rx.d2[0] + rx.d1[1] * rx.d2[1] + rx.d1[2] * rx.d2[2]) < 1e-12, '起始方向 ⟂ 轴');
+    // 参数错: 执行前报, 不入队
+    const q0 = ed.enqueued;
+    const fails = [
+      [{ op: 'pattern', solids: [{ name: 'nope' }], dir1: [1, 0, 0], count1: 3, spacing1: 1 }, /no solid named/],
+      [{ op: 'pattern', solids: ['$x'], dir1: [1, 0, 0], count1: 3, spacing1: 1 }, /unknown ref/],
+      [{ op: 'radialPattern', solids: [String(r.v.results[0].items[0].id)], center: [0, 0, 0], axis: [0, 0, 1], count: 1 }, /count must be >= 2|solid not found/],
+      [{ op: 'rotate', solids: [String(r.v.results[0].items[0].id)], pivot: [0, 0, 0], axis: [0, 0, 1], degrees: 0 }, /degrees must not be 0|solid not found/],
+    ];
+    for (const [op, re] of fails) {
+      const x = (await callAsync('cmd.exec', { ops: [op] })).v;
+      assert.ok(x.failed && re.test(x.failed.err), JSON.stringify(x));
+    }
+    assert.strictEqual(ed.enqueued, q0, '参数错不入队');
+    // 已有实体之间的布尔 + 删除
+    const n0 = ed.geo.items.length, rm0 = ed.removed || 0;
+    const b = await callAsync('cmd.exec', { ops: [
+      { op: 'box', id: 'p', p1: [0, 500, 0], p2: [20, 520, 0], height: 10 },
+      { op: 'box', id: 'q', p1: [10, 505, 0], p2: [30, 515, 0], height: 10 },
+      { op: 'boolean', id: 'x', targets: ['$p'], tools: ['$q'], operation: 'intersect' },
+      { op: 'box', id: 'tmp', p1: [0, 600, 0], p2: [1, 601, 0], height: 1 },
+      { op: 'delete', solids: ['$tmp'] },
+      { op: 'rename', solids: ['$x'], name: '  杯内六M4x25 ' },
+    ] });
+    assert.deepStrictEqual(ed.renamed.slice(-1), ['杯内六M4x25'], '改名(去掉首尾空格)');
+    assert.strictEqual(b.v.failed, null, JSON.stringify(b.v.failed));
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(b.v.results[2].items[0].bbox)), [[10, 505, 0], [20, 515, 10]], '求交 = 重叠部分');
+    assert.deepStrictEqual([ed.lastXform.op, ed.lastXform.keepTools], [15901, false]);
+    assert.strictEqual((ed.removed || 0) - rm0, 1, 'delete 走 geo.removeItem');
+    assert.strictEqual(ed.geo.items.length - n0, 1, '两个盒子求交成一个, 临时盒子删掉');
+    const bad = await callAsync('cmd.exec', { ops: [{ op: 'boolean', targets: [String(b.v.results[2].items[0].id)], tools: [String(b.v.results[2].items[0].id)], operation: 'subtract' }] });
+    assert.ok(/both target and tool/.test(bad.v.failed.err), JSON.stringify(bad.v));
+    const bad2 = await callAsync('cmd.exec', { ops: [{ op: 'boolean', targets: [String(b.v.results[2].items[0].id)], tools: [String(b.v.results[2].items[0].id)], operation: 'xor' }] });
+    assert.ok(/operation must be one of/.test(bad2.v.failed.err), JSON.stringify(bad2.v));
+  });
+
   await ta('N2 cmd.exec: 失败如实报且停在失败步; 已完成的保留; 引用已被吃掉的物体、挑不到边、PK 内核报错、参数错', async () => {
     const ed = ed3;
     // 引用被合并吃掉的底板
@@ -1245,7 +1403,7 @@ const callAsync = async (name, args) => JSON.parse(await run(`window.__PLA__.cal
     // 参数错误在执行任何一步之前就报
     const q1 = ed.enqueued;
     const bad = [
-      [{ ops: [{ op: 'sphere' }] }, /unknown op \(known: box, fillet, offsetFace, refillet, moveFaces, cylinder, chamfer, prism, revolve\)/],
+      [{ ops: [{ op: 'sphere' }] }, /unknown op \(known: box, fillet, offsetFace, refillet, moveFaces, cylinder, chamfer, prism, revolve, duplicate, mirror, move, rotate, pattern, radialPattern, boolean, delete, rename\)/],
       [{ ops: [{ op: 'box', p1: [0, 0, 0], p2: [1, 1, 0] }] }, /missing height/],
       [{ ops: [{ op: 'box', p1: [0, 0, 0], p2: [1, 1, 0], height: 1, colour: 'red' }] }, /unknown param colour/],
       [{ ops: [{ op: 'fillet', edges: ['1e1'], distance: 1, bool: 'union' }] }, /bool not supported/],
