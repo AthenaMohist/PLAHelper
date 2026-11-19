@@ -58,7 +58,8 @@ def shaft_problem():
 def check(res, prob):
     assert not res["unplaced"], res["unplaced"]
     assert not res["conflicts"], res["conflicts"]
-    assert not res["ugly"], ("labels with ugly leaders", res["ugly"])
+    # 2026-11-20 起比例不再为引线观感缩小(缩小解决不了挤), 难看的引线只报告; 这里只许少量
+    assert len(res["ugly"]) <= 2, ("labels with ugly leaders", res["ugly"])
     v = res["views"]
     assert abs(v["front"]["cy"] - v["side"]["cy"]) < 1e-6, "B 向视图与主视图同高(投影对齐)"
     assert v["side"]["cx"] > v["front"]["cx"]

@@ -857,6 +857,50 @@ def feature_anchor(ft):
     return None
 
 
+def feature_rowgeom(ft):
+    """回转件主视里的标注行几何(局部坐标): {anchors: {top, bottom}, slide?, approach, axis_d?} 或 None(不是同轴要素 → 用自由引出)。
+    圆柱: 上 / 下轮廓线, 可沿段滑动; 锥: 两侧轮廓线中点; 台阶面(边视的平面): 外沿的延长线上, 水平进去。"""
+    if not TURN:
+        return None
+    bw_, bh_, _ = VAX["Front"]
+    axs = TURN["axs"]
+    yc = (TURN["c"] - bb.Center).dot(bh_)
+    xt = lambda t: (TURN["c"] + axs * t - bb.Center).dot(bw_)
+    if ft["kind"] in ("cyl", "bore", "cone") and abs(abs(ft["ax"].dot(axs)) - 1) > 1e-6:
+        return None
+    if ft["kind"] in ("cyl", "bore"):
+        d_ = (ft["c"] - TURN["c"])
+        if (d_ - axs * d_.dot(axs)).Length > 1e-3:
+            return None
+        ts = [(vx.Point - TURN["c"]).dot(axs) for vx in ft["face"].Vertexes] or [0.0]
+        x0, x1 = sorted((xt(min(ts)), xt(max(ts))))
+        m = min(1.5, (x1 - x0) / 4)
+        r = ft["r"]
+        mid = (x0 + x1) / 2
+        return {"anchors": {"top": [mid, yc + r], "bottom": [mid, yc - r]}, "slide": [x0 + m, x1 - m], "approach": "v", "d": round(2 * r, 3)}
+    if ft["kind"] == "cone":
+        mx, my = local_of("Front", ft["mid"])
+        return {"anchors": {"top": [mx, yc + abs(my - yc)], "bottom": [mx, yc - abs(my - yc)]}, "approach": "v"}
+    if ft["kind"] == "plane" and "rmax" in ft:
+        x = local_of("Front", ft["p"])[0]
+        return {"anchors": {"top": [x, yc + ft["rmax"]], "bottom": [x, yc - ft["rmax"]]}, "approach": "h", "ext_out": 3.0}
+    return None
+
+
+def rowify(item, ft, axis=False, top_only=False):
+    """回转件: 标签进标注行(带两侧锚点 / 滑动范围 / 进入方式); axis = 指轴线(挂在该直径的尺寸线上); top_only = 只许在上侧(粗糙度符号)。"""
+    g = feature_rowgeom(ft)
+    if not g:
+        return item
+    item.update({"row": True, "anchors": ({"top": g["anchors"]["top"]} if top_only else g["anchors"]), "approach": g["approach"]})
+    for k in ("slide", "ext_out"):
+        if k in g:
+            item[k] = g[k]
+    if "d" in g:
+        item["axis_d" if axis else "avoid_d"] = g["d"]
+    return item
+
+
 def gdt_items():
     """方案里的基准 / 形位 / 粗糙度 → 布局标签 + 自洽检查。违规的不画, 写进报告(用户 2026-11-19: 基准与被测要素要说得通, 引线指到被测要素本身)。"""
     out, issues = [], []
@@ -872,8 +916,8 @@ def gdt_items():
         if a_ is None:
             issues.append("datum %s: not visible as an edge in the front view" % d_["label"])
             continue
-        out.append({"id": "DAT%d" % (i_ + 1), "view": "Front", "anchor": a_, "text": str(d_["label"]), "w": 6.0, "h": 6.0, "prio": 3,
-                    "kind": "datum", "axis": ft["kind"] in ("cyl", "bore", "cone")})
+        out.append(rowify({"id": "DAT%d" % (i_ + 1), "view": "Front", "anchor": a_, "text": str(d_["label"]), "w": 6.0, "h": 6.0, "prio": 3,
+                           "kind": "datum", "axis": ft["kind"] in ("cyl", "bore", "cone")}, ft, axis=ft["kind"] in ("cyl", "bore")))
     for i_, g_ in enumerate(spec.get("gdt") or []):
         sym = str(g_.get("symbol", ""))
         tag = "gdt %d (%s)" % (i_ + 1, sym)
@@ -922,8 +966,8 @@ def gdt_items():
         cells = [GDT_SYM[sym], val] + ds
         T_ = LAYM.Text(std)
         ws = [max(6.0, T_.width(c_) + 2.0) for c_ in cells]
-        out.append({"id": "GDT%d" % (i_ + 1), "view": "Front", "anchor": a_, "text": " ".join(cells), "w": sum(ws), "h": 6.0, "prio": 2,
-                    "kind": "gdt", "cells": cells, "cell_w": ws})
+        out.append(rowify({"id": "GDT%d" % (i_ + 1), "view": "Front", "anchor": a_, "text": " ".join(cells), "w": sum(ws), "h": 6.0, "prio": 2,
+                           "kind": "gdt", "cells": cells, "cell_w": ws}, ft, axis=sym in GDT_AXIAL))
     for i_, r_ in enumerate(spec.get("roughness") or []):
         try:
             ft = resolve_sel(r_["on"])
@@ -936,7 +980,8 @@ def gdt_items():
             continue
         txt = "Ra %s" % fmt(float(r_["ra"]))
         # 符号高 7 mm(长边), 框高按符号算, 否则符号伸出框外压到别的标注
-        out.append({"id": "RA%d" % (i_ + 1), "view": "Front", "anchor": a_, "text": txt, "pad_left": 7.0, "h": 7.5, "prio": 1, "kind": "roughness"})
+        out.append(rowify({"id": "RA%d" % (i_ + 1), "view": "Front", "anchor": a_, "text": txt, "pad_left": 7.0, "h": 7.5, "prio": 1, "kind": "roughness"},
+                          ft, top_only=True))
     rep["gdt"] = {"items": [{"id": o["id"], "text": o["text"]} for o in out], "issues": issues}
     for s_ in issues:
         rep["warnings"].append("annotation skipped: " + s_)
@@ -1062,6 +1107,7 @@ def layout_problem(anchors=None, fixed_scale=None, sec_dir=None):
         if rs:
             reserve += [{"view": "Front", "side": k, "depth": v} for k, v in rs.items()]
     fr_ = outer_round("Front")
+    dstep_ids = {}   # 段直径 → 它的 ⌀ 尺寸 id(轴线基准 / 同轴度挂在这条尺寸线上; 表面要求与它错开)
     if TURN:
         # 回转件(主视轴线水平): 每段外圆标 ⌀(在视图上, 段内滑动避让) + 轴向链式尺寸(主视下方); 总长仍在上方(极值点)
         yc = (TURN["c"] - bb.Center).dot(VAX["Front"][1])
@@ -1077,6 +1123,7 @@ def layout_problem(anchors=None, fixed_scale=None, sec_dir=None):
         for i_, s_ in enumerate(segs):
             x0_, x1_ = sorted((xt(s_["t0"]), xt(s_["t1"])))
             id_ = "Dstep%d" % (i_ + 1)
+            dstep_ids.setdefault(round(s_["d"], 3), id_)
             tol_ = shaft_tol(s_["d"] / 2)
             dims_.append({"id": id_, "view": "Front", "kind": "inline", "dir": "y", "span": [yc - s_["d"] / 2, yc + s_["d"] / 2],
                           "slide": [x0_ + min(0.8, (x1_ - x0_) / 4), x1_ - min(0.8, (x1_ - x0_) / 4)],
@@ -1127,7 +1174,12 @@ def layout_problem(anchors=None, fixed_scale=None, sec_dir=None):
         labels_.append({"id": id_, "view": a_[0], "anchor": a_[1], "text": taper_text(cn, a_[0]), "prio": 2})
     # 基准 / 形位公差 / 粗糙度(锚点都在要素本身上)
     for o_ in GDT_LABELS:
-        labels_.append({k: o_[k] for k in ("id", "view", "anchor", "text", "prio", "w", "h", "pad_left") if k in o_})
+        lb_ = {k: o_[k] for k in ("id", "view", "anchor", "text", "prio", "w", "h", "pad_left", "row", "anchors", "slide", "approach", "ext_out") if k in o_}
+        if o_.get("axis_d") is not None and o_["axis_d"] in dstep_ids:
+            lb_["attach_dim"] = dstep_ids[o_["axis_d"]]
+        if o_.get("avoid_d") is not None and o_["avoid_d"] in dstep_ids:
+            lb_["avoid_dim"] = dstep_ids[o_["avoid_d"]]
+        labels_.append(lb_)
     # 回转件的实际轮廓(布局层据此判断"引线在零件里走了多少"、标签能不能放进包围盒里空着的地方):
     # 主视 / 剖视 = 各段矩形 + 段间缝隙(倒角 / 锥)按相邻较小直径补上; 左视(端面圆)= 4 块矩形近似
     if TURN:
@@ -1874,7 +1926,7 @@ if LAY:
         rep["placed"].append({"name": id_, "type": "Diameter" if id_.startswith("D") else "DistanceX", "text": d_["text"], "at": [round(cx_, 1), round(H - cy_, 1)]})
     for id_, l_ in LAY["labels"].items():
         # 锥度; 窄台阶放不下的段直径(布局改成了引出标注)
-        if not id_.startswith(("Taper", "Dstep")):
+        if not id_.startswith(("Taper", "Dstep")) or id_.endswith("#t"):   # "#t" = 标注行里的段直径文字, 下面单独画
             continue
         a_, k_, e_ = l_["leader"]
         PAGE_SVG.append('<polyline points="%.3f,%.3f %.3f,%.3f %.3f,%.3f" style="fill:none;stroke:#000;stroke-width:%g"/>'
@@ -1886,16 +1938,37 @@ if LAY:
         rep["placed"].append({"name": id_, "type": "Taper", "text": l_["lines"][0], "at": [round(r_[0], 1), round(H - r_[3], 1)]})
     # 基准(实心三角在要素上 + 方框字母)/ 形位公差框格(箭头指到被测要素)/ 粗糙度(去除材料符号 + Ra 值, 引线指到表面)
     sym_font_ = fam_ + ", Segoe UI Symbol"
+    # 段直径的文字放不进段里时进了标注行: 尺寸线一端 → 行里的文字(细线连过去, 文字下面一条肩线)
+    for id_, l_ in LAY["labels"].items():
+        if not id_.endswith("#t"):
+            continue
+        pts_ = l_["leader"]
+        r_ = l_["text_rect"]
+        for p_, q_ in zip(pts_, pts_[1:]):
+            svg_line_(p_, q_)
+        svg_line_((r_[0], r_[3]), (r_[2], r_[3]))
+        PAGE_SVG.append('<text x="%.3f" y="%.3f" style="font-family:%s;font-size:%gpx;fill:#000">%s</text>'
+                        % (r_[0] + 0.5, r_[3] - 0.8, fam_, fs_, l_["lines"][0]))
+        rep["placed"].append({"name": id_, "type": "DiameterText", "text": l_["lines"][0], "at": [round(r_[0], 1), round(H - r_[3], 1)]})
     for id_, l_ in LAY["labels"].items():
         o_ = GDT_BY_ID.get(id_)
         if not o_:
             continue
-        a_, k_, e_ = l_["leader"]
+        pts_ = l_["leader"]
+        a_, k_, e_ = pts_[0], pts_[1], pts_[-1]
         r_ = l_["text_rect"]
+        row_ = l_.get("row")
+        rest_ = list(zip(pts_[1:], pts_[2:]))   # 折点之后的各段(标注行: 竖直出尺寸区 → 斜线到框)
+        if l_.get("ext_line"):
+            svg_line_(l_["ext_line"][0], l_["ext_line"][1])   # 边视平面的延长线(箭头 / 三角落在上面)
         if o_["kind"] == "gdt":
-            # 引线: 要素 → 折点 → 框格底边(箭头在要素一端)
+            # 引线: 要素 → 折点 → 框格(箭头在要素一端)
             svg_line_(a_, k_)
-            svg_line_(k_, (k_[0], r_[3]))
+            if row_:
+                for p_, q_ in rest_:
+                    svg_line_(p_, q_)
+            else:
+                svg_line_(k_, (k_[0], r_[3]))
             svg_arrow_(a_, k_)
             x_ = r_[0]
             for c_, w_ in zip(o_["cells"], o_["cell_w"]):
@@ -1916,17 +1989,26 @@ if LAY:
             PAGE_SVG.append('<polygon points="%.3f,%.3f %.3f,%.3f %.3f,%.3f" style="fill:#000"/>' % (p1[0], p1[1], p2[0], p2[1], tp[0], tp[1]))
             bx = (r_[0] + r_[2]) / 2
             svg_line_(tp, k_)
-            svg_line_(k_, (bx, r_[3]) if abs(k_[0] - bx) > 0.1 else k_)
+            if row_:
+                for p_, q_ in rest_:
+                    svg_line_(p_, q_)
+            else:
+                svg_line_(k_, (bx, r_[3]) if abs(k_[0] - bx) > 0.1 else k_)
             PAGE_SVG.append('<rect x="%.3f" y="%.3f" width="%.3f" height="%.3f" style="fill:none;stroke:#000;stroke-width:%g"/>'
                             % (r_[0], r_[1], r_[2] - r_[0], r_[3] - r_[1], lw_))
             PAGE_SVG.append('<text x="%.3f" y="%.3f" style="font-family:%s;font-size:%gpx;text-anchor:middle;fill:#000">%s</text>'
                             % (bx, (r_[1] + r_[3]) / 2 + fs_ * 0.35, fam_, fs_, o_["text"]))
         else:
             svg_line_(a_, k_)
-            svg_line_(k_, e_)
+            for p_, q_ in (rest_ if row_ else [(k_, e_)]):
+                svg_line_(p_, q_)
             svg_arrow_(a_, k_)
             x0_ = r_[0] + 0.5
             s_ = k_[1]
+            if row_:
+                # 行里: 肩线 = 框底边, 符号尖落在肩线上
+                s_ = r_[3]
+                svg_line_((r_[0], s_), (r_[2], s_))
             A_, Tp_, B_ = (x0_, s_ - 3.0), (x0_ + 2.0, s_), (x0_ + 5.5, s_ - 7.0)
             PAGE_SVG.append('<polyline points="%.3f,%.3f %.3f,%.3f %.3f,%.3f" style="fill:none;stroke:#000;stroke-width:%g"/>'
                             % (A_[0], A_[1], Tp_[0], Tp_[1], B_[0], B_[1], lw_))

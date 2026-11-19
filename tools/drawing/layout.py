@@ -165,8 +165,8 @@ class Layout:
                 out[d["id"]] = (sd, ren[l], iv, to)
         return out
 
-    def halos(self, lanes):
-        """每个视图四边要留的宽度(尺寸层 + 文字)。"""
+    def halos(self, lanes, s=1.0):
+        """每个视图四边要留的宽度(尺寸层 + 文字 + 标注行)。"""
         h = {vid: {"top": 0.0, "bottom": 0.0, "left": 0.0, "right": 0.0} for vid in self.views}
         for did, (side, lane, _, _) in lanes.items():
             d = next(x for x in self.dims if x["id"] == did)
@@ -176,7 +176,256 @@ class Layout:
         for rsv in self.p.get("reserve", []):
             if rsv["view"] in h:
                 h[rsv["view"]][rsv["side"]] += rsv["depth"]
+        # 标注行(形位框格 / 基准 / 粗糙度): 叠在最外面; 行数按宽度在"视图宽 + 两边各 25"里装箱估计
+        for (vid, side), labs in self.row_groups(s).items():
+            limit = self.views[vid]["w"] * s + 50.0
+            rows = self.pack_rows([self.label_w(l) for l in labs], limit)
+            h[vid][side] += rows * (self.row_h(labs) + self.L.get("row_gap", 2.5)) + 3.0
         return h
+
+    # ---- 标注行: 形位框格 / 基准 / 粗糙度排在视图上下的整齐行里, 引线尽量竖直(用户 2026-11-20: 标注密时不能乱拉长引线)
+    def long_inline(self, s):
+        """这个比例下文字比自己的尺寸线还长的 inline ⌀(如 ⌀20 g7(-0.007/-0.028) 在 ⌀20 段上): 线留在零件上, 文字进标注行。"""
+        out = []
+        for d in self.dims:
+            if d.get("kind") == "inline" and d["dir"] == "y":
+                c_scale = s
+                if self.T.width(d["text"]) + 2 * self.L["arrow"] > (max(d["span"]) - min(d["span"])) * c_scale:
+                    out.append(d["id"])
+        return out
+
+    def row_labels(self, s=None):
+        base = [l for l in self.labels if l.get("row")]
+        if s is None:
+            return base
+        extra = []
+        for did in self.long_inline(s):
+            d = next(x for x in self.dims if x["id"] == did)
+            extra.append({"id": did + "#t", "view": d["view"], "text": d["text"], "row": True, "attach_dim": did, "prio": 2, "dimtext": True})
+        return base + extra
+
+    def label_w(self, lb):
+        w, _, _ = self.T.box(lb["text"])
+        return (lb.get("w") or w) + lb.get("pad_left", 0.0)
+
+    def row_h(self, labs):
+        return max([l.get("h") or self.T.h for l in labs] or [self.T.h])
+
+    @staticmethod
+    def pack_rows(widths, limit, gap=3.0):
+        rows, used = 0, None
+        for w in widths:
+            if used is None or used + gap + w > limit:
+                rows += 1
+                used = w
+            else:
+                used += gap + w
+        return rows
+
+    def row_groups(self, s=1.0):
+        """标签 → (视图, 上 / 下): 只许在给了锚点的那侧; 两侧都行的, 按宽度均衡(宽的先分); 挂在同一条尺寸线上的两个标签各占一端。按比例缓存。"""
+        cache = self.__dict__.setdefault("_row_groups", {})
+        if s in cache:
+            return cache[s]
+        used, out, ends = {}, {}, {}
+        labs = self.row_labels(s)
+        # 挂尺寸线的先分(端点有限), 再按宽度
+        for lb in sorted(labs, key=lambda l: (0 if l.get("attach_dim") else 1, -self.label_w(l))):
+            sides = [sd for sd in ("top", "bottom") if sd in (lb.get("anchors") or {}) or (lb.get("attach_dim") and sd in lb.get("sides", ("top", "bottom")))]
+            if lb.get("attach_dim"):
+                free = [sd for sd in sides if (lb["attach_dim"], sd) not in ends]
+                sides = free or sides
+            if not sides:
+                continue
+            pref = "bottom" if lb.get("dimtext") and "bottom" in sides and (lb.get("attach_dim"), "bottom") not in ends else None
+            sd = pref or min(sides, key=lambda x: used.get((lb["view"], x), 0.0))
+            used[(lb["view"], sd)] = used.get((lb["view"], sd), 0.0) + self.label_w(lb)
+            out.setdefault((lb["view"], sd), []).append(lb)
+            if lb.get("attach_dim"):
+                ends[(lb["attach_dim"], sd)] = lb["id"]
+        cache[s] = out
+        return out
+
+    def realize_rows(self, place, s, dims, dim_texts):
+        """标注行(边界标注): 每个视图上 / 下, 框按要素的左右顺序排成一行(放不下才第二行), 横向可以错开;
+        引线 = 要素 → 竖直出尺寸区 → 斜线到框。顺序不变 → 引线互不交叉。→ (placed, unplaced)"""
+        placed, unplaced = {}, []
+        pad = self.L["pad"]
+        gap = self.L.get("row_gap", 2.5)
+        hgap = 3.0
+        for (vid, side), labs in self.row_groups(s).items():
+            c = place[vid]
+            r = c["rect"]
+            sg = -1 if side == "top" else 1
+
+            def page(pt):
+                return (c["cx"] + pt[0] * c["scale"], c["cy"] - pt[1] * c["scale"])
+
+            # 行从这一侧最外面的尺寸(线 / 文字 / 界线)之外开始
+            ys = [r[1] if side == "top" else r[3]]
+            for d in dims.values():
+                if d.get("_view") != vid:
+                    continue
+                pts = list(d.get("line_ext") or d["line"]) + [p for e in d.get("ext", []) for p in e]
+                tr = d["text_rect"]
+                cand = [p[1] for p in pts] + ([] if d.get("notext") else [tr[1], tr[3]])
+                ys += [y for y in cand if (y < r[1] if side == "top" else y > r[3])]
+            edge = (min(ys) - 2.0) if side == "top" else (max(ys) + 2.0)
+            rh = self.row_h(labs)
+            # 行的左右边界: 可画区, 且不伸到同一高度旁边的视图上
+            xlo, xhi = self.area[0], self.area[2]
+            band = (edge - 3 * (rh + gap), edge) if side == "top" else (edge, edge + 3 * (rh + gap))
+            for oid, oc in place.items():
+                if oid == vid:
+                    continue
+                orr = grow(oc["rect"], 4.0)
+                if orr[3] < band[0] or orr[1] > band[1]:
+                    continue
+                if orr[0] >= r[2] - 1e-6:
+                    xhi = min(xhi, orr[0])
+                elif orr[2] <= r[0] + 1e-6:
+                    xlo = max(xlo, orr[2])
+            # 每个标签的起点(引线从要素出来那一点)和竖直段的 x
+            items = []
+            for lb in labs:
+                w = self.label_w(lb)
+                h = lb.get("h") or self.T.h
+                ext_line = None
+                if lb.get("attach_dim") and lb["attach_dim"] in dims:
+                    ln = dims[lb["attach_dim"]].get("line_ext") or dims[lb["attach_dim"]]["line"]
+                    ends = sorted(ln, key=lambda p: p[1])
+                    a = ends[0] if side == "top" else ends[-1]       # 尺寸线这一端: 与尺寸线对齐 = 指轴线
+                    pre = [a]
+                    lx = a[0]
+                elif lb.get("anchors") and side in lb["anchors"]:
+                    a = page(lb["anchors"][side])
+                    if lb.get("approach") == "h":
+                        # 边视的平面: 箭头 / 三角落在延长线上(零件外), 水平进入, 再竖直出去
+                        a0 = a
+                        a = (a[0], a[1] + sg * lb.get("ext_out", 3.0))
+                        ext_line = [a0, (a[0], a[1] + sg * 1.5)]
+                        dx = 7.0 if a[0] >= (r[0] + r[2]) / 2 else -7.0
+                        lx = a[0] + dx
+                        pre = [a, (lx, a[1])]
+                    else:
+                        if lb.get("slide"):
+                            x0p, x1p = sorted((page([lb["slide"][0], 0])[0], page([lb["slide"][1], 0])[0]))
+                        else:
+                            x0p = x1p = a[0]
+                        mid = (x0p + x1p) / 2
+                        n = int((x1p - x0p) / 0.5) + 1
+                        xs_c = sorted({min(max(mid + k * 0.5 * t, x0p), x1p) for k in range(n) for t in (1, -1)}, key=lambda x: abs(x - mid))
+                        av = lb.get("avoid_dim")
+                        if av and av in dims:            # 与本段 ⌀ 尺寸线错开 ≥ 4 mm(对齐 = 指轴线)
+                            lxd = dims[av]["line"][0][0]
+                            xs_c = [x for x in xs_c if abs(x - lxd) >= 4.0] or xs_c
+                        lx = None
+                        for x in xs_c:                   # 竖直段不许穿过尺寸文字
+                            if not any(seg_rect_hit((x, a[1]), (x, edge), t) for t in dim_texts):
+                                lx = x
+                                break
+                        lx = xs_c[0] if lx is None else lx
+                        a = (lx, a[1])
+                        pre = [a]
+                else:
+                    unplaced.append({"id": lb["id"], "why": "no anchor on this side"})
+                    continue
+                items.append({"lb": lb, "w": w, "h": h, "lx": lx, "pre": pre, "ext": ext_line})
+            items.sort(key=lambda it: it["lx"])
+            # 分行: 一行装得下就一行, 否则隔一个放到第二行(保持各行内的左右顺序)
+            avail = xhi - xlo
+
+            def spread_(row):
+                xs = [it["lx"] - it["w"] / 2 for it in row]
+                for i in range(len(row)):
+                    lo_ = xlo if i == 0 else xs[i - 1] + row[i - 1]["w"] + hgap
+                    xs[i] = max(xs[i], lo_)
+                for i in range(len(row) - 1, -1, -1):
+                    hi_ = xhi - row[i]["w"] if i == len(row) - 1 else xs[i + 1] - hgap - row[i]["w"]
+                    xs[i] = min(xs[i], hi_)
+                return xs
+
+            def drift_(rows):
+                return sum(abs(x + it["w"] / 2 - it["lx"]) for row in rows for it, x in zip(row, spread_(row)))
+
+            tot = sum(it["w"] for it in items) + hgap * max(0, len(items) - 1)
+            one, two = [items], [items[0::2], items[1::2]]
+            # 一行放得下也要看框离要素多远: 两行能把横向偏移砍掉一大半就用两行(引线短, 不扎堆)
+            rows_ = one if tot <= avail and (len(items) < 3 or drift_(one) <= 1.6 * drift_(two) + 10.0) else two
+            # 两行时: 里行散开时给外行每个标签留一条窄缝(按左右顺序插在里行中间), 外行引线从缝里竖直穿过, 不压里行的框
+            slot_w = 3.0
+            if len(rows_) == 2:
+                seq = sorted([(it, 0) for it in rows_[0]] + [(it, 1) for it in rows_[1]], key=lambda p: p[0]["lx"])
+                ws_ = [it["w"] if r_ == 0 else slot_w for it, r_ in seq]
+                xs_ = [it["lx"] - w / 2 for (it, _), w in zip(seq, ws_)]
+                for i in range(len(seq)):
+                    lo_ = xlo if i == 0 else xs_[i - 1] + ws_[i - 1] + hgap
+                    xs_[i] = max(xs_[i], lo_)
+                for i in range(len(seq) - 1, -1, -1):
+                    hi_ = xhi - ws_[i] if i == len(seq) - 1 else xs_[i + 1] - hgap - ws_[i]
+                    xs_[i] = min(xs_[i], hi_)
+                for (it, r_), x_, w in zip(seq, xs_, ws_):
+                    if r_ == 0:
+                        it["x0"] = x_
+                    else:
+                        it["slot"] = x_ + w / 2
+                # 外行: 框中心对准各自的缝
+                for it in rows_[1]:
+                    it["aim"] = it["slot"]
+                xs1 = [it["aim"] - it["w"] / 2 for it in rows_[1]]
+                for i in range(len(rows_[1])):
+                    lo_ = xlo if i == 0 else xs1[i - 1] + rows_[1][i - 1]["w"] + hgap
+                    xs1[i] = max(xs1[i], lo_)
+                for i in range(len(rows_[1]) - 1, -1, -1):
+                    hi_ = xhi - rows_[1][i]["w"] if i == len(rows_[1]) - 1 else xs1[i + 1] - hgap - rows_[1][i]["w"]
+                    xs1[i] = min(xs1[i], hi_)
+                for it, x_ in zip(rows_[1], xs1):
+                    it["x0"] = x_
+            else:
+                for it, x_ in zip(rows_[0], spread_(rows_[0])):
+                    it["x0"] = x_
+            by1s = [(edge - 6.0 - ri * (rh + gap)) if side == "top" else (edge + 6.0 + ri * (rh + gap) + rh) for ri in range(len(rows_))]
+            for ri, row in enumerate(rows_):
+                by1 = by1s[ri]
+                for it in row:
+                    x0 = it["x0"]
+                    lb = it["lb"]
+                    h = it["h"]
+                    box = (x0, by1 - h, x0 + it["w"], by1) if side == "top" else (x0, by1 - rh, x0 + it["w"], by1 - rh + h)
+                    bedge = box[3] if side == "top" else box[1]
+                    if ri == 0:
+                        att = min(max(it["lx"], box[0] + 1.0), box[2] - 1.0)
+                        lead = it["pre"] + [(it["lx"], edge), (att, bedge)]
+                    else:
+                        # 外行: 要素 → 竖直出尺寸区 → 斜到里行的缝 → 竖直穿过里行 → 进框
+                        sx = it["slot"]
+                        b0 = by1s[0]
+                        in0 = (b0 + 1.0) if side == "top" else (b0 - rh - 1.0)    # 里行靠要素一侧的外沿
+                        out0 = (b0 - rh - 1.0) if side == "top" else (b0 + 1.0)
+                        att = min(max(sx, box[0] + 1.0), box[2] - 1.0)
+                        lead = it["pre"] + [(it["lx"], edge), (sx, in0), (sx, out0), (att, bedge)]
+                    bad = None
+                    if x0 < xlo - 0.5 or x0 + it["w"] > xhi + 0.5 or not rect_inside(box, self.area) or any(rect_hit(box, k) for k in self.keepout):
+                        bad = "no room in the annotation rows"
+                    elif any(rect_hit(box, pr, pad) for cc in place.values() for pr in cc.get("parts", [cc["rect"]])):
+                        bad = "annotation row runs into a view"
+                    if bad:
+                        unplaced.append({"id": lb["id"], "why": bad})
+                        continue
+                    flags = []
+                    if any(seg_rect_hit(p, q, t) for p, q in zip(lead, lead[1:]) for t in dim_texts):
+                        flags.append("leader crosses a dimension text")
+                    placed[lb["id"]] = {"leader": lead, "text_rect": box, "text_at": (box[0] + 0.5, box[1]),
+                                        "lines": [lb["text"]] if isinstance(lb["text"], str) else lb["text"],
+                                        "cost": 0.0, "flags": flags, "side": side, "row": True, "ext_line": it["ext"]}
+        # 第二行的引线可能穿过第一行的框: 查出来记为难看(不静默)
+        boxes = {k: v["text_rect"] for k, v in placed.items()}
+        for k, v in placed.items():
+            ld = v["leader"]
+            for k2, b2 in boxes.items():
+                if k2 != k and any(seg_rect_hit(p, q, b2) for p, q in zip(ld, ld[1:])):
+                    v["flags"].append("leader crosses label " + k2)
+        return placed, unplaced
 
     def reserved_rects(self, place):
         """预留区域(页面矩形): 标签不进去。"""
@@ -327,19 +576,27 @@ class Layout:
                 y = r[1] - off if side == "top" else r[3] + off
                 x0, x1 = sorted((A[0], B[0]))
                 sgn = -1 if side == "top" else 1
-                out[d["id"]] = {"side": side, "lane": lane, "line": [(x0, y), (x1, y)], "rot": 0, "outside": text_out, "text": d["text"],
+                out[d["id"]] = {"_view": d["view"], "side": side, "lane": lane, "line": [(x0, y), (x1, y)], "rot": 0, "outside": text_out, "text": d["text"],
                                 "ext": [[(p[0], p[1] + sgn * eg), (p[0], y + sgn * eo)] for p in (A, B)]}
             else:
                 x = r[0] - off if side == "left" else r[2] + off
                 y0, y1 = sorted((A[1], B[1]))
                 sgn = -1 if side == "left" else 1
-                out[d["id"]] = {"side": side, "lane": lane, "line": [(x, y0), (x, y1)], "rot": -90, "outside": text_out, "text": d["text"],
+                out[d["id"]] = {"_view": d["view"], "side": side, "lane": lane, "line": [(x, y0), (x, y1)], "rot": -90, "outside": text_out, "text": d["text"],
                                 "ext": [[(p[0] + sgn * eg, p[1]), (x + sgn * eo, p[1])] for p in (A, B)]}
         # 线 → 细长矩形(文字不能压别人的线)
         def thin(p, q, w=0.35):
             return (min(p[0], q[0]) - w, min(p[1], q[1]) - w, max(p[0], q[0]) + w, max(p[1], q[1]) + w)
         lines = {k: [thin(*d["line"])] + [thin(*e) for e in d["ext"]] for k, d in out.items()}
         view_rects = [pr for c in place.values() for pr in c["parts"]]
+        # 文字放不进段里的 ⌀(线在段中间, 文字进标注行): 它的引线沿尺寸线竖直穿出视图 → 尺寸文字给这条通道让路
+        keep_clear = []
+        for did in self.long_inline(s):
+            dd = next(x for x in self.dims if x["id"] == did)
+            cc = place[dd["view"]]
+            x = cc["cx"] + (sum(dd["slide"]) / 2) * cc["scale"]
+            keep_clear.append((x - 0.8, self.area[1], x + 0.8, cc["rect"][1]))
+            keep_clear.append((x - 0.8, cc["rect"][3], x + 0.8, self.area[3]))
         texts, failed = [], []
         for k in sorted(out, key=lambda k: (out[k]["lane"], out[k]["line"][0])):
             d = out[k]
@@ -369,19 +626,25 @@ class Layout:
                 cands += [("mid2", (right[0], mid - tw / 2, right[1], mid + tw / 2))]
             own = set(range(len(lines[k])))
             chosen = None
-            for name, rr in cands:
-                if not rect_inside(rr, self.area) or any(rect_hit(rr, kk) for kk in self.keepout):
-                    continue
-                if any(rect_hit(rr, vr, pad) for vr in view_rects):
-                    continue
-                if any(rect_hit(rr, t, pad) for t in texts):
-                    continue
-                if any(rect_hit(rr, ln) for kk, ls in lines.items() if kk != k for ln in ls):
-                    continue
-                if any(rect_hit(rr, ln) for i, ln in enumerate(lines[k]) if i > 0):   # 自己的界线
-                    continue
-                chosen = (name, rr)
-                break
+            # 第一遍还要给段直径的引线通道让路, 都不行再放宽(那条引线会被标为难看, 不会默默压字)
+            for strict in (True, False):
+                for name, rr in cands:
+                    if not rect_inside(rr, self.area) or any(rect_hit(rr, kk) for kk in self.keepout):
+                        continue
+                    if any(rect_hit(rr, vr, pad) for vr in view_rects):
+                        continue
+                    if any(rect_hit(rr, t, pad) for t in texts):
+                        continue
+                    if any(rect_hit(rr, ln) for kk, ls in lines.items() if kk != k for ln in ls):
+                        continue
+                    if strict and any(rect_hit(rr, kc) for kc in keep_clear):
+                        continue
+                    if any(rect_hit(rr, ln) for i, ln in enumerate(lines[k]) if i > 0):   # 自己的界线
+                        continue
+                    chosen = (name, rr)
+                    break
+                if chosen:
+                    break
             if chosen is None:
                 failed.append(k)
                 chosen = cands[0]
@@ -403,7 +666,7 @@ class Layout:
         return out, failed
 
     # ---- inline 尺寸(视图上, 如轴的各段直径): 在 slide 范围里滑动, 文字互不重叠
-    def realize_inline(self, place, s, taken_text):
+    def realize_inline(self, place, s, taken_text, lines=()):
         out, unplaced = {}, []
         th, pad = self.T.h, self.L["pad"]
         items = [d for d in self.dims if d.get("kind") == "inline"]
@@ -414,37 +677,12 @@ class Layout:
             lo, hi = sorted(d["span"])
             a, b = sorted(d["slide"])
             mid = (a + b) / 2
-            # 文字比尺寸线还长(⌀20 g7(-0.007/-0.028) 在 ⌀20 段上): 尺寸线延长到零件外, 文字写在延长段上(GB 常用), 不再加引线
-            if tw + 2 * self.L["arrow"] > (hi - lo) * c["scale"] and d["dir"] == "y":
-                ext_done = None
-                cands_o = sorted({min(max(mid + k * 0.5 / s * sg, a), b) for k in range(int(max(0, (b - a) * s) / 0.5) + 1) for sg in (1, -1)}, key=lambda t: abs(t - mid))
-                for t in cands_o:
-                    x = c["cx"] + t * c["scale"]
-                    y0, y1 = c["cy"] - hi * s, c["cy"] - lo * s
-                    for up in (True, False):
-                        if up:
-                            ty0, ty1 = y0 - 2.0 - tw, y0 - 2.0
-                        else:
-                            ty0, ty1 = y1 + 2.0, y1 + 2.0 + tw
-                        for side in (-1, 1):
-                            tx = x - 0.6 - th / 2 if side < 0 else x + 0.6 + th / 2
-                            trect = (tx - th / 2, ty0, tx + th / 2, ty1)
-                            if not rect_inside(trect, self.area) or any(rect_hit(trect, u, pad) for u in taken_text):
-                                continue
-                            if any(rect_hit(trect, pr, pad) for cc in place.values() for pr in cc.get("parts", [cc["rect"]])):
-                                continue
-                            ext_done = {"line": [(x, y0), (x, y1)], "line_ext": [(x, min(y0, ty0)), (x, max(y1, ty1))],
-                                        "text_at": (tx, (ty0 + ty1) / 2), "rot": -90, "text_rect": trect, "text": d["text"], "at": t, "kind": "inline", "outside": True}
-                            break
-                        if ext_done:
-                            break
-                    if ext_done:
-                        break
-                if ext_done:
-                    out[d["id"]] = ext_done
-                    taken_text.append(ext_done["text_rect"])
-                else:
-                    unplaced.append({"id": d["id"], "why": "inline text longer than its dimension line"})
+            # 文字比尺寸线还长(⌀20 g7(-0.007/-0.028) 在 ⌀20 段上): 线留在零件上, 文字进标注行(挂在这条尺寸线一端, 见 row_labels)
+            if d["id"] in self.long_inline(s):
+                x = c["cx"] + mid * c["scale"]
+                y0, y1 = c["cy"] - hi * s, c["cy"] - lo * s
+                out[d["id"]] = {"line": [(x, y0), (x, y1)], "text_at": (x, y0), "rot": -90, "text_rect": (x, y0, x, y0), "text": "",
+                                "at": mid, "kind": "inline", "notext": True, "_view": d["view"]}
                 continue
             steps = int(max(0, (b - a) * s) / 0.5) + 1
             cands = sorted({min(max(mid + k * 0.5 / s * sgn, a), b) for k in range(steps) for sgn in (1, -1)}, key=lambda t: abs(t - mid))
@@ -469,7 +707,7 @@ class Layout:
                     if not rect_inside(trect, self.area):
                         continue
                     if not any(rect_hit(trect, u, pad) for u in taken_text):
-                        rec.update({"text_rect": trect, "text": d["text"], "at": t, "kind": "inline"})
+                        rec.update({"text_rect": trect, "text": d["text"], "at": t, "kind": "inline", "_view": d["view"]})
                         done = rec
                         break
                 if done:
@@ -487,7 +725,7 @@ class Layout:
         th, pad = self.T.h, L["pad"]
         view_rects = {vid: c["parts"] for vid, c in place.items()}
         placed, unplaced = {}, []
-        order = sorted(self.labels + list(extra or []), key=lambda l: (-l.get("prio", 0), l["id"]))
+        order = sorted([l for l in self.labels if not l.get("row")] + list(extra or []), key=lambda l: (-l.get("prio", 0), l["id"]))
 
         def candidates(lb, others):
             w, h, lines = self.T.box(lb["text"])
@@ -615,7 +853,7 @@ class Layout:
             bump, place = {}, None
             for _round in range(12):
                 lanes = self.lanes(s, bump)
-                halo = self.halos(lanes)
+                halo = self.halos(lanes, s)
                 place, why = self.place_views(s, halo)
                 if place is None:
                     break
@@ -628,7 +866,8 @@ class Layout:
                 continue
             un0 = [{"id": k, "why": "dimension text has no free spot"} for k in failed]
             texts = [d["text_rect"] for d in dims.values()]
-            inl, un1 = self.realize_inline(place, s, list(texts))
+            lines0 = [tuple(d["line"]) for d in dims.values()] + [tuple(e) for d in dims.values() for e in d.get("ext", [])]
+            inl, un1 = self.realize_inline(place, s, list(texts), lines0)
             dims.update(inl)
             # 在段上放不下的 inline(窄台阶的 ⌀): 改成引出标注(引线指到该段轮廓的上沿), 不拖累整张图的比例
             extra = []
@@ -644,8 +883,16 @@ class Layout:
             # 尺寸线本身也是障碍(标签文字不能压线): 线 → 细长矩形
             for p, q in dim_lines:
                 obstacles.append((min(p[0], q[0]) - 0.3, min(p[1], q[1]) - 0.3, max(p[0], q[0]) + 0.3, max(p[1], q[1]) + 0.3))
-            labels, un2 = self.realize_labels(place, s, obstacles, dim_lines, extra, [d["text_rect"] for d in dims.values()] + list(self.p.get("text_obstacles", [])))
-            res = {"scale": s, "views": place, "dims": dims, "labels": labels, "unplaced": un0 + un1 + un2}
+            dtexts = [d["text_rect"] for d in dims.values()] + list(self.p.get("text_obstacles", []))
+            rows, un3 = self.realize_rows(place, s, dims, dtexts)
+            # 行里的框和竖直引线也是障碍
+            for l in rows.values():
+                obstacles.append(l["text_rect"])
+                for p, q in zip(l["leader"], l["leader"][1:]):
+                    obstacles.append((min(p[0], q[0]) - 0.3, min(p[1], q[1]) - 0.3, max(p[0], q[0]) + 0.3, max(p[1], q[1]) + 0.3))
+            labels, un2 = self.realize_labels(place, s, obstacles, dim_lines, extra, dtexts + [l["text_rect"] for l in rows.values()])
+            labels.update(rows)
+            res = {"scale": s, "views": place, "dims": dims, "labels": labels, "unplaced": un0 + un1 + un2 + un3}
             res["conflicts"] = conflicts(res, self)
             # 观感门槛: 有标签引线横穿别的视图 / 与别的引线交叉 / 在零件里走很长(代价高)→ 这个比例太挤, 试更小的
             ugly = [{"id": k, "why": l["flags"]} for k, l in labels.items() if l["flags"]]
@@ -667,6 +914,8 @@ def conflicts(res, lay):
     """落位后的复查: 文字框之间、文字框与视图(inline 文字除外)、与禁区 / 出界。→ [(a, b)]"""
     items = []
     for k, d in res["dims"].items():
+        if d.get("notext"):
+            continue   # 文字在标注行里(那边单独检查)
         items.append(("dim:" + k, d["text_rect"], d.get("kind") == "inline"))
     for k, l in res["labels"].items():
         items.append(("label:" + k, l["text_rect"], False))
