@@ -548,6 +548,27 @@ for g_ in HOLE_GROUPS:
 HOLE_IDS = {g["id"] for g in HOLE_GROUPS}  # 孔标注尺寸对象的名字 = 孔组编号(导出时据此改成水平文字 + 引线)
 
 
+def datum_faces(vname):
+    """坐标尺寸的基准(视图左下角)是不是实际要素: 视图横向最小处有法向 ∥ 横轴的平面, 竖向最小处有法向 ∥ 竖轴的平面。"""
+    bw_, bh_, _ = VAX[vname]
+    lo_w = min(V(x, y, z).dot(bw_) for x in (bb.XMin, bb.XMax) for y in (bb.YMin, bb.YMax) for z in (bb.ZMin, bb.ZMax))
+    lo_h = min(V(x, y, z).dot(bh_) for x in (bb.XMin, bb.XMax) for y in (bb.YMin, bb.YMax) for z in (bb.ZMin, bb.ZMax))
+    got_w = got_h = False
+    for f in shape.Faces:
+        try:
+            if not isinstance(f.Surface, Part.Plane):
+                continue
+            n = f.normalAt(0, 0)
+            c = f.CenterOfMass
+        except Exception:
+            continue
+        if abs(abs(n.dot(bw_)) - 1) < 1e-6 and abs(c.dot(bw_) - lo_w) < 1e-3:
+            got_w = True
+        if abs(abs(n.dot(bh_)) - 1) < 1e-6 and abs(c.dot(bh_) - lo_h) < 1e-3:
+            got_h = True
+    return got_w and got_h
+
+
 def ordinate_groups():
     """方案 ordinate: true / 省略 = 主视里全部孔组; false = 不标孔位; {"groups": ["H1", …]} 只标这些;
     {"exclude": [...]} 除去这些。返回要标孔位的孔组。"""
@@ -555,6 +576,15 @@ def ordinate_groups():
     front = [g for g in HOLE_GROUPS if g["view"] == "Front"]
     if o is False:
         return []
+    # 用户 2026-11-19: 圆形件不用坐标尺寸(孔按直径 / 节圆标); 坐标基准 0 必须是实际要素 ——
+    # 主视左边、下边都得有平面(加工 / 测量的基准面), 否则基准是悬空的包围盒角点, 不能用
+    if o is True or o is None:
+        if outer_round("Front"):
+            rep["ordinate_skipped"] = "round part: holes are dimensioned by diameter / pitch circle"
+            return []
+        if not datum_faces("Front"):
+            rep["ordinate_skipped"] = "no flat datum faces at the left / bottom of the front view"
+            return []
     if isinstance(o, dict):
         if o.get("groups") is not None:
             return [g for g in front if g["id"] in o["groups"]]
@@ -571,9 +601,6 @@ def group_positions(g):
     return [[fmt((V(*h["at"]) - bb.Center).dot(bw_) + hw), fmt((V(*h["at"]) - bb.Center).dot(bh_) + hh_)] for h in g["holes"]]
 
 
-ORD_GROUPS = ordinate_groups()
-rep["hole_groups"] = [{"id": g["id"], "view": g["view"], "text": g["text"], "count": len(g["holes"]),
-                       "positions": group_positions(g), "ordinate": g in ORD_GROUPS} for g in HOLE_GROUPS]
 # ---------------------------------------------------------------- 圆形件: 视图轮廓是整圆 → 标直径, 不标长 × 宽
 def outer_round(vname):
     """视图方向上最大的外圆柱面(凸, 轴线 ∥ 视线), 且直径 ≈ 视图外形(≥ 98%)→ 返回半径, 否则 None。"""
@@ -628,6 +655,56 @@ def tol_suffix(value, tol):
             rep["warnings"].append("tolerance %s on %s: %s" % (tol, fmt(value), e))
             return " " + tol
     return tol if tol.startswith("±") else " " + tol
+
+
+# 锥面(用户 2026-11-19: 锥孔没有标锥度): 解析圆锥面 → 锥度 C = 2·tan(半锥角), 标 "1:x"(符号尖朝小端)
+def cone_features():
+    out = []
+    for f in shape.Faces:
+        s_ = f.Surface
+        if not isinstance(s_, Part.Cone):
+            continue
+        try:
+            ha = abs(s_.SemiAngle)
+            ax = V(s_.Axis).normalize()
+            apex = V(s_.Apex)
+            u0, u1, v0, v1 = f.ParameterRange
+            mid = f.valueAt((u0 + u1) / 2, (v0 + v1) / 2)
+        except Exception:
+            continue
+        # 锥度只标"锥"(半锥角 < 15°, 如 1:10 定心锥); 45° 左右的是倒角 / 沉孔口, 另按倒角标
+        if ha < math.radians(0.2) or ha > math.radians(15):
+            continue
+        C = 2 * math.tan(ha)
+        x = 1 / C
+        txt = "1:%d" % round(x) if abs(x - round(x)) < 0.05 * max(1.0, x / 10) else "1:%s" % fmt(x, 1)
+        # 同一个锥常被存成两个半面(接缝): 按 锥顶 + 轴线 + 锥度 去重
+        if any(abs(o["ratio"] - C) < 1e-4 and (o["apex"] - apex).Length < 1e-3 and abs(abs(o["axis"].dot(ax)) - 1) < 1e-6 for o in out):
+            continue
+        rad = (mid - apex) - ax * (mid - apex).dot(ax)   # 轴线 → 面上点的径向
+        out.append({"ratio": C, "half": ha, "axis": ax, "apex": apex, "mid": mid, "text": txt,
+                    "internal": rad.dot(f.normalAt((u0 + u1) / 2, (v0 + v1) / 2)) < 0})   # 法向朝轴线 = 内锥(锥孔)
+    return out
+
+
+CONES = cone_features()
+
+
+def cone_view(c):
+    """锥面在哪个视图里显示成斜线(轴 ⟂ 视线): 有剖视且剖切面含轴线就用剖视(内锥要剖开才看得见), 否则主 → 俯 → 左。"""
+    if isinstance(sec_spec, dict) and abs(c["axis"].dot(V(*sec_spec["normal"]))) < 1e-6:
+        return "Section"
+    for n in ("Front", "Top", "Left"):
+        if abs(c["axis"].dot(VAX[n][2])) < 1e-6:
+            return n
+    return None
+
+
+rep["cones"] = [{"taper": c["text"], "half_angle_deg": round(math.degrees(c["half"]), 4), "internal": c["internal"], "view": cone_view(c)} for c in CONES]
+
+ORD_GROUPS = ordinate_groups()
+rep["hole_groups"] = [{"id": g["id"], "view": g["view"], "text": g["text"], "count": len(g["holes"]),
+                       "positions": group_positions(g), "ordinate": g in ORD_GROUPS} for g in HOLE_GROUPS]
 
 
 # ---------------------------------------------------------------- 比例: 国标优先系列里放得下的最大
@@ -692,10 +769,25 @@ def ord_reserve(vname, hole_list):
     return {"left": base + wy, "top": base + wx}
 
 
+def view_axes(vname):
+    """视图的(横, 竖)模型轴; 剖视 = 基视图的横轴 + 基视图的视线方向(剖切后从剖切面法向看)。"""
+    if vname == "Section" and isinstance(sec_spec, dict):
+        bw_, _, bd_ = VAX[sec_spec.get("base", "Front")]
+        return bw_, bd_
+    return VAX[vname][0], VAX[vname][1]
+
+
 def local_of(vname, pt):
-    """模型点 → 视图局部坐标(模型毫米, 以包围盒中心为原点, x 右 y 上)。符号在建视图前只是估计, 第二遍用视图里的圆边。"""
-    bw_, bh_, _ = VAX[vname]
+    """模型点 → 视图局部坐标(模型毫米, 以包围盒中心为原点, x 右 y 上)。符号在建视图前只是估计, 第二遍用视图里的边。"""
+    bw_, bh_ = view_axes(vname)
     return [(pt - bb.Center).dot(bw_), (pt - bb.Center).dot(bh_)]
+
+
+def taper_text(c, vname):
+    """锥度标注文字: 符号尖朝小端(GB/T 15754), 方向按小端在视图里朝左还是朝右。"""
+    bw_, _ = view_axes(vname)
+    left = (c["apex"] - c["mid"]).dot(bw_) < 0
+    return ("◁ " if left else "▷ ") + c["text"]
 
 
 def layout_problem(anchors=None, fixed_scale=None, sec_dir=("Top", "right")):
@@ -705,7 +797,7 @@ def layout_problem(anchors=None, fixed_scale=None, sec_dir=("Top", "right")):
     keep = []
     rg = std.get("roughness")
     if rg:
-        keep.append([rg["x"] - 30, rg["y"] - 8, inner_r, rg["y"] + 10])   # 右上角"其余 ∇6.3"
+        keep.append([rg["x"] - 30, rg["y"] - 13, inner_r, rg["y"] + 5])   # 右上角"其余 ∇6.3"(符号 + Ra 值伸到 y − 11.5)
     views_ = [{"id": "Front", "w": Wm, "h": Hm}, {"id": "Top", "w": Wm, "h": Dm, "rel": {"of": "Front", "dir": "below"}},
               {"id": "Left", "w": Dm, "h": Hm, "rel": {"of": "Front", "dir": "right"}}]
     reserve = []
@@ -750,6 +842,15 @@ def layout_problem(anchors=None, fixed_scale=None, sec_dir=("Top", "right")):
         pts = [(local_of(g["view"], V(*h["at"])), h) for h in g["holes"]]
         (c_, h_) = min(pts, key=lambda ph: min(hw - abs(ph[0][0]), hh_ - abs(ph[0][1])))
         lab(g["id"], g["view"], c_, h_["d"] / 2, shown_text(g["id"], "Diameter", g["text"]))
+    for i_, cn in enumerate(CONES):
+        vn = cone_view(cn)
+        if vn is None or (vn == "Section" and not isinstance(sec_spec, dict)):
+            vn = next((n for n in ("Front", "Top", "Left") if abs(cn["axis"].dot(VAX[n][2])) < 1e-6), None)
+        if vn is None:
+            continue
+        id_ = "Taper%d" % (i_ + 1)
+        a_ = anchors.get(id_, (vn, local_of(vn, cn["mid"])))
+        labels_.append({"id": id_, "view": a_[0], "anchor": a_[1], "text": taper_text(cn, a_[0]), "prio": 2})
     p_ = {"paper": [W, H], "area": area, "keepout": keep, "views": views_, "dims": dims_, "labels": labels_, "reserve": reserve}
     if fixed_scale:
         p_["scale"] = fixed_scale
@@ -1096,23 +1197,60 @@ G, STEP = DIMS["gap"], DIMS["step"]
 FSPEC = "%." + str(DIMS["decimals"]) + "w"
 
 
+def verts_of(view):
+    out = []
+    i = 0
+    while True:
+        try:
+            p = view.getVertexByIndex(i)
+        except Exception:
+            break
+        if p is None:
+            break
+        out.append(("Vertex%d" % i, p))
+        i += 1
+    return out
+
+
+def extreme_pair(view, axis):
+    """外形尺寸的两个端点: 视图里沿 axis 最靠两端的顶点(含倒角 —— 用户 2026-11-19: 厚度没把倒角含进去; 轴的总长挂在 Ø18 段上)。
+    同一端有好几个顶点时取离视图中线最近的(界线短)。→ [左 / 下端名, 右 / 上端名] 或 None"""
+    k = 0 if axis == "x" else 1
+    vs = []
+    for n, p in verts_of(view):
+        pt = getattr(p, "Point", p)
+        vs.append((n, pt.x, pt.y))
+    if len(vs) < 2:
+        return None
+    vals = [v[1 + k] for v in vs]
+    lo, hi = min(vals), max(vals)
+    if hi - lo < 1e-6:
+        return None
+    other = lambda v: abs(v[2 - k])
+    a = min((v for v in vs if abs(v[1 + k] - lo) < 1e-4), key=other)
+    b = min((v for v in vs if abs(v[1 + k] - hi) < 1e-4), key=other)
+    return [a[0], b[0]]
+
+
 def place_linear(vname, axis, side, name, value):
-    """外形尺寸: vname 视图里沿 axis("x" 横 / "y" 竖)最长的边, 放在 side(top / bottom / left / right)外侧。"""
+    """外形尺寸: vname 视图里沿 axis("x" 横 / "y" 竖)两端的极值顶点之间, 放在 side(top / bottom / left / right)外侧。"""
     v, r = views[vname], R[vname]
+    pair = extreme_pair(v, axis)
     e = longest(v, axis)
-    if not e:
+    if not pair and not e:
         return
+    refs_ = pair if pair else [e]
     cx, cy = (r[0] + r[2]) / 2, (r[1] + r[3]) / 2
     if name in LAY_DIM:
         # 布局层: 尺寸线所在位置(TechDraw 的尺寸位置 = 文字处, 尺寸线跟着走)
         d_ = LAY_DIM[name]
         (p0, p1) = d_["line"]
         p = (d_["text_at"][0], H - p0[1]) if axis == "x" else (p0[0], H - d_["text_at"][1])
-        add_dim(v, "DistanceX" if axis == "x" else "DistanceY", [e], name, p, fmt_spec=FSPEC, value=value)
+        add_dim(v, "DistanceX" if axis == "x" else "DistanceY", refs_, name, p, fmt_spec=FSPEC, value=value)
         return
     # 左右两侧多让 6 mm: 剖切符号的箭头伸在视图左右外面
     p = {"top": (cx, r[3] + G), "bottom": (cx, r[1] - G), "left": (r[0] - G - 6, cy), "right": (r[2] + G + 6, cy)}[side]
-    add_dim(v, "DistanceX" if axis == "x" else "DistanceY", [e], name, p, fmt_spec=FSPEC, value=value)
+    add_dim(v, "DistanceX" if axis == "x" else "DistanceY", refs_, name, p, fmt_spec=FSPEC, value=value)
     placer.take(text_rect(p[0], p[1], fmt(value)))
 
 
@@ -1185,11 +1323,15 @@ def ordinates(vname, hole_list):
     ys = uniq([-hh_, hh_] + [p[1] for p in pts])
     got = spread([cyp + y * scale for y in ys], fs + 0.8)
     wmax = 0.0
+    # 界线从孔心引出(用户 2026-11-19: 尺寸线要看得出连在哪个点上); 外形两端的值本身就在轮廓边上, 不用引
     for y, pg in zip(ys, got):
         py_ = cyp + y * scale
         x0_ = r[0] - gap
         x1_ = x0_ - tick
         x2_ = x1_ - jog
+        own = [p[0] for p in pts if abs(p[1] - y) < 0.01]
+        if own and abs(abs(y) - hh_) > 0.01:
+            poly((cxp + min(own) * scale, py_), (x0_, py_))
         poly((x0_, py_), (x1_, py_), (x2_, pg))
         txt = fmt(y + hh_)
         w = text_rect(0, 0, txt)[2] * 2
@@ -1206,6 +1348,9 @@ def ordinates(vname, hole_list):
         y0_ = r[3] + gap
         y1_ = y0_ + tick
         y2_ = y1_ + jog
+        own = [p[1] for p in pts if abs(p[0] - x) < 0.01]
+        if own and abs(abs(x) - hw) > 0.01:
+            poly((px_, cyp + max(own) * scale), (px_, y0_))
         poly((px_, y0_), (px_, y1_), (pg, y2_))
         txt = fmt(x + hw)
         w = text_rect(0, 0, txt)[2] * 2
@@ -1298,6 +1443,45 @@ if LAY:
         vs_ = outer_cyl_views(d_)
         if vs_:
             dia_anchor_("DiaFit%d" % (i_ + 1), vs_[0], d_ / 2)
+    # 锥面: 视图里与轴成半锥角的直线边(锥面的轮廓线), 取离估计点最近的那条的中点
+    for i_, cn in enumerate(CONES):
+        vn = cone_view(cn)
+        vobj = sec if vn == "Section" else views.get(vn)
+        if vobj is None:
+            continue
+        bw_, bh_ = view_axes(vn)
+        ax2 = (cn["axis"].dot(bw_), cn["axis"].dot(bh_))
+        la = math.hypot(*ax2)
+        if la < 1e-6:
+            continue
+        ax2 = (ax2[0] / la, ax2[1] / la)
+        est = local_of(vn, cn["mid"])
+        best_ = None
+        for n_, ed in edges_of(vobj):
+            # 剖视里锥面的轮廓线常是 B 样条(实测磁环座): 只要是直的(中点在弦上)就算
+            if len(ed.Vertexes) < 2:
+                continue
+            p0_, p1_ = ed.Vertexes[0].Point, ed.Vertexes[-1].Point
+            dx, dy = p1_.x - p0_.x, p1_.y - p0_.y
+            ll = math.hypot(dx, dy)
+            if ll < 0.5:
+                continue
+            if not isinstance(ed.Curve, Part.Line):
+                try:
+                    pm = ed.valueAt((ed.FirstParameter + ed.LastParameter) / 2)
+                except Exception:
+                    continue
+                if abs((pm.x - p0_.x) * dy - (pm.y - p0_.y) * dx) / ll > 0.02:
+                    continue
+            ang = math.acos(min(1.0, abs(dx * ax2[0] + dy * ax2[1]) / ll))
+            if abs(ang - cn["half"]) > math.radians(0.5):
+                continue
+            m_ = ((p0_.x + p1_.x) / 2, (p0_.y + p1_.y) / 2)
+            dd = min(math.hypot(m_[0] - sx * est[0], m_[1] - sy * est[1]) for sx in (1, -1) for sy in (1, -1))
+            if best_ is None or dd < best_[0]:
+                best_ = (dd, m_)
+        if best_:
+            anchors_["Taper%d" % (i_ + 1)] = (vn, [best_[1][0], best_[1][1]])
     try:
         # 剖视被删掉(空出地方)且方案没定比例 → 第二遍可以重新选比例(可能更大)
         free_scale_ = globals().get("SEC_REMOVED") and spec.get("scale", "auto") == "auto"
@@ -1341,6 +1525,19 @@ if LAY:
         rep["warnings"].append("layout: %s not placed (%s)" % (w_["id"], w_["why"]))
     LAY_DIM.update(LAY["dims"])
     LAY_LAB.update(LAY["labels"])
+    # 锥度标注: 引线(锥面上一点 → 折点 → 肩线)+ 文字, 画进页面图形(布局坐标本来就是 y 向下的页面毫米)
+    fs_, lw_, fam_ = std["fonts"]["dim"], std["lines"]["thin"], std["fonts"]["latin"]
+    for id_, l_ in LAY["labels"].items():
+        if not id_.startswith("Taper"):
+            continue
+        a_, k_, e_ = l_["leader"]
+        PAGE_SVG.append('<polyline points="%.3f,%.3f %.3f,%.3f %.3f,%.3f" style="fill:none;stroke:#000;stroke-width:%g"/>'
+                        % (a_[0], a_[1], k_[0], k_[1], e_[0], e_[1], lw_))
+        PAGE_SVG.append('<circle cx="%.3f" cy="%.3f" r="0.5" style="fill:#000"/>' % (a_[0], a_[1]))   # 引线落在面上 = 圆点
+        r_ = l_["text_rect"]
+        PAGE_SVG.append('<text x="%.3f" y="%.3f" style="font-family:%s;font-size:%gpx;fill:#000">%s</text>'
+                        % (r_[0] + 0.5, r_[3] - 0.4, fam_, fs_, l_["lines"][0]))
+        rep["placed"].append({"name": id_, "type": "Taper", "text": l_["lines"][0], "at": [round(r_[0], 1), round(H - r_[3], 1)]})
     # 布局排好的文字占位交给旧的避让器(后面补的尺寸 / 螺纹等照常避开)
     for d_ in list(LAY["dims"].values()) + list(LAY["labels"].values()):
         r_ = d_["text_rect"]
