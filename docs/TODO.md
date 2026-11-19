@@ -719,6 +719,11 @@
       百炼 Retrieve / 千帆 AppBuilder（返回分块 + 页码）—— 需要把手册 PDF 放进去（ima 订阅库的原文拿不到）。
 - [ ] **K3 计算工具逆向**（2026-11-19 用户）：大工程师、立创机械大师、怡和达的计算工具 → 逆向，提取有用的工具（公式 / 表格 / 选型逻辑）做进 GB 计算模块（K2）。注意各家许可，只取公开的工程公式与标准表。
 - [ ] **K4 向 ima 上传机械知识**（2026-11-19 用户）：把常用手册 / 国标 / 自己的设计规范传进用户自己的 ima 知识库（官方 skill 的 create_media → COS → add_knowledge），以后 agent 可直接检索。
+- [x] **K6 知识库接口 + 范例库**（2026-11-19 用户，分支 feature/knowledge-base）：helper 留接口（`kb_*` MCP 工具，`pla_ui::kb`，源配置 `<数据目录>/knowledge.json`：local / command / ima），
+      不内置数据库；范例库 `PLAHelper/mech-kb`（纯本地、独立 git，格式见其 SCHEMA.md）：知识卡片 + 外部资源（mechtool.cn 20 条、awesome-mecheng 20 条，只链接、说明自写）
+      + 计算工具（fit-limits / bolt-preload / bearing-life / shaft-torsion / key-crush，每个带参考用例，共 36 条全过；运行器在 vm 沙箱里跑、无 require、限时 2 s）。
+      工作流：先搜 → 有工具就算 → 没有就手算注明出处 → 做完提议固化（kb_propose 只写 proposals/，`node runner/kb.js test-proposal <id>` 审）。第一份草稿：coupling-select（联轴器计算转矩校核）。
+      原 knowledge_* 三个 ima 工具并进 kb_*（kind ima 的源）。待做：更多工具（K3 逆向来源）、卡片；ima 写入（K4）。
 - [ ] **K5 知识资源引导**（2026-11-19 用户：不给 helper 集成知识库，而是让 MCP / skill 引导 agent 在用的时候去权威资源找正确的知识）：
       MCP 里给一份"主题 → 资源"清单（标准号、网站深链、看什么），工具描述里要求先查再答、注明出处。
       mechtool.cn 调研（2026-11-19）：计算器（公差配合 GB/T 1800.1-2020、螺栓、轴、滚动轴承、齿轮 / 蜗杆、弹簧、带 / 链、滚珠丝杠、导轨、电机选型、液压气动、挠度…）

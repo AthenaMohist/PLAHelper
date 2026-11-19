@@ -33,7 +33,10 @@
 | `parts_library` | 零件库(全局): search / get / add(按分类 + 项目自动编号, 分类不给就猜)/ update(字段、供应商价格自动记日期、首选、改分类 = 重新编号旧号进 former)/ remove; 与 BOM 行: link / from_bom(把行存成新条目并链接)/ suggest |
 | `bom_template` | BOM 模板(全局): list / get / create(from 模板名或 builtin)/ rename / remove(最后一个不删)/ edit(add_columns 带 after、update_columns(null = 清掉该项)、remove_columns、order、columns 整体替换)。保存前体检: id 唯一、来源合法、公式只引用存在的列、无循环。文档按名字选模板(`bom_edit template`, "" = 默认); **默认 = 按名字排第一个**, 新建的名字排到最前会变成没选过模板的文档的默认(create 回包会提醒)。删列不删文档里该列的填写 |
 | `hole_table` | 孔规格方案(全局): list(含当前)/ get / create(默认复制当前)/ rename / remove / select(写偏好 hole_preset, pla-ui 孔面板 1 秒内跟着切)/ edit(set 按规格改或加, 新规格五个数都要给; remove_sizes; 按公称直径排序; > 0 校验, 可疑值给 warnings)。`model_hole` 可给 `size` + `usage` + `table`, 数值从方案里填(显式给的优先; 组合孔 d = 过孔、tapD = 底孔) |
-| `knowledge_bases` / `knowledge_search` / `knowledge_get` | 腾讯 ima 专业知识库(只读, 不依赖 Plasticity): 列库 / 按标题关键词搜(默认 5 个核心机械库)/ 下载原文到本地缓存。订阅库只有标题; 每日额度有限, 结果缓存 24 h。细节见 `pla_ui::knowledge` 文件头 |
+| `kb_search` / `kb_get` / `kb_run` / `kb_propose` / `kb_sources` | 知识库接口(2026-11-19, 不依赖 Plasticity; `pla_ui::kb`): helper 不内置知识库, 用户在 `<数据目录>/knowledge.json` 里接自己的源 ——
+`local`(目录格式见 mech-kb/SCHEMA.md: 卡片 / 外部资源 / 计算工具 / 草稿)、`command`(任意系统包一层脚本: stdin 一行 JSON search / get / run)、`ima`(腾讯 ima, 只按标题搜)。
+agent 先 `kb_search`, 有工具就 `kb_run`(输入校验 + 每步公式与出处), 没有就手算注明出处, 做完可 `kb_propose` 把这类计算写成工具草稿(只进 proposals/, 用户审核后挪进 tools/)。
+范例库 `PLAHelper/mech-kb`(独立 git): 5 个已校核工具(配合偏差、螺栓预紧 / 力矩、轴承寿命、轴最小直径、平键挤压, 36 个参考用例)+ 卡片 + mechtool.cn / awesome-mecheng 的资源链接 |
 | `dims` | 尺寸记录与参数: list; `set`(按名字改尺寸, 事务内)/ `set_param`(改参数, 绑定的尺寸跟着改)经 pla-ui 在前台文档上做 |
 
 实测(后台 bgtest): 读表 → 改料号 / 表面处理 / 归 CNC·3D 打印·外购 / 套数 2 / 加手动行(公式跟着算)→ 外发 R2: ECN-001(3 项)、重出 2 张图、CNC 包(PDF/DXF/STEP + BOM, 带表面处理)、3D 打印包(STEP + BOM)、zip;

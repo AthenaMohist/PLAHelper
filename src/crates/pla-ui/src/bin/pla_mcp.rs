@@ -221,15 +221,23 @@ The spec, a map (bodies, solid ids, undo range) and a log are saved under the do
             "action": {"type": "string", "enum": ["list", "get", "create", "rename", "remove", "select", "edit"]}, "name": {"type": "string"}, "new_name": {"type": "string"}, "from": {"type": "string"},
             "set": {"type": "array", "items": {"type": "object", "properties": {"size": {"type": "string"}, "clearance": {"type": "number"}, "tap": {"type": "number"}, "cbD": {"type": "number"}, "cbDepth": {"type": "number"}, "cskD": {"type": "number"}}, "required": ["size"]}},
             "remove_sizes": {"type": "array", "items": {"type": "string"}}}, "required": ["action"]}},
-        {"name": "knowledge_bases", "annotations": {"readOnlyHint": true},
-         "description": "Professional knowledge bases (Tencent ima, the user's account): list every knowledge base (own + subscribed) with id, name, item count, kind, role. query filters names. searched_by_default = the mechanical-design ones knowledge_search uses when kb is omitted.",
-         "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}}},
-        {"name": "knowledge_search", "annotations": {"readOnlyHint": true},
-         "description": "Search the user's ima knowledge bases (design handbooks, GB standards, material data…) BEFORE answering engineering questions from memory, and cite what you use. ima matches TITLES by keyword: give short keywords (\"联轴器\", \"键连接\", \"GB/T 1095\"); several words are searched one by one and ranked by how many the title contains. kb = knowledge base names (fragments) or ids; omitted = the mechanical-design ones. Returns hits {kb, title, type, media_id, own}. Subscribed knowledge bases only expose titles; files of the user's own knowledge base can be fetched with knowledge_get.",
-         "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "kb": {"type": "array", "items": {"type": "string"}}, "limit": {"type": "integer", "description": "max hits (default 30)"}}, "required": ["query"]}},
-        {"name": "knowledge_get", "annotations": {"readOnlyHint": true},
-         "description": "Look up one knowledge-base item (media_id from knowledge_search): notes come back as text; files return type + a temporary source link (nothing is downloaded - the user only wants queries). Items of subscribed knowledge bases are refused by ima (available: false). ima's API has no question-answering endpoint: answer from the titles you found plus your own engineering calculation, and cite the titles.",
-         "inputSchema": {"type": "object", "properties": {"media_id": {"type": "string"}}, "required": ["media_id"]}},
+        {"name": "kb_search", "annotations": {"readOnlyHint": true},
+         "description": "Engineering knowledge bases the user connected (their own folders like mech-kb, other systems via a command bridge, Tencent ima). USE IT FIRST for any design / sizing / checking question (fits, bolts, shafts, keys, bearings, materials, standards…) instead of answering from memory: kinds = card (design notes with sources) / tool (calculation tools - prefer these: run them with kb_run) / resource (external sites, standards, handbooks: link + what to look up there). Short keywords work best (\"配合 H7\", \"螺栓 力矩\", \"轴承 寿命\"). Returns hits per source. Cite what you used. If no tool fits, calculate by hand with formulas and sources, and after the task offer kb_propose so the calculation becomes a reusable tool.",
+         "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "kinds": {"type": "array", "items": {"type": "string", "enum": ["card", "tool", "resource"]}}, "source": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["query"]}},
+        {"name": "kb_get", "annotations": {"readOnlyHint": true},
+         "description": "Read one knowledge item: card (full text + sources), tool (spec: inputs with units / defaults / ranges, outputs, refs, number of reference cases), resource (url, what to look for, access, terms - only link to external sites, never scrape them). source is needed when several sources are configured.",
+         "inputSchema": {"type": "object", "properties": {"kind": {"type": "string", "enum": ["card", "tool", "resource"]}, "id": {"type": "string"}, "source": {"type": "string"}}, "required": ["kind", "id"]}},
+        {"name": "kb_run", "annotations": {"readOnlyHint": true},
+         "description": "Run a calculation tool from a knowledge base (kb_get kind tool shows its inputs). Inputs are validated (units, ranges, enums). Returns outputs with units, every step (formula, value, standard / clause), warnings and refs - quote the steps and refs in your answer. Tools are verified against reference cases; draft proposals are never run.",
+         "inputSchema": {"type": "object", "properties": {"tool": {"type": "string"}, "inputs": {"type": "object"}, "source": {"type": "string"}}, "required": ["tool", "inputs"]}},
+        {"name": "kb_propose", "annotations": {"destructiveHint": false},
+         "description": "After finishing a task where you had to calculate something by hand that will come up again, propose turning it into a tool (or write a card). Writes a DRAFT into <kb>/proposals/ only (never into tools/ or cards/); the user reviews and moves it. kind tool: id (lower-case-dashes), spec {title, summary, tags, standards, inputs [{name, label, unit, type number|integer|enum|string|boolean, default?, min?, max?, values?}], outputs [{name, label, unit}], refs [where every formula comes from]}, code (tool.js: module.exports = { run(inputs) { return { outputs, steps: [{what, formula, value, unit, ref}], warnings } } } - pure calculation, no require), tests [{name, inputs, expect: {output: [value, tolerance] | \"text\"}, ref: where the expected value comes from - a standard table, handbook example or independent hand calculation, never the tool's own output}]. kind card: id, text (markdown starting with --- id / title / tags / standards / tools / resources ---). Ask the user before proposing.",
+         "inputSchema": {"type": "object", "properties": {"kind": {"type": "string", "enum": ["tool", "card"]}, "id": {"type": "string"}, "spec": {"type": "object"}, "code": {"type": "string"},
+            "tests": {"type": "array", "items": {"type": "object"}}, "text": {"type": "string"}, "source": {"type": "string"}, "overwrite": {"type": "boolean"}}, "required": ["kind", "id"]}},
+        {"name": "kb_sources", "annotations": {"destructiveHint": false},
+         "description": "Knowledge sources PLAhelper searches (stored in <PLAhelper data dir>/knowledge.json). action=list / add / remove. add: name + kind local (path = a folder with kb.json, format in mech-kb/SCHEMA.md) | command (command + args: a program answering one-line JSON requests {op: search|get|run} on stdin) | ima (Tencent ima, title search only). Only add sources the user asked for.",
+         "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["list", "add", "remove"]}, "name": {"type": "string"}, "kind": {"type": "string", "enum": ["local", "command", "ima"]},
+            "path": {"type": "string"}, "command": {"type": "string"}, "args": {"type": "array", "items": {"type": "string"}}}, "required": ["action"]}},
         {"name": "background_bom", "annotations": {"destructiveHint": true},
          "description": "(Same as bom_export with doc=background.) Scan the BOM of the document open in the background instance (same as PLAhelper's BOM tab: template, user entries, part library, part identity tracking) and export it as CSV next to the document. scope = a configuration name (default: currently visible). Refused when the same document is open in the foreground.",
          "inputSchema": {"type": "object", "properties": {"scope": {"type": "string"}}}},
@@ -986,27 +994,22 @@ fn doc_scan(d: &Doc, scope: Option<&str>) -> Result<(Value, pla_ui::doc_jobs::Mi
 const DOC_TOOLS: &[&str] = &[
     "bom_table", "bom_edit", "bom_export", "draw_parts", "release", "release_history", "suppliers", "configs", "dims", "parts_library",
     "bom_template", "hole_table", "background_bom", "background_draw", "background_release",
-    "knowledge_bases", "knowledge_search", "knowledge_get",
+    "kb_search", "kb_get", "kb_run", "kb_propose", "kb_sources",
 ];
 
-/// K1 专业知识库(腾讯 ima, 只读)
-fn knowledge_tool(name: &str, a: &Value) -> Result<Value, String> {
-    use pla_ui::knowledge as k;
-    let list = |v: &Value| -> Vec<String> {
-        match v {
-            Value::String(s) => vec![s.clone()],
-            Value::Array(xs) => xs.iter().filter_map(|x| x.as_str().map(str::to_string)).collect(),
-            _ => vec![],
-        }
-    };
+/// K5 知识库接口(本地目录 / 命令桥 / ima; 见 pla_ui::kb)
+fn kb_tool(name: &str, a: &Value) -> Result<Value, String> {
+    use pla_ui::kb;
+    let src = a["source"].as_str().filter(|s| !s.is_empty());
     match name {
-        "knowledge_bases" => {
-            let all = k::bases(a["query"].as_str().unwrap_or(""))?;
-            let default: Vec<Value> = k::pick_bases(&all, &[]).iter().map(|b| b["name"].clone()).collect();
-            Ok(json!({"bases": all, "searched_by_default": default}))
+        "kb_search" => {
+            let kinds: Vec<String> = a["kinds"].as_array().map(|x| x.iter().filter_map(|k| k.as_str().map(str::to_string)).collect()).unwrap_or_default();
+            kb::search(a["query"].as_str().unwrap_or(""), &kinds, src, a["limit"].as_u64().unwrap_or(15) as usize)
         }
-        "knowledge_search" => k::search(a["query"].as_str().unwrap_or(""), &list(&a["kb"]), a["limit"].as_u64().unwrap_or(30) as usize),
-        "knowledge_get" => k::get(a["media_id"].as_str().unwrap_or("")),
+        "kb_get" => kb::get(src, a["kind"].as_str().unwrap_or(""), a["id"].as_str().unwrap_or("")),
+        "kb_run" => kb::run(src, a["tool"].as_str().unwrap_or(""), &a["inputs"]),
+        "kb_propose" => kb::propose(src, a),
+        "kb_sources" => kb::sources_tool(a),
         _ => Err(format!("unknown tool {name}")),
     }
 }
@@ -1034,8 +1037,8 @@ fn doc_tool(name: &str, a: &Value) -> Value {
         if name == "hole_table" {
             return hole_table_tool(&a);
         }
-        if name.starts_with("knowledge_") {
-            return knowledge_tool(&name, &a);
+        if name.starts_with("kb_") {
+            return kb_tool(&name, &a);
         }
         let d = doc_target(&a)?;
         match name.as_str() {
