@@ -14,7 +14,6 @@
 //! (与官方 ima-skill 同一位置)。凭证只发往 ima.qq.com, 不写日志、不进回包。
 
 use serde_json::{json, Value};
-use std::io::Read;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -289,21 +288,13 @@ pub fn media_type_name(t: i64) -> &'static str {
     }
 }
 
-fn ext_for(t: i64, url: &str) -> String {
-    let from_url = url.split(['?', '#']).next().and_then(|p| p.rsplit('/').next()).and_then(|f| f.rsplit_once('.').map(|(_, e)| e.to_lowercase())).filter(|e| e.len() <= 5 && e.chars().all(|c| c.is_ascii_alphanumeric()));
-    from_url.unwrap_or_else(|| match t {
-        1 => "pdf", 3 => "docx", 4 => "pptx", 5 => "xlsx", 7 => "md", 9 => "png", 13 => "txt", 2 | 6 | 20 => "html", 21 => "epub",
-        _ => "bin",
-    }.into())
-}
-
-/// 下载缓存目录(%LOCALAPPDATA%\PLAhelper\ima-cache)
+/// 本地缓存目录(%LOCALAPPDATA%\PLAhelper\ima-cache; 只存搜索结果与库清单)
 pub fn cache_dir() -> PathBuf {
     let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).or_else(home).unwrap_or_else(std::env::temp_dir);
     base.join("PLAhelper").join("ima-cache")
 }
 
-/// 取原文: 下载到本地缓存, 返回路径(PDF / 图片等交给调用方的阅读工具)。订阅库 → 说明拿不到。
+/// 条目信息: 笔记 → 正文; 文件 → 类型 + 临时访问链接(不下载)。订阅库 → 说明拿不到。
 pub fn get(media_id: &str) -> Result<Value, String> {
     let mid = media_id.trim();
     if mid.is_empty() || !mid.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
@@ -322,32 +313,11 @@ pub fn get(media_id: &str) -> Result<Value, String> {
         let c = post_note(nb)?;
         return Ok(json!({"media_id": mid, "type": "note", "available": true, "text": c}));
     }
+    // 用户 2026-11-19: 不下载到本地, 只查询 → 只给出处信息(临时访问链接), 不落盘
     let url = d["url_info"]["url"].as_str().unwrap_or("");
-    if url.is_empty() {
-        return Ok(json!({"media_id": mid, "type": media_type_name(t), "available": false, "reason": "ima gives no URL for this item (open it in the ima app)"}));
-    }
-    let dir = cache_dir();
-    std::fs::create_dir_all(&dir).map_err(|e| format!("cache dir: {e}"))?;
-    let path = dir.join(format!("{mid}.{}", ext_for(t, url)));
-    if !path.exists() {
-        let mut req = agent().get(url);
-        if let Some(h) = d["url_info"]["headers"].as_object() {
-            for (k, v) in h {
-                if let Some(v) = v.as_str() {
-                    req = req.set(k, v);
-                }
-            }
-        }
-        let resp = req.call().map_err(|e| format!("download: {e}"))?;
-        let mut buf = vec![];
-        resp.into_reader().take(300 * 1024 * 1024).read_to_end(&mut buf).map_err(|e| format!("download: {e}"))?;
-        let tmp = path.with_extension("part");
-        std::fs::write(&tmp, &buf).map_err(|e| format!("save: {e}"))?;
-        std::fs::rename(&tmp, &path).map_err(|e| format!("save: {e}"))?;
-    }
-    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-    Ok(json!({"media_id": mid, "type": media_type_name(t), "available": true, "path": path.to_string_lossy(), "bytes": size, "source_url": url,
-              "hint": "Read the local file (PDF pages / image / text) and cite the title + page."}))
+    Ok(json!({"media_id": mid, "type": media_type_name(t), "available": !url.is_empty(),
+              "source_url": if url.is_empty() { Value::Null } else { json!(url) },
+              "hint": "Files are not downloaded (user's choice): cite the title; the user can open it in the ima app. Notes come back as text."}))
 }
 
 fn post_note(note_id: &str) -> Result<String, String> {
@@ -383,7 +353,5 @@ mod tests {
         let x: Vec<_> = pick_bases(&all, &["b".into()]).iter().map(|b| b["id"].as_str().unwrap().to_string()).collect();
         assert_eq!(x, vec!["b"], "按 id");
         assert_eq!(pick_bases(&all, &["手册".into()]).len(), 1, "按名字片段");
-        assert_eq!(ext_for(1, "https://x/y/file.PDF?sig=1"), "pdf");
-        assert_eq!(ext_for(5, "https://x/y/noext"), "xlsx");
     }
 }
