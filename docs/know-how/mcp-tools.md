@@ -45,6 +45,7 @@
 1. 先 `model_state`(概览) → 再按物体查 `detail: faces/edges`; 面 / 边 id 形如 `34f9439`, **物体版本 id(34)每次改动都变**, 改完要重新查。
 2. 改模型: `model_exec {ops}`, 默认 atomic(某步失败整次撤回)。配方(唯一来源 = 垫片 `NAMES.recipes`): box / cylinder(打孔 = subtract)/ fillet / chamfer / offsetFace / refillet / moveFaces / revolve / prism;
    整体操作(2026-11-19): duplicate / move / rotate / mirror / pattern / radialPattern / boolean(已有实体之间)/ delete / rename(know-how/command-dispatch.md「A4b」);
+   大纲(2026-11-19): `model_outline` 读树(文件夹嵌套 / 隐藏 / 锁定); `model_exec` 的 folder / moveTo / hide / show / ungroup / rename(folders)改树(know-how/command-dispatch.md「A4c」);
    步骤 `id` + `$id` 引用; 挑边 / 面可用 `{near, of, tol}`。参数错在执行前就报, 不产生命令。
 3. 多次调用要能整体撤回: `model_transaction begin` → … → `commit` / `rollback`。
 4. 核对: `model_measure`(距离 / 壁厚 normalDistance / 角度 / 体积)+ `model_view`(截图后还原相机)。

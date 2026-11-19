@@ -62,6 +62,7 @@ pub fn cap_label(c: &str) -> &'static str {
         cap::HIST_WRITE => tr("事务回滚(撤到起点)", "Transaction rollback (undo to start)"),
         cap::VIEW_HIGHLIGHT => tr("面高亮(叠加显示)", "Face highlight (overlay)"),
         cap::MEASURE_WRITE => tr("本体测量(建 Distance 测量并命名)", "Plasticity measurements (create named Distance)"),
+        cap::OUTLINE_READ => tr("大纲树读取(文件夹 / 隐藏状态)", "Outliner tree (folders / hidden state)"),
         cap::SNAP_READ => tr("吸附点(面心/边中点/圆心/顶点…)", "Snap points (face centres/edge midpoints/circle centres/vertices…)"),
         cap::BOOL_RUN => tr("布尔运算", "Boolean operations"),
         cap::ASSET_PLACE => tr("放置常用件", "Place common parts"),

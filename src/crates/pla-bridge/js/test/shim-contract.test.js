@@ -1216,6 +1216,41 @@ const callAsync = async (name, args) => JSON.parse(await run(`window.__PLA__.cal
     // rename: 记下改名调用
     const setName0 = ed.nodes.setName;
     ed.nodes.setName = function (key, name) { (ed.renamed = ed.renamed || []).push(name); if (setName0) return setName0.call(this, key, name); };
+    // 大纲: 假组库(仿 Groups: 根 id 0; create 不挂树, addMembership 挂上, _unsafeMoveNodeToGroup 移动, dissolve 成员回父组)
+    class Groups_Group { constructor(id) { this.id = id; } }
+    const gs = new Map([[0, new Groups_Group(0)]]), kids = new Map([[0, []]]), parentOf = new Map(), names = new Map(), hiddenKeys = new Set();
+    let gNext = 1;
+    const item2keyRaw = ed.nodes.item2key, getName0 = ed.nodes.getName;
+    const item2key0 = function (v) { const k = item2keyRaw.call(this, v); return k !== null && k !== undefined ? k : (v && v.userData ? 'v' + v.userData.versionId : null); };
+    ed.nodes.item2key = function (v) { return v instanceof Groups_Group ? 'g' + v.id : item2key0.call(this, v); };
+    ed.nodes.key2item = function (k) {
+      if (k[0] === 'g') return gs.get(Number(k.slice(1)));
+      return ed.geo.items.map((it) => it.view).find((v) => item2key0.call(ed.nodes, v) === k);
+    };
+    ed.nodes.getName = function (k) { return names.has(k) ? names.get(k) : getName0.call(this, k); };
+    const setName1 = ed.nodes.setName;
+    ed.nodes.setName = function (k, n) { names.set(k, n); return setName1.call(this, k, n); };
+    ed.nodes.setHidden = function (k, h) { if (h) hiddenKeys.add(k); else hiddenKeys.delete(k); };
+    ed.nodes.isHidden = function (k) { return hiddenKeys.has(k); };
+    ed.nodes.isVisible = function () { return true; };
+    const detach = (k) => { const p = parentOf.get(k); if (p !== undefined) kids.set(p, kids.get(p).filter((x) => x !== k)); };
+    ed.groups = {
+      root: gs.get(0),
+      get all() { return Array.from(gs.keys()); },
+      create() { const g = new Groups_Group(gNext++); gs.set(g.id, g); kids.set(g.id, []); return g; },
+      addMembership(k, g) { kids.get(g.id).push(k); parentOf.set(k, g.id); },
+      _unsafeMoveNodeToGroup(k, g) { detach(k); kids.get(g.id).push(k); parentOf.set(k, g.id); },
+      dissolve(g) { const k = 'g' + g.id, p = parentOf.get(k); kids.get(g.id).slice().forEach((c) => this._unsafeMoveNodeToGroup(c, gs.get(p))); detach(k); gs.delete(g.id); },
+      getChildren(g) {
+        if (g.id === 0) {   // 根: 没进过组的物体也算顶层(仿真: 实体默认在根)
+          const loose = ed.geo.items.map((it) => item2key0.call(ed.nodes, it.view)).filter((k) => k && !parentOf.has(k));
+          return kids.get(0).concat(loose);
+        }
+        return kids.get(g.id).slice();
+      },
+      lookupById(id) { return gs.get(id); },
+      getParentId(k) { return parentOf.has(k) ? parentOf.get(k) : 0; },
+    };
     class BooleanFactory extends AbstractFactory {
       constructor(editor) { super(editor); this.targets = []; this.tools = []; this.operationType = 15902; this.keepTools = false; }
       async commit() {
@@ -1248,9 +1283,9 @@ const callAsync = async (name, args) => JSON.parse(await run(`window.__PLA__.cal
     assert.strictEqual(f.loaded, false);
     assert.deepStrictEqual(f.missing.sort(), ['fac.boolean', 'fac.centerPolygon', 'fac.cornerBox', 'fac.curve', 'fac.cylinder', 'fac.duplicate', 'fac.extrude', 'fac.mirror',
       'fac.moveFaces', 'fac.moveItems', 'fac.multiFillet', 'fac.offsetFace', 'fac.radialArray', 'fac.rectArray', 'fac.refillet', 'fac.revolve', 'fac.rotateItems',
-      'geo.removeItem', 'nodes.setName']);  // 假编辑器里 removeItem / setName 随假工厂一起挂上
+      'geo.removeItem', 'groups.attach', 'groups.create', 'groups.dissolve', 'groups.move', 'nodes.setHidden', 'nodes.setName']);  // 假编辑器里这些随假工厂一起挂上
     assert.deepStrictEqual(f.ops, ['box', 'fillet', 'offsetFace', 'refillet', 'moveFaces', 'cylinder', 'chamfer', 'prism', 'revolve',
-      'duplicate', 'mirror', 'move', 'rotate', 'pattern', 'radialPattern', 'boolean', 'delete', 'rename']);
+      'duplicate', 'mirror', 'move', 'rotate', 'pattern', 'radialPattern', 'boolean', 'delete', 'rename', 'folder', 'moveTo', 'hide', 'show', 'ungroup']);
   });
 
   await ta('N2 cmd.exec M-A: L 形支架 = 底板 + 立板(合并) + 内角倒圆; 文档单位 mm → 内部米; 每步一个命令一个撤销步', async () => {
@@ -1378,6 +1413,50 @@ const callAsync = async (name, args) => JSON.parse(await run(`window.__PLA__.cal
     assert.ok(/both target and tool/.test(bad.v.failed.err), JSON.stringify(bad.v));
     const bad2 = await callAsync('cmd.exec', { ops: [{ op: 'boolean', targets: [String(b.v.results[2].items[0].id)], tools: [String(b.v.results[2].items[0].id)], operation: 'xor' }] });
     assert.ok(/operation must be one of/.test(bad2.v.failed.err), JSON.stringify(bad2.v));
+    // 大纲: 新建文件夹并移进去 → 子文件夹 → 隐藏 / 显示 → 改名 → 移回顶层 → 解散; outline.read 反映每一步
+    const u1 = ed.history._undoStack.length;
+    const o = await callAsync('cmd.exec', { ops: [
+      { op: 'box', id: 's1', p1: [0, 700, 0], p2: [1, 701, 0], height: 1 },
+      { op: 'box', id: 's2', p1: [0, 710, 0], p2: [1, 711, 0], height: 1 },
+      { op: 'folder', id: 'f', name: ' 备选方案 ', solids: ['$s1', '$s2'] },
+      { op: 'folder', id: 'sub', name: '子', parent: '$f' },
+      { op: 'moveTo', solids: ['$s2'], to: '$sub' },
+      { op: 'hide', folders: ['$f'] },
+    ] });
+    assert.strictEqual(o.v.failed, null, JSON.stringify(o.v.failed));
+    assert.deepStrictEqual(o.v.results[2].items[0].kind, 'folder');
+    assert.strictEqual(o.v.results[2].items[0].name, '备选方案', '文件夹名去掉首尾空格');
+    const fid = o.v.results[2].items[0].id, s1 = o.v.results[0].items[0].id, s2 = o.v.results[1].items[0].id;
+    const tree = () => call('outline.read', {}).v.children;
+    const f = tree().find((n) => n.kind === 'folder' && n.id === fid);
+    assert.ok(f && f.hidden, '文件夹隐藏');
+    assert.deepStrictEqual(f.children.map((c) => c.kind === 'folder' ? 'F:' + c.name : c.id), [s1, 'F:子']);
+    assert.deepStrictEqual(f.children[1].children.map((c) => c.id), [s2]);
+    assert.ok(!tree().some((n) => n.id === s1 && n.kind === 'solid'), '移进文件夹后不在顶层');
+    assert.strictEqual(ed.history._undoStack.length - u1, 2, '假编辑器只在工厂提交时记撤销步(两个盒子); 真机上每个命令一步(实测见 know-how)');
+    const errs = [
+      [{ op: 'moveTo', folders: [fid], to: '子' }, /into itself/],
+      [{ op: 'moveTo', solids: [s1], to: '没有' }, /no folder named/],
+      [{ op: 'hide' }, /needs solids or folders/],
+      [{ op: 'folder', name: '  ' }, /name must not be empty/],
+      [{ op: 'ungroup', folders: ['root'] }, /top level/],
+    ];
+    for (const [op, re] of errs) {
+      const x = (await callAsync('cmd.exec', { ops: [op] })).v;
+      assert.ok(x.failed && re.test(x.failed.err), JSON.stringify(x));
+    }
+    const o2 = await callAsync('cmd.exec', { ops: [
+      { op: 'show', folders: [fid] },
+      { op: 'rename', folders: ['子'], name: '方式II' },
+      { op: 'moveTo', solids: [s1], to: 'root' },
+      { op: 'ungroup', folders: ['方式II'] },
+    ] });
+    assert.strictEqual(o2.v.failed, null, JSON.stringify(o2.v.failed));
+    const f2 = tree().find((n) => n.kind === 'folder' && n.id === fid);
+    assert.strictEqual(f2.hidden, false);
+    assert.deepStrictEqual(f2.children.map((c) => c.id), [s2], '解散子文件夹 → 成员回上一级');
+    assert.ok(tree().some((n) => n.id === s1), '移回顶层');
+    assert.ok(call('outline.read', { kinds: ['curve'] }).v.children.every((n) => n.kind === 'folder' || n.kind === 'curve'), 'kinds 过滤');
   });
 
   await ta('N2 cmd.exec: 失败如实报且停在失败步; 已完成的保留; 引用已被吃掉的物体、挑不到边、PK 内核报错、参数错', async () => {
@@ -1403,7 +1482,7 @@ const callAsync = async (name, args) => JSON.parse(await run(`window.__PLA__.cal
     // 参数错误在执行任何一步之前就报
     const q1 = ed.enqueued;
     const bad = [
-      [{ ops: [{ op: 'sphere' }] }, /unknown op \(known: box, fillet, offsetFace, refillet, moveFaces, cylinder, chamfer, prism, revolve, duplicate, mirror, move, rotate, pattern, radialPattern, boolean, delete, rename\)/],
+      [{ ops: [{ op: 'sphere' }] }, /unknown op \(known: box, fillet, offsetFace, refillet, moveFaces, cylinder, chamfer, prism, revolve, duplicate, mirror, move, rotate, pattern, radialPattern, boolean, delete, rename, folder, moveTo, hide, show, ungroup\)/],
       [{ ops: [{ op: 'box', p1: [0, 0, 0], p2: [1, 1, 0] }] }, /missing height/],
       [{ ops: [{ op: 'box', p1: [0, 0, 0], p2: [1, 1, 0], height: 1, colour: 'red' }] }, /unknown param colour/],
       [{ ops: [{ op: 'fillet', edges: ['1e1'], distance: 1, bool: 'union' }] }, /bool not supported/],

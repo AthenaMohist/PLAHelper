@@ -182,6 +182,23 @@
 - 竖板: duplicate 电机竖板 → move → box union 填掉电机止口 / 6 孔 → boolean intersect(target = 旧编码器竖板): 结果 = 编码器止口 / 中孔 / 4 孔 + 电机竖板的全部连接孔(M3 沉头槽 ×3、侧面 M3 ×2、底部 M6 ×4);
 - 螺钉: 电机座 9 颗 M3 / M6 duplicate + move; M4x12 duplicate → move 到孔位 → part.stretch +13 → radialPattern ×4 → rename "杯内六M4x25"。
 - 一个事务 16 步; 先查 id ↔ 名字, 任何一步失败整体回滚。
+- 2026-11-19 正式文件执行: 结果与演练一致(底板 145 面 160×85、竖板 113 面、9 颗 M3/M6 + 4 × M4x25), 未保存, 交用户检查。
+
+## A4c 大纲: 文件夹 / 移动 / 隐藏 / 解散(2026-11-19, 后台副本实测)
+
+用户反馈: MCP 不能和大纲树互动(建文件夹、把方案放进去并隐藏都得手工)。Plasticity 自己的 Group / Hide 命令都作用于选择集 → 不用它们, 在我们自己的命令里直接改组库 / 节点表(同 rename / delete, 一个撤销步, 撤销照常)。
+
+| 事实 | 说明 |
+|---|---|
+| 节点键 | `nodes.item2key(x)` = id × 256 + 类别(0 组 / 1 物体); `key2item` 反查; 组 = `Groups_Group{id}`, 根 id 0 = `ed.groups.root` |
+| 子项 | `groups.getChildren(组)` → 节点键数组(组和物体混排, 即大纲顺序); `getParentId(键)` |
+| 新建文件夹 | `groups.create()` 只建不挂 → `addMembership(组键, 父组)` 挂上 → `nodes.setName(组键, 名)` |
+| 移动 | `groups._unsafeMoveNodeToGroup(键, 目标组)`(从旧父组摘掉)。**`addMembership` 对已在别处的节点只加不删**, 旧父组里留残影 —— 不能拿它移动; `_unsafeMove(键, id, id)` 抛错 |
+| 解散 | `groups.dissolve(组)`, 成员回父组 |
+| 隐藏 | `nodes.setHidden(键, bool)`(= H; 文件夹隐藏 = 里面全部不显示)。**改完必须 `ed.scene.update()`**(SceneVisibilityManager 重算可见集合), 否则视口照旧; 命令结束不会自动重算。撤销(memento)会自己重算 |
+| "我们没做" | "unsafe" 指不查循环 → 垫片自己拒绝把文件夹移进自身 / 子孙 |
+
+验证: 后台 model1 副本里 folder(两实体)→ 子文件夹 → moveTo → hide → `_visible.has(Box.002)` false、大纲 DOM 出现文件夹 → show → true → 撤销 9 步回到原树。
 
 ## 加一个新操作
 

@@ -127,6 +127,8 @@ pub mod api {
     pub const ASSET_PLACE: &str = "asset.place";
     /// N5: 螺钉改长度 = 只把杆端的面(端面 + 倒角)沿轴平移(pack 里统一 10mm, 放进来再改)。
     pub const PART_STRETCH: &str = "part.stretch";
+    /// 大纲树(只读): 文件夹嵌套 + 物体(kind / id / 名字 / 隐藏); args.kinds 过滤物体类别。
+    pub const OUTLINE_READ: &str = "outline.read";
     /// N5b 建库: 改名 + 定 pivot + 标成资产 / 导出文档里所有资产成 pack / 登记 · 撤销登记 pack(paths 数组)。
     pub const ASSET_MARK: &str = "asset.mark";
     pub const ASSET_EXPORT_PACK: &str = "asset.exportPack";
@@ -149,7 +151,7 @@ pub mod api {
         CMD_PING, ERR_LAST, TREE_LIST, SEL_CANCEL_COMMAND, SEL_CLEAR, SEL_APPLY, CAM_NAVIGATE, CAM_RENDER, CAM_THUMBNAIL, CAM_VP_RECT,
         CAM_SET_ORBIT_STEP, CAM_ROLL, KEYMAP_SET_BINDINGS, VP_SAVE, VP_RESTORE, MAT_SAVE, MAT_RESTORE, CMD_EXEC, CMD_FACTORIES,
         GEO_QUERY, HIST_BEGIN, HIST_ROLLBACK, HIST_COMMIT, HIST_UNDO, GEO_SNAPS, GEO_MEASURE, CAM_VIEW, CAM_VIEW_RESTORE, DIM_FACE, VIEW_HIGHLIGHT, DIM_DISTANCE, DIM_SIGNATURE, GEO_RESOLVE,
-        DIM_RECORD, DIM_MEASURE, DIM_FACES, UI_RCLICK, HOLE_MAKE, ASSET_LIST, ASSET_PLACE, PART_STRETCH, ASSET_MARK, ASSET_EXPORT_PACK, ASSET_REGISTER, ASSET_UNREGISTER, CFG_SAVE, CFG_RESTORE, BOM_SCAN, FILE_EXPORT_STEP, FILE_EXPORT_RESTORE,
+        DIM_RECORD, DIM_MEASURE, DIM_FACES, UI_RCLICK, HOLE_MAKE, ASSET_LIST, ASSET_PLACE, PART_STRETCH, OUTLINE_READ, ASSET_MARK, ASSET_EXPORT_PACK, ASSET_REGISTER, ASSET_UNREGISTER, CFG_SAVE, CFG_RESTORE, BOM_SCAN, FILE_EXPORT_STEP, FILE_EXPORT_RESTORE,
     ];
 }
 
@@ -184,6 +186,8 @@ pub mod cap {
     pub const VIEW_HIGHLIGHT: &str = "view.highlight";
     /// N3e: 本体测量(建测量 + 写大纲名字)。
     pub const MEASURE_WRITE: &str = "measure.write";
+    /// 大纲树读取(组库 + 节点表)。
+    pub const OUTLINE_READ: &str = "outline.read";
     /// C0: 配置(可见性 + 材质指派)。
     pub const CFG_STATE: &str = "cfg.state";
     /// B1/B2: BOM(实体指纹 + 组路径 + 材质)。
@@ -198,7 +202,7 @@ pub mod cap {
     /// 全部能力名（契约测试用）。
     pub const ALL: &[&str] = &[
         EDITOR, SEL_READ, SEL_WRITE, HIST_READ, CAM_READ, CAM_WRITE, CAM_NAV, CAM_STEP, CAM_ROLL, SEL_APPLY,
-        VP_STATE, KEYMAP, CMD_DISPATCH, ERR_HOOK, TREE, MAT_STATE, MAT_SET, CMD_EXEC, GEO_READ, HIST_WRITE, SNAP_READ, VIEW_HIGHLIGHT, MEASURE_WRITE, CFG_STATE, BOM_READ, FILE_EXPORT, BOOL_RUN, ASSET_PLACE, ASSET_LIB,
+        VP_STATE, KEYMAP, CMD_DISPATCH, ERR_HOOK, TREE, MAT_STATE, MAT_SET, CMD_EXEC, GEO_READ, HIST_WRITE, SNAP_READ, VIEW_HIGHLIGHT, MEASURE_WRITE, OUTLINE_READ, CFG_STATE, BOM_READ, FILE_EXPORT, BOOL_RUN, ASSET_PLACE, ASSET_LIB,
     ];
 }
 

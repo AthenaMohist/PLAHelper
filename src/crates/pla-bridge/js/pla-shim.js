@@ -182,7 +182,27 @@
     'ed.measurements':         ['ed', 'measurements'],
     'meas.snapshot':           ['meas', 'snapshot'],
     'nodes.setName':           ['nodes', 'setName'],
-    'fac.p2pMeasure':          ['fac', 'PointToPointMeasurementFactory']
+    'fac.p2pMeasure':          ['fac', 'PointToPointMeasurementFactory'],
+    // ---- 大纲(文件夹 = 组; 实测 2026-11-19 后台副本): 节点键 = id × 256 + 类别(0 组 / 1 物体);
+    //      create() → 新组(尚未挂在树上) → addMembership(组键, 父组) 挂上; 移动 = _unsafeMoveNodeToGroup(键, 目标组)
+    //      (addMembership 对已在别处的节点只加不删, 旧父组里留下残影 → 不用它移动); dissolve(组) = 解散(成员回父组)。 ----
+    'groups.create':           ['groupsDb', 'create'],
+    'groups.attach':           ['groupsDb', 'addMembership'],
+    'groups.move':             ['groupsDb', '_unsafeMoveNodeToGroup'],
+    'groups.dissolve':         ['groupsDb', 'dissolve'],
+    'groups.children':         ['groupsDb', 'getChildren'],
+    'groups.byId':             ['groupsDb', 'lookupById'],
+    'groups.parentId':         ['groupsDb', 'getParentId'],
+    'groups.root':             ['groupsDb', 'root'],
+    'groups.all':              ['groupsDb', 'all'],
+    'nodes.key2item':          ['nodes', 'key2item'],
+    'nodes.setHidden':         ['nodes', 'setHidden'],
+    'nodes.isHidden':          ['nodes', 'isHidden'],
+    'nodes.isVisible':         ['nodes', 'isVisible'],
+    'nodes.isLocked':          ['nodes', 'isLocked'],
+    // 改完隐藏 / 组成员后要重算场景可见性(SceneVisibilityManager.update; 实测: 不调则视口照旧显示, 命令结束也不会自动重算)
+    'ed.scene':                ['ed', 'scene'],
+    'scene.update':            ['scene', 'update']
   };
 
   // 选择集里的各类 id 集合：[对外的 kind, Selection 上的集合名]。sel.ids.<kind> 表键由此生成。
@@ -441,8 +461,21 @@
       // delete = 删除实体(同 Plasticity 的 Delete, 一个撤销步; 实测 model1: 撤销后实体回来)
       delete: { custom: 'delete', fac: 'geo.removeItem', required: ['solids'], params: { solids: [null, 'solids'] } },
       // rename = 改大纲名(多个实体同名; 复制件改规格后改名, BOM 名称跟着对)
-      rename: { custom: 'rename', fac: 'nodes.setName', required: ['solids', 'name'], params: { solids: [null, 'solids'], name: [null, 'string'] } }
+      rename: { custom: 'rename', fac: 'nodes.setName', required: ['name'], params: { solids: [null, 'solids'], folders: [null, 'folders'], name: [null, 'string'] } },
+      // 大纲(2026-11-19): folder = 新建文件夹(parent 默认顶层)并把 solids / folders 移进去; moveTo = 移到文件夹 to('root' = 顶层);
+      // hide / show = 同 H / 取消隐藏(文件夹整个); ungroup = 解散文件夹(成员回上一级)。都在我们自己的命令里做 = 一个撤销步。
+      // 文件夹引用: 组 id(数字) / 名字(字符串或 {name}, 重名报错) / '$步骤id' / 'root'。
+      folder: { custom: 'folder', fac: 'groups.create', also: ['groups.attach', 'groups.move', 'nodes.setName'], required: ['name'],
+                params: { name: [null, 'string'], parent: [null, 'folder'], solids: [null, 'solids'], folders: [null, 'folders'] } },
+      moveTo: { custom: 'moveTo', fac: 'groups.move', required: ['to'], params: { to: [null, 'folder'], solids: [null, 'solids'], folders: [null, 'folders'] } },
+      hide: { custom: 'hide', fac: 'nodes.setHidden', params: { solids: [null, 'solids'], folders: [null, 'folders'] }, required: [] },
+      show: { custom: 'show', fac: 'nodes.setHidden', params: { solids: [null, 'solids'], folders: [null, 'folders'] }, required: [] },
+      ungroup: { custom: 'ungroup', fac: 'groups.dissolve', required: ['folders'], params: { folders: [null, 'folders'] } }
     },
+    // 大纲节点的类别(节点键 % 256)与物体类(key2item 的构造名)→ 对外 kind
+    outline: { groupCtor: 'Groups_Group', rootRef: 'root', ops: ['folder', 'moveTo', 'hide', 'show', 'ungroup'],
+               kinds: { Solid: 'solid', Sheet: 'sheet', Wire: 'curve', InstanceEmpty: 'instance', Plane: 'plane',
+                        DistanceMeasurement: 'measurement', AngleMeasurement: 'measurement', Image: 'image', Mesh: 'mesh' } },
     // A4b 工厂字段(实测 2026-11-19): 复制 / 移动 / 旋转 / 阵列的物体列表 = items, 镜像 = shells; 镜像 origin / normal、移动 move、
     // 旋转 pivot(原地 set)+ axis(VectorProxy, 原地 copy)+ angle(弧度); 线性阵列 dir1 / dir2(新 Vector3)+ num1 / num2 +
     // distance1 / distance2(mode extent = 首尾总长); 环形阵列 dir1 = 起始方向(⟂ 轴)、dir2 = 轴、center、num2 = 个数、angle = 总角度。
@@ -537,6 +570,7 @@
     'tree':      { needs: [], dom: true },
     'mat.state': { needs: ['ed.originator', 'nodes.state'], optional: ['mat.textures', 'tex.get', 'mats.snapshot'] },
     // B1/B2 BOM: 实体 + 显示网格 + 稳定 id; 组路径 / 材质缺了只降级
+    'outline.read': { needs: ['ed.groupsDb', 'groups.root', 'groups.children', 'groups.all', 'groups.byId', 'nodes.key2item', 'nodes.item2key', 'nodes.getName', 'nodes.isHidden', 'nodes.isVisible'], optional: ['nodes.isLocked'] },
     'bom.read': { needs: ['geo.items', 'geo.lookupTopo', 'nodes.state', 'nodes.item2key', 'nodes.getName', 'ed.docUnit'], optional: ['ed.groupsDb', 'groups.getParent', 'mats.snapshot', 'ed.originator'] },
     // D 导出 STEP: 选择增删 + 导出入口; 站内对话框是普通 DOM 元素, 运行时查(不用 dom 标记 —— 那个指 Preact 树可读, 且会跳过 needs)
     'file.export': { needs: ['ed.export', 'sel.selected', 'sel.add', 'sel.removeAll', 'geo.items', 'nodes.state', 'nodes.item2key'] },
@@ -608,6 +642,7 @@
       case 'meas': return get('ed.measurements');
       case 'mats': return get('ed.materialsDb');
       case 'groupsDb': return get('ed.groupsDb');
+      case 'scene': return get('ed.scene');
       case 'assets': return get('ed.assets');
     }
     return undefined;
@@ -1313,6 +1348,10 @@
   }
 
   function describeMade(view, k) {
+    if (view && view.constructor && view.constructor.name === NAMES.outline.groupCtor) {
+      var nm = null; try { nm = invokeOn('nodes.getName', [invokeOn('nodes.item2key', [view])]); } catch (e) {}
+      return { kind: 'folder', id: view[NAMES.bom.groupId], name: nm };
+    }
     var id = itemIdOf(view);
     if (id === null) return { kind: (view && view.constructor && view.constructor.name) || typeof view };
     return { kind: 'solid', id: id, name: nameOf(view), bbox: bboxOf(view, k) };
@@ -1530,8 +1569,123 @@
     }
     var xform = xformBuild(o, rc, ctx);
     if (xform) return xform;
+    var outl = outlineBuild(o, rc, ctx);
+    if (outl) return outl;
     throw new Error('recipe: unknown custom builder ' + rc.custom);
   }
+
+  // ---- 大纲: 文件夹 / 移动 / 隐藏 / 解散(节点键 = nodes.item2key; 文件夹 = 组对象) ----
+  function outlineRoot() { return need('groups.root'); }
+  function folderKey(g) { return invokeOn('nodes.item2key', [g]); }
+  function allFolders() {
+    var ids = Array.from(need('groups.all') || []);
+    return ids.map(function (id) { return invokeOn('groups.byId', [id]); }).filter(function (g) { return g && g[NAMES.bom.groupId] !== NAMES.bom.rootGroupId; });
+  }
+  function folderName(g) { try { return invokeOn('nodes.getName', [folderKey(g)]); } catch (e) { return null; } }
+  function resolveFolder(ref, ctx) {
+    var O = NAMES.outline;
+    if (ref === O.rootRef || ref === NAMES.bom.rootGroupId) return outlineRoot();
+    if (typeof ref === 'string' && ref.charAt(0) === '$') {
+      var f = ctx.folders && ctx.folders[ref.slice(1)];
+      if (!f) throw new Error('unknown folder ref ' + ref);
+      return f;
+    }
+    if (typeof ref === 'number') {
+      var g = invokeOn('groups.byId', [ref]);
+      if (!g || allFolders().indexOf(g) < 0) throw new Error('folder not found: ' + ref);
+      return g;
+    }
+    var name = ref && typeof ref === 'object' ? ref.name : ref;
+    if (typeof name !== 'string') throw new Error('folder ref must be an id, a name, a $ref or "root"');
+    var m = allFolders().filter(function (x) { return folderName(x) === name; });
+    if (!m.length) throw new Error('no folder named ' + JSON.stringify(name));
+    if (m.length > 1) throw new Error('several folders named ' + JSON.stringify(name) + ' (ids ' + m.map(function (x) { return x[NAMES.bom.groupId]; }).join(', ') + '); use the id');
+    return m[0];
+  }
+  function folderList(val, ctx) { return (Array.isArray(val) ? val : [val]).map(function (r) { return resolveFolder(r, ctx); }); }
+  // 文件夹 a 在 b 里面(或就是 b)?
+  function folderWithin(a, b) {
+    var root = NAMES.bom.rootGroupId, k = folderKey(a);
+    if (a === b) return true;
+    for (var i = 0; i < 64; i++) {
+      var pid = invokeOn('groups.parentId', [k]);
+      if (pid === undefined || pid === null) return false;
+      if (pid === b[NAMES.bom.groupId]) return true;
+      if (pid === root) return false;
+      k = folderKey(invokeOn('groups.byId', [pid]));
+    }
+    return false;
+  }
+  function outlineBuild(o, rc, ctx) {
+    var O = NAMES.outline;
+    var solids = o.solids === undefined ? [] : convertParam('solids', o.solids, ctx);
+    var folders = o.folders === undefined ? [] : folderList(o.folders, ctx);
+    if (folders.indexOf(outlineRoot()) >= 0) throw new Error('the top level is not a folder you can move / hide / dissolve');
+    var keys = function () { return solids.map(function (v) { return invokeOn('nodes.item2key', [v]); }).concat(folders.map(folderKey)); };
+    // 包一层: 做完重算场景可见性(隐藏 / 进出隐藏的文件夹都会改变可见集合)
+    var andRefresh = function (fn) { return function () { var r = fn(); if (get('scene.update')) invokeOn('scene.update', []); return r; }; };
+    var moveInto = function (target) {
+      folders.forEach(function (f) { if (folderWithin(target, f)) throw new Error('cannot move folder ' + JSON.stringify(folderName(f)) + ' into itself'); });
+      keys().forEach(function (k) { invokeOn('groups.move', [k, target]); });
+    };
+    switch (rc.custom) {
+      case 'folder': {
+        var nm = String(o.name).trim();
+        if (!nm) throw new Error('name must not be empty');
+        var parent = o.parent === undefined ? outlineRoot() : resolveFolder(o.parent, ctx);
+        return andRefresh(function () {
+          var g = invokeOn('groups.create', []);
+          invokeOn('groups.attach', [folderKey(g), parent]);
+          invokeOn('nodes.setName', [folderKey(g), nm]);
+          moveInto(g);
+          if (o.id) { ctx.folders = ctx.folders || {}; ctx.folders[o.id] = g; }
+          return [g].concat(solids);
+        });
+      }
+      case 'moveTo': {
+        if (!solids.length && !folders.length) throw new Error('moveTo needs solids or folders');
+        var to = resolveFolder(o.to, ctx);
+        return andRefresh(function () { moveInto(to); return folders.concat(solids); });
+      }
+      case 'hide':
+      case 'show': {
+        if (!solids.length && !folders.length) throw new Error(rc.custom + ' needs solids or folders');
+        var hid = rc.custom === 'hide';
+        return andRefresh(function () { keys().forEach(function (k) { invokeOn('nodes.setHidden', [k, hid]); }); return folders.concat(solids); });
+      }
+      case 'ungroup':
+        if (!folders.length) throw new Error('ungroup needs folders');
+        return andRefresh(function () { folders.forEach(function (f) { invokeOn('groups.dissolve', [f]); }); return []; });
+    }
+    return null;
+  }
+
+  // 大纲树(只读): 文件夹嵌套 + 物体(kind / id / 名字 / 隐藏)。物体 id = 实体版本 id(与 model_* 其余工具一致), 其他类别给节点键。
+  function outlineNode(k, depth) {
+    var O = NAMES.outline, it;
+    try { it = invokeOn('nodes.key2item', [k]); } catch (e) { return null; }
+    var ctor = it && it.constructor && it.constructor.name;
+    var hidden = false;
+    try { hidden = !!invokeOn('nodes.isHidden', [k]) || !invokeOn('nodes.isVisible', [k]); } catch (e) {}
+    if (ctor === O.groupCtor) {
+      var kids = depth > 32 ? [] : Array.from(invokeOn('groups.children', [it]) || []).map(function (c) { return outlineNode(c, depth + 1); }).filter(Boolean);
+      return { kind: 'folder', id: it[NAMES.bom.groupId], name: invokeOn('nodes.getName', [k]), hidden: hidden, children: kids };
+    }
+    var n = { kind: O.kinds[ctor] || ctor, name: null, hidden: hidden };
+    try { n.name = invokeOn('nodes.getName', [k]); } catch (e) {}
+    var vid = itemIdOf(it);
+    if (n.kind === 'solid' && vid !== null) n.id = vid; else n.key = k;
+    try { if (invokeOn('nodes.isLocked', [k])) n.locked = true; } catch (e) {}
+    return n;
+  }
+  def('outline.read', 'outline.read', function (a) {
+    var kinds = a && Array.isArray(a.kinds) ? a.kinds : null;
+    var tree = Array.from(invokeOn('groups.children', [outlineRoot()]) || []).map(function (c) { return outlineNode(c, 0); }).filter(Boolean);
+    var prune = function (list) {
+      return list.map(function (n) { if (n.kind === 'folder') { n.children = prune(n.children); return n; } return !kinds || kinds.indexOf(n.kind) >= 0 ? n : null; }).filter(Boolean);
+    };
+    return { children: prune(tree) };
+  });
 
   // ---- A4b: 整体操作(复制 / 镜像 / 移动 / 旋转 / 阵列); 参数在入队前全部换算好 ----
   function xformBuild(o, rc, ctx) {
@@ -1560,9 +1714,10 @@
         if (o.keepTools !== undefined) f[X.keepTools] = !!o.keepTools;
       });
     }
+    if (NAMES.outline.ops.indexOf(rc.custom) >= 0) return null;   // 大纲操作 → outlineBuild
     var items = rc.custom === 'mirror' ? X.mirrorItems : X.items;
-    var solids = convertParam('solids', o.solids, ctx);
-    if (!solids.length) throw new Error('solids is empty');
+    var solids = rc.custom === 'rename' && o.solids === undefined ? [] : convertParam('solids', o.solids, ctx);
+    if (!solids.length && !(rc.custom === 'rename' && o.folders !== undefined)) throw new Error('solids is empty');
     var put = function (f) { f[items] = solids; };
     if (rc.custom === 'delete') {
       return function () {
@@ -1572,9 +1727,12 @@
     if (rc.custom === 'rename') {
       var nm = String(o.name).trim();
       if (!nm) throw new Error('name must not be empty');
+      var fs = o.folders === undefined ? [] : folderList(o.folders, ctx);
+      if (fs.indexOf(outlineRoot()) >= 0) throw new Error('the top level cannot be renamed');
       return function () {
         solids.forEach(function (v) { invokeOn('nodes.setName', [invokeOn('nodes.item2key', [v]), nm]); });
-        return solids;
+        fs.forEach(function (g) { invokeOn('nodes.setName', [folderKey(g), nm]); });
+        return fs.concat(solids);
       };
     }
     switch (rc.custom) {

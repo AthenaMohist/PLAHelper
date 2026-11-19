@@ -74,6 +74,8 @@ fn model_tools() -> Value {
             "units": {"type": "string"}, "limit": {"type": "integer"}}}},
         {"name": "model_snaps", "annotations": ro, "description": "Snap points Plasticity itself uses (also internal ones): face centers + normals, edge midpoints + tangents, circle centers + axes, points on arcs, vertices, bbox corners. kinds filters (faceCenter|edgeMid|circleCenter|circleQuarter|vertex|bboxCorner); near/tol/of/limit as in model_state.",
          "inputSchema": {"type": "object", "properties": {"of": {"type": "array", "items": {}}, "kinds": {"type": "array", "items": {"type": "string"}}, "near": {"type": "array", "items": {"type": "number"}}, "tol": {"type": "number"}, "units": {"type": "string"}, "limit": {"type": "integer"}}}},
+        {"name": "model_outline", "annotations": ro, "description": "Read Plasticity's outliner tree: folders (id, name, hidden, children) and items (kind solid/sheet/curve/instance/measurement/…, name, hidden, locked; solids carry their version id like model_state, other kinds a node key). kinds filters items (e.g. [\"solid\"]); folders are always kept. Change it with model_exec ops folder / moveTo / hide / show / ungroup / rename.",
+         "inputSchema": {"type": "object", "properties": {"kinds": {"type": "array", "items": {"type": "string"}}}}},
         {"name": "model_measure", "annotations": ro, "description": format!("Measure. op=distance: a, b = [x,y,z] | face id | edge id | vertex id → distance, delta, and normalDistance (wall thickness) when both are parallel planes. op=angle: a, b = faces (normals), line edges (directions) or vectors → degrees. op=mass: of (solids) and/or faces → volume, area, centroid (display mesh, curved surfaces ~0.3% low). {refs}"),
          "inputSchema": {"type": "object", "properties": {"op": {"type": "string", "enum": ["distance", "angle", "mass"]}, "a": {}, "b": {}, "of": {"type": "array", "items": {}}, "faces": {"type": "array", "items": {"type": "string"}}, "units": {"type": "string"}}, "required": ["op"]}},
         {"name": "model_view", "annotations": ro, "description": "Screenshot the model from a standard view (front/back/left/right/top/bottom/iso), framed on 'of' solids (default: everything). The user's camera is restored afterwards. Use it to check results visually.",
@@ -95,6 +97,13 @@ Whole solids (solids = [solid refs]: ids, \"$step\", {{\"name\": ...}}; the resu
 - mirror {{solids, origin, normal}} - adds a mirrored copy about the plane through origin with that normal (originals stay; their ids change)\n\
 - pattern {{solids, dir1, count1, spacing1, dir2?, count2?, spacing2?}} - linear / grid array; counts include the original; result = the new copies\n\
 - radialPattern {{solids, center, axis, count, degrees?=360}} - circular array about the axis through center; 360 = evenly around, less = both ends included (3 over 180° = 0/90/180)\n\
+- boolean {{targets, tools, operation union|subtract|intersect, keepTools?}} - between existing solids\n\
+- delete {{solids}} / rename {{solids? | folders?, name}}\n\
+Outliner (folders = Plasticity groups; read the tree with model_outline; folder refs = folder id, name (error if several share it), \"$step\" or \"root\" = top level):\n\
+- folder {{name, parent?, solids?, folders?}} - new folder (under parent, default top level) and move those into it; result item = {{kind: folder, id, name}}\n\
+- moveTo {{solids? | folders?, to}} - move into a folder (\"root\" = top level)\n\
+- hide {{solids? | folders?}} / show {{…}} - same as H / unhide (a folder hides everything in it)\n\
+- ungroup {{folders}} - dissolve; members go up one level\n\
 bool: union | subtract | intersect with targets [solid refs]. Give a step id: \"base\" and later steps can use \"$base\" (its result). Edges / faces: topology ids, or {{\"near\": [x,y,z], \"of\": solid ref, \"tol\"?}} = the item whose bbox center is nearest (errors instead of guessing when ambiguous). {refs} After running, verify with model_state / model_measure / model_view."),
          "inputSchema": {"type": "object", "properties": {
             "ops": {"type": "array", "items": {"type": "object"}},
@@ -356,6 +365,7 @@ fn call_model_tool(name: &str, a: &Value) -> Option<Value> {
                 Err(e) => cdp_err(e),
             }
         }
+        "model_outline" => call(api::OUTLINE_READ, pick(a, &["kinds"])),
         "model_snaps" => call(api::GEO_SNAPS, pick(a, &["of", "kinds", "near", "tol", "units", "limit"])),
         "model_measure" => call(api::GEO_MEASURE, pick(a, &["op", "a", "b", "of", "faces", "units"])),
         "model_view" => {

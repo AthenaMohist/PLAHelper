@@ -704,6 +704,17 @@
       后台副本试出字段、model1 上逐项跑通并撤回，契约测试覆盖（know-how/command-dispatch.md「A4b」）。
       用例：encoder calibrator 编码器座按电机座重建（复制 → 缩短底板 → 竖板求交 → 螺钉复制 + 4 × M4x25），在副本上演练通过；2026-11-19 正式文件执行（一个事务 16 步，未保存，等用户检查）：底板 145 面 160×85、竖板 113 面、9 颗 M3/M6 + 4 × M4x25。
       还没有：shell（抽壳）、draft（拔模）、thicken、按面 / 边的阵列（RectangularArrayFacesFactory）、曲线阵列。
+- [x] **A4c 大纲**（2026-11-19，用户：MCP 不能和大纲树互动）：`model_outline` 读树；`model_exec` 加 folder / moveTo / hide / show / ungroup，rename 可改文件夹名。
+      后台 model1 副本实测（建 / 嵌套 / 移动 / 隐藏 / 显示 / 撤销），契约测试覆盖（know-how/command-dispatch.md「A4c」）。还没有：锁定、大纲排序。
+- [ ] **K1 专业知识库（腾讯 ima）**（2026-11-19 用户）：ima 有 OpenAPI（`POST https://ima.qq.com/openapi/wiki/v1/<op>`，头 `ima-openapi-clientid` / `ima-openapi-apikey`；
+      search_knowledge 返回标题 + 片段 + media_id，无生成式问答），但**无公开官方文档**，路径来自社区实现 → 先拿用户的 key 实测。计划：pla-mcp `knowledge_search` / `knowledge_get` / `knowledge_bases`，
+      key 由用户放在本机配置（不进仓库、不进日志）；只读。等用户在 https://ima.qq.com/agent-interface 建好 Client ID + API Key。
+- [ ] **K2 工程计算**（2026-11-19 用户：问联轴器孔径是否必要那么大，要从专业角度计算 / 仿真、以数据说话，而不是一句话带过）：
+      MCP 计算工具（轴扭转强度 / 刚度、键 / 过盈 / 锥面传扭、螺栓预紧与拧紧力矩、配合间隙与温升、轴承寿命…），输入取自模型（model_measure）与知识库，输出带公式和出处。
+- [ ] **D9 出图迭代**（2026-11-19，评估另一会话手画的编码器轴 / 磁环座图，docs/research/2026-11-19-mcp-drawings/）：手画图信息远多于 helper 出的图，但每张图坐标手写、不能复用、有文字重叠。
+      helper 要补：① 回转件（同轴圆柱 / 圆锥为主）自动半剖主视 + 每段台阶直径 + 轴向尺寸链 + 锥度 1:10 标注；② 尺寸可按配合代号给公差（h7 → iso286 算偏差）；
+      ③ 形位公差框 + 基准符号 + 粗糙度符号（spec 里挂到尺寸 / 面）；④ 技术要求超框时自动缩字 / 扩框（现在 15 行只显示 12 行，后 3 行丢了）；
+      ⑤ "views not ready after 20s" 时剖视图没出来、多了一个重复视图；⑥ 等于法兰厚度的孔应判为通孔；Ø2.5 底孔识别成 M3 螺纹孔。
 - [x] **A5 视图工具**（2026-11-15，know-how/geometry-query.md「A5」）：垫片 `cam.view`（临时切正交 → 视角朝向 + 包围盒投影算缩放
       对准物体 → 截图 → 还原相机与投影；七个视角）+ CLI `pla-app cdp-view`；契约测试 1 项；真机前 / 等轴 / 顶三张居中清晰、相机完全还原。
       坑：轨道控制器 `focalOffset` 要清零，否则放大后画面被推离物体。
