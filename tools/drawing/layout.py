@@ -121,10 +121,12 @@ class Text:
         w = self.plain_width(pre, h, cw) + TOL_SCALE * max(self.plain_width(up, h, cw), self.plain_width(lo, h, cw)) + self.plain_width(post, h, cw)
         return w + 0.3 * h
 
-    def box(self, lines, h=None):
+    def box(self, lines, h=None, flat=False):
+        """flat = 公差照原样一行写(TechDraw 的孔说明不叠放偏差), 按平铺宽度算。"""
         h = h or self.h
         lines = lines if isinstance(lines, list) else [lines]
-        return max(self.width(s, h) for s in lines), h * self.line_h * (len(lines) - 1) + h, lines
+        wf = self.plain_width if flat else self.width
+        return max(wf(s, h) for s in lines), h * self.line_h * (len(lines) - 1) + h, lines
 
 
 # ------------------------------------------------------------------ 布局
@@ -248,7 +250,7 @@ class Layout:
         return base + extra
 
     def label_w(self, lb):
-        w, _, _ = self.T.box(lb["text"])
+        w, _, _ = self.T.box(lb["text"], flat=lb.get("flat_tol", False))
         return (lb.get("w") or w) + lb.get("pad_left", 0.0)
 
     def row_h(self, labs):
@@ -347,8 +349,17 @@ class Layout:
                         a0 = a
                         a = (a[0], a[1] + sg * lb.get("ext_out", 3.0))
                         ext_line = [a0, (a[0], a[1] + sg * 1.5)]
-                        dx = 7.0 if a[0] >= (r[0] + r[2]) / 2 else -7.0
-                        lx = a[0] + dx
+                        # 横着进来的那一段 + 竖直出去的那一段都不许穿尺寸文字: 偏移从 7 mm(朝外一侧)起两边试
+                        # (2026-11-20 编码器轴: 固定 7 mm, B 面的 Ra 引线压到段直径文字)
+                        out_ = 1.0 if a[0] >= (r[0] + r[2]) / 2 else -1.0
+                        dxs = sorted({sg_ * m for m in (7.0, 6.0, 8.0, 5.0, 9.0, 10.0, 4.0, 11.0, 12.0) for sg_ in (out_, -out_)},
+                                     key=lambda v: (abs(abs(v) - 7.0) + (0 if v * out_ > 0 else 3.0)))
+                        lx = a[0] + dxs[0]
+                        for dx in dxs:
+                            x_ = a[0] + dx
+                            if not any(seg_rect_hit((a[0], a[1]), (x_, a[1]), t) or seg_rect_hit((x_, a[1]), (x_, edge), t) for t in dim_texts):
+                                lx = x_
+                                break
                         pre = [a, (lx, a[1])]
                     else:
                         if lb.get("slide"):
@@ -715,6 +726,11 @@ class Layout:
             texts.append(rr)
         return out, failed
 
+    def _ext_xs(self, vid, c):
+        """这个视图里边视平面标注(approach = h)要用的延长线的页面 x。"""
+        return [c["cx"] + a[0] * c["scale"] for lb in self.labels if lb.get("view") == vid and lb.get("approach") == "h"
+                for a in (lb.get("anchors") or {}).values()]
+
     # ---- inline 尺寸(视图上, 如轴的各段直径): 在 slide 范围里滑动, 文字互不重叠
     def realize_inline(self, place, s, taken_text, lines=()):
         out, unplaced = {}, []
@@ -747,6 +763,10 @@ class Layout:
                             tx = x - 0.6 - th / 2 if sd < 0 else x + 0.6 + th / 2
                             trect = (tx - th / 2, ty0, tx + th / 2, ty1)
                             if not rect_inside(trect, self.area) or any(rect_hit(trect, u, pad) for u in taken_text):
+                                continue
+                            # 边视平面(台阶面)的标注从它的延长线引出: 文字别压在那条延长线上
+                            # (2026-11-20 编码器轴: ⌀44 的字压住 B 面延长线, B 面的 Ra 引线怎么走都穿字)
+                            if any(trect[0] - 0.8 <= hx_ <= trect[2] + 0.8 for hx_ in self._ext_xs(d["view"], c)):
                                 continue
                             if any(rect_hit(trect, pr, 0.3) for cc in place.values() for pr in cc.get("parts", [cc["rect"]])):
                                 continue
@@ -818,7 +838,7 @@ class Layout:
         order = sorted([l for l in self.labels if not l.get("row")] + list(extra or []), key=lambda l: (-l.get("prio", 0), l["id"]))
 
         def candidates(lb, others):
-            w, h, lines = self.T.box(lb["text"])
+            w, h, lines = self.T.box(lb["text"], flat=lb.get("flat_tol", False))
             # 固定尺寸的标签(形位公差框格、粗糙度符号 + 值): 调用方给 w / h; pad_left = 文字左边要留的地方(符号)
             if lb.get("w"):
                 w = lb["w"]
@@ -858,7 +878,11 @@ class Layout:
                 sides = [True, False] if abs(cs_) < 1e-6 else [cs_ > 0]
                 for right in sides:
                     ex = kx + (w + 1.0) if right else kx - (w + 1.0)
-                    box = (min(kx, ex), ky - 0.6 - h, max(kx, ex), ky - 0.6)
+                    if lb.get("below_lines") and len(lines) > 1:
+                        # 多行孔说明(GB): 第一行在肩线上方(连着引线), 其余行在肩线下方
+                        box = (min(kx, ex), ky - 0.6 - th, max(kx, ex), ky + 0.6 + (h - th))
+                    else:
+                        box = (min(kx, ex), ky - 0.6 - h, max(kx, ex), ky - 0.6)
                     out.append(((ax, ay), (kx, ky), (ex, ky), box, ang, r, lines, w, h))
             return out
 

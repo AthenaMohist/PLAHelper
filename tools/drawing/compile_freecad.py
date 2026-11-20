@@ -65,6 +65,7 @@ OUT = spec.get("out") or os.path.join(HERE, "out")
 BASE = spec.get("basename") or (spec.get("title", {}).get("pn") or "drawing")
 os.makedirs(OUT, exist_ok=True)
 DIMS = std["dims"]
+SVG_EM = std["layout"].get("svg_em", 1.0)   # 自画文字的 font-size = 字高 × SVG_EM(与 TechDraw 尺寸字一样大, 见 GB.json comment_svg_em)
 GUI = False
 try:
     import FreeCADGui as Gui
@@ -330,8 +331,10 @@ part = doc.addObject("Part::Feature", "Part")
 part.Shape = shape
 # 包围盒要用精确的: shape.BoundBox 对 B 样条面按控制点算, 会偏大且中心偏(实测磁环座: 视图比布局位置整体偏 7 mm,
 # TechDraw 按真实几何居中视图); optimalBoundingBox 按几何本身算
+# 不用三角网格(useTriangulation=False): 界面模式下 part.Shape 一赋值就有了显示用的粗网格, 按它算会偏大
+# (2026-11-20 实测编码器轴 104.209 / 磁环座 13.961, 精确值 104.096 / 13.900 —— 总长尺寸因此多了 0.1)
 try:
-    bb = shape.optimalBoundingBox(True, False)
+    bb = shape.optimalBoundingBox(False, False)
 except Exception:
     bb = shape.BoundBox
 rep["part"] ={"source": pspec.get("step") or "test_plate", "bbox": [round(bb.XLength, 3), round(bb.YLength, 3), round(bb.ZLength, 3)], "faces": len(shape.Faces), "volume": round(shape.Volume, 3)}
@@ -846,6 +849,12 @@ def resolve_sel(sel):
         p_ = V(*sel["plane"]["at"])
         for f in shape.Faces:
             if isinstance(f.Surface, Part.Plane) and abs(abs(f.normalAt(0, 0).dot(n_)) - 1) < 1e-6 and abs((f.CenterOfMass - p_).dot(n_)) < 0.01:
+                if TURN and abs(abs(n_.dot(TURN["axs"])) - 1) < 1e-6:
+                    # 回转件上垂直轴线的平面(端面 / 槽底): 和台阶面一样处理 —— 主视里边视, 标注从外沿的延长线引出。
+                    # 2026-11-20 磁环座槽底: 面心在轴线上 → 三个标注的锚点都落在轴线那一点, 引线扇形横穿端面视图
+                    tf = (f.CenterOfMass - TURN["c"]).dot(TURN["axs"])
+                    rs = [((vx.Point - TURN["c"]) - TURN["axs"] * (vx.Point - TURN["c"]).dot(TURN["axs"])).Length for vx in f.Vertexes] or [0.0]
+                    return {"kind": "plane", "face": f, "n": V(TURN["axs"]), "p": TURN["c"] + TURN["axs"] * tf, "rmin": min(rs), "rmax": max(rs)}
                 return {"kind": "plane", "face": f, "n": n_, "p": f.CenterOfMass}
         raise ValueError("no planar face with that normal through that point")
     raise ValueError("unknown selector %r (use cyl / bore / cone / shoulder / plane)" % (sel,))
@@ -933,7 +942,7 @@ def gdt_items():
         if a_ is None:
             issues.append("datum %s: not visible as an edge in the front view" % d_["label"])
             continue
-        out.append(rowify({"id": "DAT%d" % (i_ + 1), "view": "Front", "anchor": a_, "text": str(d_["label"]), "w": 6.0, "h": 6.0, "prio": 3,
+        out.append(rowify({"id": "DAT%d" % (i_ + 1), "view": "Front", "anchor": a_, "text": str(d_["label"]), "w": 7.0, "h": 7.0, "prio": 3,
                            "kind": "datum", "axis": ft["kind"] in ("cyl", "bore", "cone")}, ft, axis=ft["kind"] in ("cyl", "bore")))
     for i_, g_ in enumerate(spec.get("gdt") or []):
         sym = str(g_.get("symbol", ""))
@@ -982,8 +991,8 @@ def gdt_items():
         val = ("⌀" if g_.get("dia") or sym in GDT_AXIAL else "") + fmt(float(g_["value"]), 4)   # 公差值到微米(0.003), 不按尺寸的 2 位
         cells = [GDT_SYM[sym], val] + ds
         T_ = LAYM.Text(std)
-        ws = [max(6.0, T_.width(c_) + 2.0) for c_ in cells]
-        out.append(rowify({"id": "GDT%d" % (i_ + 1), "view": "Front", "anchor": a_, "text": " ".join(cells), "w": sum(ws), "h": 6.0, "prio": 2,
+        ws = [max(7.0, T_.width(c_) + 2.0) for c_ in cells]   # 框格高 = 2h(GB/T 1182), 格宽至少同高
+        out.append(rowify({"id": "GDT%d" % (i_ + 1), "view": "Front", "anchor": a_, "text": " ".join(cells), "w": sum(ws), "h": 7.0, "prio": 2,
                            "kind": "gdt", "cells": cells, "cell_w": ws}, ft, axis=sym in GDT_AXIAL))
     for i_, r_ in enumerate(spec.get("roughness") or []):
         try:
@@ -1043,6 +1052,13 @@ rep["section_at"] = SEC_AT
 import layout as LAYM  # noqa: E402
 
 
+def split_callout(t):
+    """孔说明按 ";" / "；" 分行(一条说明写了几个要素时, 如 "M5… ; 磁环槽 ⌀34.2H8…"): 第一行在引线肩线上, 其余在肩线下。"""
+    import re
+    parts = [p.strip() for p in re.split(r"\s*[;；]\s*", t or "") if p.strip()]
+    return parts or [t or ""]
+
+
 def shown_text(name, typ, text=None, value=None):
     """add_dim 最后显示的文字(同一套规则: 方案改字 > 公差 > 原文; 关键尺寸加 *)—— 布局要按真实文字宽度排。"""
     if name in DIM_TEXT and str(DIM_TEXT[name]).strip():
@@ -1096,6 +1112,33 @@ def taper_text(c, vname):
 INLINE_AVOID = {}          # 视图 → 内部竖直轮廓线的 x(局部坐标): 段直径的尺寸线别和它们重合(第二遍从视图的边里取)
 GDT_LABELS = gdt_items()   # 要 local_of / LAYM, 所以在这里算
 GDT_BY_ID = {o["id"]: o for o in GDT_LABELS}
+
+
+_TB = []
+
+
+def turn_boundaries():
+    """回转件链式尺寸的分界(轴向参数 t): 两端(全部顶点的最小 / 最大 t)+ 每段外圆的两端 —— 1.5 mm 内有垂直轴线的平面就吸到平面上
+    (倒角 / 圆角让圆柱面比台阶面短一点), 没有(锥 / 圆弧过渡)就用段端点; 相距 < 0.05 的合并。"""
+    if _TB:
+        return _TB
+    axs, c = TURN["axs"], TURN["c"]
+    ts = [(vx.Point - c).dot(axs) for vx in shape.Vertexes]
+    planes = []
+    for f in shape.Faces:
+        if isinstance(f.Surface, Part.Plane) and abs(abs(f.normalAt(0, 0).dot(axs)) - 1) < 1e-6:
+            planes.append((f.CenterOfMass - c).dot(axs))
+    cand = [min(ts), max(ts)]
+    for s in TURN["steps"]:
+        for te in (s["t0"], s["t1"]):
+            near = [p for p in planes if abs(p - te) < 1.5]
+            cand.append(min(near, key=lambda p: abs(p - te)) if near else te)
+    out = []
+    for t in sorted(cand):
+        if not out or t - out[-1] > 0.05:
+            out.append(t)
+    _TB.extend(out)
+    return _TB
 
 
 def layout_problem(anchors=None, fixed_scale=None, sec_dir=None):
@@ -1158,14 +1201,18 @@ def layout_problem(anchors=None, fixed_scale=None, sec_dir=None):
             dstep_segs.append((round(s_["d"], 3), x0_, x1_, id_))
             tol_ = shaft_tol(s_["d"] / 2)
             dims_.append({"id": id_, "view": "Front", "kind": "inline", "dir": "y", "span": [yc - s_["d"] / 2, yc + s_["d"] / 2], "outside": True,
-                          "cw": std["layout"].get("svg_char_w", 0.5),
+                          "cw": std["layout"].get("svg_char_w", 0.5) * SVG_EM,
                           "slide": [x0_ + min(0.8, (x1_ - x0_) / 4), x1_ - min(0.8, (x1_ - x0_) / 4)],
                           "text": shown_text(id_, "Diameter", DIMS["diameter"] + fmt(s_["d"]) + (" " + tol_ if tol_ else ""), s_["d"])})
         if len(segs) > 1:
-            for i_, s_ in enumerate(sorted(segs, key=lambda s: min(xt(s["t0"]), xt(s["t1"])))):
-                x0_, x1_ = sorted((xt(s_["t0"]), xt(s_["t1"])))
+            # 链式轴向尺寸: 在台阶面 / 端面之间量(含倒角) —— 2026-11-20 编码器轴: 按圆柱面自身长度量, 倒角不计,
+            # 20.1 / 9.7 / 15.57 加起来不等于总长, B 面到法兰的 10±0.2 标不出来
+            bx_ = sorted(xt(t) for t in turn_boundaries())
+            env_ = lambda x: max([s["d"] for s in TURN["steps"] if min(xt(s["t0"]), xt(s["t1"])) - 1e-3 <= x <= max(xt(s["t0"]), xt(s["t1"])) + 1e-3] or [0.0])
+            for i_, (x0_, x1_) in enumerate(zip(bx_, bx_[1:])):
+                d_ = env_((x0_ + x1_) / 2) or min(env_(x0_), env_(x1_)) or 2 * TURN["rmax"]
                 id_ = "Lstep%d" % (i_ + 1)
-                dims_.append({"id": id_, "view": "Front", "dir": "x", "side": "bottom", "a": [x0_, yc - s_["d"] / 2], "b": [x1_, yc - s_["d"] / 2],
+                dims_.append({"id": id_, "view": "Front", "dir": "x", "side": "bottom", "a": [x0_, yc - d_ / 2], "b": [x1_, yc - d_ / 2],
                               "text": shown_text(id_, "DistanceX", value=x1_ - x0_)})
         # 半剖时总长放下方最外层(界线从下半外形引出; 放上方界线要穿过剖开的上半)
         dims_.append({"id": "LenW", "view": "Front", "dir": "x", "side": "bottom" if HALF else "top",
@@ -1197,7 +1244,11 @@ def layout_problem(anchors=None, fixed_scale=None, sec_dir=None):
         hw, hh_ = ext(bw_) / 2, ext(bh_) / 2
         pts = [(local_of(g["view"], V(*h["at"])), h) for h in g["holes"]]
         (c_, h_) = min(pts, key=lambda ph: min(hw - abs(ph[0][0]), hh_ - abs(ph[0][1])))
-        lab(g["id"], g["view"], c_, h_["d"] / 2, shown_text(g["id"], "Diameter", g["text"]))
+        lines_ = split_callout(shown_text(g["id"], "Diameter", g["text"]))
+        lab(g["id"], g["view"], c_, h_["d"] / 2, lines_ if len(lines_) > 1 else lines_[0])
+        if len(lines_) > 1:
+            labels_[-1]["below_lines"] = True
+        labels_[-1]["flat_tol"] = True   # TechDraw 的孔说明: "(+0.039/0)" 照原样一行写, 宽度别按叠放算(2026-11-20 磁环座孔说明伸出图框)
     for i_, cn in enumerate(CONES):
         vn = cone_view(cn)
         if vn is None or (vn == "Section" and not isinstance(sec_spec, dict)):
@@ -1731,7 +1782,8 @@ placer = Placer(list(R.values()))
 dims_out = []
 
 
-def add_dim(view, typ, refs, name, page_xy, text=None, fmt_spec=None, value=None):
+def add_dim(view, typ, refs, name, page_xy, text=None, fmt_spec=None, value=None, exact=False):
+    """exact = text 已经是最终文字(调用方按方案改字 / 公差处理过, 如多行孔说明的第一行), 不再套改字 / 公差。"""
     info = {"name": name, "type": typ, "view": view.Name, "text": text, "at": [round(page_xy[0], 1), round(page_xy[1], 1)]}
     if value is not None:
         info["value"] = round(value, 4)
@@ -1739,7 +1791,9 @@ def add_dim(view, typ, refs, name, page_xy, text=None, fmt_spec=None, value=None
         info["hidden"] = True
         rep["placed"].append(info)
         return None
-    if name in DIM_TEXT and str(DIM_TEXT[name]).strip():
+    if exact:
+        info["custom"] = True
+    elif name in DIM_TEXT and str(DIM_TEXT[name]).strip():
         text = str(DIM_TEXT[name]).strip()
         info["custom"] = True
     elif name in DIM_TOL and value is not None:
@@ -1787,6 +1841,9 @@ def add_dim(view, typ, refs, name, page_xy, text=None, fmt_spec=None, value=None
         except Exception as e:
             rep["warnings"].append("stacked tolerance on %s: %s (kept as text)" % (name, e))
     if text is not None:
+        # 仿宋里没有 "⌴"(沉孔符号), TechDraw 用的替补字形不占宽度 → 后面的 "⌀6.5" 叠在它上面: 后面补一个空格
+        import re
+        text = re.sub("⌴(?=[^ ])", "⌴ ", text)
         d.Arbitrary = True
         d.FormatSpec = text
     dims_out.append(d)
@@ -1915,7 +1972,7 @@ def ordinates(vname, hole_list):
         return False
     cxp, cyp = (r[0] + r[2]) / 2, (r[1] + r[3]) / 2
     hw, hh_ = ext(bw_) / 2, ext(bh_) / 2  # 模型单位, 以包围盒中心为原点
-    fs = std["fonts"]["dim"]
+    fs = std["fonts"]["dim"] * SVG_EM
     lw = std["lines"]["thin"]
     fam = std["fonts"]["latin"]
     tick, gap, jog = ORD["tick"], ORD["gap"], 4.0  # 页面毫米
@@ -2173,7 +2230,7 @@ if LAY:
             rr_ = c_["rect"]
             PAGE_SVG.append('<rect x="%.3f" y="%.3f" width="%.3f" height="%.3f" style="fill:none;stroke:#f00;stroke-width:0.3"/>' % (rr_[0], rr_[1], rr_[2] - rr_[0], rr_[3] - rr_[1]))
     # 锥度标注: 引线(锥面上一点 → 折点 → 肩线)+ 文字, 画进页面图形(布局坐标本来就是 y 向下的页面毫米)
-    fs_, lw_, fam_ = std["fonts"]["dim"], std["lines"]["thin"], std["fonts"]["latin"]
+    fs_, lw_, fam_ = std["fonts"]["dim"] * SVG_EM, std["lines"]["thin"], std["fonts"]["latin"]
     # 回转件的段直径(视图上)/ 轴向链式尺寸(主视下方): 照布局结果画尺寸线 + 箭头 + 界线 + 文字
     def svg_arrow_(tip, toward):
         dx, dy = toward[0] - tip[0], toward[1] - tip[1]
@@ -2415,6 +2472,28 @@ for g in HOLE_GROUPS:
         rep["warnings"].append("no circle for hole group %s in %s" % (g["id"], vname))
         continue
     if g["id"] in LAY_LAB and g["id"] in LAY_EDGE:
+        lines_ = split_callout(shown_text(g["id"], "Diameter", txt))
+        if len(lines_) > 1 and g["id"] not in DIM_HIDE:
+            # 多行: 第一行 = TechDraw 尺寸(连引线, 文字左端贴着肩线拐点), 其余行自己画在肩线下方、同侧对齐
+            lb_ = LAY_LAB[g["id"]]
+            k_, e_ = lb_["leader"][1], lb_["leader"][2]
+            right_ = e_[0] >= k_[0]
+            fs_h = std["fonts"]["dim"]
+            fs_s = fs_h * SVG_EM   # 自画的行(与 TechDraw 的第一行同样大)
+            r1 = text_rect(0, 0, lines_[0])
+            w1 = r1[2] - r1[0]
+            cx_ = k_[0] + 0.5 + w1 / 2 if right_ else k_[0] - 0.5 - w1 / 2
+            add_dim(v, "Diameter", [LAY_EDGE[g["id"]]], g["id"], (cx_, H - (k_[1] - 0.6 - fs_h / 2)), text=lines_[0], exact=True)
+            cw_ = std["layout"].get("svg_char_w", 0.5)
+            lh_ = std["layout"]["line_h"]
+            for i_, ln_ in enumerate(lines_[1:]):
+                wl_ = sum(fs_s * (1.0 if ord(ch) > 0x2E80 else cw_) for ch in ln_)
+                x_ = k_[0] + 0.5 if right_ else k_[0] - 0.5 - wl_
+                y_ = k_[1] + 0.6 + fs_h * 1.6 + i_ * fs_h * lh_   # TechDraw 的肩线比布局的 k 略低(字大): 第二行再往下一点, 别碰肩线
+                PAGE_SVG.append('<text x="%.3f" y="%.3f" style="font-family:%s;font-size:%gpx;fill:#000">%s</text>'
+                                % (x_, y_, std["fonts"]["latin"], fs_s, ln_.replace("&", "&amp;").replace("<", "&lt;")))
+            rep["placed"][-1]["lines"] = lines_
+            continue
         add_dim(v, "Diameter", [LAY_EDGE[g["id"]]], g["id"], lay_text_center(LAY_LAB[g["id"]]), text=txt)
         continue
     # 候选位置: 视图四周外侧一圈圈往外; 对组里每个孔 × 每个空位算引线长, 取最短(引线短、少横穿图形)
@@ -2807,7 +2886,7 @@ def draw_added_dim(item):
         rep["placed"].append(info)
         return
     r = R[vn]
-    fsz = std["fonts"]["dim"]
+    fsz = std["fonts"]["dim"] * SVG_EM
     for ring in range(10):
         for sgn in (1, -1):
             ww = (wx * sgn, wy * sgn)
@@ -2839,7 +2918,7 @@ def svg_linear_dim(pa, pb, pts, ww, off, u, txt, tc, vertical):
     """页面坐标(y 向上)的线性尺寸 → PAGE_SVG: 两条尺寸界线 + 尺寸线 + 两个实心箭头 + 数字(竖直尺寸字头朝左)。"""
     lw = std["lines"]["thin"]
     fam = std["fonts"]["latin"]
-    fsz = std["fonts"]["dim"]
+    fsz = std["fonts"]["dim"] * SVG_EM
     ar, aw = 3.0, 0.5  # 箭头长 / 半宽(页面毫米)
 
     def s(p):
