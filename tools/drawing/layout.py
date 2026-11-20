@@ -105,19 +105,21 @@ class Text:
         self.h = f["dim"]
         self.line_h = L["line_h"]
 
-    def plain_width(self, s, h=None):
+    def plain_width(self, s, h=None, cw=None):
         h = h or self.h
-        return sum(h * (self.cjk if ord(ch) > 0x2E80 else self.latin) for ch in s)
+        lat = cw if cw else self.latin
+        return sum(h * (self.cjk if ord(ch) > 0x2E80 else lat) for ch in s)
 
-    def width(self, s, h=None):
-        """文字宽度; 带上下偏差的按叠放算(偏差只占较宽的那一个的 0.7 倍)。"""
+    def width(self, s, h=None, cw=None):
+        """文字宽度; 带上下偏差的按叠放算(偏差只占较宽的那一个的 0.7 倍; 用户 2026-11-20: 不加括号)。
+        cw = 数字字母的字宽系数(编译器自己画的页面图形是 svg_char_w ≈ 0.5, TechDraw 尺寸是 char_w.latin = 0.85)。"""
         h = h or self.h
         t = split_tol(s)
         if not t:
-            return self.plain_width(s, h)
+            return self.plain_width(s, h, cw)
         pre, up, lo, post, paren = t
-        w = self.plain_width(pre, h) + TOL_SCALE * max(self.plain_width(up, h), self.plain_width(lo, h)) + self.plain_width(post, h)
-        return w + (2 * 0.5 * h if paren else 0.3 * h)
+        w = self.plain_width(pre, h, cw) + TOL_SCALE * max(self.plain_width(up, h, cw), self.plain_width(lo, h, cw)) + self.plain_width(post, h, cw)
+        return w + 0.3 * h
 
     def box(self, lines, h=None):
         h = h or self.h
@@ -197,9 +199,11 @@ class Layout:
     def halos(self, lanes, s=1.0):
         """每个视图四边要留的宽度(尺寸层 + 文字 + 标注行)。"""
         h = {vid: {"top": 0.0, "bottom": 0.0, "left": 0.0, "right": 0.0} for vid in self.views}
+        for vid in self.views:          # 段直径文字写在零件外的那一条带(紧贴轮廓, 尺寸层在它外面)
+            h[vid]["top"] = self.out_zone(vid)
         for did, (side, lane, _, _) in lanes.items():
             d = next(x for x in self.dims if x["id"] == did)
-            need = self.D["gap"] + lane * self.D["step"] + self.T.h + 1.0
+            need = self.out_zone(d["view"], side) + self.D["gap"] + lane * self.D["step"] + self.T.h + 1.0
             h[d["view"]][side] = max(h[d["view"]][side], need)
         # 预留(编译器自己画的东西: 坐标尺寸条、剖视名、剖切符号箭头 …): 叠在尺寸层外面
         for rsv in self.p.get("reserve", []):
@@ -213,11 +217,19 @@ class Layout:
         return h
 
     # ---- 标注行: 形位框格 / 基准 / 粗糙度排在视图上下的整齐行里, 引线尽量竖直(用户 2026-11-20: 标注密时不能乱拉长引线)
+    def out_zone(self, vid, side="top"):
+        """段直径文字写在零件外(outside: 尺寸线向上延长, 竖排文字在延长段上)要的带宽 = 最长的文字 + 3; 只在上侧。"""
+        if side != "top":
+            return 0.0
+        ws = [self.T.width(d["text"], cw=d.get("cw")) for d in self.dims if d.get("kind") == "inline" and d.get("outside") and d["view"] == vid]
+        return (max(ws) + 4.0) if ws else 0.0
+
     def long_inline(self, s):
-        """这个比例下文字比自己的尺寸线还长的 inline ⌀(如 ⌀20 g7(-0.007/-0.028) 在 ⌀20 段上): 线留在零件上, 文字进标注行。"""
+        """这个比例下文字比自己的尺寸线还长的 inline ⌀(如 ⌀20 g7(-0.007/-0.028) 在 ⌀20 段上): 线留在零件上, 文字进标注行。
+        outside 的(文字本来就写在零件外)不算。"""
         out = []
         for d in self.dims:
-            if d.get("kind") == "inline" and d["dir"] == "y":
+            if d.get("kind") == "inline" and d["dir"] == "y" and not d.get("outside"):
                 c_scale = s
                 if self.T.width(d["text"]) + 2 * self.L["arrow"] > (max(d["span"]) - min(d["span"])) * c_scale:
                     out.append(d["id"])
@@ -609,7 +621,7 @@ class Layout:
             side, lane, (lo, hi), text_out = lanes[d["id"]]
             r = place[d["view"]]["rect"]
             A, B = self.to_page(d["view"], d["a"], place, s), self.to_page(d["view"], d["b"], place, s)
-            off = g + lane * st
+            off = self.out_zone(d["view"], side) + g + lane * st
             if d["dir"] == "x":
                 y = r[1] - off if side == "top" else r[3] + off
                 x0, x1 = sorted((A[0], B[0]))
@@ -715,6 +727,46 @@ class Layout:
             lo, hi = sorted(d["span"])
             a, b = sorted(d["slide"])
             mid = (a + b) / 2
+            # outside(用户 2026-11-20: 轴径拉到轴外面标): 尺寸线在段上(避开视图里的内部轮廓线), 向上延长出零件, 竖排文字(字头朝左)写在延长段上
+            if d.get("outside") and d["dir"] == "y":
+                tw = self.T.width(d["text"], cw=d.get("cw"))
+                avoid = [c["cx"] + ax * c["scale"] for ax in (self.views[d["view"]].get("inline_avoid") or [])]
+                steps = int(max(0, (b - a) * s) / 0.5) + 1
+                cands = sorted({min(max(mid + k * 0.5 / s * sgn, a), b) for k in range(steps) for sgn in (1, -1)}, key=lambda t: abs(t - mid))
+                # 离内部轮廓线越远越好(到 3 mm 就够), 同样远时靠段中间 —— 只求"不贴线"会落在两条线之间的窄缝里
+                clr = lambda t: min([abs(c["cx"] + t * c["scale"] - xa) for xa in avoid] or [99.0])  # noqa: E731
+                ok_t = sorted([t for t in cands if clr(t) >= 1.2] or cands, key=lambda t: (-min(clr(t), 3.0), abs(t - mid)))
+                y0, y1 = c["cy"] - hi * s, c["cy"] - lo * s      # 上 / 下轮廓
+                done = None
+                for up in (True, False):
+                    for t in ok_t:
+                        x = c["cx"] + t * c["scale"]
+                        ty1 = (y0 - 2.0) if up else (y1 + 2.0 + tw)
+                        ty0 = ty1 - tw
+                        for sd in (-1, 1):                         # 文字在延长线左侧(GB 首选)/ 右侧
+                            tx = x - 0.6 - th / 2 if sd < 0 else x + 0.6 + th / 2
+                            trect = (tx - th / 2, ty0, tx + th / 2, ty1)
+                            if not rect_inside(trect, self.area) or any(rect_hit(trect, u, pad) for u in taken_text):
+                                continue
+                            if any(rect_hit(trect, pr, 0.3) for cc in place.values() for pr in cc.get("parts", [cc["rect"]])):
+                                continue
+                            ext_ = ((x, y0), (x, ty0 - 1.0)) if up else ((x, y1), (x, ty1 + 1.0))
+                            if any(seg_hit(ext_[0], ext_[1], p_, q_) for p_, q_ in lines):
+                                continue
+                            done = {"line": [(x, y0), (x, y1)], "line_ext": [(x, min(y0, ext_[1][1])), (x, max(y1, ext_[1][1]))],
+                                    "text_at": (tx, (ty0 + ty1) / 2), "rot": -90, "text_rect": trect, "text": d["text"], "at": t,
+                                    "kind": "inline", "outside": True, "_view": d["view"]}
+                            break
+                        if done:
+                            break
+                    if done:
+                        break
+                if done:
+                    out[d["id"]] = done
+                    taken_text.append(done["text_rect"])
+                else:
+                    unplaced.append({"id": d["id"], "why": "no room for the diameter text outside the part"})
+                continue
             # 文字比尺寸线还长(⌀20 g7(-0.007/-0.028) 在 ⌀20 段上): 线留在零件上, 文字进标注行(挂在这条尺寸线一端, 见 row_labels)
             if d["id"] in self.long_inline(s):
                 x = c["cx"] + mid * c["scale"]

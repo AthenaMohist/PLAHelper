@@ -328,8 +328,13 @@ else:
     shape = test_plate()
 part = doc.addObject("Part::Feature", "Part")
 part.Shape = shape
-bb = shape.BoundBox
-rep["part"] = {"source": pspec.get("step") or "test_plate", "bbox": [round(bb.XLength, 3), round(bb.YLength, 3), round(bb.ZLength, 3)], "faces": len(shape.Faces), "volume": round(shape.Volume, 3)}
+# 包围盒要用精确的: shape.BoundBox 对 B 样条面按控制点算, 会偏大且中心偏(实测磁环座: 视图比布局位置整体偏 7 mm,
+# TechDraw 按真实几何居中视图); optimalBoundingBox 按几何本身算
+try:
+    bb = shape.optimalBoundingBox(True, False)
+except Exception:
+    bb = shape.BoundBox
+rep["part"] ={"source": pspec.get("step") or "test_plate", "bbox": [round(bb.XLength, 3), round(bb.YLength, 3), round(bb.ZLength, 3)], "faces": len(shape.Faces), "volume": round(shape.Volume, 3)}
 lap("part")
 
 # ---------------------------------------------------------------- 字体 / 尺寸样式(TechDraw 首选项)
@@ -1076,6 +1081,7 @@ def taper_text(c, vname):
     return ("◁ " if left else "▷ ") + c["text"]
 
 
+INLINE_AVOID = {}          # 视图 → 内部竖直轮廓线的 x(局部坐标): 段直径的尺寸线别和它们重合(第二遍从视图的边里取)
 GDT_LABELS = gdt_items()   # 要 local_of / LAYM, 所以在这里算
 GDT_BY_ID = {o["id"]: o for o in GDT_LABELS}
 
@@ -1090,7 +1096,7 @@ def layout_problem(anchors=None, fixed_scale=None, sec_dir=None):
     rg = std.get("roughness")
     if rg:
         keep.append([rg["x"] - 30, rg["y"] - 13, inner_r, rg["y"] + 5])   # 右上角"其余 ∇6.3"(符号 + Ra 值伸到 y − 11.5)
-    views_ = [{"id": "Front", "w": Wm, "h": Hm}] + ([] if TURN else [{"id": "Top", "w": Wm, "h": Dm, "rel": {"of": "Front", "dir": "below"}}]) + [
+    views_ = [{"id": "Front", "w": Wm, "h": Hm, "inline_avoid": INLINE_AVOID.get("Front", [])}] + ([] if TURN else [{"id": "Top", "w": Wm, "h": Dm, "rel": {"of": "Front", "dir": "below"}}]) + [
               {"id": "Left", "w": Dm, "h": Hm, "rel": {"of": "Front", "dir": "right"}}]
     reserve = []
     if isinstance(sec_spec, dict):
@@ -1125,7 +1131,8 @@ def layout_problem(anchors=None, fixed_scale=None, sec_dir=None):
             id_ = "Dstep%d" % (i_ + 1)
             dstep_ids.setdefault(round(s_["d"], 3), id_)
             tol_ = shaft_tol(s_["d"] / 2)
-            dims_.append({"id": id_, "view": "Front", "kind": "inline", "dir": "y", "span": [yc - s_["d"] / 2, yc + s_["d"] / 2],
+            dims_.append({"id": id_, "view": "Front", "kind": "inline", "dir": "y", "span": [yc - s_["d"] / 2, yc + s_["d"] / 2], "outside": True,
+                          "cw": std["layout"].get("svg_char_w", 0.5),
                           "slide": [x0_ + min(0.8, (x1_ - x0_) / 4), x1_ - min(0.8, (x1_ - x0_) / 4)],
                           "text": shown_text(id_, "Diameter", DIMS["diameter"] + fmt(s_["d"]) + (" " + tol_ if tol_ else ""), s_["d"])})
         if len(segs) > 1:
@@ -1629,8 +1636,8 @@ def place_linear(vname, axis, side, name, value):
     if name in LAY_DIM:
         # 布局层: 尺寸线所在位置(TechDraw 的尺寸位置 = 文字处, 尺寸线跟着走)
         d_ = LAY_DIM[name]
-        (p0, p1) = d_["line"]
-        p = (d_["text_at"][0], H - p0[1]) if axis == "x" else (p0[0], H - d_["text_at"][1])
+        # TechDraw 的尺寸位置 = 文字中心, 尺寸线画在文字下面一点(实测: 给尺寸线的位置会让线往下偏 ~3.5 mm, 压到别的东西)
+        p = (d_["text_at"][0], H - d_["text_at"][1])
         add_dim(v, "DistanceX" if axis == "x" else "DistanceY", refs_, name, p, fmt_spec=FSPEC, value=value)
         return
     # 左右两侧多让 6 mm: 剖切符号的箭头伸在视图左右外面
@@ -1757,11 +1764,13 @@ def flush_page_svg():
         return
     sym = doc.addObject("TechDraw::DrawViewSymbol", "PageGraphics")
     page.addView(sym)
-    sym.Symbol = ('<svg xmlns="http://www.w3.org/2000/svg" width="%gmm" height="%gmm" viewBox="0 0 %g %g">%s</svg>'
-                  % (W, H, W, H, "".join(PAGE_SVG)))
+    # 对角两个白点让内容包围盒 = 整页(TechDraw 按符号内容包围盒居中, 不按 viewBox); 视图吸附另在出图时关掉
+    corners =('<rect x="0" y="0" width="0.2" height="0.2" style="fill:#ffffff;stroke:none"/>'
+               '<rect x="%g" y="%g" width="0.2" height="0.2" style="fill:#ffffff;stroke:none"/>' % (W - 0.2, H - 0.2))
+    sym.Symbol = ('<svg xmlns="http://www.w3.org/2000/svg" width="%gmm" height="%gmm" viewBox="0 0 %g %g">%s%s</svg>'
+                  % (W, H, W, H, corners, "".join(PAGE_SVG)))
     sym.Scale = 1.0
     sym.X, sym.Y = W / 2, H / 2
-
 
 
 
@@ -1871,6 +1880,16 @@ if LAY:
                 best_ = (dd, m_)
         if best_:
             anchors_["Taper%d" % (i_ + 1)] = (vn, [best_[1][0], best_[1][1]])
+    # 主视里的竖直轮廓线(含虚线 / 内部台阶): 段直径的尺寸线避开它们(用户 2026-11-20: 磁环座 ⌀36 的尺寸线和内部轮廓线几乎重合)
+    if TURN:
+        xs_ = []
+        for _, ed in edges_of(views["Front"]):
+            if len(ed.Vertexes) < 2:
+                continue
+            p0_, p1_ = ed.Vertexes[0].Point, ed.Vertexes[-1].Point
+            if abs(p0_.x - p1_.x) < 1e-3 and abs(p0_.y - p1_.y) > 0.5:
+                xs_.append(round(p0_.x, 3))
+        INLINE_AVOID["Front"] = sorted(set(xs_))
     try:
         # 剖视被删掉(空出地方)且方案没定比例 → 第二遍可以重新选比例(可能更大)
         free_scale_ = globals().get("SEC_REMOVED") and spec.get("scale", "auto") == "auto"
@@ -1914,6 +1933,13 @@ if LAY:
         rep["warnings"].append("layout: %s not placed (%s)" % (w_["id"], w_["why"]))
     LAY_DIM.update(LAY["dims"])
     LAY_LAB.update(LAY["labels"])
+    if spec.get("debug_frames"):
+        # 排查: 布局认为的视图矩形画成红框(和 TechDraw 实际画出来的视图对比)
+        PAGE_SVG.append('<rect x="%g" y="%g" width="%g" height="%g" style="fill:none;stroke:#00f;stroke-width:0.3"/>'
+                        % (inner_l, H - inner_t, inner_r - inner_l, inner_t - (H - inner_t)))   # 内框(和模板的框比)
+        for vid_, c_ in LAY["views"].items():
+            rr_ = c_["rect"]
+            PAGE_SVG.append('<rect x="%.3f" y="%.3f" width="%.3f" height="%.3f" style="fill:none;stroke:#f00;stroke-width:0.3"/>' % (rr_[0], rr_[1], rr_[2] - rr_[0], rr_[3] - rr_[1]))
     # 锥度标注: 引线(锥面上一点 → 折点 → 肩线)+ 文字, 画进页面图形(布局坐标本来就是 y 向下的页面毫米)
     fs_, lw_, fam_ = std["fonts"]["dim"], std["lines"]["thin"], std["fonts"]["latin"]
     # 回转件的段直径(视图上)/ 轴向链式尺寸(主视下方): 照布局结果画尺寸线 + 箭头 + 界线 + 文字
@@ -1949,12 +1975,12 @@ if LAY:
         else:
             pre, up, lo, post, paren = t
             fs2 = fs_ * LAYM.TOL_SCALE
-            head, tail = pre + ("(" if paren else ""), (")" if paren else "") + post
+            head, tail = pre, post        # 用户 2026-11-20: 偏差不加括号
             wd = max(wdt(up, fs2), wdt(lo, fs2))
-            W = wdt(head, fs_) + (0 if paren else 0.25 * fs_) + wd + wdt(tail, fs_)
+            W = wdt(head, fs_) + 0.25 * fs_ + wd + wdt(tail, fs_)
             x0 = x - W / 2 if anchor == "middle" else x
             out.append('<text x="%.3f" y="%.3f" style="font-family:%s;font-size:%gpx;fill:#000">%s</text>' % (x0, base, fam_, fs_, head))
-            xx = x0 + wdt(head, fs_) + (0 if paren else 0.25 * fs_)
+            xx = x0 + wdt(head, fs_) + 0.25 * fs_
             # 上偏差的底线在中线略上, 下偏差的底线在文字底线附近(两行合起来约一个字高), 左端对齐
             out.append('<text x="%.3f" y="%.3f" style="font-family:%s;font-size:%gpx;fill:#000">%s</text>' % (xx, cy - fs_ * 0.08, fam_, fs2, up))
             out.append('<text x="%.3f" y="%.3f" style="font-family:%s;font-size:%gpx;fill:#000">%s</text>' % (xx, cy + fs_ * 0.62, fam_, fs2, lo))
@@ -2665,6 +2691,11 @@ if GUI:
             except Exception as e:
                 rep["warnings"].append("hole style: %s" % e)
     progress("gui: open page")
+    # TechDraw 的"视图吸附"(首选项 General/SnapViews)会把整页图形符号吸到附近视图的中心线上
+    # (实测磁环座: 页面图形整体上移 6.6 mm, 和 Y 设多少无关) → 出图期间关掉, 完了恢复用户的设置
+    snap_prm = App.ParamGet("User parameter:BaseApp/Preferences/Mod/TechDraw/General")
+    snap_old = snap_prm.GetBool("SnapViews", True)
+    snap_prm.SetBool("SnapViews", False)
     page.ViewObject.doubleClicked()
     for _ in range(20):
         Gui.updateGui()
@@ -2676,6 +2707,7 @@ if GUI:
     TechDrawGui.exportPageAsSvg(page, os.path.join(OUT, BASE + ".svg"))
     progress("gui: export qt pdf")
     TechDrawGui.exportPageAsPdf(page, os.path.join(OUT, BASE + ".qt.pdf"))
+    snap_prm.SetBool("SnapViews", snap_old)
     progress("gui: done")
     rep["paper_mm"] = [W, H]
 else:
