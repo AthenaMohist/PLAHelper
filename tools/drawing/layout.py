@@ -79,6 +79,25 @@ def max_empty_rects(area, keepout):
     return sorted(out, key=lambda r: -(r[2] - r[0]) * (r[3] - r[1]))
 
 
+import re as _re
+
+# 公差写成上下偏差叠放(用户 2026-11-20: 上下界用上下角标的格式): "⌀18 h7(0/-0.018)" / "12 +0.1/-0.05" →
+# (前缀, 上偏差, 下偏差, 后缀, 是否带括号)。对称的 "±0.05" 照常同号写, 不叠。
+_TOL_PAREN = _re.compile(r"^(.*?)\s?\(\s*([+\-]?\d+(?:\.\d+)?)\s*/\s*([+\-]?\d+(?:\.\d+)?)\s*\)(.*)$")
+_TOL_BARE = _re.compile(r"^(.*?\d)\s+([+\-]\d+(?:\.\d+)?|0)\s*/\s*([+\-]\d+(?:\.\d+)?|0)\s*$")
+TOL_SCALE = 0.7      # 偏差字号 = 0.7 × 尺寸字号
+
+
+def split_tol(s):
+    m = _TOL_PAREN.match(s or "")
+    if m:
+        return m.group(1).replace(" ", ""), m.group(2), m.group(3), m.group(4), True
+    m = _TOL_BARE.match(s or "")
+    if m:
+        return m.group(1), m.group(2), m.group(3), "", False
+    return None
+
+
 class Text:
     def __init__(self, std):
         L, f = std["layout"], std["fonts"]
@@ -86,9 +105,19 @@ class Text:
         self.h = f["dim"]
         self.line_h = L["line_h"]
 
-    def width(self, s, h=None):
+    def plain_width(self, s, h=None):
         h = h or self.h
         return sum(h * (self.cjk if ord(ch) > 0x2E80 else self.latin) for ch in s)
+
+    def width(self, s, h=None):
+        """文字宽度; 带上下偏差的按叠放算(偏差只占较宽的那一个的 0.7 倍)。"""
+        h = h or self.h
+        t = split_tol(s)
+        if not t:
+            return self.plain_width(s, h)
+        pre, up, lo, post, paren = t
+        w = self.plain_width(pre, h) + TOL_SCALE * max(self.plain_width(up, h), self.plain_width(lo, h)) + self.plain_width(post, h)
+        return w + (2 * 0.5 * h if paren else 0.3 * h)
 
     def box(self, lines, h=None):
         h = h or self.h
@@ -201,7 +230,9 @@ class Layout:
         extra = []
         for did in self.long_inline(s):
             d = next(x for x in self.dims if x["id"] == did)
-            extra.append({"id": did + "#t", "view": d["view"], "text": d["text"], "row": True, "attach_dim": did, "prio": 2, "dimtext": True})
+            # 带叠放偏差的文字比一行字高 → 框高 1.35 倍(下偏差不压肩线)
+            hh = self.T.h * (1.35 if split_tol(d["text"]) else 1.0)
+            extra.append({"id": did + "#t", "view": d["view"], "text": d["text"], "row": True, "attach_dim": did, "prio": 2, "dimtext": True, "h": hh})
         return base + extra
 
     def label_w(self, lb):
@@ -396,6 +427,10 @@ class Layout:
                     if ri == 0:
                         att = min(max(it["lx"], box[0] + 1.0), box[2] - 1.0)
                         lead = it["pre"] + [(it["lx"], edge), (att, bedge)]
+                        if lb.get("dimtext") and side == "bottom":
+                            # 文字 + 肩线(肩线在框底): 引线从上面来, 沿文字外侧落到肩线一端, 不穿过文字
+                            ex_ = box[0] - 0.6 if it["lx"] <= (box[0] + box[2]) / 2 else box[2] + 0.6
+                            lead = it["pre"] + [(it["lx"], edge), (ex_, box[1]), (ex_, box[3])]
                     else:
                         # 外行: 要素 → 竖直出尺寸区 → 斜到里行的缝 → 竖直穿过里行 → 进框
                         sx = it["slot"]
@@ -404,6 +439,9 @@ class Layout:
                         out0 = (b0 - rh - 1.0) if side == "top" else (b0 + 1.0)
                         att = min(max(sx, box[0] + 1.0), box[2] - 1.0)
                         lead = it["pre"] + [(it["lx"], edge), (sx, in0), (sx, out0), (att, bedge)]
+                        if lb.get("dimtext") and side == "bottom":
+                            ex_ = box[0] - 0.6 if sx <= (box[0] + box[2]) / 2 else box[2] + 0.6
+                            lead = it["pre"] + [(it["lx"], edge), (sx, in0), (sx, out0), (ex_, box[1]), (ex_, box[3])]
                     bad = None
                     if x0 < xlo - 0.5 or x0 + it["w"] > xhi + 0.5 or not rect_inside(box, self.area) or any(rect_hit(box, k) for k in self.keepout):
                         bad = "no room in the annotation rows"
@@ -992,9 +1030,10 @@ def render_svg(problem, res, path, std=None):
         arrow(d["line"][0], d["line"][1])
         text(d["text_at"], d["text"], d.get("rot", 0))
     for k, l in res["labels"].items():
-        a_, kn, e = l["leader"]
-        line(a_, kn); line(kn, e)
-        o.append('<circle cx="%.2f" cy="%.2f" r="0.5" fill="black"/>' % a_)
+        pts = l["leader"]
+        for p_, q_ in zip(pts, pts[1:]):
+            line(p_, q_)
+        o.append('<circle cx="%.2f" cy="%.2f" r="0.5" fill="black"/>' % tuple(pts[0]))
         r = l["text_rect"]
         for i, s in enumerate(l["lines"]):
             text((r[0] + 0.5, r[1] + T.h / 2 + i * T.h * T.line_h), s, 0, "start")

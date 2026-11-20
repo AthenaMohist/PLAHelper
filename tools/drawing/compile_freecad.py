@@ -1502,6 +1502,29 @@ def add_dim(view, typ, refs, name, page_xy, text=None, fmt_spec=None, value=None
     d.X, d.Y = page_xy[0] - vx, page_xy[1] - vy
     if fmt_spec:
         d.FormatSpec = fmt_spec
+    # 不对称公差(用户 2026-11-20: 上下界写成上下角标): 用 TechDraw 自己的上 / 下偏差(叠放显示), 不拼进文字; 对称 ± 照常同号写
+    tsp = LAYM.split_tol(text) if text is not None and not info.get("custom") else None
+    if tsp and value is not None:
+        # 只处理"数值 [代号] (上/下)"这种单纯的尺寸; 孔说明("2 x ⌀8 H7(+0.015/0) 贯穿")等带别的字的不动
+        core_ = tsp[0].replace(DIMS["key_mark"], "").replace(DIMS["diameter"], "").lstrip("R")
+        if tsp[3].strip() or not core_.startswith(fmt(value)):
+            tsp = None
+    if tsp and value is not None and typ in ("DistanceX", "DistanceY", "Distance", "Diameter", "Radius"):
+        pre, up, lo, post, paren = tsp
+        try:
+            code_ = pre.split(fmt(value))[-1] if fmt(value) in pre else ""
+            lead_ = {"Diameter": DIMS["diameter"], "Radius": "R"}.get(typ, "")
+            d.FormatSpec = (DIMS["key_mark"] if info.get("key") else "") + lead_ + FSPEC + (code_ if code_ else "")
+            d.EqualTolerance = False
+            d.OverTolerance = float(up)
+            d.UnderTolerance = float(lo)
+            for prop, v_ in (("FormatSpecOverTolerance", "%+.3w"), ("FormatSpecUnderTolerance", "%+.3w")):
+                if hasattr(d, prop):
+                    setattr(d, prop, v_)
+            info["tolerance"] = [up, lo]
+            text = None
+        except Exception as e:
+            rep["warnings"].append("stacked tolerance on %s: %s (kept as text)" % (name, e))
     if text is not None:
         d.Arbitrary = True
         d.FormatSpec = text
@@ -1906,6 +1929,40 @@ if LAY:
     def svg_line_(p, q):
         PAGE_SVG.append('<line x1="%.3f" y1="%.3f" x2="%.3f" y2="%.3f" style="stroke:#000;stroke-width:%g"/>' % (p[0], p[1], q[0], q[1], lw_))
 
+    T_ = LAYM.Text(std)
+
+    def svg_text_(x, cy, s, rot=0, anchor="middle"):
+        """文字(竖向的转 -90°: 字头朝左, 从下往上读 —— GB); 带上下偏差的写成叠放的小字(上偏差在上、下偏差在下)。
+        x = 中心(anchor middle)或左端(anchor start), cy = 文字竖直中线。"""
+        t = LAYM.split_tol(s)
+        g0 = '<g transform="rotate(-90 %.3f %.3f)">' % (x, cy) if rot == -90 else "<g>"   # 绕给定点(中心 / 左端)转
+        base = cy + fs_ * 0.35
+        # 页面图形由 TechDraw 的 SVG 渲染器画: 不认 tspan 的字号 / 偏移 / 透明 → 每段单独一个 <text>, 按实测字宽摆
+        # (仿宋: 汉字 1.0 × 字高, 数字字母 svg_char_w × 字高, 实测 0.50; layout 的 0.85 是 TechDraw 尺寸字体的)
+        cw = std["layout"].get("svg_char_w", 0.5)
+        wdt = lambda u, h: sum(h * (1.0 if ord(ch) > 0x2E80 else cw) for ch in u)
+        out = [g0]
+        if not t:
+            W = wdt(s, fs_)
+            x0 = x - W / 2 if anchor == "middle" else x
+            out.append('<text x="%.3f" y="%.3f" style="font-family:%s;font-size:%gpx;fill:#000">%s</text>' % (x0, base, fam_, fs_, s))
+        else:
+            pre, up, lo, post, paren = t
+            fs2 = fs_ * LAYM.TOL_SCALE
+            head, tail = pre + ("(" if paren else ""), (")" if paren else "") + post
+            wd = max(wdt(up, fs2), wdt(lo, fs2))
+            W = wdt(head, fs_) + (0 if paren else 0.25 * fs_) + wd + wdt(tail, fs_)
+            x0 = x - W / 2 if anchor == "middle" else x
+            out.append('<text x="%.3f" y="%.3f" style="font-family:%s;font-size:%gpx;fill:#000">%s</text>' % (x0, base, fam_, fs_, head))
+            xx = x0 + wdt(head, fs_) + (0 if paren else 0.25 * fs_)
+            # 上偏差的底线在中线略上, 下偏差的底线在文字底线附近(两行合起来约一个字高), 左端对齐
+            out.append('<text x="%.3f" y="%.3f" style="font-family:%s;font-size:%gpx;fill:#000">%s</text>' % (xx, cy - fs_ * 0.08, fam_, fs2, up))
+            out.append('<text x="%.3f" y="%.3f" style="font-family:%s;font-size:%gpx;fill:#000">%s</text>' % (xx, cy + fs_ * 0.62, fam_, fs2, lo))
+            if tail:
+                out.append('<text x="%.3f" y="%.3f" style="font-family:%s;font-size:%gpx;fill:#000">%s</text>' % (xx + wd, base, fam_, fs_, tail))
+        out.append("</g>")
+        PAGE_SVG.append("".join(out))
+
     for id_, d_ in LAY["dims"].items():
         if not id_.startswith(("Dstep", "Lstep")):
             continue
@@ -1920,9 +1977,8 @@ if LAY:
         svg_arrow_(q_, p_)
         r_ = d_["text_rect"]
         cx_, cy_ = (r_[0] + r_[2]) / 2, (r_[1] + r_[3]) / 2
-        rot_ = ' transform="rotate(-90 %.3f %.3f)"' % (cx_, cy_) if d_.get("rot") == -90 else ""
-        PAGE_SVG.append('<text x="%.3f" y="%.3f" style="font-family:%s;font-size:%gpx;text-anchor:middle;fill:#000"%s>%s</text>'
-                        % (cx_, cy_ + fs_ * 0.35, fam_, fs_, rot_, d_["text"]))
+        if d_.get("text"):
+            svg_text_(cx_, cy_, d_["text"], d_.get("rot", 0))
         rep["placed"].append({"name": id_, "type": "Diameter" if id_.startswith("D") else "DistanceX", "text": d_["text"], "at": [round(cx_, 1), round(H - cy_, 1)]})
     for id_, l_ in LAY["labels"].items():
         # 锥度; 窄台阶放不下的段直径(布局改成了引出标注)
@@ -1947,8 +2003,7 @@ if LAY:
         for p_, q_ in zip(pts_, pts_[1:]):
             svg_line_(p_, q_)
         svg_line_((r_[0], r_[3]), (r_[2], r_[3]))
-        PAGE_SVG.append('<text x="%.3f" y="%.3f" style="font-family:%s;font-size:%gpx;fill:#000">%s</text>'
-                        % (r_[0] + 0.5, r_[3] - 0.8, fam_, fs_, l_["lines"][0]))
+        svg_text_(r_[0] + 0.5, (r_[1] + r_[3]) / 2 - 0.4, l_["lines"][0], 0, "start")
         rep["placed"].append({"name": id_, "type": "DiameterText", "text": l_["lines"][0], "at": [round(r_[0], 1), round(H - r_[3], 1)]})
     for id_, l_ in LAY["labels"].items():
         o_ = GDT_BY_ID.get(id_)

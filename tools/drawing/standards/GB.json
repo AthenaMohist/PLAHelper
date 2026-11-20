@@ -10,6 +10,7 @@
   "diameter": "⌀", "through": "贯穿", "depth": "↧", "counterbore": "⌴", "countersink": "⌵",
   "key_mark": "*", "count_format": "{n} x "
  },
+ "comment_text_rules": "用户 2026-11-20: 竖向尺寸文字字头朝左(从下往上读, 旋转 -90°); 不对称公差写成上下偏差叠放(偏差字号 0.7 倍, 上偏差在上、下偏差在下, 左端对齐; 有公差带代号时加括号), 对称的 ± 同号写。svg_char_w = 页面图形里仿宋数字字母的实测字宽(字高的倍数)。",
  "comment_layout_engine": "布局中间层(tools/drawing/layout.py)的参数, 页面毫米。scales = GB/T 14690 优先比例(从大到小试); char_w = 字宽 / 字高(实测 A3 PDF: 汉字 1.0, 数字字母 0.85); gap / step 沿用 dims; label_r = 引出标注候选半径; view_gap = 视图之间最小间距(含标注圈之外), max_gap = 余量均分时的上限。",
  "layout": {
   "scales": [10, 5, 4, 2.5, 2, 1.5, 1, 0.6667, 0.5, 0.4, 0.3333, 0.25, 0.2, 0.1, 0.05],
@@ -17,7 +18,7 @@
   "arrow": 3.0, "ext_gap": 1.0, "ext_over": 2.0, "pad": 1.2,
   "view_gap": 10.0, "max_gap": 40.0, "edge_gap": 6.0,
   "label_r": [8, 12, 17, 23, 30], "label_angles": [45, 135, 225, 315, 60, 120, 240, 300, 30, 150, 210, 330, 90, 270],
-  "line_h": 1.45, "ugly_inside": 10.0
+  "line_h": 1.45, "ugly_inside": 10.0, "svg_char_w": 0.5
  },
  "general_tolerance": "±0.05",
  "comment_threads": "螺纹孔: 优先用打孔工具的孔记录(选了 M4、用途 = 螺纹底孔)。thread_by_diameter = 没记录时按孔径认螺纹的规则(孔径 → 螺纹, 如 {\"3.3\": \"M4\"}); 是建模习惯, 默认空, 由项目 / 偏好填(⌀3.2 也可能是 M3 过孔)。thread_class = 螺纹公差带后缀(如 \"-6H\"), 空 = 不写。",
