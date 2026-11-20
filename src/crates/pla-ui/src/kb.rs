@@ -89,10 +89,25 @@ fn pick_sources(source: Option<&str>) -> Result<Vec<Value>, String> {
     if all.is_empty() {
         return Err(format!("no knowledge source configured: add one with kb_sources action=add (e.g. kind local, path = a mech-kb folder); config file {}", config_path().display()));
     }
-    match source {
-        None | Some("") => Ok(all),
-        Some(n) => all.into_iter().find(|s| s["name"].as_str() == Some(n)).map(|s| vec![s]).ok_or_else(|| format!("no knowledge source named {n}")),
+    let picked = match source {
+        None | Some("") => all,
+        Some(n) => all.into_iter().find(|s| s["name"].as_str() == Some(n)).map(|s| vec![s]).ok_or_else(|| format!("no knowledge source named {n}"))?,
+    };
+    Ok(picked.into_iter().map(via_rpc).collect())
+}
+
+/// 本地库的 kb.json 写了 `"rpc": ["runner/kb.js", "rpc"]` → 交给库自己的运行器(检索 / 目录结构 / 格式由库决定, 体量上来换检索后端也不用改 helper);
+/// 没写的(schema 1 的老库)按内置的本地读法。
+fn via_rpc(s: Value) -> Value {
+    if s["kind"].as_str() != Some("local") {
+        return s;
     }
+    let root = PathBuf::from(s["path"].as_str().unwrap_or(""));
+    let kbj: Value = read(&root.join("kb.json")).and_then(|t| serde_json::from_str(&t).ok()).unwrap_or(Value::Null);
+    let Some(rpc) = kbj["rpc"].as_array().filter(|a| !a.is_empty()) else { return s };
+    let mut args: Vec<Value> = vec![json!(root.join(rpc[0].as_str().unwrap_or("runner/kb.js")).to_string_lossy())];
+    args.extend(rpc[1..].iter().cloned());
+    json!({"name": s["name"], "kind": "command", "command": "node", "args": args, "path": s["path"], "via": "rpc"})
 }
 
 // ---------------------------------------------------------------- 本地库: 读取与检索
@@ -463,7 +478,15 @@ pub fn propose(source: Option<&str>, a: &Value) -> Result<Value, String> {
     let s = one_source(source)?;
     match s["kind"].as_str().unwrap_or("") {
         "local" => local_propose(Path::new(s["path"].as_str().unwrap_or("")), a),
-        _ => Err("proposals can only be written to a local knowledge base".into()),
+        "command" => {
+            let mut req = a.clone();
+            if let Some(o) = req.as_object_mut() {
+                o.remove("source");
+                o.insert("op".into(), json!("propose"));
+            }
+            command_call(&s, req)
+        }
+        _ => Err("this knowledge source does not take proposals".into()),
     }
 }
 
@@ -510,6 +533,32 @@ mod tests {
         assert!(dir.join("proposals").join("tools").join("x1").join("tool.json").is_file(), "{r}");
         assert!(!dir.join("tools").join("x1").exists(), "不碰 tools/");
         assert!(local_propose(&dir, &json!({"kind": "tool", "id": "demo", "spec": ok["spec"], "code": "x", "tests": ok["tests"]})).is_err(), "不覆盖已审核的工具");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn local_kb_with_rpc_runner() {
+        let dir = std::env::temp_dir().join(format!("pla-kb-rpc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("runner")).unwrap();
+        // 没写 rpc 的老库 → 原样(内置读法)
+        std::fs::write(dir.join("kb.json"), r#"{"schema":1,"name":"t"}"#).unwrap();
+        let src = json!({"name": "t", "kind": "local", "path": dir.to_string_lossy()});
+        assert_eq!(via_rpc(src.clone())["kind"], json!("local"));
+        // 写了 rpc → 交给库自己的运行器
+        std::fs::write(dir.join("kb.json"), r#"{"schema":2,"name":"t","rpc":["runner/kb.js","rpc"]}"#).unwrap();
+        std::fs::write(dir.join("runner").join("kb.js"),
+            "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const r=JSON.parse(s);console.log(JSON.stringify(r.op==='search'?{hits:[{kind:'page',id:'x',q:r.query}]}:r.op==='propose'?{proposed:r.kind,id:r.id,hasSource:'source' in r}:{error:'unsupported'}))});").unwrap();
+        let s = via_rpc(src);
+        assert_eq!(s["kind"], json!("command"));
+        assert_eq!(s["command"], json!("node"));
+        assert_eq!(s["args"][1], json!("rpc"));
+        assert!(s["args"][0].as_str().unwrap().ends_with("kb.js"));
+        if Command::new("node").arg("--version").output().is_ok() {
+            let r = command_call(&s, json!({"op": "search", "query": "联轴器"})).unwrap();
+            assert_eq!(r["hits"][0]["q"], json!("联轴器"));
+            assert_eq!(command_call(&s, json!({"op": "nope"})).unwrap_err(), "unsupported");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

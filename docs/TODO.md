@@ -724,6 +724,11 @@
       + 计算工具（fit-limits / bolt-preload / bearing-life / shaft-torsion / key-crush，每个带参考用例，共 36 条全过；运行器在 vm 沙箱里跑、无 require、限时 2 s）。
       工作流：先搜 → 有工具就算 → 没有就手算注明出处 → 做完提议固化（kb_propose 只写 proposals/，`node runner/kb.js test-proposal <id>` 审）。第一份草稿：coupling-select（联轴器计算转矩校核）。
       原 knowledge_* 三个 ima 工具并进 kb_*（kind ima 的源）。待做：更多工具（K3 逆向来源）、卡片；ima 写入（K4）。
+      2026-11-20 用户：按 Karpathy 的 LLM Wiki 组织，体量按"机械设计手册全量 + 案例 + 各领域"定，小体量先开一部分。mech-kb 改成 schema 2
+      （wiki/<领域>/ 知识页 + [[链接]]、data/ 数据表注入工具、脚本生成 index/、原始资料在库外、检索 scan → SQLite FTS5 自动切换、hybrid 预留；
+      迁移程序加 ingest（对照原文审）/ audit（每领域定期体检）；见 mech-kb 的 AGENTS.md、PLAN.md）。
+      helper 侧：local 源的 kb.json 写了 `rpc` 就交给库自己的运行器（`node runner/kb.js rpc`），检索 / 格式由库决定；kb_* 的 kind 加 page / data / raw，kb_propose 加 page / data。
+      待用户：手册版本与电子版形式（文字 PDF / 扫描件）→ 决定提取流程。
 - [ ] **K5 知识资源引导**（2026-11-19 用户：不给 helper 集成知识库，而是让 MCP / skill 引导 agent 在用的时候去权威资源找正确的知识）：
       MCP 里给一份"主题 → 资源"清单（标准号、网站深链、看什么），工具描述里要求先查再答、注明出处。
       mechtool.cn 调研（2026-11-19）：计算器（公差配合 GB/T 1800.1-2020、螺栓、轴、滚动轴承、齿轮 / 蜗杆、弹簧、带 / 链、滚珠丝杠、导轨、电机选型、液压气动、挠度…）
