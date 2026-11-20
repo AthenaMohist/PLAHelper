@@ -938,8 +938,9 @@ class Layout:
     # ---- 总装
     def solve(self):
         scales = [self.p["scale"]] if self.p.get("scale") else self.L["scales"]
-        best = None
-        for s in scales:
+        best, first_ok = None, None
+        for idx, s in enumerate(scales):
+            idx = -idx   # 越往后比例越小: first_ok[0] − idx = 退了几档
             bump, place = {}, None
             for _round in range(12):
                 lanes = self.lanes(s, bump)
@@ -989,7 +990,15 @@ class Layout:
             res["ugly"] = ugly
             bad = len(res["unplaced"]) + len(res["conflicts"])
             if not bad and not ugly:
+                # 干净的比例: 比最大的"放得下、不重叠"比例只小一档才要; 小得更多就宁可用大比例(引线观感只报告)
+                # —— 2026-11-20 编码器轴半剖: 2:1 有一处引线交叉 → 一路退到 1:1, 实际孔说明文字反而叠在一起
+                # 例外: "引线在零件里走得长"随比例变短, 缩小确实能治(磁环座内锥: 5:1 走 57 mm, 3:1 合格)→ 照常往下退
+                if first_ok is not None and first_ok[0] - idx > 1 and not first_ok[2]:
+                    return first_ok[1]
                 return res
+            if not bad and first_ok is None:
+                fixable = all("through the part" in w for u in ugly for w in u["why"])
+                first_ok = (idx, res, fixable)
             # 都不干净时: 放不下 / 重叠最少的里面取比例最大的(缩小比例解决不了标注挤 —— 字号不变, 零件变小反而更挤);
             # 引线观感问题只当警告(res["ugly"])
             key = (bad, -s, len(ugly))

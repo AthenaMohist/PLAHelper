@@ -553,12 +553,16 @@ def hole_view(h):
 sec = None
 sec_spec = spec.get("section", "auto")
 sec_base = None
+HALF = False
 if sec_spec == "auto" and TURN:
     # 回转件: 过轴线剖主视(GB 轴 / 盘类的常规表达; 实测编码器轴按"孔最多的视图"横剖, 剖视是空的)
     o_ = TURN["c"]
     n_ = VAX["Front"][2]
     sec_spec = {"base": "Front", "origin": [o_.x, o_.y, o_.z], "normal": [n_.x, n_.y, n_.z], "symbol": "A"}
     sec_base = "Front"
+    # 主视半剖(用户 2026-11-20, 照手画图): 上半剖开、下半外形, 分界 = 轴线(点画线), 不再另出一个 A-A。
+    # 剖切面过对称面 + 就在主视上 → 按 GB/T 4458.6 不标剖切符号和剖视名。方案 "half_section": false 回到单独的 A-A。
+    HALF = spec.get("half_section", True) is not False
 elif sec_spec == "auto" and holes:
     from collections import Counter
 
@@ -764,7 +768,7 @@ CONES = cone_features()
 def cone_view(c):
     """锥面在哪个视图里显示成斜线(轴 ⟂ 视线): 有剖视且剖切面含轴线就用剖视(内锥要剖开才看得见), 否则主 → 俯 → 左。"""
     if isinstance(sec_spec, dict) and abs(c["axis"].dot(V(*sec_spec["normal"]))) < 1e-6:
-        return "Section"
+        return "Front" if HALF else "Section"
     for n in VIEWS3:
         if abs(c["axis"].dot(VAX[n][2])) < 1e-6:
             return n
@@ -1099,7 +1103,7 @@ def layout_problem(anchors=None, fixed_scale=None, sec_dir=None):
     views_ = [{"id": "Front", "w": Wm, "h": Hm, "inline_avoid": INLINE_AVOID.get("Front", [])}] + ([] if TURN else [{"id": "Top", "w": Wm, "h": Dm, "rel": {"of": "Front", "dir": "below"}}]) + [
               {"id": "Left", "w": Dm, "h": Hm, "rel": {"of": "Front", "dir": "right"}}]
     reserve = []
-    if isinstance(sec_spec, dict):
+    if isinstance(sec_spec, dict) and not HALF:
         bw_, bh_, bd_ = VAX[sec_spec.get("base", "Front")]
         views_.append({"id": "Section", "w": ext(bw_), "h": ext(bd_), "rel": {"of": sec_dir[0], "dir": sec_dir[1]}})
         reserve.append({"view": "Section", "side": "top", "depth": 10.0})          # 剖视名 "A-A"
@@ -1141,7 +1145,9 @@ def layout_problem(anchors=None, fixed_scale=None, sec_dir=None):
                 id_ = "Lstep%d" % (i_ + 1)
                 dims_.append({"id": id_, "view": "Front", "dir": "x", "side": "bottom", "a": [x0_, yc - s_["d"] / 2], "b": [x1_, yc - s_["d"] / 2],
                               "text": shown_text(id_, "DistanceX", value=x1_ - x0_)})
-        dims_.append({"id": "LenW", "view": "Front", "dir": "x", "side": "top", "a": [-Wm / 2, Hm / 2], "b": [Wm / 2, Hm / 2], "text": shown_text("LenW", "DistanceX", value=Wm)})
+        # 半剖时总长放下方最外层(界线从下半外形引出; 放上方界线要穿过剖开的上半)
+        dims_.append({"id": "LenW", "view": "Front", "dir": "x", "side": "bottom" if HALF else "top",
+                      "a": [-Wm / 2, -Hm / 2 if HALF else Hm / 2], "b": [Wm / 2, -Hm / 2 if HALF else Hm / 2], "text": shown_text("LenW", "DistanceX", value=Wm)})
     elif not fr_ and not ORD_GROUPS:
         dims_.append({"id": "LenW", "view": "Front", "dir": "x", "side": "top", "a": [-Wm / 2, Hm / 2], "b": [Wm / 2, Hm / 2], "text": shown_text("LenW", "DistanceX", value=Wm)})
         dims_.append({"id": "LenH", "view": "Front", "dir": "y", "side": "left", "a": [-Wm / 2, -Hm / 2], "b": [-Wm / 2, Hm / 2], "text": shown_text("LenH", "DistanceY", value=Hm)})
@@ -1177,7 +1183,12 @@ def layout_problem(anchors=None, fixed_scale=None, sec_dir=None):
         if vn is None:
             continue
         id_ = "Taper%d" % (i_ + 1)
-        a_ = anchors.get(id_, (vn, local_of(vn, cn["mid"])))
+        est_ = local_of(vn, cn["mid"])
+        if HALF and vn == "Front":
+            # 半剖: 内锥只在剖开的上半看得见, 外锥两半都行 —— 统一取上半(轴线以上)
+            yc0_ = (TURN["c"] - bb.Center).dot(VAX["Front"][1])
+            est_ = [est_[0], yc0_ + abs(est_[1] - yc0_)]
+        a_ = anchors.get(id_, (vn, est_))
         labels_.append({"id": id_, "view": a_[0], "anchor": a_[1], "text": taper_text(cn, a_[0]), "prio": 2})
     # 基准 / 形位公差 / 粗糙度(锚点都在要素本身上)
     for o_ in GDT_LABELS:
@@ -1360,7 +1371,226 @@ def vcenter(v):
 
 R = {n: vrect(views[n], ext(VAX[n][0]) * scale, ext(VAX[n][1]) * scale) for n in VAX if n in views}
 
-if isinstance(sec_spec, dict):
+
+# ---------------------------------------------------------------- 回转件主视半剖
+# 投影组的主视(整件, 带虚线)留着只做几何查询(边 / 顶点坐标、正负校准), 界面里隐藏; 页面上画的是两个同位置的视图:
+#   下半 = 下半个零件的外形(不画虚线), 上半 = 上半个零件过轴线剖开(TechDraw 剖视, 剖面线自带)。
+# 实测(2026-11-20 halfexp): ① 普通视图按源形体包围盒居中 —— 半个零件 + 整件包围盒两个对角顶点 → 与整件主视同心同坐标;
+# ② 剖视切的是基视图的形体(不是自己的 Source), 且按切后形体的包围盒居中 → 基视图 = 隐藏的"上半 + 角点"视图, 剖视位置补偏移;
+# ③ 两半在轴线上各留一串边(半剖切出来的平面) → formatGeometricEdge 设为不可见, 分界由轴线的点画线表示。
+HALF_VIEWS = {}
+
+
+def edges_of(view):
+    out = []
+    i = 0
+    while True:
+        try:
+            e = view.getEdgeByIndex(i)
+        except Exception:
+            break
+        if e is None:
+            break
+        out.append(("Edge%d" % i, e))
+        i += 1
+    return out
+
+
+def verts_of(view):
+    out = []
+    i = 0
+    while True:
+        try:
+            p = view.getVertexByIndex(i)
+        except Exception:
+            break
+        if p is None:
+            break
+        out.append(("Vertex%d" % i, p))
+        i += 1
+    return out
+
+
+def half_box(O, n):
+    """以 O 为界、n 一侧的大盒子(半空间)。"""
+    big = 4 * (bb.DiagonalLength + 10)
+    n = V(n).normalize()
+    u = n.cross(V(1, 0, 0)) if abs(n.x) < 0.9 else n.cross(V(0, 1, 0))
+    u.normalize()
+    w = n.cross(u)
+    box = Part.makeBox(big, big, big)
+    box = box.transformGeometry(App.Matrix(u.x, w.x, n.x, 0, u.y, w.y, n.y, 0, u.z, w.z, n.z, 0, 0, 0, 0, 1))
+    box.translate(O - u * (big / 2) - w * (big / 2))
+    return box
+
+
+def sync_half():
+    """半剖的两个视图跟着(隐藏的)主视走: 位置 / 比例。"""
+    if not HALF_VIEWS:
+        return
+    fx_, fy_ = vcenter(views["Front"])
+    for k_, v_ in HALF_VIEWS.items():
+        if k_.startswith("_"):
+            continue
+        v_.Scale = scale
+        dx_, dy_ = HALF_VIEWS["_off"].get(k_, (0.0, 0.0))
+        v_.X, v_.Y = fx_ + dx_ * scale, fy_ + dy_ * scale
+
+
+def make_half_views():
+    O = TURN["c"]
+    ax_h_ = VAX["Front"][1]
+    corners = [Part.Vertex(bb.XMin, bb.YMin, bb.ZMin), Part.Vertex(bb.XMax, bb.YMax, bb.ZMax)]
+    up_ = shape.common(half_box(O, ax_h_))
+    lo_ = shape.common(half_box(O, -ax_h_))
+    feats = {}
+    for n_, s_ in (("HalfUpper", up_), ("HalfLower", lo_)):
+        f_ = doc.addObject("Part::Feature", n_)
+        f_.Shape = Part.Compound([s_] + corners)
+        feats[n_] = f_
+        if GUI and f_.ViewObject is not None:
+            f_.ViewObject.Visibility = False
+
+    def part_view(name_, src):
+        v_ = doc.addObject("TechDraw::DrawViewPart", name_)
+        page.addView(v_)
+        v_.Source = [src]
+        v_.Direction = front
+        v_.XDirection = ax_w
+        v_.ScaleType = "Custom"
+        v_.Scale = scale
+        try:
+            v_.HardHidden = False
+        except Exception:
+            pass
+        return v_
+
+    lo_v = part_view("FrontLower", feats["HalfLower"])
+    base_v = part_view("HalfBase", feats["HalfUpper"])
+    s_ = doc.addObject("TechDraw::DrawViewSection", "FrontUpper")
+    page.addView(s_)
+    s_.BaseView = base_v
+    s_.Source = [feats["HalfUpper"]]
+    s_.SectionNormal = front
+    s_.SectionOrigin = O
+    s_.Direction = front
+    s_.XDirection = ax_w
+    s_.SectionSymbol = ""
+    s_.ScaleType = "Custom"
+    s_.Scale = scale
+    try:
+        s_.CutSurfaceDisplay = "PatHatch"
+    except Exception:
+        pass
+    HALF_VIEWS.update({"lower": lo_v, "base": base_v, "upper": s_, "_off": {"upper": (0.0, 0.0)}, "_yc": (O - bb.Center).dot(ax_h_)})
+    for v_ in (base_v, s_):
+        try:
+            v_.ShowSectionLine = False
+        except Exception:
+            pass
+    sync_half()
+    if GUI:
+        for v_ in (views["Front"], base_v):
+            try:
+                v_.ViewObject.Visibility = False
+            except Exception as e:
+                rep["warnings"].append("half section: hide %s: %s" % (v_.Name, e))
+    doc.recompute()
+    wait_views([lo_v, s_], timeout=30.0)
+    # 剖视按切后形体的包围盒居中: 用它自己的边量偏移 —— 剖视的下边 = 轴线, 左端 = 整件主视的左端
+    ue = [p.Point for _, ed in edges_of(s_) for p in ed.Vertexes]
+    fe_ = [p.Point for _, ed in edges_of(views["Front"]) for p in ed.Vertexes]
+    if not ue or not fe_:
+        raise RuntimeError("half section produced no geometry")
+    HALF_VIEWS["_off"]["upper"] = (min(p.x for p in fe_) - min(p.x for p in ue), HALF_VIEWS["_yc"] - min(p.y for p in ue))
+    sync_half()
+    hide_axis_edges()
+
+
+def hide_axis_edges():
+    """半剖两半在轴线上切出来的边设为不可见(分界画点画线)。"""
+    yc_ = HALF_VIEWS["_yc"]
+    n_hidden = 0
+    for k_, yax in (("lower", yc_), ("upper", yc_ - HALF_VIEWS["_off"]["upper"][1])):
+        v_ = HALF_VIEWS[k_]
+        for n_, ed in edges_of(v_):
+            ps = [p.Point for p in ed.Vertexes]
+            if len(ps) >= 2 and all(abs(p.y - yax) < 1e-3 for p in ps):
+                try:
+                    v_.formatGeometricEdge(int(n_[4:]), 1, 0.35, (0.0, 0.0, 0.0), False)
+                    n_hidden += 1
+                except Exception as e:
+                    rep["warnings"].append("half section: hide edge: %s" % e)
+                    return
+    up_es = [ed for _, ed in edges_of(HALF_VIEWS["upper"])]
+    ux = [p.Point.x for ed in up_es for p in ed.Vertexes]
+    uy = [p.Point.y for ed in up_es for p in ed.Vertexes]
+    rep["half_section"] = {"axis_edges_hidden": n_hidden, "off": HALF_VIEWS["_off"], "yc": yc_,
+                           "upper_edge_bb": [min(ux or [0]), max(ux or [0]), min(uy or [0]), max(uy or [0])],
+                           "front_xy": list(vcenter(views["Front"])), "upper_xy": [q(HALF_VIEWS["upper"].X), q(HALF_VIEWS["upper"].Y)]}
+
+
+def half_refs(typ, refs, name):
+    """主视(隐藏)上的尺寸引用 → 下半视图里同一位置的顶点 / 边; 横向尺寸可用关于轴线的镜像点(回转件对称)。
+    找不到就留在隐藏的主视上(尺寸会看不见)并报告。"""
+    full, lo_v = views["Front"], HALF_VIEWS["lower"]
+    yc_ = HALF_VIEWS["_yc"]
+    lv = [(n_, getattr(p, "Point", p)) for n_, p in verts_of(lo_v)]
+    le = edges_of(lo_v)
+    fv = dict((n_, getattr(p, "Point", p)) for n_, p in verts_of(full))
+    fe = dict(edges_of(full))
+    ys = (lambda y: [y, 2 * yc_ - y]) if typ in ("DistanceX", "Diameter") else (lambda y: [y])
+    out = []
+    for r in refs:
+        hit = None
+        if r.startswith("Vertex") and r in fv:
+            p = fv[r]
+            for y in ys(p.y):
+                hit = next((n_ for n_, q_ in lv if abs(q_.x - p.x) < 0.02 and abs(q_.y - y) < 0.02), None)
+                if hit:
+                    break
+            if hit is None and typ == "DistanceX":
+                # 横向尺寸只看 x: 同一 x 上离轴线最近的顶点(原顶点可能是虚线上的, 下半外形里没有)
+                same_x = [(abs(q_.y - yc_), n_) for n_, q_ in lv if abs(q_.x - p.x) < 0.02]
+                hit = min(same_x)[1] if same_x else None
+        elif r.startswith("Edge") and r in fe:
+            e = fe[r]
+            for sgn in ((1, -1) if typ in ("DistanceX", "Diameter") else (1,)):
+                key = sorted((round(p.Point.x, 1), round(yc_ + sgn * (p.Point.y - yc_), 1)) for p in e.Vertexes)
+                hit = next((n_ for n_, e2 in le if sorted((round(p.Point.x, 1), round(p.Point.y, 1)) for p in e2.Vertexes) == key), None)
+                if hit:
+                    break
+        if hit is None:
+            pp = fv.get(r)
+            rep["warnings"].append("half section: %s ref %s %s not found in lower half (%d verts, x %s..%s)" % (
+                name, r, (round(pp.x, 3), round(pp.y, 3)) if pp is not None else "?", len(lv),
+                round(min([q_.x for _, q_ in lv] or [0]), 3), round(max([q_.x for _, q_ in lv] or [0]), 3)))
+            return full, refs
+        out.append(hit)
+    return lo_v, out
+
+
+if HALF:
+    try:
+        make_half_views()
+    except Exception as e:
+        import traceback
+        rep["warnings"].append("half section failed: %s" % traceback.format_exc(limit=3))
+        HALF = False
+        for k_, v_ in list(HALF_VIEWS.items()):
+            if not k_.startswith("_"):
+                try:
+                    doc.removeObject(v_.Name)
+                except Exception:
+                    pass
+        HALF_VIEWS.clear()
+        if GUI:
+            try:
+                views["Front"].ViewObject.Visibility = True
+            except Exception:
+                pass
+
+if isinstance(sec_spec, dict) and not HALF:
     sec_base = sec_spec.get("base", "Front")
     bw, bh, bd = VAX[sec_base]
     sec = doc.addObject("TechDraw::DrawViewSection", "SectionA")
@@ -1501,6 +1731,8 @@ def add_dim(view, typ, refs, name, page_xy, text=None, fmt_spec=None, value=None
             text = DIMS["key_mark"] + text if not text.startswith(DIMS["key_mark"]) else text
         else:
             fmt_spec = DIMS["key_mark"] + (fmt_spec or FSPEC)
+    if HALF_VIEWS and view is views.get("Front"):
+        view, refs = half_refs(typ, refs, name)
     d = doc.addObject("TechDraw::DrawViewDimension", name)
     d.Type = typ
     d.References2D = [(view, r) for r in refs]
@@ -1541,21 +1773,6 @@ def add_dim(view, typ, refs, name, page_xy, text=None, fmt_spec=None, value=None
     return d
 
 
-def edges_of(view):
-    out = []
-    i = 0
-    while True:
-        try:
-            e = view.getEdgeByIndex(i)
-        except Exception:
-            break
-        if e is None:
-            break
-        out.append(("Edge%d" % i, e))
-        i += 1
-    return out
-
-
 def rtol(r):
     """圆半径比较的容差: 解析圆 0.001; B 样条边拟合出来的半径会差一点, 按半径的 0.3% 放宽。"""
     return max(1e-3, 3e-3 * r)
@@ -1587,21 +1804,6 @@ def longest(view, axis):
 
 G, STEP = DIMS["gap"], DIMS["step"]
 FSPEC = "%." + str(DIMS["decimals"]) + "w"
-
-
-def verts_of(view):
-    out = []
-    i = 0
-    while True:
-        try:
-            p = view.getVertexByIndex(i)
-        except Exception:
-            break
-        if p is None:
-            break
-        out.append(("Vertex%d" % i, p))
-        i += 1
-    return out
 
 
 def extreme_pair(view, axis):
@@ -1845,6 +2047,10 @@ if LAY:
     for i_, cn in enumerate(CONES):
         vn = cone_view(cn)
         vobj = sec if vn == "Section" else views.get(vn)
+        off_ = (0.0, 0.0)
+        if HALF and vn == "Front" and cn["internal"]:
+            # 半剖: 内锥的轮廓线在剖开的上半(剖视)里; 剖视边坐标 + 偏移 = 主视坐标
+            vobj, off_ = HALF_VIEWS["upper"], HALF_VIEWS["_off"]["upper"]
         if vobj is None:
             continue
         bw_, bh_ = view_axes(vn)
@@ -1874,7 +2080,9 @@ if LAY:
             ang = math.acos(min(1.0, abs(dx * ax2[0] + dy * ax2[1]) / ll))
             if abs(ang - cn["half"]) > math.radians(0.5):
                 continue
-            m_ = ((p0_.x + p1_.x) / 2, (p0_.y + p1_.y) / 2)
+            m_ = ((p0_.x + p1_.x) / 2 + off_[0], (p0_.y + p1_.y) / 2 + off_[1])
+            if HALF and vn == "Front" and m_[1] < HALF_VIEWS["_yc"] - 1e-3:
+                continue   # 半剖: 锥度标注挂在上半
             dd = min(math.hypot(m_[0] - sx * est[0], m_[1] - sy * est[1]) for sx in (1, -1) for sy in (1, -1))
             if best_ is None or dd < best_[0]:
                 best_ = (dd, m_)
@@ -1898,8 +2106,9 @@ if LAY:
             scale = L2_["scale"]
             rep["scale"] = scale
             grp.Scale = scale
+            sync_half()
             doc.recompute()
-            wait_views(list(grp.Views))
+            wait_views(list(grp.Views) + [v_ for k_, v_ in HALF_VIEWS.items() if not k_.startswith("_")])
         same_ = L2_.get("scale") and all(abs(L2_["views"][k]["cx"] - LAY["views"][k]["cx"]) < 1e-6 and abs(L2_["views"][k]["cy"] - LAY["views"][k]["cy"]) < 1e-6
                                          for k in LAY["views"])
         if same_:
@@ -1918,6 +2127,7 @@ if LAY:
                 iso.X, iso.Y = lay_xy("Iso")
             if sec is not None and "Section" in LAY["views"]:
                 sec.X, sec.Y = lay_xy("Section")
+            sync_half()
             doc.recompute()
             R = {n: vrect(views[n], ext(VAX[n][0]) * scale, ext(VAX[n][1]) * scale) for n in VAX if n in views}
             iso_s = q(iso.Scale)
@@ -2149,7 +2359,7 @@ front_r = outer_round("Front")
 rep["round_front"] = bool(front_r)
 if TURN:
     # 回转件: 总长在上; 高 / 厚 = 最大外圆, 已在视图上按段标 ⌀(左视是端面圆, 不再标宽)
-    place_linear("Front", "x", "top", "LenW", Wm)
+    place_linear("Front", "x", "bottom" if HALF else "top", "LenW", Wm)
 elif front_r:
     place_diameter("Front", front_r, "DiaOuter")
 elif not has_ord:
@@ -2333,11 +2543,13 @@ def kept_half(v, sec_spec_):
 def draw_thread_sides(taps, ex, ey):
     lw, lk = std["lines"]["thin"], std["lines"]["visible"]
     dash = std["lines"].get("hidden_dash", "2 1")
-    targets = [(views[n], shape, False) for n in VAX]
+    # 半剖主视: 只画剖切面上的螺纹、只画上半(剖开, 实线); 下半是外形, 里面的不画
+    targets = [(views[n], shape, "half" if (HALF and n == "Front") else False) for n in VAX]
     if sec is not None and isinstance(sec_spec, dict):
         targets.append((sec, kept_half(sec, sec_spec), True))
     drawn = 0
     for v, sh, is_sec in targets:
+        half_ = is_sec == "half"
         X, U, C = view_frame(v, sh)
         D = V(v.Direction).normalize()
         vx, vy = vcenter(v)
@@ -2362,12 +2574,27 @@ def draw_thread_sides(taps, ex, ey):
             R_ = thread_major(h["tap"]) / 2
             side = a.cross(D).normalize()  # 视图平面内、垂直孔轴
             end = at - a * L
+            sides_ = (1, -1)
+            on_axis = False
+            if half_:
+                if abs(side.dot(VAX["Front"][1])) < 0.5:
+                    continue   # 孔轴竖直(径向孔): 剖开的上半里另算, 先不画
+                off_ = (at - TURN["c"]).dot(VAX["Front"][1])
+                if off_ < -1e-3:
+                    continue   # 在下半(外形, 看不见)
+                if off_ < 1e-3:
+                    on_axis = True
+                    sides_ = (1,) if side.dot(VAX["Front"][1]) > 0 else (-1,)   # 在轴线上: 只画上半那一侧
+                # 否则整个在上半(剖开): 照剖视画两侧
             style = "fill:none;stroke:#000;stroke-width:%g%s" % (lw, "" if is_sec else ";stroke-dasharray:%s" % dash)
-            for s_ in (1, -1):
+            for s_ in sides_:
                 p0, p1 = page(at + side * (R_ * s_)), page(end + side * (R_ * s_))
                 PAGE_SVG.append('<path d="M %.3f %.3f L %.3f %.3f" style="%s"/>' % (p0[0], p0[1], p1[0], p1[1], style))
             if not h.get("through"):
                 p0, p1 = page(end + side * R_), page(end - side * R_)
+                if on_axis:
+                    # 只到轴线(孔在轴线上: 孔轴就是分界线)
+                    p0, p1 = page(end + side * (R_ * sides_[0])), page(end)
                 st = ("fill:none;stroke:#000;stroke-width:%g" % lk) if is_sec else style
                 PAGE_SVG.append('<path d="M %.3f %.3f L %.3f %.3f" style="%s"/>' % (p0[0], p0[1], p1[0], p1[1], st))
             drawn += 1
@@ -2627,6 +2854,14 @@ for it_ in DIM_EDIT.get("add") or []:
     draw_added_dim(it_)
 
 draw_threads()
+if TURN:
+    # 回转件主视的轴线(细点画线, 伸出轮廓 3 mm); 半剖时它就是剖开 / 不剖两半的分界
+    fx_, fy_ = vcenter(views["Front"])
+    yc_ = (TURN["c"] - bb.Center).dot(VAX["Front"][1])
+    y_ = H - (fy_ + yc_ * scale)
+    x0_, x1_ = fx_ - Wm / 2 * scale - 3, fx_ + Wm / 2 * scale + 3
+    PAGE_SVG.append('<path d="M %.3f %.3f L %.3f %.3f" style="fill:none;stroke:#000;stroke-width:%g;stroke-dasharray:%s"/>'
+                    % (x0_, y_, x1_, y_, std["lines"]["center"], std["lines"].get("center_dash", "8 1.5 1 1.5")))
 flush_page_svg()
 doc.recompute()
 lap("dims")
