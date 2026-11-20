@@ -52,6 +52,13 @@ pub struct Patch {
     /// 技术要求全文(一行一条, 整体替换)。
     #[serde(default)]
     pub tech: Option<Vec<String>>,
+    /// 基准 / 形位公差 / 粗糙度(各自整体替换; 空列表 = 清掉)。格式 = 编译器的(见 drawing::Sheet.datums)。
+    #[serde(default)]
+    pub datums: Option<Vec<Value>>,
+    #[serde(default)]
+    pub gdt: Option<Vec<Value>>,
+    #[serde(default)]
+    pub roughness: Option<Vec<Value>>,
     /// 标题栏字段(designer / reviewer / project / finish / hardness / version / pn / name / material); 空串 = 去掉本图的覆盖。
     #[serde(default)]
     pub title: BTreeMap<String, String>,
@@ -87,6 +94,12 @@ pub fn apply(s: &mut Sheet, p: &Patch, rep: Option<&Report>) -> Result<Vec<Strin
     for n in p.hide.iter().chain(&p.show).chain(&p.key_add).chain(&p.key_remove).chain(p.dim_text.keys()).chain(p.dim_tol.keys()) {
         if !known(n) {
             return Err(t!("没有叫 {n} 的尺寸", "No dimension named {n}"));
+        }
+    }
+    // 先查完再改: 坏的基准 / 形位 / 粗糙度条目让整个补丁不生效
+    for (kind, items) in [("datums", &p.datums), ("gdt", &p.gdt), ("roughness", &p.roughness)] {
+        if let Some(items) = items {
+            crate::drawing::check_annotations(kind, items)?;
         }
     }
     let mut out = Vec::new();
@@ -163,6 +176,16 @@ pub fn apply(s: &mut Sheet, p: &Patch, rep: Option<&Report>) -> Result<Vec<Strin
         s.tech = Some(tl.iter().map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect());
         out.push(t!("技术要求改为 {} 条", "Technical requirements: {} lines", tl.len()));
     }
+    for (kind, new, label) in [("datums", &p.datums, ("基准", "Datums")), ("gdt", &p.gdt, ("形位公差", "Geometric tolerances")), ("roughness", &p.roughness, ("粗糙度", "Roughness"))] {
+        let Some(items) = new else { continue };
+        let dst = match kind {
+            "datums" => &mut s.datums,
+            "gdt" => &mut s.gdt,
+            _ => &mut s.roughness,
+        };
+        *dst = items.clone();
+        out.push(t!("{}: {} 条", "{}: {} item(s)", tr(label.0, label.1), items.len()));
+    }
     if !p.title.is_empty() {
         merge_map(&mut s.title, &p.title);
         out.push(t!("标题栏: {}", "Title block: {}", p.title.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(", ")));
@@ -172,6 +195,12 @@ pub fn apply(s: &mut Sheet, p: &Patch, rep: Option<&Report>) -> Result<Vec<Strin
     }
     Ok(out)
 }
+
+/// 几何选择器的说明(工具描述里用)。
+const SELECTOR_DOC: &str = "SELECTOR picks a model face by geometry (model coordinates, mm): {\"cyl\": 20} outer cylinder ⌀20 | {\"bore\": 8} bore ⌀8 \
+(add \"near\": [x, y, z] when several faces have that diameter: the one whose centre is closest) | {\"cone\": true} or {\"cone\": \"1:10\"} | \
+{\"shoulder\": {\"d\": 29.5, \"side\": \"start\" | \"end\"}} the step face at the start / end of the ⌀29.5 segment of a turned part | \
+{\"plane\": {\"normal\": [x, y, z], \"at\": [x, y, z]}} a flat face. Get the numbers from the model (model_state / model_measure).";
 
 /// 工具定义(固定 → 可缓存)。
 pub fn tools() -> Value {
@@ -197,6 +226,9 @@ pub fn tools() -> Value {
                     "dim_text": {"description": "Dimension name -> replacement text; empty value restores the automatic text", "type": "object", "additionalProperties": {"type": "string"}},
                     "dim_tol": {"description": "Dimension name -> tolerance: ISO 286 code like h7 / H7, or \"±0.05\", or \"+0.1/-0.05\"; empty value removes", "type": "object", "additionalProperties": {"type": "string"}},
                     "tech": {"description": "Full replacement of the technical requirements, one item per line", "type": "array", "items": {"type": "string"}},
+                    "datums": {"description": format!("Full replacement of the datum list (empty list clears). Item: {{\"label\": \"A\", \"on\": SELECTOR}}. {SELECTOR_DOC}"), "type": "array", "items": {"type": "object"}},
+                    "gdt": {"description": format!("Full replacement of the geometric tolerance list (empty list clears). Item: {{\"symbol\": one of {}, \"value\": mm, \"datums\": [\"A\"] (not for form tolerances), \"on\": SELECTOR, \"dia\": true for a ⌀ tolerance zone}}. Runout / coaxiality need an axis datum (cylinder or cone). The compiler checks consistency; items that don't make sense are skipped and listed in the report warnings. {SELECTOR_DOC}", crate::drawing::GDT_SYMBOLS.join(" / ")), "type": "array", "items": {"type": "object"}},
+                    "roughness": {"description": format!("Full replacement of the surface roughness list (empty list clears; all other surfaces get the default in the corner). Item: {{\"ra\": µm, \"on\": SELECTOR}}. {SELECTOR_DOC}"), "type": "array", "items": {"type": "object"}},
                     "title": {"description": "Title block fields for this sheet (designer, reviewer, project, finish, hardness, version, pn, name, material); empty value removes this sheet's override", "type": "object", "additionalProperties": {"type": "string"}}
                 },
                 "required": ["summary"]
@@ -222,7 +254,8 @@ GB/T 1800 tolerances, GB/T 1804-f general tolerances). The drawing is produced b
 only by proposing a patch with the propose_drawing_changes tool. The user reviews every patch and applies it themselves.\n\n\
 What a patch can change: front-view orientation (flip / rotate 90° / view the back / auto), section A-A on or off, which hole groups get \
 coordinate dimensions, hole diameter -> thread size, density, hide or show individual dimensions, key-dimension marks (*), dimension text, \
-dimension tolerances, technical requirements, title block fields.\n\
+dimension tolerances, technical requirements, title block fields, datums / geometric tolerances / surface roughness (each list is replaced \
+as a whole: send the full list including the items to keep).\n\
 What it cannot do: move individual dimensions or views to coordinates, add new dimensions (the user adds those by picking faces in \
 Plasticity with the + button), change the model. If asked for that, say briefly what the user can do instead.\n\n\
 Each user turn carries the current settings, the last compile report (placed dimensions with names and values, hole groups, warnings) and \
@@ -252,6 +285,7 @@ pub fn context_with(s: &Sheet, rep: Option<&Report>, bom_title: &BTreeMap<String
     let sheet = json!({
         "front": s.front, "up": s.up, "section": s.section, "ordinate": s.ordinate, "threads": s.threads, "density": s.density,
         "hidden": s.dims_hide, "key": s.dims_key, "dim_text": s.dims_text, "dim_tol": s.dims_tol, "tech": s.tech, "title": s.title,
+        "datums": s.datums, "gdt": s.gdt, "roughness": s.roughness,
         "added_dims": s.dims_add.iter().map(|a| &a.name).collect::<Vec<_>>(),
     });
     let report = rep.map(|r| {
@@ -485,6 +519,46 @@ mod tests {
         r.hole_groups = vec![HoleGroup { id: "H1".into(), view: "Front".into(), text: "4×⌀5.5".into(), count: 4, ordinate: true }];
         r.axes = Some(Axes { front: [0.0, 0.0, 1.0], up: [0.0, 1.0, 0.0], right: [1.0, 0.0, 0.0] });
         r
+    }
+
+    #[test]
+    fn patch_gdt_saved_in_sheet_and_spec() {
+        let mut s = Sheet::new("k", "Shaft", "m", "Shaft");
+        let p: Patch = serde_json::from_value(json!({
+            "summary": "gdt",
+            "datums": [{"label": "A", "on": {"cyl": 20, "near": [0, 165, 110]}}, {"label": "B", "on": {"shoulder": {"d": 29.5, "side": "start"}}}],
+            "gdt": [{"symbol": "circular_runout", "value": 0.005, "datums": ["A"], "on": {"shoulder": {"d": 29.5, "side": "start"}}},
+                    {"symbol": "cylindricity", "value": 0.003, "on": {"cyl": 20}}],
+            "roughness": [{"ra": 0.4, "on": {"cone": true}}]
+        }))
+        .unwrap();
+        assert_eq!(apply(&mut s, &p, None).unwrap().len(), 3);
+        assert_eq!((s.datums.len(), s.gdt.len(), s.roughness.len()), (2, 2, 1));
+        // 存进 sheets.json 再读回来不丢, 出图方案里原样带上(重新出图时 spec.json 由它重写)
+        let back: Sheet = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back, s);
+        let v = crate::drawing::spec(&back, std::path::Path::new("d"), None);
+        assert_eq!(v["datums"][0]["on"]["near"], json!([0, 165, 110]));
+        assert_eq!(v["gdt"][0]["symbol"], "circular_runout");
+        assert_eq!(v["roughness"][0]["ra"], 0.4);
+        // 空列表 = 清掉, 方案里也不再有这一项; 别的两项不动
+        apply(&mut s, &serde_json::from_value(json!({"roughness": []})).unwrap(), None).unwrap();
+        assert!(s.roughness.is_empty() && s.gdt.len() == 2);
+        assert!(crate::drawing::spec(&s, std::path::Path::new("d"), None).get("roughness").is_none());
+        // 粗查: 坏条目整体拒绝, 图不动
+        let before = s.clone();
+        for bad in [
+            json!({"datums": [{"label": "AB", "on": {"cyl": 20}}]}),
+            json!({"gdt": [{"symbol": "wobble", "value": 0.01, "on": {"cyl": 20}}]}),
+            json!({"gdt": [{"symbol": "flatness", "value": 0, "on": {"cone": true}}]}),
+            json!({"roughness": [{"ra": 0.8, "on": {"cyl": 20, "bore": 8}}]}),
+            json!({"roughness": [{"ra": 0.8, "on": {"plane": {"normal": [0, 1, 0]}}}]}),
+            json!({"roughness": [{"ra": 0.8, "on": {"cyl": 20, "near": [1, 2]}}]}),
+        ] {
+            let p: Patch = serde_json::from_value(bad.clone()).unwrap();
+            assert!(apply(&mut s, &p, None).is_err(), "{bad}");
+            assert_eq!(s, before, "{bad}");
+        }
     }
 
     #[test]

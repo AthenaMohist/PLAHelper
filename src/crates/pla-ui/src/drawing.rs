@@ -83,6 +83,15 @@ pub struct Sheet {
     /// 技术要求(人改过的全文, 一行一条); None = 规范默认 + 按配合自动加的条目。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tech: Option<Vec<String>>,
+    /// 基准 / 形位公差 / 粗糙度(编译器的格式原样存, 见 compile_freecad.py「基准 / 形位公差 / 粗糙度」):
+    /// datums [{label, on}], gdt [{symbol, value, datums?, on, dia?}], roughness [{ra, on}]; on = 几何选择器。
+    /// 2026-11-20: 以前只能手改 spec.json, 重新出图就丢 → 存在图纸设置里。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub datums: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gdt: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roughness: Vec<Value>,
     /// 装配剖视: 剖哪个视图(None = 主视 "Front"; "Left")、过哪个配合的轴线(配合候选 id; None = 自动)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub section_view: Option<String>,
@@ -302,6 +311,9 @@ impl Sheet {
             dims_tol: BTreeMap::new(),
             dims_add: Vec::new(),
             tech: None,
+            datums: Vec::new(),
+            gdt: Vec::new(),
+            roughness: Vec::new(),
             section_view: None,
             section_fit: None,
             balloons: BTreeMap::new(),
@@ -461,8 +473,78 @@ pub fn spec(s: &Sheet, dir: &Path, dims_file: Option<&Path>) -> Value {
     if !s.dims_hide.is_empty() || !s.dims_key.is_empty() || !text.is_empty() || !tol.is_empty() || !s.dims_add.is_empty() {
         v["dims"] = json!({ "hide": s.dims_hide, "key": s.dims_key, "text": text, "tol": tol, "add": s.dims_add });
     }
+    for (k, items) in [("datums", &s.datums), ("gdt", &s.gdt), ("roughness", &s.roughness)] {
+        if !items.is_empty() {
+            v[k] = json!(items);
+        }
+    }
     put_tech(&mut v, s);
     v
+}
+
+/// 形位公差符号(与编译器 GDT_SYM 同名)。
+pub const GDT_SYMBOLS: &[&str] = &[
+    "straightness", "flatness", "roundness", "cylindricity", "profile_line", "profile_surface", "parallelism", "perpendicularity", "angularity",
+    "position", "coaxiality", "concentricity", "symmetry", "circular_runout", "total_runout",
+];
+
+/// 几何选择器的粗查(细查 —— 找不找得到面、基准关系通不通 —— 由编译器做, 不通的写进报告 warnings)。
+fn check_selector(on: &Value) -> Result<(), String> {
+    let o = on.as_object().ok_or("on must be an object")?;
+    let kinds: Vec<&str> = ["cyl", "bore", "cone", "shoulder", "plane"].into_iter().filter(|k| o.contains_key(*k)).collect();
+    if kinds.len() != 1 {
+        return Err("on needs exactly one of cyl / bore / cone / shoulder / plane".into());
+    }
+    match kinds[0] {
+        "cyl" | "bore" if !o[kinds[0]].is_number() => Err(format!("{} must be a diameter (number)", kinds[0])),
+        "shoulder" if !o["shoulder"]["d"].is_number() => Err("shoulder needs d (diameter)".into()),
+        "plane" if !(o["plane"]["normal"].as_array().is_some_and(|a| a.len() == 3) && o["plane"]["at"].as_array().is_some_and(|a| a.len() == 3)) => {
+            Err("plane needs normal [x,y,z] and at [x,y,z]".into())
+        }
+        _ => match o.get("near") {
+            Some(n) if !n.as_array().is_some_and(|a| a.len() == 3 && a.iter().all(Value::is_number)) => Err("near must be [x, y, z]".into()),
+            _ => Ok(()),
+        },
+    }
+}
+
+/// 基准 / 形位公差 / 粗糙度条目的粗查; kind = "datums" / "gdt" / "roughness"。错误带条目序号。
+pub fn check_annotations(kind: &str, items: &[Value]) -> Result<(), String> {
+    for (i, it) in items.iter().enumerate() {
+        let r: Result<(), String> = (|| {
+            match kind {
+                "datums" => {
+                    let l = it["label"].as_str().unwrap_or("");
+                    if l.chars().count() != 1 || !l.chars().all(|c| c.is_ascii_uppercase()) {
+                        return Err("label must be one capital letter".into());
+                    }
+                }
+                "gdt" => {
+                    let sym = it["symbol"].as_str().unwrap_or("");
+                    if !GDT_SYMBOLS.contains(&sym) {
+                        return Err(format!("unknown symbol '{sym}' (one of {})", GDT_SYMBOLS.join(", ")));
+                    }
+                    if !it["value"].as_f64().is_some_and(|v| v > 0.0) {
+                        return Err("value must be a positive number (mm)".into());
+                    }
+                    if let Some(d) = it.get("datums") {
+                        if !d.as_array().is_some_and(|a| a.iter().all(|x| x.as_str().is_some_and(|s| s.len() == 1))) {
+                            return Err("datums must be a list of letters".into());
+                        }
+                    }
+                }
+                "roughness" => {
+                    if !it["ra"].as_f64().is_some_and(|v| v > 0.0) {
+                        return Err("ra must be a positive number (µm)".into());
+                    }
+                }
+                _ => return Err(format!("unknown annotation kind {kind}")),
+            }
+            check_selector(&it["on"])
+        })();
+        r.map_err(|e| format!("{kind}[{i}]: {e}"))?;
+    }
+    Ok(())
 }
 
 /// 人改过的技术要求(去掉空行; 全空 = 用默认)。
