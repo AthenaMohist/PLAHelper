@@ -107,7 +107,17 @@ fn via_rpc(s: Value) -> Value {
     let Some(rpc) = kbj["rpc"].as_array().filter(|a| !a.is_empty()) else { return s };
     let mut args: Vec<Value> = vec![json!(root.join(rpc[0].as_str().unwrap_or("runner/kb.js")).to_string_lossy())];
     args.extend(rpc[1..].iter().cloned());
-    json!({"name": s["name"], "kind": "command", "command": "node", "args": args, "path": s["path"], "via": "rpc"})
+    json!({"name": s["name"], "kind": "command", "command": node_for(&root), "args": args, "path": s["path"], "via": "rpc"})
+}
+
+/// 知识库自带运行时(发布包里的 runtime/node.exe, 用户不用装 Node)优先, 否则用 PATH 上的 node。
+fn node_for(root: &Path) -> String {
+    let bundled = root.join("runtime").join("node.exe");
+    if bundled.is_file() {
+        bundled.to_string_lossy().into_owned()
+    } else {
+        "node".into()
+    }
 }
 
 // ---------------------------------------------------------------- 本地库: 读取与检索
@@ -340,7 +350,7 @@ pub fn local_run(root: &Path, tool: &str, inputs: &Value) -> Result<Value, Strin
     if !runner.is_file() {
         return Err(format!("runner {} not found", runner.display()));
     }
-    let mut cmd = Command::new("node");
+    let mut cmd = Command::new(node_for(root));
     cmd.arg(&runner).arg("run").arg(tool).arg("-").current_dir(root);
     let v = run_json(cmd, &inputs.to_string()).map_err(|e| format!("node: {e} (Node.js ≥ 18 must be on PATH)"))?;
     if let Some(e) = v["error"].as_str() {
@@ -549,9 +559,14 @@ mod tests {
         std::fs::write(dir.join("kb.json"), r#"{"schema":2,"name":"t","rpc":["runner/kb.js","rpc"]}"#).unwrap();
         std::fs::write(dir.join("runner").join("kb.js"),
             "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const r=JSON.parse(s);console.log(JSON.stringify(r.op==='search'?{hits:[{kind:'page',id:'x',q:r.query}]}:r.op==='propose'?{proposed:r.kind,id:r.id,hasSource:'source' in r}:{error:'unsupported'}))});").unwrap();
-        let s = via_rpc(src);
+        let s = via_rpc(src.clone());
         assert_eq!(s["kind"], json!("command"));
         assert_eq!(s["command"], json!("node"));
+        // 库里带了运行时 → 用它(用户没装 Node 也能用)
+        std::fs::create_dir_all(dir.join("runtime")).unwrap();
+        std::fs::write(dir.join("runtime").join("node.exe"), b"").unwrap();
+        assert!(via_rpc(src).as_object().unwrap()["command"].as_str().unwrap().ends_with("node.exe"));
+        std::fs::remove_dir_all(dir.join("runtime")).unwrap();
         assert_eq!(s["args"][1], json!("rpc"));
         assert!(s["args"][0].as_str().unwrap().ends_with("kb.js"));
         if Command::new("node").arg("--version").output().is_ok() {
