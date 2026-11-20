@@ -783,6 +783,7 @@ rep["cones"] = [{"taper": c["text"], "half_angle_deg": round(math.degrees(c["hal
 #   "gdt":       [{"symbol": "circular_runout", "value": 0.005, "datums": ["A"], "on": 选择器, "dia": false}]
 #   "roughness": [{"ra": 0.4, "on": 选择器}]          (其余 = 右上角, 规范 roughness_default)
 # 选择器(按几何, agent 从 model_state / model_measure 拿数): {"cyl": 20} 外圆 ⌀20 | {"bore": 8} 内孔 ⌀8 | {"cone": true} / {"cone": "1:10"}
+#   (cyl / bore 同直径有多段时加 "near": [x, y, z] = 取面心离这点最近的那段)
 #   | {"shoulder": {"d": 29.5, "side": "start" | "end"}} 回转件 ⌀29.5 段起 / 止端的台阶面 | {"plane": {"normal": [x,y,z], "at": [x,y,z]}}
 GDT_SYM = {"straightness": "⏤", "flatness": "⏥", "roundness": "○", "cylindricity": "⌭", "profile_line": "⌒", "profile_surface": "⌓",
            "parallelism": "∥", "perpendicularity": "⊥", "angularity": "∠", "position": "⌖", "coaxiality": "◎", "concentricity": "◎",
@@ -799,11 +800,18 @@ def resolve_sel(sel):
     if "cyl" in sel or "bore" in sel:
         d_ = float(sel.get("cyl", sel.get("bore")))
         want_int = "bore" in sel
+        hits = []
         for f in shape.Faces:
             cy = geomutil.cylinder_of(f)
             if cy and cy["internal"] == want_int and abs(2 * cy["r"] - d_) < 0.01:
-                return {"kind": "bore" if want_int else "cyl", "face": f, "ax": V(cy["ax"]), "c": V(cy["c"]), "r": cy["r"], "t0": cy["t0"], "t1": cy["t1"]}
-        raise ValueError("no %s of diameter %s" % ("bore" if want_int else "outer cylinder", fmt(d_)))
+                hits.append({"kind": "bore" if want_int else "cyl", "face": f, "ax": V(cy["ax"]), "c": V(cy["c"]), "r": cy["r"], "t0": cy["t0"], "t1": cy["t1"]})
+        if not hits:
+            raise ValueError("no %s of diameter %s" % ("bore" if want_int else "outer cylinder", fmt(d_)))
+        # 同直径多段(如 ⌀20 止口 + ⌀20 凸台): "near": [x, y, z] 取面心最近的那段(模型坐标)
+        if sel.get("near") is not None:
+            p_ = V(*sel["near"])
+            return min(hits, key=lambda h: (h["face"].CenterOfMass - p_).Length)
+        return hits[0]
     if "cone" in sel:
         for cn in CONES:
             if sel["cone"] is True or str(sel["cone"]) == cn["text"]:
@@ -1118,6 +1126,19 @@ def layout_problem(anchors=None, fixed_scale=None, sec_dir=None):
             reserve += [{"view": "Front", "side": k, "depth": v} for k, v in rs.items()]
     fr_ = outer_round("Front")
     dstep_ids = {}   # 段直径 → 它的 ⌀ 尺寸 id(轴线基准 / 同轴度挂在这条尺寸线上; 表面要求与它错开)
+    dstep_segs = []  # (直径, x0, x1, id): 同直径多段(⌀20 止口 + ⌀20 凸台)时按标签所在段挑尺寸
+
+    def dstep_for(d_, o_):
+        x_ = None
+        if o_.get("slide"):
+            x_ = (o_["slide"][0] + o_["slide"][1]) / 2
+        elif (o_.get("anchors") or {}).get("top"):
+            x_ = o_["anchors"]["top"][0]
+        if x_ is not None:
+            for dd, a_, b_, i_ in dstep_segs:
+                if dd == d_ and a_ - 1e-6 <= x_ <= b_ + 1e-6:
+                    return i_
+        return dstep_ids.get(d_)
     if TURN:
         # 回转件(主视轴线水平): 每段外圆标 ⌀(在视图上, 段内滑动避让) + 轴向链式尺寸(主视下方); 总长仍在上方(极值点)
         yc = (TURN["c"] - bb.Center).dot(VAX["Front"][1])
@@ -1134,6 +1155,7 @@ def layout_problem(anchors=None, fixed_scale=None, sec_dir=None):
             x0_, x1_ = sorted((xt(s_["t0"]), xt(s_["t1"])))
             id_ = "Dstep%d" % (i_ + 1)
             dstep_ids.setdefault(round(s_["d"], 3), id_)
+            dstep_segs.append((round(s_["d"], 3), x0_, x1_, id_))
             tol_ = shaft_tol(s_["d"] / 2)
             dims_.append({"id": id_, "view": "Front", "kind": "inline", "dir": "y", "span": [yc - s_["d"] / 2, yc + s_["d"] / 2], "outside": True,
                           "cw": std["layout"].get("svg_char_w", 0.5),
@@ -1194,9 +1216,9 @@ def layout_problem(anchors=None, fixed_scale=None, sec_dir=None):
     for o_ in GDT_LABELS:
         lb_ = {k: o_[k] for k in ("id", "view", "anchor", "text", "prio", "w", "h", "pad_left", "row", "anchors", "slide", "approach", "ext_out") if k in o_}
         if o_.get("axis_d") is not None and o_["axis_d"] in dstep_ids:
-            lb_["attach_dim"] = dstep_ids[o_["axis_d"]]
+            lb_["attach_dim"] = dstep_for(o_["axis_d"], o_)
         if o_.get("avoid_d") is not None and o_["avoid_d"] in dstep_ids:
-            lb_["avoid_dim"] = dstep_ids[o_["avoid_d"]]
+            lb_["avoid_dim"] = dstep_for(o_["avoid_d"], o_)
         labels_.append(lb_)
     # 回转件的实际轮廓(布局层据此判断"引线在零件里走了多少"、标签能不能放进包围盒里空着的地方):
     # 主视 / 剖视 = 各段矩形 + 段间缝隙(倒角 / 锥)按相邻较小直径补上; 左视(端面圆)= 4 块矩形近似
