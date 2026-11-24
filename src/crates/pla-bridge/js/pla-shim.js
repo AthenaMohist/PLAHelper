@@ -4464,7 +4464,8 @@
       var fk = Object.keys(l.fp.faces).sort().map(function (t) { return t + l.fp.faces[t]; }).join('.');
       return { key: [l.fp.volume, l.fp.area, l.fp.moments.join('/'), fk, l.fp.chiral].join('|'),
                name: common(names), names: names.filter(function (x, i) { return names.indexOf(x) === i; }), qty: l.members.length,
-               members: l.members.map(function (p) { return { id: p.id, name: p.name, path: p.path }; }),
+               // H9: solid = 当前版本 id(model_exec / model_view 用的那个), bbox 区分同一零件的多个实例
+               members: l.members.map(function (p) { return { id: p.id, name: p.name, path: p.path, solid: itemIdOf(p.view), bbox: bboxOf(p.view, k) }; }),
                path: common(paths) || '', material: common(l.members.map(function (p) { return p.material || ''; })) || null,
                volume: l.fp.volume, area: l.fp.area, faces: l.fp.faces, chiral: l.fp.chiral, mirrorOf: l.mirrorOf,
                shape: (function () { try { return revShape(l.members[0].view, k); } catch (x) { return null; } })() };

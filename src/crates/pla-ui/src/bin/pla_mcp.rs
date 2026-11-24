@@ -76,6 +76,9 @@ fn model_tools() -> Value {
          "inputSchema": {"type": "object", "properties": {"of": {"type": "array", "items": {}}, "kinds": {"type": "array", "items": {"type": "string"}}, "near": {"type": "array", "items": {"type": "number"}}, "tol": {"type": "number"}, "units": {"type": "string"}, "limit": {"type": "integer"}}}},
         {"name": "model_outline", "annotations": ro, "description": "Read Plasticity's outliner tree: folders (id, name, hidden, children) and items (kind solid/sheet/curve/instance/measurement/…, name, hidden, locked; solids carry their version id like model_state, other kinds a node key). kinds filters items (e.g. [\"solid\"]); folders are always kept. Change it with model_exec ops folder / moveTo / hide / show / ungroup / rename.",
          "inputSchema": {"type": "object", "properties": {"kinds": {"type": "array", "items": {"type": "string"}}}}},
+        {"name": "model_locate", "annotations": ro,
+         "description": "Find the solids of a BOM part (name, part number or key from list_parts, e.g. \"磁环座\") in the model: their current solid ids, names, folder paths and bboxes (several = several instances). BOM part names are not solid names; you can also write {\"part\": \"磁环座\"} wherever a solid ref is expected (of / solids / targets / tools). Only visible solids are scanned.",
+         "inputSchema": {"type": "object", "properties": {"part": {"type": "string"}}, "required": ["part"]}},
         {"name": "model_rename", "annotations": {"destructiveHint": false},
          "description": "Batch rename solids / folders. Exactly one way: name (all the same) | items [{solid|folder, name}] (one by one) | pattern (\"螺钉M3-{n:02}\": {name} = old name, {n} = number from start (default 1), sort = selection|x|y|z|name by bbox centre) | find + replace (regex: true for a regular expression); dedupe: true appends .001, .002 … where a new name clashes with another solid or within the batch (alone = only dedupe). Without apply it only PREVIEWS old → new (nothing changes) — show the preview to the user, then call again with apply: true (one undo step). Same names make {name} references ambiguous, so dedupe is a good default.",
          "inputSchema": {"type": "object", "properties": {"solids": {"type": "array", "items": {}}, "folders": {"type": "array", "items": {}}, "items": {"type": "array", "items": {"type": "object"}},
@@ -355,7 +358,66 @@ fn pick(a: &Value, keys: &[&str]) -> Value {
     Value::Object(m)
 }
 
+/// H9: BOM 零件(名字 / 编号 / key)→ 模型里它的实体(当前可见的; 按 bom.scan 的零件指纹 key 对)。
+fn locate_part(h: isize, part: &str) -> Result<Value, String> {
+    let st = state()?;
+    let p = bridge::resolve(&st.parts, part)?.clone();
+    let scan = rt().block_on(pla_bridge::query::call_once(port(), h, pla_bridge::shim::api::BOM_SCAN, &json!({}))).map_err(|e| format!("{e:#}"))?;
+    let line = scan["lines"].as_array().into_iter().flatten().find(|l| l["key"].as_str() == Some(p.key.as_str()));
+    let Some(line) = line else {
+        return Err(format!(
+            "{} {}: not found among the visible solids (hidden solids are not scanned; or the part's geometry changed since the BOM was made — refresh the BOM in PLAhelper)",
+            p.pn, p.name
+        ));
+    };
+    let solids: Vec<Value> = line["members"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|m| json!({ "solid": m["solid"], "name": m["name"], "path": m["path"], "bbox": m["bbox"] }))
+        .collect();
+    Ok(json!({ "part": { "key": p.key, "pn": p.pn, "name": p.name, "qty": line["qty"] }, "units": scan["units"], "solids": solids }))
+}
+
+/// H9: 参数里的 {part: "磁环座"}(数组元素)换成该零件的实体 id(可能多个)。
+fn expand_part_refs(h: isize, v: &Value) -> Result<Value, String> {
+    Ok(match v {
+        Value::Array(items) => {
+            let mut out = Vec::new();
+            for it in items {
+                match it.as_object().filter(|o| o.len() == 1).and_then(|o| o.get("part")).and_then(|p| p.as_str()) {
+                    Some(part) => {
+                        let r = locate_part(h, part)?;
+                        out.extend(r["solids"].as_array().into_iter().flatten().map(|s| s["solid"].clone()));
+                    }
+                    None => out.push(expand_part_refs(h, it)?),
+                }
+            }
+            Value::Array(out)
+        }
+        Value::Object(m) => Value::Object(m.iter().map(|(k, x)| Ok((k.clone(), expand_part_refs(h, x)?))).collect::<Result<_, String>>()?),
+        x => x.clone(),
+    })
+}
+
 fn call_model_tool(name: &str, a: &Value) -> Option<Value> {
+    let r = call_model_tool_inner(name, a)?;
+    // H9: "找不到实体 X" 而 X 其实是 BOM 零件名 → 提示怎么引用
+    if r["isError"] == true {
+        let t = r["content"][0]["text"].as_str().unwrap_or("").to_string();
+        let cap = ["no solid named \\\"", "solid not found: \\\"", "no solid named \"", "solid not found: \""].iter().find_map(|pre| {
+            t.find(pre).map(|i| t[i + pre.len()..].split(['"', '\\']).next().unwrap_or("").to_string())
+        });
+        if let (Some(x), Ok(st)) = (cap.filter(|x| !x.is_empty()), state()) {
+            if bridge::resolve(&st.parts, &x).is_ok() {
+                return Some(err(format!("{t}\n\"{x}\" is a BOM part name, not a solid name: use {{\"part\": \"{x}\"}} in of / solids, or model_locate {{part}} to get its solid ids.")));
+            }
+        }
+    }
+    Some(r)
+}
+
+fn call_model_tool_inner(name: &str, a: &Value) -> Option<Value> {
     use pla_bridge::shim::api;
     // instance = background → 后台隐藏实例(代理里只有它一个窗口, hwnd 0 = 让代理挑)
     let bg = a["instance"].as_str() == Some("background");
@@ -368,6 +430,23 @@ fn call_model_tool(name: &str, a: &Value) -> Option<Value> {
         return Some(doc_tool(name, a));
     }
     let json_text = |v: &Value| text(serde_json::to_string_pretty(v).unwrap_or_default());
+    if name == "model_locate" {
+        return Some(match locate_part(h, a["part"].as_str().unwrap_or("")) {
+            Ok(v) => json_text(&v),
+            Err(e) => err(e),
+        });
+    }
+    // H9: {part: "…"} 引用 → 实体 id(只在出现时才扫 BOM)
+    let expanded;
+    let a = if a.to_string().contains("\"part\"") && name.starts_with("model_") {
+        expanded = match expand_part_refs(h, a) {
+            Ok(v) => v,
+            Err(e) => return Some(err(e)),
+        };
+        &expanded
+    } else {
+        a
+    };
     let call = |api_name: &str, args: Value| match rt().block_on(pla_bridge::query::call_once(port(), h, api_name, &args)) {
         Ok(v) if v.get("err").is_some() => err(v["err"].to_string()),
         Ok(v) => json_text(&v),
