@@ -1494,6 +1494,17 @@ const callAsync = async (name, args) => JSON.parse(await run(`window.__PLA__.cal
     assert.strictEqual(ap.v.failed, null, JSON.stringify(ap.v.failed));
     assert.deepStrictEqual([i1, i2, i3].map(nameOfId), ['左', '右', '左.001'], '逐个改名 + 规则改名去重');
     assert.strictEqual(ed.enqueued - q2, 2, '每条 rename 一条命令(一批多个实体也只一条; 假机的撤销栈只记工厂提交)');
+    // H9: 同名多个 → 报错列出候选; {name, all: true} 才全选
+    await callAsync('cmd.exec', { ops: [{ op: 'rename', solids: [i1, i2], name: '同名' }] });
+    const dup = call('geo.query', { detail: 'solids', of: [{ name: '同名' }] });
+    assert.ok(dup.ok === false && /2 solids are named "同名"/.test(dup.err) && dup.err.includes(String(i1)) && dup.err.includes(String(i2)), dup.err);
+    assert.strictEqual(call('geo.query', { detail: 'solids', of: [{ name: '同名', all: true }] }).v.solids.length, 2);
+    // H11: 每步回带用掉的输入 id; $ 引用跨调用 → 说明
+    const mv = await callAsync('cmd.exec', { ops: [{ op: 'move', solids: [i3], move: [1, 0, 0] }] });
+    assert.deepStrictEqual(mv.v.results[0].inputIds, [i3], 'inputIds');
+    assert.notStrictEqual(mv.v.results[0].items[0].id, i3, '移动后新 id');
+    const xr = await callAsync('cmd.exec', { ops: [{ op: 'move', solids: ['$gone'], move: [1, 0, 0] }] });
+    assert.ok(/only refers to an earlier step of the same call/.test(xr.v.failed.err), xr.v.failed.err);
   });
 
   await ta('N2 cmd.exec: 失败如实报且停在失败步; 已完成的保留; 引用已被吃掉的物体、挑不到边、PK 内核报错、参数错', async () => {

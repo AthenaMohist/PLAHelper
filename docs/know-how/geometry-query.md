@@ -39,7 +39,8 @@ args: { detail?: 'solids'(默认) | 'faces' | 'edges' | 'all',
         limit?: 每类上限(默认 2000) }
 → { units,
     solids:   [{id, name, bbox, faces, edges}],
-    faces?:   [{id, solid, bbox, surface, center, normal, radius?, axis?, axisOrigin?}],
+    faces?:   [{id, solid, bbox, surface, center, normal, radius?, axis?, axisOrigin?, axisPoint?}],
+          // center = 面中点(圆柱 / 圆锥面上 = 面上的点, 不是孔心); axisPoint = 面中点投影到轴线上(H8: 孔心 / 轴线位置用它)
     edges?:   [{id, solid, bbox, curve, length, start, end, direction? | radius?, axis?, axisOrigin?}],
     vertices?:[{id, solid, point}],          // detail=all; 由边端点去重
     truncated?: {faces?: 被截掉的数量, …} }

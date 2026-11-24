@@ -1370,7 +1370,8 @@
   function resolveSolids(ref, refs) {
     if (typeof ref === 'string' && ref.charAt(0) === '$') {
       var made = refs[ref.slice(1)];
-      if (!made) throw new Error('unknown ref ' + ref);
+      // H11: $ 引用只在同一次 cmd.exec 里、指向前面的步骤; 跨调用要用上次返回的真实 id
+      if (!made) throw new Error('unknown ref ' + ref + ' — "$id" only refers to an earlier step of the same call (steps so far: ' + (Object.keys(refs).map(function (k) { return '$' + k; }).join(', ') || 'none') + '); across calls use the real ids from results[].items[].id');
       var alive = solidViews();
       var v = made.filter(function (x) { return alive.indexOf(x) >= 0; });
       if (!v.length) throw new Error('ref ' + ref + ' no longer exists (consumed by a later step)');
@@ -1379,6 +1380,12 @@
     if (ref && typeof ref === 'object' && typeof ref.name === 'string') {
       var m = solidViews().filter(function (x) { return nameOf(x) === ref.name; });
       if (!m.length) throw new Error('no solid named ' + JSON.stringify(ref.name));
+      // H9: 同名多个 → 报错并列出候选(以前全选, 包围盒撑爆 / 改错对象); 要全选写 {name, all: true}
+      if (m.length > 1 && !ref.all) {
+        var k9 = 1;
+        try { k9 = unitOf({}).k; } catch (e9) {}
+        throw new Error(m.length + ' solids are named ' + JSON.stringify(ref.name) + ': ' + m.slice(0, 12).map(function (x) { var b = bboxOf(x, k9); return itemIdOf(x) + (b ? ' at ' + JSON.stringify(boxCenter(b).map(sig7)) : ''); }).join('; ') + (m.length > 12 ? ' …' : '') + ' — use an id, or {name, all: true} for all of them (model_rename dedupe: true makes names unique)');
+      }
       return m;
     }
     var view = viewOf('solid', ref);
@@ -2051,12 +2058,20 @@
       if (o.op === 'delete') return deleteStep(i, o);
       var build;
       try { build = buildStep(o, ctx); } catch (e) { return done({ index: i, op: o.op, err: errMsg(e) }); }
+      // H11: 这一步用到的已有实体(执行前的 id); 移动 / 旋转 / 镜像 / 阵列 / 布尔 / 改面之后它们换成新 id(items 里), 旧 id 作废
+      var inputIds = [];
+      ['solids', 'targets', 'tools'].forEach(function (key) {
+        if (o[key] === undefined) return;
+        try { convertParam('solids', o[key], ctx).forEach(function (v) { var id = itemIdOf(v); if (id !== null && inputIds.indexOf(id) < 0) inputIds.push(id); }); } catch (e) {}
+      });
       var cmd = new Cls(editor(), build);
       return runCommand(cmd, NAMES.cmdTimeoutMs).then(function (how) {
         if (cmd.plaErr || how !== 'ended') return done({ index: i, op: o.op, err: cmd.plaErr || how });
         var made = cmd.plaResult === null || cmd.plaResult === undefined ? [] : (Array.isArray(cmd.plaResult) ? cmd.plaResult : [cmd.plaResult]);
         if (o.id) ctx.refs[o.id] = made.filter(function (v) { return itemIdOf(v) !== null; });
-        results.push({ index: i, op: o.op, id: o.id || null, items: made.map(function (v) { return describeMade(v, U.k); }) });
+        var res = { index: i, op: o.op, id: o.id || null, items: made.map(function (v) { return describeMade(v, U.k); }) };
+        if (inputIds.length) res.inputIds = inputIds;
+        results.push(res);
         return step(i + 1);
       });
     };
@@ -2126,6 +2141,12 @@
       radialInfo(surf, o, k);
     } catch (x) { o.err = errMsg(x); }
     try { var mp = m[A.midpoint](); o.center = vecOut(mp[A.midPos], k); o.normal = dirOut(mp[A.midNormal]); } catch (x2) {}
+    // H8(外部反馈 2026-11-21): 圆柱 / 圆锥面的 center 是面上的点(面中点), 不是孔心 —— 按它算孔位会差一个半径。
+    // axisPoint = 面中点投影到轴线上的点(轴线上、与面中点同高), 判孔位 / 轴线位置用它。
+    if (o.center && o.axis && o.axisOrigin) {
+      var w = [o.center[0] - o.axisOrigin[0], o.center[1] - o.axisOrigin[1], o.center[2] - o.axisOrigin[2]], t = vdot(w, o.axis);
+      o.axisPoint = [0, 1, 2].map(function (q) { return sig7(o.axisOrigin[q] + o.axis[q] * t); });
+    }
     return o;
   }
 
