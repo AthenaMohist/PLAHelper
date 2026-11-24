@@ -75,10 +75,37 @@ pub async fn ensure_factories(ws: &mut WsStream, mid: &mut u64, force: bool) -> 
 
 async fn call_exec(ws: &mut WsStream, mid: &mut u64, script: &Value) -> Result<Value, ShimErr> {
     let steps = script["ops"].as_array().map(|a| a.len()).unwrap_or(1).max(1) as u32;
-    let raw = eval_roundtrip_timeout(ws, mid, &shim::call_expr(api::CMD_EXEC, script), PER_STEP * steps + Duration::from_secs(5))
-        .await
-        .map_err(|e| ShimErr::Bad(format!("{e:#}")))?;
-    shim::parse_reply(&raw)
+    // H7: 每次调用一个 token; 回包丢了(CDP 报错 / 解析不了)→ 按 token 取回页面上记下的实际结果, 不让调用方以为没做而重做一遍
+    let token = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0);
+    let mut s = script.clone();
+    s["token"] = serde_json::json!(token.to_string());
+    let first = match eval_roundtrip_timeout(ws, mid, &shim::call_expr(api::CMD_EXEC, &s), PER_STEP * steps + Duration::from_secs(5)).await {
+        Ok(raw) => shim::parse_reply(&raw),
+        Err(e) => Err(ShimErr::Bad(format!("{e:#}"))),
+    };
+    match first {
+        Err(ShimErr::Bad(why)) => match recover(ws, mid, &token.to_string()).await {
+            Some(mut v) => {
+                v["recovered"] = serde_json::json!(why);
+                Ok(v)
+            }
+            None => Err(ShimErr::Bad(format!(
+                "{why} — {}",
+                crate::t!(
+                    "回包丢了, 操作可能已经生效: 先用 model_state / model_outline 核实, 不要直接重试",
+                    "reply lost; the operation may have been applied: check with model_state / model_outline before retrying"
+                )
+            ))),
+        },
+        other => other,
+    }
+}
+
+/// H7: 取回页面上记下的最近一次 cmd.exec 结果(token 对得上才算)。
+async fn recover(ws: &mut WsStream, mid: &mut u64, token: &str) -> Option<Value> {
+    let raw = eval_roundtrip(ws, mid, &shim::call_expr(api::CMD_LAST_RESULT, &Value::Null)).await.ok()?;
+    let last = shim::parse_reply(&raw).ok()?;
+    (last["token"].as_str() == Some(token)).then(|| last["result"].clone())
 }
 
 /// H5: 工厂快照失效的症状(2026-11-21 外部反馈, 撤销之后出现): 建模命令构造时读 `xxx.Viewport` 拿到 undefined。

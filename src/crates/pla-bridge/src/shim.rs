@@ -129,6 +129,8 @@ pub mod api {
     pub const PART_STRETCH: &str = "part.stretch";
     /// 大纲树(只读): 文件夹嵌套 + 物体(kind / id / 名字 / 隐藏); args.kinds 过滤物体类别。
     pub const OUTLINE_READ: &str = "outline.read";
+    /// H7: 最近一次 cmd.exec 的结果 {token, at, result}(回包丢了时取回实际做了什么)。
+    pub const CMD_LAST_RESULT: &str = "cmd.lastResult";
     /// H3: 批量改名预览(只读; 规则同 cmd.exec 的 rename 步骤: name / items / pattern / find+replace / dedupe)。
     pub const RENAME_PLAN: &str = "rename.plan";
     /// N5b 建库: 改名 + 定 pivot + 标成资产 / 导出文档里所有资产成 pack / 登记 · 撤销登记 pack(paths 数组)。
@@ -153,7 +155,7 @@ pub mod api {
         CMD_PING, ERR_LAST, TREE_LIST, SEL_CANCEL_COMMAND, SEL_CLEAR, SEL_APPLY, CAM_NAVIGATE, CAM_RENDER, CAM_THUMBNAIL, CAM_VP_RECT,
         CAM_SET_ORBIT_STEP, CAM_ROLL, KEYMAP_SET_BINDINGS, VP_SAVE, VP_RESTORE, MAT_SAVE, MAT_RESTORE, CMD_EXEC, CMD_FACTORIES,
         GEO_QUERY, HIST_BEGIN, HIST_ROLLBACK, HIST_COMMIT, HIST_UNDO, GEO_SNAPS, GEO_MEASURE, CAM_VIEW, CAM_VIEW_RESTORE, DIM_FACE, VIEW_HIGHLIGHT, DIM_DISTANCE, DIM_SIGNATURE, GEO_RESOLVE,
-        DIM_RECORD, DIM_MEASURE, DIM_FACES, UI_RCLICK, HOLE_MAKE, ASSET_LIST, ASSET_PLACE, PART_STRETCH, OUTLINE_READ, RENAME_PLAN, ASSET_MARK, ASSET_EXPORT_PACK, ASSET_REGISTER, ASSET_UNREGISTER, CFG_SAVE, CFG_RESTORE, BOM_SCAN, FILE_EXPORT_STEP, FILE_EXPORT_RESTORE,
+        DIM_RECORD, DIM_MEASURE, DIM_FACES, UI_RCLICK, HOLE_MAKE, ASSET_LIST, ASSET_PLACE, PART_STRETCH, OUTLINE_READ, RENAME_PLAN, CMD_LAST_RESULT, ASSET_MARK, ASSET_EXPORT_PACK, ASSET_REGISTER, ASSET_UNREGISTER, CFG_SAVE, CFG_RESTORE, BOM_SCAN, FILE_EXPORT_STEP, FILE_EXPORT_RESTORE,
     ];
 }
 

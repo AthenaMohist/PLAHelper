@@ -1105,15 +1105,20 @@ pub(crate) async fn eval_roundtrip_timeout(
         if let tokio_tungstenite::tungstenite::Message::Text(t) = msg {
             let v: Value = serde_json::from_str(&t)?;
             if v["id"].as_u64() == Some(want) {
+                // H7: CDP 层错误(如 "Execution context was destroyed" / "Promise was collected")以前被当成空回包 →
+                // 上层报 "EOF while parsing", 而页面里的操作可能已经做完了。现在如实报错, 由调用方去核实。
+                if let Some(m) = v["error"]["message"].as_str() {
+                    return Err(anyhow::anyhow!("cdp: {m}"));
+                }
                 if let Some(exc) = v["result"]["exceptionDetails"]["exception"]["description"]
                     .as_str()
                 {
                     return Err(anyhow::anyhow!("js: {exc}"));
                 }
-                return Ok(v["result"]["result"]["value"]
-                    .as_str()
-                    .unwrap_or("")
-                    .to_string());
+                if let Some(t) = v["result"]["exceptionDetails"]["text"].as_str() {
+                    return Err(anyhow::anyhow!("js: {t}"));
+                }
+                return Ok(v["result"]["result"]["value"].as_str().unwrap_or("").to_string());
             }
         }
     }

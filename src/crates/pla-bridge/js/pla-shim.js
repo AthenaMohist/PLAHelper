@@ -2004,6 +2004,9 @@
     return rollbackTo(mark).then(function (n) { return { undone: n, depth: undoStack().length }; });
   }, { async: true });
 
+  // H7: 最近一次 cmd.exec 的结果(只读; {token, at, result} 或 null)。回包丢了时 Rust 按 token 取回实际做了什么。
+  def('cmd.lastResult', 'cmd.exec', function () { return pageState().lastExec || null; });
+
   // 工厂挂载状态(只读): 供 Rust 判断要不要让代理拍快照、自检显示。
   def('cmd.factories', 'cmd.exec', function () {
     var F = W[CFG.factoriesGlobal];
@@ -2032,7 +2035,8 @@
       mark = markNow();
     }
     var results = [];
-    var finish = function (failed) { return { units: U.unit, results: results, failed: failed }; };
+    // H7: 结果同时记在页面上(带调用方给的 token)—— 回包在路上丢了(CDP 报错 / 连接断), Rust 侧用 cmd.lastResult 取回实际做了什么
+    var finish = function (failed) { var r = { units: U.unit, results: results, failed: failed }; pageState().lastExec = { token: a.token === undefined ? null : a.token, at: Date.now(), result: r }; return r; };
     var done = function (failed) {
       if (!failed || !mark) return Promise.resolve(finish(failed));
       return rollbackTo(mark).then(function (n) {
