@@ -1476,15 +1476,31 @@
       if (!ids || !bx) return;
       Array.from(ids).forEach(function (id, i) {
         var o = i * 6;
-        out.push({ id: String(id), center: [(bx[o] + bx[o + 3]) / 2, (bx[o + 1] + bx[o + 4]) / 2, (bx[o + 2] + bx[o + 5]) / 2] });
+        out.push({ id: String(id), center: [(bx[o] + bx[o + 3]) / 2, (bx[o + 1] + bx[o + 4]) / 2, (bx[o + 2] + bx[o + 5]) / 2],
+                   mn: [bx[o], bx[o + 1], bx[o + 2]], mx: [bx[o + 3], bx[o + 4], bx[o + 5]] });
       });
     });
     return out;
   }
   // 提交辅助曲线后新出现的区域里, 中心离 expect 最近的那个(没有新区域 = 曲线并进了已有的草图 → 全部区域里找)
-  function pickNewRegion(before, expect, k) {
+  // H13(外部反馈 2026-11-21: 已有实体 / 草图旁边旋转出 ⌀10 而不是 ⌀38): 给了 pbox(这段曲线的包围盒, 米)就只认
+  // 落在 pbox 里的新区域 —— 恰好一个才用; 没有(曲线并进了旁边的草图)或好几个(被旁边的曲线切开)→ 报错, 不猜。
+  function pickNewRegion(before, expect, k, pbox) {
     var all = allRegions();
     var fresh = all.filter(function (r) { return before.indexOf(r.id) < 0; });
+    if (pbox) {
+      var diag = Math.hypot(pbox[1][0] - pbox[0][0], pbox[1][1] - pbox[0][1], pbox[1][2] - pbox[0][2]);
+      var tl = Math.max(1e-7, diag * 1e-4);
+      var inside = fresh.filter(function (r) { return [0, 1, 2].every(function (q) { return r.mn[q] >= pbox[0][q] - tl && r.mx[q] <= pbox[1][q] + tl; }); });
+      if (inside.length !== 1) {
+        throw new Error(inside.length
+          ? 'the profile was split into ' + inside.length + ' regions by other sketch curves at this spot — move it away from existing sketch curves (or use cylinder / prism)'
+          : 'the profile did not make a region of its own (it touches / merges with existing sketch curves here) — move it away from existing sketch curves (or use cylinder / prism)');
+      }
+      var t0 = invokeOn('geo.lookupTopo', [inside[0].id]);
+      if (!t0 || !t0[NAMES.lookupViewKey]) throw new Error('region ' + inside[0].id + ' could not be looked up');
+      return t0[NAMES.lookupViewKey];
+    }
     var pool = fresh.length ? fresh : all;
     var best = null, bd = Infinity;
     pool.forEach(function (r) { var d = Math.hypot(r.center[0] - expect[0], r.center[1] - expect[1], r.center[2] - expect[2]); if (d < bd) { bd = d; best = r; } });
@@ -1535,7 +1551,8 @@
         p[P.sides] = sides;
         p[P.radius] = R;
         return Promise.resolve(p[NAMES.facCommit]()).then(function () {
-          var region = pickNewRegion(before, c, k);
+          // 多边形的包围盒在 c ± R 之内(按外接圆放宽)
+          var region = pickNewRegion(before, c, k, [[c[0] - R, c[1] - R, c[2] - R], [c[0] + R, c[1] + R, c[2] + R]]);
           var f = new Ext(cmd.editor);
           f[NAMES.facResource](cmd);
           f[S.regions] = [region];
@@ -1572,7 +1589,7 @@
         pts.forEach(function (p) { cf[C.push](new V(p[0], p[1], p[2])); });
         cf[C.closed] = true;
         return Promise.resolve(cf[NAMES.facCommit]()).then(function () {
-          var region = pickNewRegion(before, mid, k);
+          var region = pickNewRegion(before, mid, k, [mn, mx]);
           var f = new Rev(cmd.editor);
           f[NAMES.facResource](cmd);
           f[S2.regions] = [region];
