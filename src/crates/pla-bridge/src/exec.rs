@@ -182,7 +182,13 @@ pub fn summary(v: &Value) -> (bool, String) {
         Some(f) => {
             let i = f["index"].as_u64().unwrap_or(0) + 1;
             let op = f["op"].as_str().unwrap_or("?");
-            let err = f["err"].as_str().unwrap_or("");
+            // H11: 带上文档单位(长度按它解释; inch 文档里按 mm 给值会差 25.4 倍)
+            let err_raw = f["err"].as_str().unwrap_or("");
+            let err_s = match v["units"].as_str() {
+                Some(u) => format!("{err_raw} [{}: {u}]", crate::t!("文档单位", "document units")),
+                None => err_raw.to_string(),
+            };
+            let err = err_s.as_str();
             // atomic: 已完成的步骤被撤回(或撤回失败)
             if let Some(n) = v["rolledBack"].as_u64() {
                 return (false, crate::t!(

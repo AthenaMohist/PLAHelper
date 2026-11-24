@@ -88,7 +88,7 @@ fn model_tools() -> Value {
         {"name": "model_exec", "annotations": {"destructiveHint": true},
          "description": format!("CHANGES THE USER'S MODEL - only when the user asked for this modeling work. Runs geometry steps through Plasticity's own factories (each step = one undo step, same as manual work). atomic (default true): if a step fails, every step of this call is undone. Cancels any command the user has in progress; the Plasticity window must be visible.\n\
 ops (lengths in document units unless units is given; points [x,y,z]):\n\
-- box {{p1, p2 (opposite corners of the base), height}} (+ bool, targets)\n\
+- box {{p1, p2 (opposite corners of the base rectangle; both with the same z: the base lies parallel to XY), height (along +Z)}} (+ bool, targets) - axis-aligned only; for a tilted box build it, then rotate / move it\n\
 - cylinder {{center (base center), axis [x,y,z] (grow direction), radius, height}} (+ bool, targets) - a hole = cylinder with bool 'subtract' and targets [the solid]\n\
 - fillet {{edges, distance}} / chamfer {{edges, distance}} (45°)\n\
 - offsetFace {{faces, distance}} (+ = grow outward along the face normal; on a hole wall + makes the hole smaller)\n\
@@ -109,7 +109,7 @@ Outliner (folders = Plasticity groups; read the tree with model_outline; folder 
 - moveTo {{solids? | folders?, to}} - move into a folder (\"root\" = top level)\n\
 - hide {{solids? | folders?}} / show {{…}} - same as H / unhide (a folder hides everything in it)\n\
 - ungroup {{folders}} - dissolve; members go up one level\n\
-bool: union | subtract | intersect with targets [solid refs]. Give a step id: \"base\" and later steps can use \"$base\" (its result). Edges / faces: topology ids, or {{\"near\": [x,y,z], \"of\": solid ref, \"tol\"?}} = the item whose bbox center is nearest (errors instead of guessing when ambiguous). {refs} After running, verify with model_state / model_measure / model_view."),
+bool: union | subtract | intersect with targets [solid refs]. Give a step id: \"base\" and later steps of THE SAME call can use \"$base\" (its result); across calls use the real ids from results[].items[].id. IDS CHANGE: move / rotate / mirror / pattern / radialPattern / boolean / fillet / any face edit give the solid a NEW id (results[].items[].id; results[].inputIds = the ids that were used up) - never reuse the old id. Solid refs: id, \"$step\", or {{name}} (error when several solids share the name; {{name, all: true}} = all of them). Edges / faces: topology ids, or {{\"near\": [x,y,z], \"of\": solid ref, \"tol\"?}} = the item whose bbox center is nearest (errors instead of guessing when ambiguous). {refs} After running, verify with model_state / model_measure / model_view."),
          "inputSchema": {"type": "object", "properties": {
             "ops": {"type": "array", "items": {"type": "object"}},
             "atomic": {"type": "boolean"}, "units": {"type": "string"}}, "required": ["ops"]}},
