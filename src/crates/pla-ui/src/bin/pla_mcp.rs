@@ -65,12 +65,14 @@ fn model_tools() -> Value {
     let refs = "Topology ids look like '34f9439' (face) / '34e912' (edge) / '34v12' (vertex) - '34' is the solid's version id, which changes after every edit of that solid, so re-query after changes. Solids can also be given as {\"name\": \"<outliner name>\"}.";
     let ro = json!({"readOnlyHint": true});
     let mut tools = json!([
-        {"name": "model_state", "annotations": ro, "description": format!("Read the open Plasticity model: undo depth, current selection, and geometry. detail: solids (default, overview) / faces / edges / all (+ vertices). Filter with of (solid ids or {{name}}), surface (Plane/Cylinder/Cone/Torus/…), curve (Line/Circle/…), normal [x,y,z] with angleTol (deg), near [x,y,z] with tol. Lengths in document units. Start with the overview, then query faces/edges of one solid. {refs}"),
+        {"name": "model_state", "annotations": ro, "description": format!("Read the open Plasticity model: undo depth, current selection, and geometry. detail: solids (default, overview) / faces / edges / all (+ vertices). Filter with of (solid ids, {{name}} or {{part}}), surface (Plane/Cylinder/Cone/Torus/…), curve (Line/Circle/…), normal [x,y,z] with angleTol (deg), near [x,y,z] with tol. Solids: name (substring), folder (folder name anywhere in its path), inBox [[x0,y0,z0],[x1,y1,z1]] (bbox centre inside); the solid list is paged: solidLimit (default 50) + offset, the reply says solidsTotal / more. Cylinder / cone faces: center is a point ON the surface; axisPoint is on the axis (use it for hole positions). Lengths in document units. Start with the overview, then query faces/edges of one solid. {refs}"),
          "inputSchema": {"type": "object", "properties": {
             "detail": {"type": "string", "enum": ["solids", "faces", "edges", "all"]},
             "of": {"type": "array", "items": {}}, "surface": {"type": "string"}, "curve": {"type": "string"},
             "normal": {"type": "array", "items": {"type": "number"}}, "angleTol": {"type": "number"},
             "near": {"type": "array", "items": {"type": "number"}}, "tol": {"type": "number"},
+            "name": {"type": "string"}, "folder": {"type": "string"}, "inBox": {"type": "array", "items": {"type": "array", "items": {"type": "number"}}},
+            "solidLimit": {"type": "integer"}, "offset": {"type": "integer"},
             "units": {"type": "string"}, "limit": {"type": "integer"}}}},
         {"name": "model_snaps", "annotations": ro, "description": "Snap points Plasticity itself uses (also internal ones): face centers + normals, edge midpoints + tangents, circle centers + axes, points on arcs, vertices, bbox corners. kinds filters (faceCenter|edgeMid|circleCenter|circleQuarter|vertex|bboxCorner); near/tol/of/limit as in model_state.",
          "inputSchema": {"type": "object", "properties": {"of": {"type": "array", "items": {}}, "kinds": {"type": "array", "items": {"type": "string"}}, "near": {"type": "array", "items": {"type": "number"}}, "tol": {"type": "number"}, "units": {"type": "string"}, "limit": {"type": "integer"}}}},
@@ -454,7 +456,11 @@ fn call_model_tool_inner(name: &str, a: &Value) -> Option<Value> {
     };
     Some(match name {
         "model_state" => {
-            let args = pick(a, &["detail", "of", "surface", "curve", "normal", "angleTol", "near", "tol", "units", "limit"]);
+            let mut args = pick(a, &["detail", "of", "surface", "curve", "normal", "angleTol", "near", "tol", "units", "limit", "name", "folder", "inBox", "solidLimit", "offset"]);
+            // H12: 概览默认只列 50 个实体(404 个实体全列约 100 KB); 回包带 solidsTotal / more, 用 offset 翻页或用过滤
+            if args.get("solidLimit").is_none() && args.get("of").is_none() {
+                args["solidLimit"] = json!(50);
+            }
             match rt().block_on(pla_bridge::query::state_once(port(), h, &args)) {
                 Ok(v) => json_text(&v),
                 Err(e) => cdp_err(e),

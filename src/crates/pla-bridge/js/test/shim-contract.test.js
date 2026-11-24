@@ -1499,6 +1499,12 @@ const callAsync = async (name, args) => JSON.parse(await run(`window.__PLA__.cal
     const dup = call('geo.query', { detail: 'solids', of: [{ name: '同名' }] });
     assert.ok(dup.ok === false && /2 solids are named "同名"/.test(dup.err) && dup.err.includes(String(i1)) && dup.err.includes(String(i2)), dup.err);
     assert.strictEqual(call('geo.query', { detail: 'solids', of: [{ name: '同名', all: true }] }).v.solids.length, 2);
+    // H12: 名字过滤 + 分页
+    const pg = call('geo.query', { detail: 'solids', name: '同', solidLimit: 1 }).v;
+    assert.deepStrictEqual([pg.solids.length, pg.solidsTotal, pg.more], [1, 2, true], JSON.stringify(pg));
+    const pg2 = call('geo.query', { detail: 'solids', name: '同', solidLimit: 1, offset: 1 }).v;
+    assert.deepStrictEqual([pg2.solids.length, pg2.offset, pg2.more], [1, 1, false]);
+    assert.strictEqual(call('geo.query', { detail: 'solids', name: '同' }).v.solidsTotal, undefined, '没截断就不带分页字段');
     // H11: 每步回带用掉的输入 id; $ 引用跨调用 → 说明
     const mv = await callAsync('cmd.exec', { ops: [{ op: 'move', solids: [i3], move: [1, 0, 0] }] });
     assert.deepStrictEqual(mv.v.results[0].inputIds, [i3], 'inputIds');

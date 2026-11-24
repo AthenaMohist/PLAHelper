@@ -2213,9 +2213,24 @@
     if (!want) throw new Error('detail must be solids | faces | edges | all');
     var U = unitOf(a), k = U.k;
     var pool = a.of !== undefined ? (Array.isArray(a.of) ? a.of : [a.of]).reduce(function (acc, r) { return acc.concat(resolveSolids(r, {})); }, []) : solidViews();
+    // H12: 实体过滤 name(名字包含, 不分大小写)/ folder(所在文件夹路径里有这个名字)/ inBox [[min],[max]](包围盒中心在框里);
+    // 分页 offset / solidLimit(默认不限; MCP 的 model_state 默认 50)
+    if (a.name !== undefined) { var nq = String(a.name).toLowerCase(); pool = pool.filter(function (v) { return (nameOf(v) || '').toLowerCase().indexOf(nq) >= 0; }); }
+    if (a.folder !== undefined) { var fq = String(a.folder); pool = pool.filter(function (v) { try { return groupPath(invokeOn('nodes.item2key', [v])).indexOf(fq) >= 0; } catch (e) { return false; } }); }
+    if (a.inBox !== undefined) {
+      var ib = a.inBox;
+      if (!Array.isArray(ib) || ib.length !== 2) throw new Error('inBox must be [[x0,y0,z0],[x1,y1,z1]]');
+      pool = pool.filter(function (v) { var b = bboxOf(v, k); if (!b) return false; var c = boxCenter(b); return [0, 1, 2].every(function (q) { return c[q] >= Math.min(ib[0][q], ib[1][q]) && c[q] <= Math.max(ib[0][q], ib[1][q]); }); });
+    }
+    var solidsTotal = pool.length, off = Math.max(0, Math.floor(Number(a.offset) || 0));
+    if (a.offset !== undefined || a.solidLimit !== undefined) {
+      var sl = a.solidLimit !== undefined ? Math.max(0, Math.floor(Number(a.solidLimit))) : Infinity;
+      pool = pool.slice(off, off + sl);
+    }
     var flt = topoFilter(a);
     var limit = a.limit !== undefined ? Math.max(0, Number(a.limit)) : NAMES.queryLimit;
     var out = { units: U.unit, solids: [] };
+    if (pool.length < solidsTotal) { out.solidsTotal = solidsTotal; out.offset = off; out.more = off + pool.length < solidsTotal; }
     var total = {};
     var verts = want.indexOf('vertices') >= 0 ? new Map() : null;
     want.forEach(function (w) { if (w !== 'solids') { out[w] = []; total[w] = 0; } });
