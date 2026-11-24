@@ -57,8 +57,11 @@ const COL_GRAY_DOT: egui::Color32 = egui::Color32::from_rgb(0x77, 0x77, 0x77);
 /// 宽 246(R8-1: +30 视口状态按钮); 高 30。
 /// R30: +30 笔记按钮 → 276。R34: +30 材质状态按钮 → 306。
 /// 宽度 = 状态点 + 6 个按钮(24 + 间距 6) + 分隔线 + 关闭 ×; 2026-11-17 九个按钮减到六个时只算到按钮(216), × 被裁掉看不见
-/// (用户 2026-11-19 报) → 补上分隔线 + × 的 40。
-const TOOLBAR_SIZE: [f32; 2] = [256.0, 30.0];
+/// (用户 2026-11-19 报) → 补上分隔线 + × 的 40。2026-11-24 又被裁(256 < 实际需要的 258: 少算了边距)
+/// → H4: 这里只是启动时的初值, 运行时按排出来的内容宽度自动调整窗口(`toolbar_w`)。
+const TOOLBAR_SIZE: [f32; 2] = [262.0, 30.0];
+/// 工具栏一行内容之外的左右留白(panel_frame 的 outer + inner margin)。
+const TOOLBAR_HPAD: f32 = 12.0;
 /// 配置窗口(配置 / 视口 / 材质 / 选择集 四个标签共用一个 OS 窗口)。
 const CFG_PANEL_ID: &str = "panel-config";
 /// 面板整体右移微调(逻辑 px, 按 ppp 缩放; R6-2e 用户要求再偏右 10)。
@@ -299,6 +302,8 @@ struct PlaApp {
     /// R8b: 工具栏拖动位置(None=自动吸附; Some=用户拖到的位置, 逻辑 pt)。
     toolbar_drag_pos: Option<egui::Pos2>,
     toolbar_dragging: bool,
+    /// H4: 工具栏窗口当前宽度(逻辑点) —— 按实际排出来的一行内容量出来, 不再靠手算常数(× 被裁两次)。
+    toolbar_w: f32,
     /// R9: 自管拖动的起始鼠标位置(**屏幕物理像素**, 不能用窗口内相对坐标)。
     drag_origin_cursor: Option<(f32, f32)>,
     /// R9: 自管拖动的起始窗口外框左上角(逻辑 pt, 屏幕坐标系)。
@@ -2688,6 +2693,7 @@ impl PlaApp {
             show_vpstate: false,
     toolbar_drag_pos: None,
     toolbar_dragging: false,
+    toolbar_w: TOOLBAR_SIZE[0],
     // R9: 自管拖动的起始基准(鼠标屏幕位置/窗口位), 松手即清。
     drag_origin_cursor: None,
     drag_origin_win: None,
@@ -9928,7 +9934,7 @@ impl PlaApp {
     /// R23: HUD(悬停提示 / 通知)的左缘 = 工具栏与当前打开的二级面板中较宽者的右侧 + 间隙。
     /// 二级面板贴在工具栏下方、与工具栏左对齐, 比工具栏宽时 HUD 不能再按工具栏宽度放(会压在面板上)。
     fn hud_left(&self, toolbar_x: f32) -> f32 {
-        let mut w = TOOLBAR_SIZE[0];
+        let mut w = self.toolbar_w;
         for (open, size) in [
             (self.show_snapshots, PANEL_SNAPSHOTS),
             (self.show_entities, PANEL_ENTITIES),
@@ -10754,7 +10760,7 @@ impl eframe::App for PlaApp {
                     egui::Sense::click_and_drag(),
                 );
                 let mut reset_to_snap = tb_drag.double_clicked();
-                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(row_rect), |ui| {
+                let row_w = ui.allocate_new_ui(egui::UiBuilder::new().max_rect(row_rect), |ui| {
                 ui.horizontal(|ui| {
                     // 状态圆点区: 未绑定=灰; 已绑定显示 bridge 状态色; 双击亦可归位。
                     let (dot_rect, dot_resp) =
@@ -10859,8 +10865,17 @@ impl eframe::App for PlaApp {
                         pla_ui::diag::log("工具栏 × 被点击");
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
-                });
-                }); // allocate_new_ui(居中行矩形)
+                    // H4: 这一行实际排到的最右端(含 ×)
+                    close_resp.rect.right() - row_rect.left()
+                }).inner
+                }).inner; // allocate_new_ui(居中行矩形)
+                // H4: 窗口宽度跟着内容走 —— 内容比窗口宽(× 会被裁)或明显窄就改窗口尺寸。
+                let need = (row_w + TOOLBAR_HPAD).ceil();
+                if (need - self.toolbar_w).abs() > 0.5 && !self.toolbar_dragging {
+                    pla_ui::diag::log(&format!("toolbar width {} -> {need}", self.toolbar_w));
+                    self.toolbar_w = need;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(need, TOOLBAR_SIZE[1])));
+                }
                 // R9: 自管拖动(SetCapture + 屏幕坐标 delta) — 取代 OS 模态循环。
                 // 帧循环照常运行 → 二级面板在同一帧拿到同一个权威坐标, 与工具栏
                 // 同步平移(不再"疯狂瞬移"); 鼠标移出小窗口也不断流。
@@ -10876,7 +10891,7 @@ impl eframe::App for PlaApp {
                         ctx.input(|i| i.viewport().outer_rect),
                         pla_ui::window_drag::find_own_window(
                             "PLA Toolbar",
-                            TOOLBAR_SIZE[0],
+                            self.toolbar_w,
                             ctx.pixels_per_point(),
                         ),
                     ) {
