@@ -171,7 +171,7 @@
 | pattern | RectangularArrayFactory | `items`, `dir1` / `dir2`(**必须给新 Vector3**, 没有就在 makeRectangularMatrices 里 clone undefined), `num1` / `num2`, `distance1` / `distance2`(mode extent = 首尾总长) | 新增副本(不含原件) |
 | radialPattern | RadialArrayFactory | `items`, `dir1` = 起始方向(⟂ 轴), `dir2` = 轴, `center.set()`, `num2` = 个数, `angle` = 总角度; 360° 整圈等分, 不足一圈首尾都放(3 个 / 180° → 0/90/180) | 新增副本 |
 | boolean | BooleanFactory | `targets`, `tools`, `operationType`(15901 交 / 15902 减 / 15903 并), `keepTools` | 结果实体(沿用 target 的名字) |
-| delete | (无工厂)`geo.removeItem(view)` 包在自建命令里 | — | 一个撤销步, 撤销后实体回来 |
+| delete | 选中(同 sel.apply 的选择命令)→ Plasticity 自己的 `commands.DeleteCommand`(H6, 2026-11-24) | — | 两条原生命令; 删后核对实体确实没了。以前 `geo.removeItem(view)` 包在自建命令里: 删掉以后**每条**命令都报 "object N missing from stable model"(同上面辅助曲线那条, 后台实例复现) |
 | rename | `nodes.setName(item2key(view), name)` 包在自建命令里 | — | 一个撤销步, 撤销恢复原名 |
 
 找"读了哪个 undefined 字段": 用 `new Proxy(factory, {get})` 包一层再读 `params`, 记下返回 undefined 的属性名(dir1 / dir2 就是这样找到的)。
