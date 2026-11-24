@@ -1119,6 +1119,15 @@ fn paint_text(
     r
 }
 
+/// H1: 放紧固件的回包里"放好的那个实体": part.stretch → `solid`; asset.place → items 里的 solid; cmd.exec(生成的件)→ 最后一步产物里的 solid。
+fn placed_solid(v: &serde_json::Value) -> Option<serde_json::Value> {
+    if !v["solid"].is_null() {
+        return Some(v["solid"].clone());
+    }
+    let solid_in = |items: &serde_json::Value| items.as_array().into_iter().flatten().find(|i| i["kind"] == "solid").map(|i| i["id"].clone());
+    solid_in(&v["items"]).or_else(|| v["results"].as_array().and_then(|r| r.last()).and_then(|r| solid_in(&r["items"])))
+}
+
 fn lerp_color(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
     let l = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
     egui::Color32::from_rgb(l(a.r(), b.r()), l(a.g(), b.g()), l(a.b(), b.b()))
@@ -3295,18 +3304,33 @@ impl PlaApp {
                         Some(f) if !f.is_null() => Err(format!("{} {}", f["op"].as_str().unwrap_or(""), f["err"].as_str().unwrap_or(""))),
                         _ => Ok(v),
                     });
-                    // 放好的 pack 螺钉要改长度 → 紧接着改(算同一件)
-                    let stretch = self.screw_inflight.take().filter(|_| name == pla_bridge::shim::api::ASSET_PLACE).map(|a| a["_stretch"].clone()).filter(|s| s.is_object());
+                    let inflight = self.screw_inflight.take().unwrap_or_default();
+                    let copies = inflight["_copies"].clone();
+                    // 放好的 pack 螺钉要改长度 → 紧接着改(算同一件; 复制要等改完长度再做)
+                    let stretch = Some(inflight["_stretch"].clone()).filter(|_| name == pla_bridge::shim::api::ASSET_PLACE).filter(|s| s.is_object());
                     if let (Some(s), Ok(v)) = (&stretch, &result) {
                         let solid = v["items"].as_array().into_iter().flatten().find(|i| i["kind"] == "solid").map(|i| i["id"].clone());
                         if let Some(solid) = solid {
-                            self.screw_queue.push_front((pla_bridge::shim::api::PART_STRETCH, serde_json::json!({ "solid": solid, "axis": s["axis"], "delta": s["delta"] })));
+                            self.screw_queue.push_front((pla_bridge::shim::api::PART_STRETCH, serde_json::json!({ "solid": solid, "axis": s["axis"], "delta": s["delta"], "units": inflight["units"], "_copies": copies })));
                             self.screw_pump();
                             continue;
                         }
                     }
+                    // H1: 第一个孔的这一件放好了 → 复制到其余孔(一次调用)
+                    if let (Some(offs), Ok(v)) = (copies.as_array().filter(|a| !a.is_empty()), &result) {
+                        let solid = placed_solid(v);
+                        if let Some(solid) = solid {
+                            let mut ops = Vec::new();
+                            for (i, off) in offs.iter().enumerate() {
+                                ops.push(serde_json::json!({ "op": "duplicate", "id": format!("c{i}"), "solids": [solid] }));
+                                ops.push(serde_json::json!({ "op": "move", "solids": [format!("$c{i}")], "move": off }));
+                            }
+                            self.screw_queue.push_front((pla_bridge::shim::api::CMD_EXEC, serde_json::json!({ "atomic": true, "ops": ops, "units": inflight["units"], "_copyN": offs.len() })));
+                        }
+                    }
+                    let count = inflight["_copyN"].as_u64().unwrap_or(1) as usize;
                     match result {
-                        Ok(_) => self.screw_count.0 += 1,
+                        Ok(_) => self.screw_count.0 += count,
                         Err(e) => {
                             self.screw_count.1 += 1;
                             self.screw_count.2.get_or_insert(e);
@@ -8084,17 +8108,23 @@ impl PlaApp {
             return;
         }
         let units = v["units"].clone();
-        for h in v["holes"].as_array().cloned().unwrap_or_default() {
-            let at: Vec<f64> = h["at"].as_array().map(|a| a.iter().filter_map(|x| x.as_f64()).collect()).unwrap_or_default();
-            if at.len() != 3 {
-                continue;
-            }
+        // H1: 每种紧固件只在第一个孔正常放(导入 / 生成 + 改长度), 其余孔复制过去(一次 cmd.exec: 复制 + 平移),
+        // 不再每孔一遍拖放导入(每次带 150 ms 等待与最长 6 s 轮询)。同一面上的孔 → 同一朝向, 平移即可。
+        let ats: Vec<Vec<f64>> = v["holes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|h| h["at"].as_array().map(|a| a.iter().filter_map(|x| x.as_f64()).collect::<Vec<f64>>()))
+            .filter(|a| a.len() == 3)
+            .collect();
+        let copies: Vec<Vec<f64>> = ats.iter().skip(1).map(|a| (0..3).map(|i| ((a[i] - ats[0][i]) * 1000.0).round() / 1000.0).collect()).collect();
+        for at in ats.iter().take(1).cloned() {
             for it in items {
                 // 深度 z 沿孔轴(= −n)
                 let pt: Vec<f64> = (0..3).map(|i| ((at[i] - n[i] * it.z) * 1000.0).round() / 1000.0).collect();
                 let out: Vec<f64> = n.iter().map(|x| if it.up { *x } else { -*x }).collect();
                 if let Some(a) = pla_ui::screw_kit::find(&self.screw_assets, it) {
-                    let mut args = serde_json::json!({ "asset": a.id, "pack": a.pack, "at": pt, "normal": out, "units": units });
+                    let mut args = serde_json::json!({ "asset": a.id, "pack": a.pack, "at": pt, "normal": out, "units": units, "_copies": copies });
                     // 螺钉: pack 里是统一长度(10mm), 放好后只移动杆端改到要的长度(用户 2026-11-18)
                     if let (Kind::Screw, Some(l)) = (it.kind, it.length) {
                         let l0 = pla_ui::screw_kit::asset_len(a, it.std, it.d);
@@ -8112,7 +8142,7 @@ impl PlaApp {
                 };
                 let req = serde_json::json!({ "kind": kind, "std": it.std, "size": it.d, "length": it.length, "at": pt, "axis": axis });
                 match serde_json::from_value::<pla_ui::fasteners::PartReq>(req).map_err(|e| e.to_string()).and_then(|q| pla_ui::fasteners::expand(&q)) {
-                    Ok(x) => self.screw_queue.push_back((pla_bridge::shim::api::CMD_EXEC, serde_json::json!({ "atomic": true, "ops": x.ops, "units": units }))),
+                    Ok(x) => self.screw_queue.push_back((pla_bridge::shim::api::CMD_EXEC, serde_json::json!({ "atomic": true, "ops": x.ops, "units": units, "_copies": copies }))),
                     Err(e) => {
                         self.screw_count.1 += 1;
                         self.screw_count.2.get_or_insert(e);
