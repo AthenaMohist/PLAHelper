@@ -1711,6 +1711,18 @@ const callAsync = async (name, args) => JSON.parse(await run(`window.__PLA__.cal
     assert.deepStrictEqual(ed.bools, [{ target: rb, tools: 2, op: 15902 }], '两个孔一次相减');
     assert.ok(/hole points must be curve points/.test((await callAsync('hole.make', { face: call('geo.query', { detail: 'faces', of: [Object.values(mp.v.solids)[0]], normal: [0, 0, 1] }).v.faces[0].id, points: [{ kind: 'face', id: 'x' }], d: 3 })).err));
     ed.geo.items = ed.geo.items.filter((x) => !(x.view.userData && x.view.userData.versionId === 901));
+    // H2: 选中的直线 = 腰孔(两端圆柱 + 中间长方体 → 原点建、转到腰孔方向、移到中点; 一起减); 圆弧(包围盒鼓出两端点之外)仍按两端点打孔
+    const line = (vid, p0, p1, bbox) => ({ view: { userData: { versionId: vid }, vertices: { length: 2, points: { geometry: { attributes: { position: { array: Float32Array.from([...p0, ...p1]) } } } } }, segments: { bboxes: Float32Array.from(bbox) } }, model: {} });
+    ed.geo.items.push(line(902, [0.765, 0.01, 0.01], [0.785, 0.02, 0.01], [0.765, 0.01, 0.01, 0.785, 0.02, 0.01]));
+    ed.geo.items.push(line(903, [0.77, 0.005, 0.01], [0.79, 0.005, 0.01], [0.77, 0.005, 0.01, 0.79, 0.015, 0.01]));   // 圆弧: y 鼓到 0.015
+    ed.cyls = []; ed.bools = [];
+    const topS = call('geo.query', { detail: 'faces', of: [Object.values(mp.v.solids)[0]], normal: [0, 0, 1] }).v.faces[0].id;
+    const sl = await callAsync('hole.make', { face: topS, points: [{ kind: 'curve', id: '902' }, { kind: 'curve', id: '903' }], type: 'simple', d: 3 });
+    assert.ok(sl.ok, JSON.stringify(sl));
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(sl.v.holes.map((x) => x.slot || x.at))), [{ from: [765, 10, 10], to: [785, 20, 10] }, [770, 5, 10], [790, 5, 10]], '直线 → 腰孔; 圆弧 → 两端点各一孔');
+    assert.strictEqual(ed.cyls.length, 2 + 2, '腰孔两端两个圆柱 + 圆弧两端点两个孔');
+    assert.deepStrictEqual(ed.bools.map((b) => b.tools), [5], '腰孔 3 把刀具(两圆柱 + 长方体)+ 2 个孔, 一次减');
+    ed.geo.items = ed.geo.items.filter((x) => !(x.view.userData && (x.view.userData.versionId === 902 || x.view.userData.versionId === 903)));
     // N4b 组合孔: 上板 A(z 0..10)+ 下板 B(z −8..0)。A = 过孔 d + 柱形沉头; B = 底孔 tapD, 深 6 从 B 的入口(孔口下 10)算 → 圆柱高 16
     const ra = (await callAsync('cmd.exec', { ops: [{ op: 'box', p1: [820, 0, 0], p2: [860, 30, 0], height: 10 }] })).v.results[0].items[0].id;
     const rbb = (await callAsync('cmd.exec', { ops: [{ op: 'box', p1: [820, 0, -8], p2: [860, 30, -8], height: 8 }] })).v.results[0].items[0].id;

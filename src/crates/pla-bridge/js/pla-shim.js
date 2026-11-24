@@ -3088,6 +3088,48 @@
     return out;
   }
 
+  // H2 腰孔(用户 2026-11-24: 选直线 = 默认腰孔): 选择里的直线 → {from, to}; 其余照 sketchPoints。
+  // 直线判定: 开放曲线、恰好 2 个端点、曲线包围盒 = 两端点张成的包围盒(圆弧的包围盒会鼓出去)。
+  function slotsAndPoints(refs, k) {
+    var HK = NAMES.holePointKinds, Wn = NAMES.wire, slots = [], rest = [];
+    (refs || []).forEach(function (r) {
+      if (String(r && r.kind) === HK.curve) {
+        var v = viewOf('curve', String(r.id));
+        var vg = v && v[Wn.vertices], pos = vg ? walk(vg, Wn.vertexPositions) : MISS;
+        var bx = v && v[Wn.segments] && v[Wn.segments][NAMES.groupBboxes];
+        if (vg && vg.length === 2 && pos !== MISS && pos && bx && bx.length >= 6) {
+          var p0 = [pos[0], pos[1], pos[2]], p1 = [pos[3], pos[4], pos[5]];
+          var len = Math.hypot(p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]), tol = Math.max(1e-7, len * 1e-4), straight = len > 1e-9;
+          for (var j = 0; j + 5 < bx.length && straight; j += 6) {
+            for (var q = 0; q < 3; q++) {
+              if (bx[j + q] < Math.min(p0[q], p1[q]) - tol || bx[j + 3 + q] > Math.max(p0[q], p1[q]) + tol) straight = false;
+            }
+          }
+          if (straight) { slots.push({ from: p0.map(function (x) { return x / k; }), to: p1.map(function (x) { return x / k; }) }); return; }
+        }
+      }
+      rest.push(r);
+    });
+    return { slots: slots, points: sketchPoints(rest, k) };
+  }
+
+  // H2: 把 box 局部轴(X = 长度方向, Y = 宽度方向, Z = 深度方向)转到 (u, axis × u, axis) 的旋转 → 绕过原点的轴 + 角度(度); 不用转 → null
+  function frameRotation(u, w) {
+    var v = vcross(w, u);
+    var R = [[u[0], v[0], w[0]], [u[1], v[1], w[1]], [u[2], v[2], w[2]]];
+    var tr = R[0][0] + R[1][1] + R[2][2], ang = Math.acos(Math.max(-1, Math.min(1, (tr - 1) / 2)));
+    if (ang < 1e-9) return null;
+    var ax;
+    if (Math.PI - ang < 1e-6) {
+      var i = R[0][0] >= R[1][1] && R[0][0] >= R[2][2] ? 0 : R[1][1] >= R[2][2] ? 1 : 2;
+      ax = [0, 1, 2].map(function (j) { return j === i ? Math.sqrt(Math.max(0, (R[i][i] + 1) / 2)) : R[i][j] / (2 * Math.sqrt(Math.max(1e-12, (R[i][i] + 1) / 2))); });
+    } else {
+      var s2 = 2 * Math.sin(ang);
+      ax = [(R[2][1] - R[1][2]) / s2, (R[0][2] - R[2][0]) / s2, (R[1][0] - R[0][1]) / s2];
+    }
+    return { axis: vnorm(ax), degrees: ang * 180 / Math.PI };
+  }
+
   // args = { face, points?: [{kind: curveVertex|curve, id}](省略 = at / 面中点 + offset), stack?: [实体 id…](组合孔, 按选择顺序),
   //          type: simple|counterbore|countersink, d(入口实体 / 中间实体的孔径), tapD?(组合孔: 最后一个实体的孔径),
   //          depth?(省略 = 通孔; 组合孔 = 最后一个实体里的深度), cbD?, cbDepth?, cskD?, at?, offset?, units? }
@@ -3103,9 +3145,13 @@
     var f = faceSigFull(String(a.face || ''), k);
     if (f.surface !== NAMES.planeSurface || !f.normal || !f.center) throw new Error('holes go on a plane face (got ' + (f.surface || '?') + ')');
     var n = f.normal, c = f.center;
-    // 位置: 草图点; 没有就 at / 面中点 + offset(沿 planeAxes)
-    var pts = sketchPoints(a.points, k);
-    if (!pts.length) {
+    // 位置: 草图点; 选中的直线 = 腰孔(H2); 都没有就 at / 面中点 + offset(沿 planeAxes)
+    var sp = slotsAndPoints(a.points, k), pts = sp.points;
+    var slots = sp.slots.concat((Array.isArray(a.slots) ? a.slots : []).map(function (s) {
+      if (!s || !Array.isArray(s.from) || !Array.isArray(s.to)) throw new Error('slots: [{from:[x,y,z], to:[x,y,z]}]');
+      return { from: s.from.map(Number), to: s.to.map(Number) };
+    }));
+    if (!pts.length && !slots.length) {
       var at0 = Array.isArray(a.at) && a.at.length === 3 ? a.at.map(Number) : c.slice();
       if (Array.isArray(a.offset) && a.offset.length === 2) {
         var ax2 = planeAxes(n), ou = Number(a.offset[0]) || 0, ov = Number(a.offset[1]) || 0;
@@ -3113,20 +3159,42 @@
       }
       pts = [at0];
     }
-    pts = pts.map(function (p) { var o = vdot([p[0] - c[0], p[1] - c[1], p[2] - c[2]], n); return [p[0] - n[0] * o, p[1] - n[1] * o, p[2] - n[2] * o]; });
+    var onFace = function (p) { var o = vdot([p[0] - c[0], p[1] - c[1], p[2] - c[2]], n); return [p[0] - n[0] * o, p[1] - n[1] * o, p[2] - n[2] * o]; };
+    pts = pts.map(onFace);
+    // 腰孔的螺纹孔位(组合孔最后一层只打一个螺纹孔, 用户 2026-11-24): 同时选的点落在这条腰孔上(离线段 ≤ d)→ 用它;
+    // 否则 tapAt = from | to | mid(默认)| [x,y,z]
+    var tapAt = a.tapAt === undefined ? 'mid' : a.tapAt;
+    slots = slots.map(function (s) {
+      var f0 = onFace(s.from), t0 = onFace(s.to), dv = [t0[0] - f0[0], t0[1] - f0[1], t0[2] - f0[2]], L = Math.hypot(dv[0], dv[1], dv[2]);
+      if (!(L > 1e-9)) throw new Error('slot from and to are the same point');
+      var u = dv.map(function (x) { return x / L; });
+      var segDist = function (p) { var t = Math.max(0, Math.min(L, vdot([p[0] - f0[0], p[1] - f0[1], p[2] - f0[2]], u))); return Math.hypot(p[0] - f0[0] - u[0] * t, p[1] - f0[1] - u[1] * t, p[2] - f0[2] - u[2] * t); };
+      var hit = -1;
+      for (var i = 0; i < pts.length && hit < 0; i++) if (segDist(pts[i]) <= d) hit = i;
+      var tap;
+      if (hit >= 0) { tap = pts[hit]; pts.splice(hit, 1); }
+      else if (Array.isArray(tapAt) && tapAt.length === 3) tap = onFace(tapAt.map(Number));
+      else if (tapAt === 'from') tap = f0;
+      else if (tapAt === 'to') tap = t0;
+      else if (tapAt === 'mid') tap = [(f0[0] + t0[0]) / 2, (f0[1] + t0[1]) / 2, (f0[2] + t0[2]) / 2];
+      else throw new Error('tapAt must be from / to / mid / [x,y,z]');
+      return { from: f0, to: t0, u: u, L: L, mid: [(f0[0] + t0[0]) / 2, (f0[1] + t0[1]) / 2, (f0[2] + t0[2]) / 2], tap: tap };
+    });
     // 实体: 入口(面所在) + 组合孔的其余实体(按顺序, 最后一个 = 螺纹 / 底孔)
     var A = itemIdOf(viewOf('solid', /^(\d+)/.exec(String(a.face))[1]));
     var stack = (Array.isArray(a.stack) ? a.stack : []).map(String).filter(function (s) { return s !== String(A); });
     stack.forEach(function (s) { if (!viewOf('solid', s)) throw new Error('solid not found: ' + s); });
+    if (slots.length && type === 'countersink') throw new Error('countersink is not supported on slots (use simple or counterbore)');
     // dry: 只算孔位 + 第一个孔位上各实体沿孔轴的入口 / 出口深度(包围盒投影; 打孔面板算螺丝长度用), 不打孔
     if (a.dry) {
-      var ax0 = n.map(function (x) { return -x; }), p0 = pts[0];
+      var ax0 = n.map(function (x) { return -x; }), p0 = slots.length ? slots[0].tap : pts[0];
       var layers = [A].concat(stack).map(function (s) {
         var b = bboxOf(viewOf('solid', s), k), lo = Infinity, hi = -Infinity;
         for (var i = 0; i < 8; i++) { var q = [(i & 1 ? b[1] : b[0])[0], (i & 2 ? b[1] : b[0])[1], (i & 4 ? b[1] : b[0])[2]]; var t = vdot([q[0] - p0[0], q[1] - p0[1], q[2] - p0[2]], ax0); lo = Math.min(lo, t); hi = Math.max(hi, t); }
         return { solid: s, t0: sig7(Math.max(0, lo)), t1: sig7(hi) };
       });
-      return { dry: true, holes: pts.map(function (p) { return { at: p.map(sig7) }; }), normal: n.map(sig7), solid: A, layers: layers, units: U.unit };
+      return { dry: true, holes: slots.map(function (s) { return { at: s.tap.map(sig7), slot: { from: s.from.map(sig7), to: s.to.map(sig7) } }; }).concat(pts.map(function (p) { return { at: p.map(sig7) }; })),
+               normal: n.map(sig7), solid: A, layers: layers, units: U.unit };
     }
     var last = stack.length ? stack[stack.length - 1] : null, mids = stack.slice(0, -1);
     var tapD = last ? num(a.tapD, 'tapD') : null;
@@ -3158,7 +3226,31 @@
     var ops = [], toolsOf = {}, cutAt = {};
     [A].concat(stack).forEach(function (s) { toolsOf[s] = []; });
     var tool = function (p, r, h, s) { var id = 't' + ops.length; ops.push({ op: 'cylinder', id: id, center: p, axis: axis, radius: r, height: h }); toolsOf[s].push('$' + id); };
-    var holes = pts.map(function (p) {
+    // H2 腰孔刀具 = 两端圆柱 + 中间长方体。box 只能在默认平面里按两角点建(没有朝向参数),
+    // 所以先在原点按局部轴建(X 长度、Y 宽度、Z 深度), 转到 (u, axis × u, axis), 再平移到腰孔中点 —— 不画草图、不挑区域(H13)。
+    var slotTool = function (sl, r, h, s) {
+      tool(sl.from, r, h, s); tool(sl.to, r, h, s);
+      var id = 'b' + ops.length;
+      ops.push({ op: 'box', id: id, p1: [-sl.L / 2, -r, 0], p2: [sl.L / 2, r, 0], height: h });
+      var rot = frameRotation(sl.u, axis);
+      if (rot) { var rid = 'r' + ops.length; ops.push({ op: 'rotate', id: rid, solids: ['$' + id], pivot: [0, 0, 0], axis: rot.axis, degrees: rot.degrees }); id = rid; }
+      var mid2 = 'm' + ops.length;
+      ops.push({ op: 'move', id: mid2, solids: ['$' + id], move: sl.mid });
+      toolsOf[s].push('$' + mid2);
+    };
+    var slotHoles = slots.map(function (sl) {
+      var hole = { at: sl.tap, slot: { from: sl.from, to: sl.to } };
+      if (!last) slotTool(sl, d / 2, depth, A);
+      else {
+        slotTool(sl, d / 2, long, A);
+        mids.forEach(function (m) { slotTool(sl, d / 2, long, m); });
+        hole.t0 = entryDepth(last, sl.tap);
+        tool(sl.tap, tapD / 2, through ? long : hole.t0 + depth, last);
+      }
+      if (type === 'counterbore') slotTool(sl, cbD / 2, cbDepth, A);
+      return hole;
+    });
+    var holes = slotHoles.concat(pts.map(function (p) {
       var hole = { at: p };
       if (!last) tool(p, d / 2, depth, A);
       else {
@@ -3169,14 +3261,14 @@
       }
       if (type === 'counterbore') tool(p, cbD / 2, cbDepth, A);
       return hole;
-    });
+    }));
     [A].concat(stack).forEach(function (s) {
       cutAt[s] = ops.length;
       ops.push({ op: 'boolean', id: 'cut' + ops.length, targets: [s], tools: toolsOf[s], operation: 'subtract' });
     });
     // 锥形沉头: 全部孔口边一条倒角命令
     var cskAt = null;
-    if (type === 'countersink') { cskAt = ops.length; ops.push({ op: 'chamfer', edges: pts.map(function (p) { return { near: p, tol: d / 4 }; }), distance: (cskD - d) / 2 }); }
+    if (type === 'countersink') { cskAt = ops.length; ops.push({ op: 'chamfer', edges: holes.map(function (h) { return { near: h.at, tol: d / 4 }; }), distance: (cskD - d) / 2 }); }
     return API['cmd.exec'].fn({ atomic: true, ops: ops, units: U.unit }).then(function (r) {
       if (r.failed) throw new Error('step ' + r.failed.index + ' (' + r.failed.op + '): ' + r.failed.err + (r.rolledBack !== undefined ? ' — rolled back' : ''));
       // 各实体的最终产物(相减的结果; 入口实体有锥形沉头时取倒角之后的)
@@ -3195,11 +3287,26 @@
       var tol = Math.max(1e-3, d * 1e-3);
       holes.forEach(function (h) {
         var at = h.at;
-        var distToAxis = function (s) {
-          var w = [at[0] - s.axisOrigin[0], at[1] - s.axisOrigin[1], at[2] - s.axisOrigin[2]], al = vdot(w, s.axis);
+        var distToAxis = function (s, p) {
+          p = p || at;
+          var w = [p[0] - s.axisOrigin[0], p[1] - s.axisOrigin[1], p[2] - s.axisOrigin[2]], al = vdot(w, s.axis);
           return Math.hypot(w[0] - al * s.axis[0], w[1] - al * s.axis[1], w[2] - al * s.axis[2]);
         };
-        var cylOf = function (s, rr) { return sigsOf(s).filter(function (g) { return typeof g.radius === 'number' && g.axis && g.axisOrigin && g.surface !== NAMES.coneSurface && Math.abs(g.radius - rr) < tol && Math.abs(Math.abs(vdot(g.axis, n)) - 1) < 1e-4 && distToAxis(g) < tol; })[0]; };
+        var cylOf = function (s, rr, p) { return sigsOf(s).filter(function (g) { return typeof g.radius === 'number' && g.axis && g.axisOrigin && g.surface !== NAMES.coneSurface && Math.abs(g.radius - rr) < tol && Math.abs(Math.abs(vdot(g.axis, n)) - 1) < 1e-4 && distToAxis(g, p) < tol; })[0]; };
+        if (h.slot) {
+          // 腰孔: 两端的半圆柱面 + 入口 / 沉槽台阶 / 槽底; 组合孔最后一层的螺纹孔照常
+          var fs = { entry: null, wallFrom: cylOf(A, d / 2, h.slot.from), wallTo: cylOf(A, d / 2, h.slot.to) };
+          var nearPlane = function (s, hh) { return sigsOf(s).filter(function (g) { return g.surface === NAMES.planeSurface && g.normal && vdot(g.normal, n) > 0.9999 && Math.abs(vdot([at[0] - g.center[0], at[1] - g.center[1], at[2] - g.center[2]], n) - hh) < tol; })[0]; };
+          fs.entry = nearPlane(A, 0);
+          if (!last && !through) fs.bottom = nearPlane(A, depth);
+          if (type === 'counterbore') { fs.cbFrom = cylOf(A, cbD / 2, h.slot.from); fs.cbTo = cylOf(A, cbD / 2, h.slot.to); fs.cbFloor = nearPlane(A, cbDepth); }
+          if (last) { fs.tapWall = cylOf(last, tapD / 2); if (!through) { fs.tapEntry = nearPlane(last, h.t0); fs.bottom = nearPlane(last, h.t0 + depth); } }
+          h.faces = fs;
+          h.at = at.map(sig7);
+          h.slot = { from: h.slot.from.map(sig7), to: h.slot.to.map(sig7) };
+          if (h.t0 !== undefined) h.t0 = sig7(h.t0);
+          return;
+        }
         // 朝外(= +n)的平面, 中心在孔口下方 hh 处(入口 / 孔底 / 沉头台阶), 取离孔轴最近的
         var floorAt = function (s, hh) { return sigsOf(s).filter(function (g) { return g.surface === NAMES.planeSurface && g.normal && vdot(g.normal, n) > 0.9999 && Math.abs(vdot([at[0] - g.center[0], at[1] - g.center[1], at[2] - g.center[2]], n) - hh) < tol; }).sort(function (p, q) { return Math.hypot(p.center[0] - at[0], p.center[1] - at[1], p.center[2] - at[2]) - Math.hypot(q.center[0] - at[0], q.center[1] - at[1], q.center[2] - at[2]); })[0]; };
         var fc = { entry: floorAt(A, 0), wall: cylOf(A, d / 2) };
