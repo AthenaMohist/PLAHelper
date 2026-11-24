@@ -360,6 +360,8 @@ async fn session_loop(
     let mut last_snapshot = String::new();
     let mut last_tree = String::new();
     let mut sel_tick: u32 = 0;
+    let mut pending: Option<CdpCmd> = None;
+    let mut last_poll = tokio::time::Instant::now();
 
     // F1: 注入垫片(错误捕获钩子由垫片按 editor 代际自动安装); F2: 上报能力。
     let mut last_caps: Option<shim::CapsReport> = None;
@@ -372,8 +374,12 @@ async fn session_loop(
         if target.load(std::sync::atomic::Ordering::Relaxed) != connected_to {
             return Err(anyhow::anyhow!("绑定窗口已变更, 重新连接"));
         }
-        // --- UI 命令(非阻塞) ---
-        match cmd_rx.try_recv() {
+        // --- UI 命令(非阻塞; 心跳等待里先收到的那条放在 pending) ---
+        let got = match pending.take() {
+            Some(c) => Ok(c),
+            None => cmd_rx.try_recv(),
+        };
+        match got {
             Ok(CdpCmd::Shutdown) => return Err(anyhow::anyhow!("shutdown")),
             Ok(CdpCmd::Call { name, args }) => {
                 let mut result = shim_call(ws, &mut mid, name, args.clone()).await;
@@ -595,9 +601,10 @@ async fn session_loop(
             Err(_) => {}
         }
 
-        // --- 轮询选择快照(每 2 个 tick ≈ 1s; 500ms 底噪) ---
-        sel_tick += 1;
-        if sel_tick % 2 == 0 {
+        // --- 轮询选择快照(约 1 s 一次; 有排队的 UI 命令时先处理命令) ---
+        if pending.is_none() && last_poll.elapsed() >= Duration::from_millis(1000) {
+            last_poll = tokio::time::Instant::now();
+            sel_tick += 2;
             // R7-25: renderer reload(切文档/崩溃恢复)会清掉页面上的垫片。
             // 探活: stale = 垫片缺失或接口版本不符 → 重注; noed = 垫片在但 editor 丢了
             // (重新定位 editor 是 F4 的事, 这里如实上报 no-editor)。
@@ -627,14 +634,31 @@ async fn session_loop(
             }
         }
 
-        // --- 500ms 心跳 + ws 事件抽取 ---
-        tokio::select! {
-            _ = tokio::time::sleep(Duration::from_millis(500)) => {}
-            msg = ws.next() => {
-                match msg {
-                    Some(Ok(_)) => {} // 事件帧忽略
-                    Some(Err(e)) => return Err(anyhow::anyhow!("ws: {e}")),
-                    None => return Err(anyhow::anyhow!("ws closed")),
+        // --- 心跳(≤ 500 ms) + ws 事件抽取 ---
+        // H1: 以前固定睡 500 ms 才看下一条 UI 命令(打孔面板每次调用平均多等 ~0.25 s, 配螺钉时每孔 4 次)。
+        // 现在每 20 ms 看一眼命令通道, 来了就立刻回到循环顶部处理。
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        while pending.is_none() {
+            match cmd_rx.try_recv() {
+                Ok(c) => {
+                    pending = Some(c);
+                    break;
+                }
+                Err(TryRecvError::Disconnected) => return Err(anyhow::anyhow!("ui gone")),
+                Err(_) => {}
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            tokio::select! {
+                _ = tokio::time::sleep((deadline - now).min(Duration::from_millis(20))) => {}
+                msg = ws.next() => {
+                    match msg {
+                        Some(Ok(_)) => {} // 事件帧忽略
+                        Some(Err(e)) => return Err(anyhow::anyhow!("ws: {e}")),
+                        None => return Err(anyhow::anyhow!("ws closed")),
+                    }
                 }
             }
         }
