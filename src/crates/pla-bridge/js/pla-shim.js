@@ -130,6 +130,8 @@
     // ---- N2: 命令派发(know-how/command-dispatch.md) ----
     'geo.items':               ['geo', 'items'],
     'ed.docUnit':              ['ed', 'document.settings._Unit.length'],
+    // H14: 当前文档的文件路径(没存过 = 空); 写操作前自动备份用
+    'ed.docFile':              ['ed', 'document._filename'],
     // 自建工厂命令的基类 Command: 取任一几何命令类的父类
     'cmd.factoryBaseHolder':   ['ed', 'commands.CornerBoxCommand'],
     // 几何工厂类(只在闭包里; 代理按需拍堆快照挂到 CFG.factoriesGlobal, 根 fac)
@@ -932,6 +934,9 @@
     if (a && a.arm !== undefined) state.rc.armed = !!a.arm;
     return { armed: state.rc.armed, count: state.rc.count };
   });
+
+  // H14: 当前文档文件(只读): { path(没存过 = null) }
+  def('doc.file', 'hist.read', function () { var p = get('ed.docFile'); return { path: typeof p === 'string' && p ? p : null }; });
 
   def('hist.state', 'hist.read', function () {
     var st = need('ed.undoStack');

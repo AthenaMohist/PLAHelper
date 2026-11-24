@@ -402,8 +402,65 @@ fn expand_part_refs(h: isize, v: &Value) -> Result<Value, String> {
     })
 }
 
+/// H14: 本进程里已经备份过的文档(每个文档第一次写之前备份一次)。
+static BACKED_UP: std::sync::Mutex<Option<std::collections::HashSet<String>>> = std::sync::Mutex::new(None);
+/// 一次调用里步骤数 ≥ 这个也备份(大批量改动前)。
+const BACKUP_BIG_OPS: usize = 20;
+const BACKUP_KEEP: usize = 10;
+
+/// H14: 改模型之前自动备份文档文件(外部反馈: 模型没先备份就批量改、撤销试错, 做完的活全丢)。
+/// 规则: 本进程第一次改这个文档 / 一次调用 ≥ BACKUP_BIG_OPS 步 / 撤销 · 回滚之前 → 复制到 %LOCALAPPDATA%\PLAhelper\backups\<文档名>\, 每个文档留最近 BACKUP_KEEP 份。
+/// 备份的是磁盘上的文件(上次保存的状态), 没保存的改动不在里面。没存过的新文档没法备份 → 提示。
+fn backup_before_write(h: isize, name: &str, a: &Value) -> Option<String> {
+    let ops = a["ops"].as_array().map(|x| x.len()).unwrap_or(1);
+    let risky = name == "model_transaction";
+    let v = rt().block_on(pla_bridge::query::call_once(port(), h, pla_bridge::shim::api::DOC_FILE, &Value::Null)).ok()?;
+    let Some(path) = v["path"].as_str().filter(|p| !p.is_empty()) else {
+        return Some("backup: not possible — the document has never been saved (save it once so changes can be backed up)".into());
+    };
+    let first = BACKED_UP.lock().ok().map(|mut g| g.get_or_insert_with(Default::default).insert(path.to_lowercase())).unwrap_or(false);
+    if !first && ops < BACKUP_BIG_OPS && !risky {
+        return None;
+    }
+    let src = std::path::Path::new(path);
+    let stem = src.file_stem()?.to_string_lossy().to_string();
+    let base = std::env::var("LOCALAPPDATA").map(std::path::PathBuf::from).unwrap_or_else(|_| std::env::temp_dir());
+    let dir = base.join("PLAhelper").join("backups").join(pla_ui::snapshot::sanitize_filename(&stem));
+    // 毫秒: 同一秒里连着两次写(大批量 + 回滚)也不会互相覆盖
+    let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+    let dest = dir.join(format!("{}-{}-{ms}.plasticity", pla_ui::snapshot::sanitize_filename(&stem), pla_ui::parts_lib::today()));
+    if let Err(e) = std::fs::create_dir_all(&dir).and_then(|_| std::fs::copy(src, &dest)) {
+        return Some(format!("backup FAILED ({e}) — consider saving a copy by hand before continuing"));
+    }
+    // 只留最近几份
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        let mut files: Vec<(std::time::SystemTime, std::path::PathBuf)> = rd
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "plasticity"))
+            .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
+            .collect();
+        files.sort_by(|x, y| y.0.cmp(&x.0));
+        for (_, p) in files.into_iter().skip(BACKUP_KEEP) {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+    Some(format!("backup: {} (the file as last saved; unsaved changes are not in it)", dest.display()))
+}
+
 fn call_model_tool(name: &str, a: &Value) -> Option<Value> {
-    let r = call_model_tool_inner(name, a)?;
+    let writes = matches!(name, "model_exec" | "model_hole" | "model_asset_place" | "model_part_stretch" | "model_part" | "model_build")
+        || (name == "model_rename" && a["apply"].as_bool() == Some(true))
+        || (name == "model_transaction" && matches!(a["action"].as_str(), Some("undo" | "rollback")));
+    let note = if writes {
+        PORT.store(if a["instance"].as_str() == Some("background") { BG_PORT } else { FG_PORT }, std::sync::atomic::Ordering::Relaxed);
+        backup_before_write(if a["instance"].as_str() == Some("background") { 0 } else { hwnd() }, name, a)
+    } else {
+        None
+    };
+    let mut r = call_model_tool_inner(name, a)?;
+    if let (Some(n), Some(c)) = (note, r["content"].as_array_mut()) {
+        c.insert(0, json!({"type": "text", "text": n}));
+    }
     // H9: "找不到实体 X" 而 X 其实是 BOM 零件名 → 提示怎么引用
     if r["isError"] == true {
         let t = r["content"][0]["text"].as_str().unwrap_or("").to_string();
