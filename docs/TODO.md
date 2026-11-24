@@ -112,7 +112,7 @@
 
 ### P2 —— 文档与接入
 
-- [ ] **H15 MCP 安全守则**（写进 MCP instructions 与工具描述）：
+- [x] **H15 MCP 安全守则**（2026-11-25：pla_mcp.rs `INSTRUCTIONS` 8 条 + model_exec / model_transaction 描述；写操作失败的回包末尾加"先核实别重试"）（写进 MCP instructions 与工具描述）：
   - 写操作报错先核实状态，不直接重试；
   - 不拿撤销做探索；
   - 窗口不可见时不写；
@@ -120,7 +120,7 @@
   - 圆柱轴线用 `axisPoint`；
   - 不绕过 MCP 直接跑 CDP 脚本。
   H5–H7 修好后相应删减。
-- [ ] **H16 接入说明**：`.mcp.json` 现在是相对路径（要求客户端在 repo 根目录启动）。文档给出绝对路径写法（Claude Code / WorkBuddy / 通用 stdio 客户端各一段）。
+- [x] **H16 接入说明**（2026-11-25：docs/MCP-SETUP.md）：`.mcp.json` 现在是相对路径（要求客户端在 repo 根目录启动）。文档给出绝对路径写法（Claude Code / WorkBuddy / 通用 stdio 客户端各一段）。
 
 ## T — 待测（用户 2026-11-18 记录：两组测试挂起，开发先往前走）
 

@@ -61,6 +61,18 @@ fn port() -> u16 {
     PORT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// H15: 给 agent 的使用守则(MCP initialize 的 instructions)。来源: 外部模型建模反馈 docs/AGENT-LESSONS.md。
+const INSTRUCTIONS: &str = "PLAhelper: modeling, BOM and Chinese GB part drawings for the user's Plasticity model. The user's model is their real work - follow these rules:\n\
+1. Look first: model_state (overview, then faces/edges of one solid), model_outline, model_view (isolate: true to see one part). BOM part names (list_parts, bom_table) are not solid names: use model_locate or {\"part\": ...}. Never guess a part's role from its position.\n\
+2. Change the model only when the user asked for that work. Before a batch change (many solids, rename, delete, pattern), list what will change and get the user's OK; model_rename previews by default.\n\
+3. If a write call fails or its reply is lost, do NOT retry blindly - it may have been applied (or rolled back). Check with model_state / model_transaction state first, then decide.\n\
+4. Never use undo to explore or to 'try and see'. Plan, preview with read-only tools, then write once. To make several calls undoable as one, use model_transaction begin / commit / rollback.\n\
+5. Writes need the Plasticity window visible and idle (they cancel a command in progress). If the window is minimized or hidden, ask the user instead of writing; for independent jobs use the background instance (background tool, instance: \"background\").\n\
+6. Ids change after every edit of a solid: use the ids in the latest result, not old ones. Hole / shaft positions on cylinder faces: use axisPoint (center is a point on the surface).\n\
+7. Use only these tools. Never drive Plasticity through your own CDP / devtools scripts or internal objects (e.g. originator.restore) - that bypasses undo, backups and safety checks and has broken documents before.\n\
+8. After changing, verify (model_state / model_measure / model_view) and tell the user what changed. Writes are backed up automatically (path in the reply) only from the last saved file.\n\
+Drawings: start with list_parts / get_drawing; use dimension names from get_drawing when changing settings. Drawing / BOM jobs need pla-ui running.";
+
 fn model_tools() -> Value {
     let refs = "Topology ids look like '34f9439' (face) / '34e912' (edge) / '34v12' (vertex) - '34' is the solid's version id, which changes after every edit of that solid, so re-query after changes. Solids can also be given as {\"name\": \"<outliner name>\"}.";
     let ro = json!({"readOnlyHint": true});
@@ -114,7 +126,7 @@ Outliner (folders = Plasticity groups; read the tree with model_outline; folder 
 - moveTo {{solids? | folders?, to}} - move into a folder (\"root\" = top level)\n\
 - hide {{solids? | folders?}} / show {{…}} - same as H / unhide (a folder hides everything in it)\n\
 - ungroup {{folders}} - dissolve; members go up one level\n\
-bool: union | subtract | intersect with targets [solid refs]. Give a step id: \"base\" and later steps of THE SAME call can use \"$base\" (its result); across calls use the real ids from results[].items[].id. IDS CHANGE: move / rotate / mirror / pattern / radialPattern / boolean / fillet / any face edit give the solid a NEW id (results[].items[].id; results[].inputIds = the ids that were used up) - never reuse the old id. Solid refs: id, \"$step\", or {{name}} (error when several solids share the name; {{name, all: true}} = all of them). Edges / faces: topology ids, or {{\"near\": [x,y,z], \"of\": solid ref, \"tol\"?}} = the item whose bbox center is nearest (errors instead of guessing when ambiguous). {refs} After running, verify with model_state / model_measure / model_view."),
+bool: union | subtract | intersect with targets [solid refs]. Give a step id: \"base\" and later steps of THE SAME call can use \"$base\" (its result); across calls use the real ids from results[].items[].id. IDS CHANGE: move / rotate / mirror / pattern / radialPattern / boolean / fillet / any face edit give the solid a NEW id (results[].items[].id; results[].inputIds = the ids that were used up) - never reuse the old id. Solid refs: id, \"$step\", or {{name}} (error when several solids share the name; {{name, all: true}} = all of them). Edges / faces: topology ids, or {{\"near\": [x,y,z], \"of\": solid ref, \"tol\"?}} = the item whose bbox center is nearest (errors instead of guessing when ambiguous). {refs} After running, verify with model_state / model_measure / model_view. If the call errors, check model_state before retrying - a retried move moves twice."),
          "inputSchema": {"type": "object", "properties": {
             "ops": {"type": "array", "items": {"type": "object"}},
             "atomic": {"type": "boolean"}, "units": {"type": "string"}}, "required": ["ops"]}},
@@ -174,7 +186,7 @@ checks: {bbox [[min],[max]], of?, tol?=0.05} · {count {\"Cylinder\": 3}, of?} �
 The spec, a map (bodies, solid ids, undo range) and a log are saved under the document's .pla/models/<doc>/specs/. replace: true first undoes this spec's previous build (only if nothing else was done since).",
          "inputSchema": {"type": "object", "properties": {"spec": {"type": "object"}, "replace": {"type": "boolean"}}, "required": ["spec"]}},
         {"name": "model_transaction", "annotations": {"destructiveHint": true},
-         "description": "Group several model_exec / model_hole calls so they can be undone together. action=begin (remember the undo depth) → work → commit (keep) or rollback (undo everything since begin, including anything the user did in between; refused if the undo stack below begin was changed). action=undo with steps = undo the last N steps (like Ctrl+Z). action=state = undo / redo depth. The transaction survives shim updates (kept on the page).",
+         "description": "Group several model_exec / model_hole calls so they can be undone together. action=begin (remember the undo depth) → work → commit (keep) or rollback (undo everything since begin, including anything the user did in between; refused if the undo stack below begin was changed). action=undo with steps = undo the last N steps (like Ctrl+Z). action=state = undo / redo depth. The transaction survives shim updates (kept on the page). Undo is for taking back work the user no longer wants - never for trial and error.",
          "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["begin", "commit", "rollback", "undo", "state"]}, "steps": {"type": "integer", "description": "for undo: how many steps (default 1)"}}, "required": ["action"]}},
         {"name": "background", "annotations": {"destructiveHint": true},
          "description": "A separate, hidden Plasticity instance for independent jobs, so the user can keep working (browser, or their own Plasticity on another project) undisturbed: it never shows a window, never appears in the taskbar, never takes focus, and never moves the real mouse. action=start (doc?: a .plasticity file to open; uses a copy of the user's login/settings in its own data folder; ~5 s) / open (doc, discard?: drop unsaved changes) / save_as (doc) / status / stop. A document that is open in the user's foreground Plasticity is REFUSED (open / save_as / jobs) - tell the user to close it there first. Jobs on the open document: background_bom / background_draw / background_release. Then pass instance: \"background\" to any model_* tool to work in it. Native dialogs there never show: save dialogs are answered by PLAhelper (pack / STEP export), other message boxes are auto-cancelled and logged (see status).",
@@ -460,6 +472,12 @@ fn call_model_tool(name: &str, a: &Value) -> Option<Value> {
     let mut r = call_model_tool_inner(name, a)?;
     if let (Some(n), Some(c)) = (note, r["content"].as_array_mut()) {
         c.insert(0, json!({"type": "text", "text": n}));
+    }
+    // H15: 写操作失败 → 提醒先核实再决定, 别盲目重试(外部模型重试 move 移了两次)
+    if writes && r["isError"] == true {
+        if let Some(c) = r["content"].as_array_mut() {
+            c.push(json!({"type": "text", "text": "Do not retry blindly: the change may have been applied or rolled back. Check with model_state (and model_transaction state) first."}));
+        }
     }
     // H9: "找不到实体 X" 而 X 其实是 BOM 零件名 → 提示怎么引用
     if r["isError"] == true {
@@ -1015,7 +1033,7 @@ fn handle(msg: &Value) -> Option<Value> {
             let want = msg["params"]["protocolVersion"].as_str().unwrap_or("");
             let v = if SUPPORTED.contains(&want) { want } else { SUPPORTED[0] };
             json!({"protocolVersion": v, "capabilities": {"tools": {}}, "serverInfo": {"name": "plahelper", "version": env!("CARGO_PKG_VERSION")},
-                   "instructions": "PLAhelper drawing tools for the user's Plasticity model (Chinese GB part drawings). Start with list_parts / get_drawing; use dimension names from get_drawing when changing settings. pla-ui must be running."})
+                   "instructions": INSTRUCTIONS})
         }
         "ping" => json!({}),
         "tools/list" => json!({"tools": tools()}),

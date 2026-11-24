@@ -1,7 +1,8 @@
 # pla-mcp 工具(A6 + 出图, 2026-11-17)
 
 `src/target/release/pla-mcp.exe` = stdio MCP 服务器(JSON-RPC, 一行一条; 协议版本 2025-06-18 / 2025-03-26 / 2024-11-05)。
-仓库根 `.mcp.json` 已登记(Claude Code 在本项目里首次使用时要批准); 别处: `claude mcp add plahelper -- <repo>\src\target\release\pla-mcp.exe`。
+仓库根 `.mcp.json` 已登记(Claude Code 在本项目里首次使用时要批准); 别处 / 其他客户端（WorkBuddy 等）用绝对路径，写法见 `docs/MCP-SETUP.md`。
+给 agent 的使用守则在 `pla_mcp.rs` 的 `INSTRUCTIONS`（initialize 回包里下发）。
 
 ## 两类工具, 两条通路
 
@@ -55,7 +56,7 @@
 
 - `model_exec` 会**取消用户正在进行的命令**; 窗口不可见时 atomic 一开始就拒绝(撤销走 memento, 隐藏窗口不行)—— 只在用户要求建模时用。
 - 第一次 `model_exec` 要挂工厂类(堆快照, 实测 93 MB / 10 s), 之后同一页面零等待。
-- `model_view` 只对准、不隔离: 埋在别的零件里的物体(如装配内部的磁环)从外面看会被挡住。
+- `model_view` 默认只对准、不隔离: 埋在别的零件里的物体(如装配内部的磁环)从外面看会被挡住 → 加 `isolate: true`(H10, Plasticity 自己的隔离, 截完退出)。
 - 截图: 同一个同步调用里摆完相机立刻渲染, 窗口可见时画面还是旧相机(空渲一帧也没用)→ 分三步: `cam.view {shot: false}` 摆相机 →
   隔 150 ms 单独 `cam.thumbnail` → `cam.viewRestore` 还原(`pla_bridge::query::view_png_once`; 截完相机与截前逐字段相同)。
 - 事务记录原来在垫片实例上, begin 之后垫片热替换(版本变了)就丢 → 改记在页面级 `__PLA_PAGE__`。另加 `hist.undo {steps}` = 撤销最近 N 步。
