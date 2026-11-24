@@ -76,6 +76,11 @@ fn model_tools() -> Value {
          "inputSchema": {"type": "object", "properties": {"of": {"type": "array", "items": {}}, "kinds": {"type": "array", "items": {"type": "string"}}, "near": {"type": "array", "items": {"type": "number"}}, "tol": {"type": "number"}, "units": {"type": "string"}, "limit": {"type": "integer"}}}},
         {"name": "model_outline", "annotations": ro, "description": "Read Plasticity's outliner tree: folders (id, name, hidden, children) and items (kind solid/sheet/curve/instance/measurement/…, name, hidden, locked; solids carry their version id like model_state, other kinds a node key). kinds filters items (e.g. [\"solid\"]); folders are always kept. Change it with model_exec ops folder / moveTo / hide / show / ungroup / rename.",
          "inputSchema": {"type": "object", "properties": {"kinds": {"type": "array", "items": {"type": "string"}}}}},
+        {"name": "model_rename", "annotations": {"destructiveHint": false},
+         "description": "Batch rename solids / folders. Exactly one way: name (all the same) | items [{solid|folder, name}] (one by one) | pattern (\"螺钉M3-{n:02}\": {name} = old name, {n} = number from start (default 1), sort = selection|x|y|z|name by bbox centre) | find + replace (regex: true for a regular expression); dedupe: true appends .001, .002 … where a new name clashes with another solid or within the batch (alone = only dedupe). Without apply it only PREVIEWS old → new (nothing changes) — show the preview to the user, then call again with apply: true (one undo step). Same names make {name} references ambiguous, so dedupe is a good default.",
+         "inputSchema": {"type": "object", "properties": {"solids": {"type": "array", "items": {}}, "folders": {"type": "array", "items": {}}, "items": {"type": "array", "items": {"type": "object"}},
+            "name": {"type": "string"}, "pattern": {"type": "string"}, "start": {"type": "number"}, "sort": {"type": "string", "enum": ["selection", "x", "y", "z", "name"]},
+            "find": {"type": "string"}, "replace": {"type": "string"}, "regex": {"type": "boolean"}, "dedupe": {"type": "boolean"}, "apply": {"type": "boolean"}}}},
         {"name": "model_measure", "annotations": ro, "description": format!("Measure. op=distance: a, b = [x,y,z] | face id | edge id | vertex id → distance, delta, and normalDistance (wall thickness) when both are parallel planes. op=angle: a, b = faces (normals), line edges (directions) or vectors → degrees. op=mass: of (solids) and/or faces → volume, area, centroid (display mesh, curved surfaces ~0.3% low). {refs}"),
          "inputSchema": {"type": "object", "properties": {"op": {"type": "string", "enum": ["distance", "angle", "mass"]}, "a": {}, "b": {}, "of": {"type": "array", "items": {}}, "faces": {"type": "array", "items": {"type": "string"}}, "units": {"type": "string"}}, "required": ["op"]}},
         {"name": "model_view", "annotations": ro, "description": "Screenshot the model from a standard view (front/back/left/right/top/bottom/iso), framed on 'of' solids (default: everything). The user's camera is restored afterwards. Use it to check results visually.",
@@ -98,7 +103,7 @@ Whole solids (solids = [solid refs]: ids, \"$step\", {{\"name\": ...}}; the resu
 - pattern {{solids, dir1, count1, spacing1, dir2?, count2?, spacing2?}} - linear / grid array; counts include the original; result = the new copies\n\
 - radialPattern {{solids, center, axis, count, degrees?=360}} - circular array about the axis through center; 360 = evenly around, less = both ends included (3 over 180° = 0/90/180)\n\
 - boolean {{targets, tools, operation union|subtract|intersect, keepTools?}} - between existing solids\n\
-- delete {{solids}} / rename {{solids? | folders?, name}}\n\
+- delete {{solids}} / rename {{solids? | folders?, name}} (batch: items [{{solid|folder, name}}] / pattern \"M3-{{n:02}}\" ({{name}} = old name, start?, sort? selection|x|y|z|name) / find + replace (regex?) / dedupe: true; preview with model_rename)\n\
 Outliner (folders = Plasticity groups; read the tree with model_outline; folder refs = folder id, name (error if several share it), \"$step\" or \"root\" = top level):\n\
 - folder {{name, parent?, solids?, folders?}} - new folder (under parent, default top level) and move those into it; result item = {{kind: folder, id, name}}\n\
 - moveTo {{solids? | folders?, to}} - move into a folder (\"root\" = top level)\n\
@@ -377,6 +382,22 @@ fn call_model_tool(name: &str, a: &Value) -> Option<Value> {
             }
         }
         "model_outline" => call(api::OUTLINE_READ, pick(a, &["kinds"])),
+        "model_rename" => {
+            let spec = pick(a, &["solids", "folders", "items", "name", "pattern", "start", "sort", "find", "replace", "regex", "dedupe"]);
+            if !a["apply"].as_bool().unwrap_or(false) {
+                call(api::RENAME_PLAN, spec)
+            } else {
+                let mut op = spec;
+                op["op"] = json!("rename");
+                match rt().block_on(pla_bridge::exec::run_once(port(), h, &json!({ "atomic": true, "ops": [op] }))) {
+                    Ok(v) => {
+                        let (ok, msg) = pla_bridge::exec::summary(&v);
+                        if ok { text(msg) } else { err(msg) }
+                    }
+                    Err(e) => err(&format!("{e:#}")),
+                }
+            }
+        }
         "model_snaps" => call(api::GEO_SNAPS, pick(a, &["of", "kinds", "near", "tol", "units", "limit"])),
         "model_measure" => call(api::GEO_MEASURE, pick(a, &["op", "a", "b", "of", "faces", "units"])),
         "model_view" => {

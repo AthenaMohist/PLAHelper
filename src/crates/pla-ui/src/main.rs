@@ -401,6 +401,23 @@ struct PlaApp {
     hole_through: bool,
     /// H2: 腰孔组合孔最后一层螺纹孔的位置(没另选对应点时): 0 中点 / 1 起点 / 2 终点
     hole_tap_at: u8,
+    /// H3 批量改名(参数化面板第三个模式): 方式 0 规则编号 / 1 查找替换 / 2 逐个; 规则 / 起始 / 排序 / 查找 / 替换 / 正则 / 去重
+    rn_mode: u8,
+    rn_pattern: String,
+    rn_start: String,
+    rn_sort: u8,
+    rn_find: String,
+    rn_replace: String,
+    rn_regex: bool,
+    rn_dedupe: bool,
+    /// 逐个模式: 实体 id → 新名字(选择变了就清空)
+    rn_items: std::collections::BTreeMap<String, String>,
+    rn_items_key: String,
+    /// 预览(rename.plan 回包的 items)/ 上次预览请求的参数(变了才重新预览)/ 预览请求在路上 / 应用中
+    rn_preview: Option<Result<Vec<serde_json::Value>, String>>,
+    rn_preview_key: String,
+    rn_pending: bool,
+    rn_busy: bool,
     hole_vals: [String; 6],
     hole_pending: Option<serde_json::Value>,
     /// N4b 孔规格方案(hole_presets): 方案名列表、当前方案、其规格、文件修改时间 / 上次检查(热生效)、读错、改名输入。
@@ -2767,6 +2784,20 @@ impl PlaApp {
             hole_type: 0,
             hole_through: true,
             hole_tap_at: 0,
+            rn_mode: 0,
+            rn_pattern: "{name}-{n:02}".into(),
+            rn_start: "1".into(),
+            rn_sort: 0,
+            rn_find: String::new(),
+            rn_replace: String::new(),
+            rn_regex: false,
+            rn_dedupe: true,
+            rn_items: Default::default(),
+            rn_items_key: String::new(),
+            rn_preview: None,
+            rn_preview_key: String::new(),
+            rn_pending: false,
+            rn_busy: false,
             hole_vals: Default::default(),
             hole_pending: None,
             hole_presets: Vec::new(),
@@ -3299,6 +3330,28 @@ impl PlaApp {
                     }
                     Err(e) => pla_ui::diag::log(&format!("asset.list failed: {e}")),
                 },
+                // H3 批量改名: 预览回包 / 应用回包
+                pla_bridge::cdp::CdpEvent::CallResult { name, result } if name == pla_bridge::shim::api::RENAME_PLAN => {
+                    self.rn_pending = false;
+                    self.rn_preview = Some(result.map(|v| v["items"].as_array().cloned().unwrap_or_default()));
+                }
+                pla_bridge::cdp::CdpEvent::CallResult { name, result } if name == pla_bridge::shim::api::CMD_EXEC && self.rn_busy => {
+                    self.rn_busy = false;
+                    let r = result.and_then(|v| match v.get("failed") {
+                        Some(f) if !f.is_null() => Err(f["err"].as_str().unwrap_or("").to_string()),
+                        _ => Ok(v),
+                    });
+                    match r {
+                        Ok(v) => {
+                            let n = v["results"].as_array().and_then(|r| r.first()).and_then(|r| r["items"].as_array()).map(|a| a.len()).unwrap_or(0);
+                            self.set_notice((false, t!("已改名 {n} 个(一个撤销步)", "Renamed {n} (one undo step)")));
+                        }
+                        Err(e) => self.set_notice((true, t!("改名失败(没有改动): {e}", "Rename failed (nothing changed): {e}"))),
+                    }
+                    // 名字变了: 重新预览, 逐个模式的输入从新名字重来
+                    self.rn_preview_key.clear();
+                    self.rn_items.clear();
+                }
                 pla_bridge::cdp::CdpEvent::CallResult { name, result }
                     if self.screw_running && (name == pla_bridge::shim::api::ASSET_PLACE || name == pla_bridge::shim::api::CMD_EXEC || name == pla_bridge::shim::api::PART_STRETCH) =>
                 {
@@ -3970,8 +4023,8 @@ impl PlaApp {
                     ),
                     _ => (String::new(), Vec::new()),
                 };
-                // 打孔模式不画改尺寸的候选高亮(选中的面本身就是孔要打的面)
-                if self.dim_mode == 1 {
+                // 打孔 / 改名模式不画改尺寸的候选高亮(选中的面本身就是孔要打的面)
+                if self.dim_mode >= 1 {
                     self.dim_set_highlight(String::new(), Vec::new());
                 } else {
                     self.dim_set_highlight(hl_key, hl_faces);
@@ -4014,7 +4067,7 @@ impl PlaApp {
                 }
                 // ---- 「操作」的模式: 改尺寸 / 打孔(以后的新操作加在这一行) ----
                 {
-                    let labels = vec![tr("改尺寸", "Resize").to_string(), tr("打孔", "Hole").to_string()];
+                    let labels = vec![tr("改尺寸", "Resize").to_string(), tr("打孔", "Hole").to_string(), tr("改名", "Rename").to_string()];
                     let mut s = self.dim_mode as usize;
                     if rz_segmented(ui, "dim-mode", &labels, &mut s) {
                         self.dim_mode = s as u8;
@@ -4022,6 +4075,10 @@ impl PlaApp {
                 }
                 if self.dim_mode == 1 {
                     self.hole_ui(ui, info.as_ref(), &faces);
+                    return;
+                }
+                if self.dim_mode == 2 {
+                    self.rename_ui(ui);
                     return;
                 }
                 let units = |v: &serde_json::Value| -> String {
@@ -7589,6 +7646,134 @@ impl PlaApp {
     /// P3/N4b 打孔表单(「操作」→ 打孔)。选择 = 一个平面(入口)+ 可选的草图点(曲线端点 / 圆; 一点一孔, 没有 = 面中点)
     /// + 可选的其它实体(组合孔, 按选择顺序, 最后一个 = 底孔)。规格方案 / 规格 / 用途 / 类型 / 深度 / 数值 → OK(回车 / 右键)= 垫片 hole.make,
     /// 一次原子执行(失败整体撤回); 成功后每个孔在「记录」里生成孔特征 + 自动子尺寸。
+    /// H3: 批量改名(选中的实体)。规则编号 / 查找替换 / 逐个; 改动先预览(rename.plan, 不改文档), OK 才应用(一条命令 = 一个撤销步)。
+    fn rename_ui(&mut self, ui: &mut egui::Ui) {
+        let ids: Vec<String> = self.live_sel.iter().filter(|it| it.kind == "solid").map(|it| it.id.clone()).collect();
+        if ids.is_empty() {
+            rz_info_card(ui, tr("选几个实体", "Select some solids"), tr("Shift 多选。规则编号可按选择顺序或位置(X / Y / Z)排。", "Shift-select several. Numbering follows the selection order or position (X / Y / Z)."));
+            return;
+        }
+        rz_info_card(ui, tr("批量改名", "Batch rename"), &t!("选中 {} 个实体", "{} solid(s) selected", ids.len()));
+        let sel_key = ids.join(",");
+        if sel_key != self.rn_items_key {
+            self.rn_items_key = sel_key;
+            self.rn_items.clear();
+        }
+        rz_label(ui, tr("方式", "Mode"));
+        let labels = vec![tr("规则编号", "Pattern").to_string(), tr("查找替换", "Find & replace").to_string(), tr("逐个", "One by one").to_string()];
+        let mut s = self.rn_mode as usize;
+        if rz_segmented(ui, "rn-mode", &labels, &mut s) {
+            self.rn_mode = s as u8;
+        }
+        let mut enter = false;
+        let mut args = serde_json::json!({ "solids": ids, "dedupe": self.rn_dedupe });
+        match self.rn_mode {
+            0 => {
+                rz_label(ui, tr("名称规则: {name} = 原名, {n} = 序号, {n:02} = 补零到 2 位", "Pattern: {name} = old name, {n} = number, {n:02} = zero-padded"));
+                enter |= rz_field(ui, &mut self.rn_pattern, "", true);
+                ui.columns(2, |cols| {
+                    rz_label(&mut cols[0], tr("起始序号", "Start at"));
+                    enter |= rz_field(&mut cols[0], &mut self.rn_start, "", true);
+                });
+                rz_label(ui, tr("编号顺序", "Numbering order"));
+                let labels = vec![tr("选择顺序", "Selection").to_string(), "X".into(), "Y".into(), "Z".into(), tr("原名", "Name").to_string()];
+                let mut s = self.rn_sort as usize;
+                if rz_segmented(ui, "rn-sort", &labels, &mut s) {
+                    self.rn_sort = s as u8;
+                }
+                args["pattern"] = serde_json::json!(self.rn_pattern);
+                args["start"] = serde_json::json!(self.rn_start.trim().parse::<i64>().unwrap_or(1));
+                args["sort"] = serde_json::json!(["selection", "x", "y", "z", "name"][self.rn_sort.min(4) as usize]);
+            }
+            1 => {
+                ui.columns(2, |cols| {
+                    rz_label(&mut cols[0], tr("查找", "Find"));
+                    enter |= rz_field(&mut cols[0], &mut self.rn_find, "", true);
+                    rz_label(&mut cols[1], tr("替换为", "Replace with"));
+                    enter |= rz_field(&mut cols[1], &mut self.rn_replace, "", true);
+                });
+                ui.checkbox(&mut self.rn_regex, tr("正则表达式", "Regular expression"));
+                args["find"] = serde_json::json!(self.rn_find);
+                args["replace"] = serde_json::json!(self.rn_replace);
+                args["regex"] = serde_json::json!(self.rn_regex);
+            }
+            _ => {
+                // 逐个: 预览用 {name} 规则只为拿到当前名字
+                args["pattern"] = serde_json::json!("{name}");
+                rz_label(ui, tr("新名字(要改的才改)", "New names (edit the ones to change)"));
+                if let Some(Ok(list)) = &self.rn_preview {
+                    egui::ScrollArea::vertical().id_salt("rn-items").max_height(200.0).show(ui, |ui| {
+                        for x in list {
+                            let id = x["id"].to_string().trim_matches('"').to_string();
+                            let from = x["from"].as_str().unwrap_or("").to_string();
+                            let buf = self.rn_items.entry(id).or_insert_with(|| from.clone());
+                            ui.horizontal(|ui| {
+                                ui.add_sized([110.0, 20.0], egui::Label::new(egui::RichText::new(&from).small().color(COL_MUTED)).truncate());
+                                ui.add(egui::TextEdit::singleline(buf).desired_width(ui.available_width()));
+                            });
+                        }
+                    });
+                }
+            }
+        }
+        ui.checkbox(&mut self.rn_dedupe, tr("重名自动加 .001(与文档里其它实体也不撞)", "Add .001 … where names clash (also with other solids)"));
+        args["dedupe"] = serde_json::json!(self.rn_dedupe);
+        // 预览: 参数变了才重新请求(查找为空不预览)
+        let want_preview = !(self.rn_mode == 1 && self.rn_find.is_empty());
+        let key = format!("{}|{args}", self.rn_mode);
+        if want_preview && key != self.rn_preview_key && !self.rn_pending && !self.rn_busy {
+            self.rn_preview_key = key;
+            self.rn_pending = true;
+            self.cdp.send(pla_bridge::cdp::CdpCmd::Call { name: pla_bridge::shim::api::RENAME_PLAN, args: args.clone() });
+        }
+        // 改动清单
+        let mut changes: Vec<(String, String, String)> = Vec::new(); // (id, 旧名, 新名)
+        let mut perr: Option<String> = None;
+        match &self.rn_preview {
+            Some(Ok(list)) => {
+                for x in list {
+                    let id = x["id"].to_string().trim_matches('"').to_string();
+                    let from = x["from"].as_str().unwrap_or("").to_string();
+                    let to = if self.rn_mode == 2 { self.rn_items.get(&id).cloned().unwrap_or_else(|| from.clone()) } else { x["to"].as_str().unwrap_or("").to_string() };
+                    changes.push((id, from, to));
+                }
+            }
+            Some(Err(e)) => perr = Some(e.clone()),
+            None => {}
+        }
+        let changed = changes.iter().filter(|(_, f, t)| f != t).count();
+        if self.rn_mode != 2 && want_preview {
+            rz_label(ui, &t!("预览: {changed} 个会改名", "Preview: {changed} will change"));
+            egui::ScrollArea::vertical().id_salt("rn-preview").max_height(160.0).show(ui, |ui| {
+                for (_, f, t) in &changes {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(f).small().color(COL_MUTED));
+                        ui.label(egui::RichText::new("→").small().color(COL_MUTED));
+                        ui.label(egui::RichText::new(t).small().color(if f != t { COL_ACCENT } else { COL_TEXT }));
+                    });
+                }
+            });
+        }
+        if let Some(e) = &perr {
+            ui.label(egui::RichText::new(e).small().color(COL_RED));
+        }
+        let can = perr.is_none() && changed > 0 && !self.rn_busy && !self.rn_pending && !self.dim_busy;
+        let (_cancel, ok) = rz_footer(ui, can, self.rn_busy);
+        if !((ok || (enter && can)) && can) {
+            return;
+        }
+        let op = if self.rn_mode == 2 {
+            let items: Vec<serde_json::Value> = changes.iter().map(|(id, _, t)| serde_json::json!({ "solid": id, "name": t })).collect();
+            serde_json::json!({ "op": "rename", "items": items, "dedupe": self.rn_dedupe })
+        } else {
+            let mut o = args.clone();
+            o["op"] = serde_json::json!("rename");
+            o
+        };
+        self.rn_busy = true;
+        self.cdp.send(pla_bridge::cdp::CdpCmd::Call { name: pla_bridge::shim::api::CMD_EXEC, args: serde_json::json!({ "atomic": true, "ops": [op] }) });
+    }
+
     fn hole_ui(&mut self, ui: &mut egui::Ui, info: Option<&serde_json::Value>, faces: &[String]) {
         self.hole_presets_tick();
         let plane = info.filter(|v| faces.len() == 1 && v["surface"] == "Plane" && v["axes"].is_object()).cloned();
