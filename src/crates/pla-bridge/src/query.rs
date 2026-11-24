@@ -50,7 +50,14 @@ pub async fn call_once(cdp_port: u16, hwnd: isize, name: &str, args: &Value) -> 
     let mut mid: u64 = 100;
     eval_roundtrip(&mut ws, &mut mid, &shim::install_expr()).await?;
     let raw = eval_roundtrip(&mut ws, &mut mid, &shim::call_expr(name, args)).await?;
-    Ok(shim::parse_reply(&raw)?)
+    let first = shim::parse_reply(&raw);
+    // H5: 要用几何工厂的接口(hole.make 等)第一次用 / 快照失效 → 挂 / 重拍后重试一次(以前只有 model_exec 会)
+    if let Some(force) = crate::exec::factory_retry(&first) {
+        crate::exec::heal_factories(&mut ws, &mut mid, force).await?;
+        let raw = eval_roundtrip(&mut ws, &mut mid, &shim::call_expr(name, args)).await?;
+        return Ok(shim::parse_reply(&raw)?);
+    }
+    Ok(first?)
 }
 
 /// D CLI 用: 导出 STEP(全流程见 `export.rs`)。ids = 稳定 id(空 = 全部可见)。

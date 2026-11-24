@@ -377,10 +377,10 @@ async fn session_loop(
             Ok(CdpCmd::Shutdown) => return Err(anyhow::anyhow!("shutdown")),
             Ok(CdpCmd::Call { name, args }) => {
                 let mut result = shim_call(ws, &mut mid, name, args.clone()).await;
-                // 要用几何工厂的调用(如 dim.measure)第一次报 need-factories → 让代理挂一次再重试(同 cmd.exec)
-                let need_fac = matches!(&result, Err(e) if matches!(e.downcast_ref::<shim::ShimErr>(), Some(shim::ShimErr::Exc(m)) if m == shim::NEED_FACTORIES_ERR));
-                if need_fac {
-                    result = match crate::exec::ensure_factories(ws, &mut mid, false).await {
+                // 要用几何工厂的调用(如 dim.measure / hole.make)第一次报 need-factories → 让代理挂一次再重试;
+                // H5: 快照失效(撤销后 'Viewport' undefined)→ 强制重拍再重试
+                if let Some(force) = crate::exec::factory_retry_any(&result) {
+                    result = match crate::exec::heal_factories(ws, &mut mid, force).await {
                         Ok(_) => shim_call(ws, &mut mid, name, args).await,
                         Err(e) => Err(e),
                     };

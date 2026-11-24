@@ -81,15 +81,55 @@ async fn call_exec(ws: &mut WsStream, mid: &mut u64, script: &Value) -> Result<V
     shim::parse_reply(&raw)
 }
 
-/// 执行脚本; 工厂类还没挂上就先让代理挂一次再重试。返回 `cmd.exec` 的 v(某步失败时 failed 非空, 仍是 Ok)。
+/// H5: 工厂快照失效的症状(2026-11-21 外部反馈, 撤销之后出现): 建模命令构造时读 `xxx.Viewport` 拿到 undefined。
+/// 页面上的 `__PLA_FACTORIES__` 还在, 所以 `ensure_factories(false)` 会直接返回缓存 —— 必须 `force = true` 重拍。
+pub fn stale_factories(msg: &str) -> bool {
+    msg.contains("reading 'Viewport'") || msg.contains("reading \"Viewport\"")
+}
+
+/// H5: 这个结果要不要先挂 / 重拍几何工厂再重试一次? `Some(false)` = 还没挂; `Some(true)` = 快照失效, 强制重拍。
+/// 只在"什么都没留下"时重试: 抛异常(hole.make 失败时已整体撤回), 或 `cmd.exec` 回包里第一步就失败 / 已撤回。
+/// 部分步骤已生效且没撤回的不重试(重试会把已完成的步骤再做一遍)。
+pub fn factory_retry(r: &Result<Value, ShimErr>) -> Option<bool> {
+    match r {
+        Err(ShimErr::Exc(m)) if m == shim::NEED_FACTORIES_ERR => Some(false),
+        Err(ShimErr::Exc(m)) if stale_factories(m) => Some(true),
+        Ok(v) => {
+            let err = v["failed"]["err"].as_str().unwrap_or("");
+            let nothing_left = v["results"].as_array().map(|a| a.is_empty()).unwrap_or(true) || v.get("rolledBack").map(|x| !x.is_null()).unwrap_or(false);
+            (stale_factories(err) && nothing_left).then_some(true)
+        }
+        _ => None,
+    }
+}
+
+/// 同上, 给拿到 `anyhow::Error` 的调用方(CDP 会话)用。
+pub fn factory_retry_any(r: &anyhow::Result<Value>) -> Option<bool> {
+    match r {
+        Ok(v) => factory_retry(&Ok(v.clone())),
+        Err(e) => match e.downcast_ref::<ShimErr>() {
+            Some(ShimErr::Exc(m)) => factory_retry(&Err(ShimErr::Exc(m.clone()))),
+            _ => None,
+        },
+    }
+}
+
+/// 挂 / 重拍工厂并记日志(force = 快照失效后的自愈)。
+pub async fn heal_factories(ws: &mut WsStream, mid: &mut u64, force: bool) -> anyhow::Result<Value> {
+    let r = ensure_factories(ws, mid, force).await?;
+    eprintln!("[pla-exec] 工厂类{}: {r}", if force { "已重拍(快照失效自愈)" } else { "已挂上" });
+    Ok(r)
+}
+
+/// 执行脚本; 工厂类还没挂上就先让代理挂一次, 快照失效就强制重拍, 再重试一次。返回 `cmd.exec` 的 v(某步失败时 failed 非空, 仍是 Ok)。
 pub async fn run(ws: &mut WsStream, mid: &mut u64, script: &Value) -> Result<Value, String> {
-    match call_exec(ws, mid, script).await {
-        Err(ShimErr::Exc(m)) if m == shim::NEED_FACTORIES_ERR => {
-            let r = ensure_factories(ws, mid, false).await.map_err(|e| format!("{e:#}"))?;
-            eprintln!("[pla-exec] 工厂类已挂上: {r}");
+    let first = call_exec(ws, mid, script).await;
+    match factory_retry(&first) {
+        Some(force) => {
+            heal_factories(ws, mid, force).await.map_err(|e| format!("{e:#}"))?;
             call_exec(ws, mid, script).await.map_err(|e| e.to_string())
         }
-        other => other.map_err(|e| e.to_string()),
+        None => first.map_err(|e| e.to_string()),
     }
 }
 
@@ -158,6 +198,22 @@ mod tests {
         assert!(!ok && msg.contains("撤回") && msg.contains('2'), "{msg}");
         let rbe = json!({"results":[{},{}],"failed":{"index":2,"op":"fillet","err":"PK"},"rollbackErr":"window hidden"});
         assert!(summary(&rbe).1.contains("window hidden"));
+    }
+
+    #[test]
+    fn factory_retry_rules() {
+        let exc = |m: &str| Err(ShimErr::Exc(m.to_string()));
+        assert_eq!(factory_retry(&exc(shim::NEED_FACTORIES_ERR)), Some(false));
+        assert_eq!(factory_retry(&exc("step 0 (cylinder): Cannot read properties of undefined (reading 'Viewport') — rolled back")), Some(true));
+        assert_eq!(factory_retry(&exc("solid not found: 12")), None);
+        // cmd.exec 回包: 第一步就失败 / 已撤回 → 重拍重试; 部分步骤已生效且没撤回 → 不重试
+        let v = |results: Value, rolled: Value| Ok(json!({"results": results, "failed": {"index": 0, "op": "cylinder", "err": "Cannot read properties of undefined (reading 'Viewport')"}, "rolledBack": rolled}));
+        assert_eq!(factory_retry(&v(json!([]), Value::Null)), Some(true));
+        assert_eq!(factory_retry(&v(json!([{"index": 0}]), json!(1))), Some(true));
+        assert_eq!(factory_retry(&v(json!([{"index": 0}]), Value::Null)), None, "非原子、已有步骤生效: 不重试");
+        assert_eq!(factory_retry(&Ok(json!({"results": [], "failed": null}))), None);
+        let any: anyhow::Result<Value> = Err(anyhow::Error::new(ShimErr::Exc("x (reading 'Viewport')".into())));
+        assert_eq!(factory_retry_any(&any), Some(true));
     }
 
     #[test]
