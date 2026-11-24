@@ -1460,6 +1460,30 @@ const callAsync = async (name, args) => JSON.parse(await run(`window.__PLA__.cal
     assert.deepStrictEqual(f2.children.map((c) => c.id), [s2], '解散子文件夹 → 成员回上一级');
     assert.ok(tree().some((n) => n.id === s1), '移回顶层');
     assert.ok(call('outline.read', { kinds: ['curve'] }).v.children.every((n) => n.kind === 'folder' || n.kind === 'curve'), 'kinds 过滤');
+    // H3 批量改名: 预览(rename.plan, 不改文档)与执行(rename 步骤, 一个撤销步)同一套规则
+    const rn = await callAsync('cmd.exec', { ops: [
+      { op: 'box', id: 'r3', p1: [30, 800, 0], p2: [31, 801, 0], height: 1 },
+      { op: 'box', id: 'r1', p1: [10, 800, 0], p2: [11, 801, 0], height: 1 },
+      { op: 'box', id: 'r2', p1: [20, 800, 0], p2: [21, 801, 0], height: 1 },
+      { op: 'rename', solids: ['$r1', '$r2', '$r3'], name: '螺钉' },
+    ] });
+    const [i3, i1, i2] = [0, 1, 2].map((i) => rn.v.results[i].items[0].id);
+    const nameOfId = (id) => call('rename.plan', { solids: [id], dedupe: true }).v.items[0].from;
+    assert.deepStrictEqual([i1, i2, i3].map(nameOfId), ['螺钉', '螺钉', '螺钉'], '同名起步');
+    const pv = call('rename.plan', { solids: [i3, i1, i2], pattern: 'M3-{n:02}', sort: 'x', start: 1 }).v.items;
+    assert.deepStrictEqual(pv.map((x) => [x.id, x.to]), [[i1, 'M3-01'], [i2, 'M3-02'], [i3, 'M3-03']], '按 x 排序编号, 补零');
+    assert.deepStrictEqual([i1, i2, i3].map(nameOfId), ['螺钉', '螺钉', '螺钉'], '预览不改名');
+    assert.deepStrictEqual(call('rename.plan', { solids: [i1], pattern: '{name}-A{n}', start: 7 }).v.items[0].to, '螺钉-A7', '{name} = 原名');
+    assert.deepStrictEqual(call('rename.plan', { solids: [i1], find: '螺', replace: '销' }).v.items[0].to, '销钉', '查找替换');
+    assert.deepStrictEqual(call('rename.plan', { solids: [i1], find: '^(.)(.)$', replace: '$2$1', regex: true }).v.items[0].to, '钉螺', '正则');
+    assert.deepStrictEqual(call('rename.plan', { solids: [i1, i2, i3], dedupe: true }).v.items.map((x) => x.to), ['螺钉', '螺钉.001', '螺钉.002'], '只去重');
+    assert.ok(/exactly one of/.test(call('rename.plan', { solids: [i1], name: 'a', pattern: 'b' }).err), '两种方式一起 → 报错');
+    assert.ok(/would be empty/.test(call('rename.plan', { solids: [i1], find: '螺钉' }).err), '改成空名 → 报错');
+    const q2 = ed.enqueued;
+    const ap = await callAsync('cmd.exec', { ops: [{ op: 'rename', items: [{ solid: i1, name: '左' }, { solid: i2, name: '右' }] }, { op: 'rename', solids: [i3], pattern: '左', dedupe: true }] });
+    assert.strictEqual(ap.v.failed, null, JSON.stringify(ap.v.failed));
+    assert.deepStrictEqual([i1, i2, i3].map(nameOfId), ['左', '右', '左.001'], '逐个改名 + 规则改名去重');
+    assert.strictEqual(ed.enqueued - q2, 2, '每条 rename 一条命令(一批多个实体也只一条; 假机的撤销栈只记工厂提交)');
   });
 
   await ta('N2 cmd.exec: 失败如实报且停在失败步; 已完成的保留; 引用已被吃掉的物体、挑不到边、PK 内核报错、参数错', async () => {

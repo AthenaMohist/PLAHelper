@@ -461,7 +461,12 @@
       // delete = 删除实体(同 Plasticity 的 Delete, 一个撤销步; 实测 model1: 撤销后实体回来)
       delete: { custom: 'delete', fac: 'geo.removeItem', required: ['solids'], params: { solids: [null, 'solids'] } },
       // rename = 改大纲名(多个实体同名; 复制件改规格后改名, BOM 名称跟着对)
-      rename: { custom: 'rename', fac: 'nodes.setName', required: ['name'], params: { solids: [null, 'solids'], folders: [null, 'folders'], name: [null, 'string'] } },
+      // H3 批量改名(2026-11-24): 恰好一种方式 —— name(全部同名)/ items [{solid | folder, name}](逐个)/
+      // pattern('螺钉-{n:02}', {name} = 原名, {n} = 序号从 start 起, sort = selection | x | y | z | name)/ find + replace(regex: true = 正则);
+      // dedupe: true = 与文档里其它实体及本批重名的自动加 .001 …(可单独用 = 只去重)。一条命令、一个撤销步; rename.plan 预览同一套规则。
+      rename: { custom: 'rename', fac: 'nodes.setName', required: [],
+                params: { solids: [null, 'solids'], folders: [null, 'folders'], name: [null, 'string'], items: [null, 'raw'], pattern: [null, 'string'],
+                          start: [null, 'number'], sort: [null, 'string'], find: [null, 'string'], replace: [null, 'string'], regex: [null, 'bool'], dedupe: [null, 'bool'] } },
       // 大纲(2026-11-19): folder = 新建文件夹(parent 默认顶层)并把 solids / folders 移进去; moveTo = 移到文件夹 to('root' = 顶层);
       // hide / show = 同 H / 取消隐藏(文件夹整个); ungroup = 解散文件夹(成员回上一级)。都在我们自己的命令里做 = 一个撤销步。
       // 文件夹引用: 组 id(数字) / 名字(字符串或 {name}, 重名报错) / '$步骤id' / 'root'。
@@ -1688,6 +1693,83 @@
   });
 
   // ---- A4b: 整体操作(复制 / 镜像 / 移动 / 旋转 / 阵列); 参数在入队前全部换算好 ----
+  // H3: 改名计划(rename 执行与 rename.plan 预览共用)→ [{kind, view, key, id, from, to}]
+  function renamePlan(o, ctx) {
+    var modes = ['name', 'items', 'pattern', 'find'].filter(function (m) { return o[m] !== undefined && o[m] !== null; });
+    if (modes.length > 1 || (!modes.length && !o.dedupe)) throw new Error('rename: give exactly one of name / items / pattern / find (+ replace), or dedupe: true');
+    var list = [];
+    var addSolid = function (v, to) { list.push({ kind: 'solid', view: v, key: invokeOn('nodes.item2key', [v]), id: itemIdOf(v), from: nameOf(v) || '', to: to }); };
+    var addFolder = function (g, to) {
+      if (g === outlineRoot()) throw new Error('the top level cannot be renamed');
+      var key = folderKey(g), nm = null;
+      try { nm = invokeOn('nodes.getName', [key]); } catch (e) {}
+      list.push({ kind: 'folder', view: g, key: key, id: g[NAMES.bom.groupId], from: nm || '', to: to });
+    };
+    if (o.items !== undefined) {
+      if (!Array.isArray(o.items) || !o.items.length) throw new Error('items must be [{solid | folder, name}]');
+      o.items.forEach(function (it) {
+        var nm = String(it && it.name !== undefined ? it.name : '');
+        if (it && it.solid !== undefined) convertParam('solids', [it.solid], ctx).forEach(function (v) { addSolid(v, nm); });
+        else if (it && it.folder !== undefined) folderList([it.folder], ctx).forEach(function (g) { addFolder(g, nm); });
+        else throw new Error('each item needs solid or folder, and name');
+      });
+    } else {
+      if (o.solids !== undefined) convertParam('solids', o.solids, ctx).forEach(function (v) { addSolid(v); });
+      if (o.folders !== undefined) folderList(o.folders, ctx).forEach(function (g) { addFolder(g); });
+      if (!list.length) throw new Error('rename needs solids and / or folders');
+    }
+    // 规则改名的顺序: 选择顺序(默认)/ 包围盒中心的 x | y | z / 原名
+    var sort = o.sort || 'selection';
+    if (o.pattern !== undefined && sort !== 'selection') {
+      var ax = { x: 0, y: 1, z: 2 }[sort];
+      if (ax === undefined && sort !== 'name') throw new Error('sort must be selection / x / y / z / name');
+      var key = function (e) {
+        if (sort === 'name') return e.from;
+        var b = e.kind === 'solid' ? bboxOf(e.view, ctx.k) : null;
+        return b ? (b[0][ax] + b[1][ax]) / 2 : Infinity;
+      };
+      list.forEach(function (e, i) { e.i0 = i; });
+      list.sort(function (p, q) { var a = key(p), b = key(q); return a < b ? -1 : a > b ? 1 : p.i0 - q.i0; });
+    }
+    var start = o.start === undefined ? 1 : Math.round(Number(o.start));
+    if (!isFinite(start)) throw new Error('start must be a number');
+    list.forEach(function (e, i) {
+      if (e.to !== undefined) return;
+      if (o.name !== undefined) e.to = String(o.name);
+      else if (o.pattern !== undefined) {
+        e.to = String(o.pattern).replace(/\{name\}/g, e.from).replace(/\{n(?::0?(\d+))?\}/g, function (m, w) { var s = String(start + i); return w ? s.padStart(Number(w), '0') : s; });
+      } else if (o.find !== undefined) {
+        var rep = o.replace === undefined ? '' : String(o.replace);
+        if (o.regex) { var re; try { re = new RegExp(String(o.find), 'g'); } catch (err) { throw new Error('find: bad regex: ' + errMsg(err)); } e.to = e.from.replace(re, rep); }
+        else e.to = e.from.split(String(o.find)).join(rep);
+      } else e.to = e.from;
+      e.to = e.to.trim();
+    });
+    list.forEach(function (e) { if (!e.to) throw new Error('new name for ' + e.kind + ' ' + e.id + ' would be empty'); });
+    // 去重: 与文档里不在本批的实体名、以及本批已分配的名字都不撞; 撞了加 .001 …(Plasticity 的习惯)
+    if (o.dedupe) {
+      var mine = {};
+      list.forEach(function (e) { if (e.kind === 'solid') mine[e.id] = true; });
+      var taken = {};
+      solidViews().forEach(function (v) { if (!mine[itemIdOf(v)]) { var nm = nameOf(v); if (nm) taken[nm] = true; } });
+      list.forEach(function (e) {
+        if (e.kind !== 'solid') return;
+        var base = e.to, nm = base, k = 0;
+        while (taken[nm]) { k++; nm = base + '.' + String(k).padStart(3, '0'); }
+        e.to = nm; taken[nm] = true;
+      });
+    }
+    return list;
+  }
+
+  // H3: 改名预览(只读): 同一套规则算出 旧名 → 新名, 不改文档。参数同 cmd.exec 的 rename 步骤(不含 op)。
+  def('rename.plan', 'outline.read', function (a) {
+    a = a || {};
+    var U = unitOf(a);
+    var ctx = { k: U.k, V3: need('vp.camera').position.constructor, refs: {} };
+    return { items: renamePlan(a, ctx).map(function (e) { return { kind: e.kind, id: e.id, from: e.from, to: e.to, changed: e.from !== e.to }; }) };
+  });
+
   function xformBuild(o, rc, ctx) {
     var X = NAMES.xformFields, V = ctx.V3;
     var count = function (x, name) {
@@ -1715,24 +1797,20 @@
       });
     }
     if (NAMES.outline.ops.indexOf(rc.custom) >= 0) return null;   // 大纲操作 → outlineBuild
+    if (rc.custom === 'rename') {
+      var plan = renamePlan(o, ctx);
+      return function () {
+        plan.forEach(function (e) { invokeOn('nodes.setName', [e.key, e.to]); });
+        return plan.map(function (e) { return e.view; });
+      };
+    }
     var items = rc.custom === 'mirror' ? X.mirrorItems : X.items;
-    var solids = rc.custom === 'rename' && o.solids === undefined ? [] : convertParam('solids', o.solids, ctx);
-    if (!solids.length && !(rc.custom === 'rename' && o.folders !== undefined)) throw new Error('solids is empty');
+    var solids = convertParam('solids', o.solids, ctx);
+    if (!solids.length) throw new Error('solids is empty');
     var put = function (f) { f[items] = solids; };
     if (rc.custom === 'delete') {
       return function () {
         return Promise.all(solids.map(function (v) { return invokeOn('geo.removeItem', [v]); })).then(function () { return []; });
-      };
-    }
-    if (rc.custom === 'rename') {
-      var nm = String(o.name).trim();
-      if (!nm) throw new Error('name must not be empty');
-      var fs = o.folders === undefined ? [] : folderList(o.folders, ctx);
-      if (fs.indexOf(outlineRoot()) >= 0) throw new Error('the top level cannot be renamed');
-      return function () {
-        solids.forEach(function (v) { invokeOn('nodes.setName', [invokeOn('nodes.item2key', [v]), nm]); });
-        fs.forEach(function (g) { invokeOn('nodes.setName', [folderKey(g), nm]); });
-        return fs.concat(solids);
       };
     }
     switch (rc.custom) {
