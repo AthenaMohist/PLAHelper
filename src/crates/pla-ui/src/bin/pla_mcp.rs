@@ -88,8 +88,8 @@ fn model_tools() -> Value {
             "find": {"type": "string"}, "replace": {"type": "string"}, "regex": {"type": "boolean"}, "dedupe": {"type": "boolean"}, "apply": {"type": "boolean"}}}},
         {"name": "model_measure", "annotations": ro, "description": format!("Measure. op=distance: a, b = [x,y,z] | face id | edge id | vertex id → distance, delta, and normalDistance (wall thickness) when both are parallel planes. op=angle: a, b = faces (normals), line edges (directions) or vectors → degrees. op=mass: of (solids) and/or faces → volume, area, centroid (display mesh, curved surfaces ~0.3% low). {refs}"),
          "inputSchema": {"type": "object", "properties": {"op": {"type": "string", "enum": ["distance", "angle", "mass"]}, "a": {}, "b": {}, "of": {"type": "array", "items": {}}, "faces": {"type": "array", "items": {"type": "string"}}, "units": {"type": "string"}}, "required": ["op"]}},
-        {"name": "model_view", "annotations": ro, "description": "Screenshot the model from a standard view (front/back/left/right/top/bottom/iso), framed on 'of' solids (default: everything). The user's camera is restored afterwards. Use it to check results visually.",
-         "inputSchema": {"type": "object", "properties": {"view": {"type": "string", "enum": ["front", "back", "left", "right", "top", "bottom", "iso"]}, "of": {"type": "array", "items": {}}, "width": {"type": "integer", "description": "max width px (default 960)"}}}},
+        {"name": "model_view", "annotations": ro, "description": "Screenshot the model from a standard view (front/back/left/right/top/bottom/iso), framed on 'of' solids (default: everything). isolate: true shows ONLY the 'of' solids (Plasticity's own Isolate, so nothing in front hides them; undone afterwards, the user's selection is restored) - use it to look at one part. The user's camera is restored afterwards. Use it to check results visually.",
+         "inputSchema": {"type": "object", "properties": {"view": {"type": "string", "enum": ["front", "back", "left", "right", "top", "bottom", "iso"]}, "of": {"type": "array", "items": {}}, "isolate": {"type": "boolean"}, "width": {"type": "integer", "description": "max width px (default 960)"}}}},
         {"name": "model_exec", "annotations": {"destructiveHint": true},
          "description": format!("CHANGES THE USER'S MODEL - only when the user asked for this modeling work. Runs geometry steps through Plasticity's own factories (each step = one undo step, same as manual work). atomic (default true): if a step fails, every step of this call is undone. Cancels any command the user has in progress; the Plasticity window must be visible.\n\
 ops (lengths in document units unless units is given; points [x,y,z]):\n\
@@ -543,7 +543,7 @@ fn call_model_tool_inner(name: &str, a: &Value) -> Option<Value> {
         "model_snaps" => call(api::GEO_SNAPS, pick(a, &["of", "kinds", "near", "tol", "units", "limit"])),
         "model_measure" => call(api::GEO_MEASURE, pick(a, &["op", "a", "b", "of", "faces", "units"])),
         "model_view" => {
-            let mut args = pick(a, &["view", "of"]);
+            let mut args = pick(a, &["view", "of", "isolate"]);
             if let Some(w) = a["width"].as_u64() {
                 args["maxWidth"] = json!(w);
             }

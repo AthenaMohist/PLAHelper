@@ -88,7 +88,30 @@ pub async fn view_png_once(cdp_port: u16, hwnd: isize, args: &Value) -> anyhow::
         .map_err(|_| anyhow::anyhow!("connect timeout (8s)"))??;
     let mut mid: u64 = 100;
     eval_roundtrip(&mut ws, &mut mid, &shim::install_expr()).await?;
+    // H10: isolate = 先用 Plasticity 自己的隔离只留 of 里的实体; 截完一定退出隔离 + 恢复选择(截图失败也退)
+    let iso = if args["isolate"].as_bool() == Some(true) {
+        if args["of"].is_null() {
+            anyhow::bail!("isolate needs of (the solids to show)");
+        }
+        let raw = eval_roundtrip(&mut ws, &mut mid, &shim::call_expr(api::VIEW_ISOLATE, &json!({ "of": args["of"] }))).await?;
+        Some(shim::parse_reply(&raw)?)
+    } else {
+        None
+    };
+    let shot = view_png_inner(&mut ws, &mut mid, args).await;
+    if let Some(iso) = iso {
+        let back = json!({ "to": iso["start"], "prev": iso["prev"] });
+        if let Err(e) = eval_roundtrip(&mut ws, &mut mid, &shim::call_expr(api::VIEW_UNISOLATE, &back)).await {
+            eprintln!("[pla-view] unisolate failed: {e:#}");
+        }
+    }
+    shot
+}
+
+async fn view_png_inner(ws: &mut WsStream, mid: &mut u64, args: &Value) -> anyhow::Result<(Vec<u8>, Value)> {
+    let (mut ws, mut mid) = (ws, mid);
     let mut a = args.clone();
+    a.as_object_mut().map(|o| o.remove("isolate"));
     a["shot"] = json!(false);
     let raw = eval_roundtrip(&mut ws, &mut mid, &shim::call_expr(api::CAM_VIEW, &a)).await?;
     let mut v = shim::parse_reply(&raw)?;

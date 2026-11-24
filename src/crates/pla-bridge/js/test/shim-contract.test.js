@@ -271,7 +271,8 @@ function mkEditor(opts = {}) {
 let currentEd = null;
 const vpEl = {
   id: 'vp1',
-  dispatchEvent(ev) { if (currentEd) currentEd.registry.fire(this, ev.type); return true; },
+  // 和真 DOM 一样冒泡到 body(H10: 退出隔离派发在视口元素上, body 也收得到)
+  dispatchEvent(ev) { if (currentEd) currentEd.registry.fire(this, ev.type); if (ev.bubbles) body.dispatchEvent(ev); return true; },
   contains() { return true; },
 };
 const canvasEl = { getBoundingClientRect: () => ({ x: 10.2, y: 20.7, width: 800.4, height: 600 }) };

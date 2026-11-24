@@ -397,6 +397,9 @@
     undoCommand: 'edit:undo',
     // 退出隔离 = Plasticity 自己的命令(键位 alt-. → command:unisolate, 选择器 body); 恢复可见性时用它, 不直接写 NodeState 隔离层
     unisolateCommand: 'command:unisolate',
+    // H10: 隔离 = Plasticity 自己的命令(作用于当前选择)。实测 26.2.3 后台实例: isolate / unisolate 都要派发在视口元素上(冒泡到 body);
+    // 直接派发在 body 上不生效(以前 cfg 恢复退出隔离就是这样, 等于没退)。
+    isolateCommand: 'command:isolate',
     undoPollMs: 50,
     undoStepTimeoutMs: 5000,
     // 每步命令的超时(ms); 按位置挑边/面的默认容差(文档单位)
@@ -1028,6 +1031,50 @@
   function dispatchOn(el, name) {
     el.dispatchEvent(new CustomEvent(name, { bubbles: true }));
   }
+
+  // ---- H10 隔离显示(看一个零件: 先隔离再取景, 用户 2026-11-21 的提示)----
+  // 只用 Plasticity 自己的 isolate / unisolate 命令(不直接写隔离层 —— 2026-11-15 那样写过, 卡在隔离里只能杀进程)。
+  function isoLevels() { var st = need('nodes.state'); return (st[NAMES.nodeIsolations] || []).length; }
+  function waitIso(pred, ms) {
+    return new Promise(function (resolve) {
+      var t0 = Date.now();
+      (function poll() { if (pred(isoLevels()) || Date.now() - t0 > ms) return resolve(isoLevels()); setTimeout(poll, 50); })();
+    });
+  }
+  // args = { of: [实体引用] } → { start(隔离前层数), levels, prev(原来的选择) }; 选中它们 → isolate → 清掉选择(截图里没有选中描边)
+  def('view.isolate', 'cmd.dispatch', function (a) {
+    var el = viewportElement();
+    if (!el) throw new Error('no viewport element (' + CFG.viewportSelector + ')');
+    var views = (Array.isArray(a && a.of) ? a.of : [a && a.of]).reduce(function (acc, r) { return acc.concat(resolveSolids(r, {})); }, []);
+    if (!views.length) throw new Error('view.isolate needs of: [solids]');
+    var start = isoLevels();
+    var prev = API['sel.snapshot'].fn().items.map(function (it) { return { kind: it.kind, id: it.e }; });
+    var Sel = selectionCommandClass();
+    return runCommand(new Sel(editor(), views.map(function (v) { return { kind: 'solid', id: String(itemIdOf(v)), view: v }; }), true), NAMES.cmdTimeoutMs).then(function () {
+      dispatchOn(el, NAMES.isolateCommand);
+      return waitIso(function (n) { return n > start; }, 3000);
+    }).then(function (levels) {
+      if (levels <= start) throw new Error('isolate had no effect');
+      var Ctor = need('cmd.selectionBaseHolder');
+      return runCommand(new Ctor(editor()), 5000).then(function () { return { start: start, levels: levels, prev: prev }; });
+    });
+  }, { async: true });
+  // args = { to(回到的层数, 默认 0), prev?(要恢复的选择 [{kind, id}]) } → { levels }
+  def('view.unisolate', 'cmd.dispatch', function (a) {
+    a = a || {};
+    var el = viewportElement() || W.document.body, to = Math.max(0, Number(a.to) || 0);
+    var step = function (tries) {
+      var n = isoLevels();
+      if (n <= to || tries <= 0) return Promise.resolve(n);
+      dispatchOn(el, NAMES.unisolateCommand);
+      return waitIso(function (m) { return m < n; }, 2000).then(function () { return step(tries - 1); });
+    };
+    return step(8).then(function (n) {
+      var done = function () { return { levels: n }; };
+      if (Array.isArray(a.prev) && a.prev.length) return API['sel.apply'].fn({ items: a.prev, replace: true }).then(done, done);
+      return done();
+    });
+  }, { async: true });
 
   def('cmd.dispatch', 'cmd.dispatch', function (a) {
     var el = viewportElement();
@@ -3919,7 +3966,9 @@
     }
     // 退出隔离放最后: 恢复前的 mementoGuard 会取消活动命令, 先派发的话会把刚排上的退出隔离命令取消掉
     if (curIso) {
-      for (var i = 0; i < curIso; i++) W.document.body.dispatchEvent(new CustomEvent(NAMES.unisolateCommand, { bubbles: true }));
+      // H10: 派发在视口元素上(冒泡到 body); 直接派发在 body 上实测不生效
+      var vpEl = viewportElement() || W.document.body;
+      for (var i = 0; i < curIso; i++) dispatchOn(vpEl, NAMES.unisolateCommand);
       parts.push('unisolate' + curIso);
     }
     return 'vis:' + parts.join('/');
