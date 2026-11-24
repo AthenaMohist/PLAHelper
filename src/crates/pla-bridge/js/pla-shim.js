@@ -162,6 +162,8 @@
     'fac.radialArray':         ['fac', 'RadialArrayFactory'],
     'fac.boolean':             ['fac', 'BooleanFactory'],
     'geo.removeItem':          ['geo', 'removeItem'],
+    // H6: Plasticity 自己的删除命令(删当前选择)。直接 db.removeItem 会让之后每条命令报 "object N missing from stable model"(实测 2026-11-24)
+    'cmd.deleteCommand':       ['ed', 'commands.DeleteCommand'],
     // ---- N5 资产(asset pack)放置(实测 2026-11-18, know-how/asset-place.md) ----
     'ed.assets':               ['ed', 'assets'],
     'assets.packs':            ['assets', 'getAssetPacks'],
@@ -459,7 +461,9 @@
       boolean: { custom: 'boolean', fac: 'fac.boolean', required: ['targets', 'tools', 'operation'],
                  params: { targets: [null, 'solids'], tools: [null, 'solids'], operation: [null, 'boolOp'], keepTools: [null, 'bool'] } },
       // delete = 删除实体(同 Plasticity 的 Delete, 一个撤销步; 实测 model1: 撤销后实体回来)
-      delete: { custom: 'delete', fac: 'geo.removeItem', required: ['solids'], params: { solids: [null, 'solids'] } },
+      // H6(2026-11-24): delete = 选中这些实体 → Plasticity 自己的 DeleteCommand(与按 Delete 键同路径)。
+      // 以前在自建命令里直接 db.removeItem: 删掉以后每条命令都报 "object N missing from stable model"(实测复现), 只能撤销一步恢复。
+      delete: { custom: 'delete', fac: 'cmd.deleteCommand', also: ['cmd.selectionBaseHolder'], required: ['solids'], params: { solids: [null, 'solids'] } },
       // rename = 改大纲名(多个实体同名; 复制件改规格后改名, BOM 名称跟着对)
       // H3 批量改名(2026-11-24): 恰好一种方式 —— name(全部同名)/ items [{solid | folder, name}](逐个)/
       // pattern('螺钉-{n:02}', {name} = 原名, {n} = 序号从 start 起, sort = selection | x | y | z | name)/ find + replace(regex: true = 正则);
@@ -1808,11 +1812,6 @@
     var solids = convertParam('solids', o.solids, ctx);
     if (!solids.length) throw new Error('solids is empty');
     var put = function (f) { f[items] = solids; };
-    if (rc.custom === 'delete') {
-      return function () {
-        return Promise.all(solids.map(function (v) { return invokeOn('geo.removeItem', [v]); })).then(function () { return []; });
-      };
-    }
     switch (rc.custom) {
       case 'duplicate':
         return make(put);
@@ -2045,6 +2044,7 @@
     var step = function (i) {
       if (i >= a.ops.length) return done(null);
       var o = a.ops[i];
+      if (o.op === 'delete') return deleteStep(i, o);
       var build;
       try { build = buildStep(o, ctx); } catch (e) { return done({ index: i, op: o.op, err: errMsg(e) }); }
       var cmd = new Cls(editor(), build);
@@ -2054,6 +2054,24 @@
         if (o.id) ctx.refs[o.id] = made.filter(function (v) { return itemIdOf(v) !== null; });
         results.push({ index: i, op: o.op, id: o.id || null, items: made.map(function (v) { return describeMade(v, U.k); }) });
         return step(i + 1);
+      });
+    };
+    // H6: 删除 = 选中 → Plasticity 的 DeleteCommand(两条原生命令); 删完核对实体确实没了
+    var deleteStep = function (i, o) {
+      var views;
+      try { views = convertParam('solids', o.solids, ctx); if (!views.length) throw new Error('solids is empty'); }
+      catch (e) { return done({ index: i, op: o.op, err: errMsg(e) }); }
+      var ids = views.map(function (v) { return String(itemIdOf(v)); });
+      var Sel = selectionCommandClass(), Del = need('cmd.deleteCommand');
+      return runCommand(new Sel(editor(), views.map(function (v, k) { return { kind: 'solid', id: ids[k], view: v }; }), true), NAMES.cmdTimeoutMs).then(function (how) {
+        if (how !== 'ended') return done({ index: i, op: o.op, err: 'select: ' + how });
+        return runCommand(new Del(editor()), NAMES.cmdTimeoutMs).then(function (how2) {
+          if (how2 !== 'ended') return done({ index: i, op: o.op, err: 'delete: ' + how2 });
+          var left = ids.filter(function (id) { return !!viewOf('solid', id); });
+          if (left.length) return done({ index: i, op: o.op, err: 'not deleted: ' + left.join(', ') });
+          results.push({ index: i, op: o.op, id: o.id || null, items: [] });
+          return step(i + 1);
+        });
       });
     };
     return step(0);

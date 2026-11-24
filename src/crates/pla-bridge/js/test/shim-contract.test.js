@@ -1093,6 +1093,16 @@ const callAsync = async (name, args) => JSON.parse(await run(`window.__PLA__.cal
       return add(new Wire());
     };
     ed.geo.removeItem = function (v) { ed.removed = (ed.removed || 0) + 1; remove(v); return Promise.resolve(); };
+    // H6: Plasticity 的 DeleteCommand = 删当前选中的实体(shim 先用选择命令选中; 假实体没有可点的面 → 选择命令走 add 兜底)
+    const SS = ed.selection.selected;
+    if (!SS.add) { SS.add = (v) => SS.solidIds.add(v.userData ? v.userData.versionId : v.id); SS.removeAll = () => SS.solidIds.clear(); }
+    ed.commands.DeleteCommand = class DeleteCommand extends ed._Command {
+      async execute() {
+        const s = this.editor.selection.selected;
+        [...s.solidIds].forEach((id) => { const it = ed.geo.items.find((x) => x.view.userData && x.view.userData.versionId === id); if (it) { ed.removed = (ed.removed || 0) + 1; remove(it.view); } });
+        s.solidIds.clear();
+      }
+    };
     class CenterPolygonFactory extends AbstractFactory {
       constructor(editor) {
         super(editor);
@@ -1284,9 +1294,9 @@ const callAsync = async (name, args) => JSON.parse(await run(`window.__PLA__.cal
     assert.strictEqual(r.err, 'exc:need-factories');
     const f = call('cmd.factories').v;
     assert.strictEqual(f.loaded, false);
-    assert.deepStrictEqual(f.missing.sort(), ['fac.boolean', 'fac.centerPolygon', 'fac.cornerBox', 'fac.curve', 'fac.cylinder', 'fac.duplicate', 'fac.extrude', 'fac.mirror',
+    assert.deepStrictEqual(f.missing.sort(), ['cmd.deleteCommand', 'fac.boolean', 'fac.centerPolygon', 'fac.cornerBox', 'fac.curve', 'fac.cylinder', 'fac.duplicate', 'fac.extrude', 'fac.mirror',
       'fac.moveFaces', 'fac.moveItems', 'fac.multiFillet', 'fac.offsetFace', 'fac.radialArray', 'fac.rectArray', 'fac.refillet', 'fac.revolve', 'fac.rotateItems',
-      'geo.removeItem', 'groups.attach', 'groups.create', 'groups.dissolve', 'groups.move', 'nodes.setHidden', 'nodes.setName']);  // 假编辑器里这些随假工厂一起挂上
+      'groups.attach', 'groups.create', 'groups.dissolve', 'groups.move', 'nodes.setHidden', 'nodes.setName']);  // 假编辑器里这些随假工厂一起挂上
     assert.deepStrictEqual(f.ops, ['box', 'fillet', 'offsetFace', 'refillet', 'moveFaces', 'cylinder', 'chamfer', 'prism', 'revolve',
       'duplicate', 'mirror', 'move', 'rotate', 'pattern', 'radialPattern', 'boolean', 'delete', 'rename', 'folder', 'moveTo', 'hide', 'show', 'ungroup']);
   });
@@ -1406,8 +1416,8 @@ const callAsync = async (name, args) => JSON.parse(await run(`window.__PLA__.cal
       { op: 'delete', solids: ['$tmp'] },
       { op: 'rename', solids: ['$x'], name: '  杯内六M4x25 ' },
     ] });
-    assert.deepStrictEqual(ed.renamed.slice(-1), ['杯内六M4x25'], '改名(去掉首尾空格)');
     assert.strictEqual(b.v.failed, null, JSON.stringify(b.v.failed));
+    assert.deepStrictEqual(ed.renamed.slice(-1), ['杯内六M4x25'], '改名(去掉首尾空格)');
     assert.deepStrictEqual(JSON.parse(JSON.stringify(b.v.results[2].items[0].bbox)), [[10, 505, 0], [20, 515, 10]], '求交 = 重叠部分');
     assert.deepStrictEqual([ed.lastXform.op, ed.lastXform.keepTools], [15901, false]);
     assert.strictEqual((ed.removed || 0) - rm0, 1, 'delete 走 geo.removeItem');
