@@ -399,6 +399,8 @@ struct PlaApp {
     hole_usage: u8,
     hole_type: u8,
     hole_through: bool,
+    /// H2: 腰孔组合孔最后一层螺纹孔的位置(没另选对应点时): 0 中点 / 1 起点 / 2 终点
+    hole_tap_at: u8,
     hole_vals: [String; 6],
     hole_pending: Option<serde_json::Value>,
     /// N4b 孔规格方案(hole_presets): 方案名列表、当前方案、其规格、文件修改时间 / 上次检查(热生效)、读错、改名输入。
@@ -2764,6 +2766,7 @@ impl PlaApp {
             hole_usage: 0,
             hole_type: 0,
             hole_through: true,
+            hole_tap_at: 0,
             hole_vals: Default::default(),
             hole_pending: None,
             hole_presets: Vec::new(),
@@ -7608,8 +7611,8 @@ impl PlaApp {
                 ui,
                 tr("选一个平面(孔的入口)", "Select a plane face (the hole entry)"),
                 tr(
-                    "再 Shift 加选草图点(曲线端点 / 圆)= 孔位, 一点一孔; 不选点 = 面中点。\n再加选别的实体 = 组合孔(最后一个实体 = 底孔)。",
-                    "Shift-add sketch points (curve ends / circles) = hole positions, one hole each; none = face midpoint.\nShift-add more solids = stacked hole (the last solid gets the tap hole).",
+                    "再 Shift 加选草图点(曲线端点 / 圆)= 孔位, 一点一孔; 选直线 = 腰孔(沿直线); 不选点 = 面中点。\n再加选别的实体 = 组合孔(最后一个实体 = 底孔; 腰孔的最后一层只打一个螺纹孔)。",
+                    "Shift-add sketch points (curve ends / circles) = hole positions, one hole each; a straight line = a slot along it; none = face midpoint.\nShift-add more solids = stacked hole (the last solid gets the tap hole; for a slot, one tap hole).",
                 ),
             ),
             Some(_) => {
@@ -7761,6 +7764,15 @@ impl PlaApp {
                 enter |= rz_field(&mut cols[0], &mut self.hole_vals[1], &u, true);
             });
         }
+        // H2: 选了直线(腰孔)+ 组合孔 → 最后一层的螺纹孔位置; 另选了落在直线上的点就用那个点(这里不用选)
+        if combo && points.iter().any(|p| p["kind"] == "curve") {
+            rz_label(ui, tr("腰孔的螺纹孔位置(没另选对应点时)", "Slot tap hole position (if no point was picked)"));
+            let labels = vec![tr("中点", "Middle").to_string(), tr("起点", "Start").to_string(), tr("终点", "End").to_string()];
+            let mut s = self.hole_tap_at as usize;
+            if rz_segmented(ui, "hole-tap-at", &labels, &mut s) {
+                self.hole_tap_at = s as u8;
+            }
+        }
         if ty == "counterbore" {
             ui.columns(2, |cols| {
                 rz_label(&mut cols[0], tr("沉头直径", "Bore dia."));
@@ -7811,6 +7823,7 @@ impl PlaApp {
         if combo {
             args["stack"] = serde_json::json!(stack);
             args["tapD"] = serde_json::json!(tapd);
+            args["tapAt"] = serde_json::json!(["mid", "from", "to"][self.hole_tap_at.min(2) as usize]);
         }
         match ty {
             "counterbore" => {
